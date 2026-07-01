@@ -596,6 +596,46 @@ impl super::TermWindow {
         }
     }
 
+    fn sidebar_search_key_input(
+        &mut self,
+        key: ::termwiz::input::KeyCode,
+        modifiers: Modifiers,
+        context: &dyn WindowOps,
+    ) -> bool {
+        use ::termwiz::input::KeyCode as KC;
+        match key {
+            KC::Escape => {
+                self.sidebar_search = None;
+                context.invalidate();
+                true
+            }
+            KC::Backspace => {
+                if let Some(state) = self.sidebar_search.as_mut() {
+                    state.query.pop();
+                }
+                context.invalidate();
+                true
+            }
+            KC::Enter => {
+                self.activate_first_sidebar_search_match();
+                self.sidebar_search = None;
+                context.invalidate();
+                true
+            }
+            KC::Char(c)
+                if !modifiers.intersects(Modifiers::CTRL | Modifiers::ALT | Modifiers::SUPER)
+                    && !c.is_control() =>
+            {
+                if let Some(state) = self.sidebar_search.as_mut() {
+                    state.query.push(c);
+                }
+                context.invalidate();
+                true
+            }
+            _ => false,
+        }
+    }
+
     pub fn key_event_impl(&mut self, window_key: KeyEvent, context: &dyn WindowOps) {
         let pane = match self.get_active_pane_or_overlay() {
             Some(pane) => pane,
@@ -669,6 +709,12 @@ impl super::TermWindow {
                         modal.key_down(key, modifiers, self).ok();
                     }
                     return;
+                }
+
+                if self.sidebar_search.is_some() && window_key.key_is_down {
+                    if self.sidebar_search_key_input(key, modifiers, context) {
+                        return;
+                    }
                 }
 
                 let res = if let Some(encoded) = self.encode_win32_input(&pane, &window_key) {

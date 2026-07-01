@@ -1,12 +1,15 @@
 use crate::tabbar::TabBarItem;
 use crate::termwindow::{
-    GuiWin, MouseCapture, PositionedSplit, ScrollHit, TermWindowNotif, UIItem, UIItemType, TMB,
+    AgentCopyAction, AgentCopyMenuState, AgentToolbeltAction, GuiWin, MouseCapture,
+    PositionedSplit, ScrollHit, TermWindowNotif, UIItem, UIItemType, TMB,
 };
 use ::window::{
     MouseButtons as WMB, MouseCursor, MouseEvent, MouseEventKind as WMEK, MousePress,
     WindowDecorations, WindowOps, WindowState,
 };
-use config::keyassignment::{KeyAssignment, MouseEventTrigger, SpawnTabDomain};
+use config::keyassignment::{
+    ClipboardCopyDestination, KeyAssignment, MouseEventTrigger, SpawnTabDomain,
+};
 use config::MouseEventAltScreen;
 use mux::pane::{Pane, WithPaneLines};
 use mux::tab::SplitDirection;
@@ -16,12 +19,12 @@ use std::convert::TryInto;
 use std::ops::Sub;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use termwiz::hyperlink::Hyperlink;
 use termwiz::surface::Line;
 use wezterm_dynamic::ToDynamic;
 use wezterm_term::input::{MouseButton, MouseEventKind as TMEK};
-use wezterm_term::{ClickPosition, LastMouseClick, StableRowIndex};
+use wezterm_term::{ClickPosition, KeyCode, KeyModifiers, LastMouseClick, StableRowIndex};
 
 impl super::TermWindow {
     fn resolve_ui_item(&self, event: &MouseEvent) -> Option<UIItem> {
@@ -39,7 +42,16 @@ impl super::TermWindow {
             UIItemType::TabBar(_) => {
                 self.update_title_post_status();
             }
-            UIItemType::CloseTab(_)
+            UIItemType::SidebarTab { .. }
+            | UIItemType::SidebarTabList
+            | UIItemType::SidebarScrollTrack
+            | UIItemType::SidebarScrollThumb
+            | UIItemType::CloseTab(_)
+            | UIItemType::SidebarResize { .. }
+            | UIItemType::SidebarSearch
+            | UIItemType::SidebarWorktreeButton
+            | UIItemType::AgentToolbeltButton { .. }
+            | UIItemType::AgentCopyMenuItem { .. }
             | UIItemType::AboveScrollThumb
             | UIItemType::BelowScrollThumb
             | UIItemType::ScrollThumb
@@ -50,7 +62,16 @@ impl super::TermWindow {
     fn enter_ui_item(&mut self, item: &UIItem) {
         match item.item_type {
             UIItemType::TabBar(_) => {}
-            UIItemType::CloseTab(_)
+            UIItemType::SidebarTab { .. }
+            | UIItemType::SidebarTabList
+            | UIItemType::SidebarScrollTrack
+            | UIItemType::SidebarScrollThumb
+            | UIItemType::CloseTab(_)
+            | UIItemType::SidebarResize { .. }
+            | UIItemType::SidebarSearch
+            | UIItemType::SidebarWorktreeButton
+            | UIItemType::AgentToolbeltButton { .. }
+            | UIItemType::AgentCopyMenuItem { .. }
             | UIItemType::AboveScrollThumb
             | UIItemType::BelowScrollThumb
             | UIItemType::ScrollThumb
@@ -66,14 +87,18 @@ impl super::TermWindow {
         };
 
         self.current_mouse_event.replace(event.clone());
+        if self.update_sidebar_auto_hide_state() {
+            context.invalidate();
+        }
 
         let border = self.get_os_border();
 
-        let first_line_offset = if self.show_tab_bar && !self.config.tab_bar_at_bottom {
-            self.tab_bar_pixel_height().unwrap_or(0.) as isize
-        } else {
-            0
-        } + border.top.get() as isize;
+        let first_line_offset =
+            if self.show_tab_bar && !self.sidebar_is_active() && !self.config.tab_bar_at_bottom {
+                self.tab_bar_pixel_height().unwrap_or(0.) as isize
+            } else {
+                0
+            } + border.top.get() as isize;
 
         let (padding_left, padding_top) = self.padding_left_top();
 
@@ -126,12 +151,31 @@ impl super::TermWindow {
                 self.current_mouse_capture = None;
                 self.current_mouse_buttons.retain(|p| p != press);
                 if press == &MousePress::Left && self.window_drag_position.take().is_some() {
+                    self.pressed_ui_item = None;
                     // Completed a window drag
                     return;
                 }
-                if press == &MousePress::Left && self.dragging.take().is_some() {
-                    // Completed a drag
-                    return;
+                if press == &MousePress::Left {
+                    if let Some((item, _)) = self.dragging.take() {
+                        let dropped_tab = match &item.item_type {
+                            UIItemType::SidebarTab { tab_idx, .. } => Some(*tab_idx),
+                            _ => None,
+                        };
+                        self.pressed_ui_item = None;
+                        if matches!(item.item_type, UIItemType::SidebarResize { .. }) {
+                            self.finish_sidebar_resize();
+                        }
+                        if let Some(tab_idx) = dropped_tab {
+                            self.sidebar_drop_flash = Some((tab_idx, Instant::now()));
+                            *self.has_animation.borrow_mut() = Some(Instant::now());
+                            context.invalidate();
+                        }
+                        if self.update_sidebar_auto_hide_state() {
+                            context.invalidate();
+                        }
+                        // Completed a drag
+                        return;
+                    }
                 }
             }
 
@@ -215,6 +259,36 @@ impl super::TermWindow {
         } else {
             None
         };
+        let is_left_release = event.kind == WMEK::Release(MousePress::Left);
+
+        if matches!(&event.kind, WMEK::Press(_)) && self.sidebar_search.is_some() {
+            let on_search = matches!(
+                &ui_item,
+                Some(item) if item.item_type == UIItemType::SidebarSearch
+            );
+            if !on_search {
+                self.sidebar_search = None;
+                context.invalidate();
+            }
+        }
+
+        if matches!(&event.kind, WMEK::Press(_)) && self.agent_copy_menu.is_some() {
+            let on_copy_menu = matches!(
+                &ui_item,
+                Some(item)
+                    if matches!(
+                        item.item_type,
+                        UIItemType::AgentToolbeltButton {
+                            action: AgentToolbeltAction::CopyMenu,
+                            ..
+                        } | UIItemType::AgentCopyMenuItem { .. }
+                    )
+            );
+            if !on_copy_menu {
+                self.agent_copy_menu = None;
+                context.invalidate();
+            }
+        }
 
         if let Some(item) = ui_item.clone() {
             if capture_mouse {
@@ -242,10 +316,17 @@ impl super::TermWindow {
         if prior_ui_item != ui_item {
             self.update_title_post_status();
         }
+        if is_left_release {
+            self.pressed_ui_item = None;
+            context.invalidate();
+        }
     }
 
     pub fn mouse_leave_impl(&mut self, context: &dyn WindowOps) {
         self.current_mouse_event = None;
+        if self.sidebar_auto_hide_open && self.schedule_sidebar_auto_hide_close() {
+            context.invalidate();
+        }
         self.update_title();
         context.set_cursor(Some(MouseCursor::Arrow));
         context.invalidate();
@@ -285,7 +366,7 @@ impl super::TermWindow {
         item: UIItem,
         start_event: MouseEvent,
         event: MouseEvent,
-        context: &dyn WindowOps,
+        _context: &dyn WindowOps,
     ) {
         let pane = match self.get_active_pane_or_overlay() {
             Some(pane) => pane,
@@ -295,7 +376,7 @@ impl super::TermWindow {
         let dims = pane.get_dimensions();
         let current_viewport = self.get_viewport(pane.pane_id());
 
-        let tab_bar_height = if self.show_tab_bar {
+        let tab_bar_height = if self.show_tab_bar && !self.sidebar_is_active() {
             self.tab_bar_pixel_height().unwrap_or(0.)
         } else {
             0.
@@ -328,7 +409,6 @@ impl super::TermWindow {
             self.min_scroll_bar_height() as usize,
         );
         self.set_viewport(pane.pane_id(), Some(row), dims);
-        context.invalidate();
         self.dragging.replace((item, start_event));
     }
 
@@ -348,6 +428,15 @@ impl super::TermWindow {
             UIItemType::ScrollThumb => {
                 self.drag_scroll_thumb(item, start_event, event, context);
             }
+            UIItemType::SidebarResize { start_width } => {
+                self.drag_sidebar_resize(start_width, start_event, event, context);
+            }
+            UIItemType::SidebarScrollThumb => {
+                self.drag_sidebar_scroll_thumb(item, start_event, event, context);
+            }
+            UIItemType::SidebarTab { tab_idx, .. } => {
+                self.drag_sidebar_tab(item, tab_idx, start_event, event, context);
+            }
             _ => {
                 log::error!("drag not implemented for {:?}", item);
             }
@@ -362,7 +451,12 @@ impl super::TermWindow {
         event: MouseEvent,
         context: &dyn WindowOps,
     ) {
+        let is_left_press = event.kind == WMEK::Press(MousePress::Left);
         self.last_ui_item.replace(item.clone());
+        if is_left_press {
+            self.pressed_ui_item.replace(item.item_type.clone());
+            context.invalidate();
+        }
         match item.item_type {
             UIItemType::TabBar(item) => {
                 self.mouse_event_tab_bar(item, event, context);
@@ -382,7 +476,379 @@ impl super::TermWindow {
             UIItemType::CloseTab(idx) => {
                 self.mouse_event_close_tab(idx, event, context);
             }
+            UIItemType::SidebarTab { tab_idx, .. } => {
+                self.mouse_event_sidebar_tab(item, tab_idx, event, context);
+            }
+            UIItemType::SidebarTabList => {
+                self.mouse_event_sidebar_tab_list(event, context);
+            }
+            UIItemType::SidebarScrollTrack => {
+                self.mouse_event_sidebar_scroll_track(item, event, context);
+            }
+            UIItemType::SidebarScrollThumb => {
+                self.mouse_event_sidebar_scroll_thumb(item, event, context);
+            }
+            UIItemType::SidebarResize { .. } => {
+                self.mouse_event_sidebar_resize(item, event, context);
+            }
+            UIItemType::SidebarSearch => {
+                self.mouse_event_sidebar_search(event, context);
+            }
+            UIItemType::SidebarWorktreeButton => {
+                self.mouse_event_sidebar_worktree_button(pane, event, context);
+            }
+            UIItemType::AgentToolbeltButton { pane_id, action } => {
+                self.mouse_event_agent_toolbelt_button(pane_id, action, event, context);
+            }
+            UIItemType::AgentCopyMenuItem { pane_id, action } => {
+                self.mouse_event_agent_copy_menu_item(pane_id, action, event, context);
+            }
         }
+    }
+
+    fn finish_sidebar_resize(&mut self) {
+        if let Some(window) = self.window.as_ref().map(|w| w.clone()) {
+            let dims = self.dimensions;
+            self.apply_dimensions(&dims, None, &window);
+        }
+    }
+
+    fn drag_sidebar_resize(
+        &mut self,
+        start_width: usize,
+        start_event: MouseEvent,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        let min_width = self.sidebar_collapsed_width().max(140) as isize;
+        let border = self.get_os_border();
+        let max_width = (self.dimensions.pixel_width / 2).max(min_width as usize) as isize;
+        let raw_width = match self.config.sidebar_position {
+            config::SidebarPosition::Left => {
+                event.coords.x.saturating_sub(border.left.get() as isize)
+            }
+            config::SidebarPosition::Right => (self.dimensions.pixel_width as isize)
+                .saturating_sub(border.right.get() as isize)
+                .saturating_sub(event.coords.x),
+        };
+        let width = raw_width.clamp(min_width, max_width).max(0) as usize;
+        context.set_cursor(Some(MouseCursor::SizeLeftRight));
+        if self.sidebar_drag_width == Some(width) {
+            self.dragging.replace((
+                UIItem {
+                    x: 0,
+                    y: 0,
+                    width: 0,
+                    height: 0,
+                    item_type: UIItemType::SidebarResize { start_width },
+                },
+                start_event,
+            ));
+            return;
+        }
+        self.sidebar_drag_width = Some(width);
+        self.quad_generation += 1;
+        *self.has_animation.borrow_mut() = Some(Instant::now());
+        context.invalidate();
+        self.dragging.replace((
+            UIItem {
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 0,
+                item_type: UIItemType::SidebarResize { start_width },
+            },
+            start_event,
+        ));
+    }
+
+    fn mouse_event_sidebar_resize(
+        &mut self,
+        item: UIItem,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        context.set_cursor(Some(MouseCursor::SizeLeftRight));
+        if event.kind == WMEK::Press(MousePress::Left) {
+            self.dragging.replace((item, event));
+        }
+    }
+
+    fn mouse_event_sidebar_worktree_button(
+        &mut self,
+        pane: Arc<dyn Pane>,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        if event.kind == WMEK::Release(MousePress::Left) {
+            self.open_file_browser(&pane);
+            self.pressed_ui_item = None;
+        }
+        context.invalidate();
+    }
+
+    fn drag_sidebar_tab(
+        &mut self,
+        mut item: UIItem,
+        current_idx: usize,
+        start_event: MouseEvent,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        let delta_y = event.coords.y.saturating_sub(start_event.coords.y).abs();
+        if delta_y < 4 {
+            self.dragging.replace((item, start_event));
+            return;
+        }
+
+        let pointer_y = event.coords.y;
+        let target_idx = self
+            .ui_items
+            .iter()
+            .filter_map(|ui_item| match &ui_item.item_type {
+                UIItemType::SidebarTab { tab_idx, .. } => {
+                    let top = ui_item.y as isize - 4;
+                    let bottom = (ui_item.y + ui_item.height) as isize + 4;
+                    if pointer_y >= top && pointer_y <= bottom {
+                        Some(*tab_idx)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            })
+            .next();
+
+        if let Some(target_idx) = target_idx {
+            if target_idx != current_idx && self.move_tab(target_idx).is_ok() {
+                item.item_type = UIItemType::SidebarTab {
+                    tab_idx: target_idx,
+                    active: true,
+                };
+                self.pressed_ui_item.replace(item.item_type.clone());
+                self.last_ui_item.replace(item.clone());
+                context.invalidate();
+            }
+        }
+
+        context.set_cursor(Some(MouseCursor::Arrow));
+        self.dragging.replace((item, start_event));
+    }
+
+    fn mouse_event_sidebar_tab(
+        &mut self,
+        item: UIItem,
+        tab_idx: usize,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        match event.kind {
+            WMEK::Press(MousePress::Left) => {
+                self.activate_tab(tab_idx as isize).ok();
+                self.dragging.replace((item, event));
+                context.invalidate();
+            }
+            WMEK::Press(MousePress::Middle) => {
+                self.close_specific_tab(tab_idx, true);
+            }
+            WMEK::Press(MousePress::Right) => {
+                self.show_tab_navigator();
+            }
+            WMEK::VertWheel(n) => {
+                if self.scroll_sidebar_tabs(n.into()) {
+                    context.invalidate();
+                } else if self.config.mouse_wheel_scrolls_tabs {
+                    self.activate_tab_relative(if n < 1 { 1 } else { -1 }, true)
+                        .ok();
+                }
+            }
+            _ => {}
+        }
+        context.set_cursor(Some(MouseCursor::Arrow));
+    }
+
+    fn mouse_event_sidebar_tab_list(&mut self, event: MouseEvent, context: &dyn WindowOps) {
+        if let WMEK::VertWheel(n) = event.kind {
+            if self.scroll_sidebar_tabs(n.into()) {
+                context.invalidate();
+            }
+        }
+        context.set_cursor(Some(MouseCursor::Arrow));
+    }
+
+    fn drag_sidebar_scroll_thumb(
+        &mut self,
+        item: UIItem,
+        start_event: MouseEvent,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        if self.scroll_sidebar_thumb_to(event.coords.y) {
+            context.invalidate();
+        }
+        self.dragging.replace((item, start_event));
+    }
+
+    fn mouse_event_sidebar_scroll_track(
+        &mut self,
+        item: UIItem,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        match event.kind {
+            WMEK::Press(MousePress::Left) => {
+                if self.scroll_sidebar_tabs_page_toward(event.coords.y) {
+                    context.invalidate();
+                }
+            }
+            WMEK::VertWheel(n) => {
+                if self.scroll_sidebar_tabs(n.into()) {
+                    context.invalidate();
+                }
+            }
+            _ => {}
+        }
+        self.pressed_ui_item.replace(item.item_type);
+        context.set_cursor(Some(MouseCursor::Arrow));
+    }
+
+    fn mouse_event_sidebar_scroll_thumb(
+        &mut self,
+        item: UIItem,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        match event.kind {
+            WMEK::Press(MousePress::Left) => {
+                self.pressed_ui_item.replace(item.item_type.clone());
+                self.dragging.replace((item, event));
+            }
+            WMEK::VertWheel(n) => {
+                if self.scroll_sidebar_tabs(n.into()) {
+                    context.invalidate();
+                }
+            }
+            _ => {}
+        }
+        context.set_cursor(Some(MouseCursor::Arrow));
+    }
+
+    fn mouse_event_sidebar_search(&mut self, event: MouseEvent, context: &dyn WindowOps) {
+        if event.kind == WMEK::Press(MousePress::Left) {
+            self.sidebar_search.get_or_insert_with(Default::default);
+            context.invalidate();
+        }
+        context.set_cursor(Some(MouseCursor::Text));
+    }
+
+    fn mouse_event_agent_toolbelt_button(
+        &mut self,
+        pane_id: mux::pane::PaneId,
+        action: AgentToolbeltAction,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        let item_type = UIItemType::AgentToolbeltButton {
+            pane_id,
+            action: action.clone(),
+        };
+        match event.kind {
+            WMEK::Press(MousePress::Left) => {
+                self.pressed_ui_item.replace(item_type);
+                context.invalidate();
+            }
+            WMEK::Release(MousePress::Left) => {
+                if self.pressed_ui_item.as_ref() == Some(&item_type) {
+                    if let Some(pane) = Mux::get().get_pane(pane_id) {
+                        match action {
+                            AgentToolbeltAction::Interrupt => {
+                                if let Err(err) =
+                                    pane.key_down(KeyCode::Char('c'), KeyModifiers::CTRL)
+                                {
+                                    log::warn!("failed to send agent interrupt: {err:#}");
+                                } else {
+                                    wezterm_toast_notification::show(
+                                        wezterm_toast_notification::ToastNotification {
+                                            title: "Agent control".to_string(),
+                                            message: "Sent Ctrl-C to the active agent pane"
+                                                .to_string(),
+                                            url: None,
+                                            timeout: Some(Duration::from_millis(1800)),
+                                        },
+                                    );
+                                }
+                            }
+                            AgentToolbeltAction::CopyMenu => {
+                                self.agent_copy_menu = Some(AgentCopyMenuState {
+                                    pane_id,
+                                    x: event.coords.x.max(0) as usize,
+                                    y: event.coords.y.max(0) as usize,
+                                });
+                            }
+                            AgentToolbeltAction::Attach
+                            | AgentToolbeltAction::Resume
+                            | AgentToolbeltAction::OpenLogs => {}
+                        }
+                    }
+                    self.pressed_ui_item.take();
+                    context.invalidate();
+                }
+            }
+            _ => {}
+        }
+        context.set_cursor(Some(MouseCursor::Arrow));
+    }
+
+    fn mouse_event_agent_copy_menu_item(
+        &mut self,
+        pane_id: mux::pane::PaneId,
+        action: AgentCopyAction,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        let item_type = UIItemType::AgentCopyMenuItem {
+            pane_id,
+            action: action.clone(),
+        };
+        match event.kind {
+            WMEK::Press(MousePress::Left) => {
+                self.pressed_ui_item.replace(item_type);
+                context.invalidate();
+            }
+            WMEK::Release(MousePress::Left) => {
+                if self.pressed_ui_item.as_ref() == Some(&item_type) {
+                    if let Some(pane) = Mux::get().get_pane(pane_id) {
+                        let (text, message) = match action {
+                            AgentCopyAction::Conversation => (
+                                self.agent_pane_conversation_text(&pane),
+                                "Copied the agent conversation",
+                            ),
+                            AgentCopyAction::LastAgentMessage => (
+                                self.agent_pane_last_message_text(&pane),
+                                "Copied the latest visible agent message",
+                            ),
+                            AgentCopyAction::Summary => {
+                                (self.agent_pane_summary(&pane), "Copied the agent details")
+                            }
+                        };
+                        self.copy_to_clipboard(ClipboardCopyDestination::Clipboard, text);
+                        wezterm_toast_notification::show(
+                            wezterm_toast_notification::ToastNotification {
+                                title: "Agent copy".to_string(),
+                                message: message.to_string(),
+                                url: None,
+                                timeout: Some(Duration::from_millis(1800)),
+                            },
+                        );
+                    }
+                    self.agent_copy_menu = None;
+                    self.pressed_ui_item.take();
+                    context.invalidate();
+                }
+            }
+            _ => {}
+        }
+        context.set_cursor(Some(MouseCursor::Arrow));
     }
 
     pub fn mouse_event_close_tab(
@@ -391,10 +857,17 @@ impl super::TermWindow {
         event: MouseEvent,
         context: &dyn WindowOps,
     ) {
+        let close_type = UIItemType::CloseTab(idx);
         match event.kind {
             WMEK::Press(MousePress::Left) => {
-                log::debug!("Should close tab {}", idx);
-                self.close_specific_tab(idx, true);
+                self.pressed_ui_item.replace(close_type);
+                context.invalidate();
+            }
+            WMEK::Release(MousePress::Left) => {
+                if self.pressed_ui_item.as_ref() == Some(&close_type) {
+                    log::debug!("Should close tab {}", idx);
+                    self.close_specific_tab(idx, true);
+                }
             }
             _ => {}
         }
@@ -583,7 +1056,6 @@ impl super::TermWindow {
                 ),
                 dims,
             );
-            context.invalidate();
         }
         context.set_cursor(Some(MouseCursor::Arrow));
     }
@@ -608,7 +1080,6 @@ impl super::TermWindow {
                 ),
                 dims,
             );
-            context.invalidate();
         }
         context.set_cursor(Some(MouseCursor::Arrow));
     }

@@ -48,6 +48,248 @@ use wezterm_input_types::{
 };
 use wezterm_term::TerminalSize;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromDynamic, ToDynamic)]
+pub enum SidebarPosition {
+    Left,
+    Right,
+}
+
+impl Default for SidebarPosition {
+    fn default() -> Self {
+        Self::Left
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromDynamic, ToDynamic)]
+pub enum SidebarTabDensity {
+    Comfortable,
+    Compact,
+}
+
+impl Default for SidebarTabDensity {
+    fn default() -> Self {
+        Self::Comfortable
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, FromDynamic, ToDynamic)]
+pub enum SidebarTabTitleSource {
+    Title,
+    Command,
+    WorkingDirectory,
+    GitBranch,
+}
+
+impl Default for SidebarTabTitleSource {
+    fn default() -> Self {
+        Self::Title
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, FromDynamic, ToDynamic)]
+pub enum SidebarTabMetadata {
+    GitBranch,
+    WorkingDirectory,
+}
+
+#[derive(Debug, Clone, FromDynamic, ToDynamic)]
+pub struct FileBrowserConfig {
+    /// Command used to open a selected file. The file path is appended.
+    #[dynamic(default)]
+    pub editor_command: Option<Vec<String>>,
+
+    /// Command used to list selectable files.
+    #[dynamic(default = "default_file_browser_list_command")]
+    pub list_command: Vec<String>,
+
+    /// Percentage of the window assigned to the browser split.
+    #[dynamic(default = "default_file_browser_split_size_percent")]
+    pub split_size_percent: u8,
+
+    /// Reuse a previously opened editor pane when possible.
+    #[dynamic(default = "default_true")]
+    pub reuse_editor_pane: bool,
+}
+
+impl Default for FileBrowserConfig {
+    fn default() -> Self {
+        Self {
+            editor_command: None,
+            list_command: default_file_browser_list_command(),
+            split_size_percent: default_file_browser_split_size_percent(),
+            reuse_editor_pane: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, FromDynamic, ToDynamic)]
+pub enum AgentTelemetryField {
+    Kind,
+    Model,
+    Status,
+    InputTokens,
+    OutputTokens,
+    TotalTokens,
+    EstimatedCost,
+}
+
+#[derive(Debug, Clone, FromDynamic, ToDynamic)]
+pub struct AgentTelemetryConfig {
+    /// Enable vendor-neutral agent telemetry display surfaces.
+    #[dynamic(default)]
+    pub enabled: bool,
+
+    /// Fields accepted by the telemetry UI and status surfaces.
+    #[dynamic(default = "default_agent_telemetry_fields")]
+    pub fields: Vec<AgentTelemetryField>,
+}
+
+impl Default for AgentTelemetryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            fields: default_agent_telemetry_fields(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromDynamic, ToDynamic)]
+pub enum AgentToolbeltPosition {
+    Top,
+    Bottom,
+}
+
+impl Default for AgentToolbeltPosition {
+    fn default() -> Self {
+        Self::Top
+    }
+}
+
+#[derive(Debug, Clone, FromDynamic, ToDynamic)]
+pub struct AgentAdapterConfig {
+    /// Enable passive detection for this adapter.
+    #[dynamic(default = "default_true")]
+    pub enabled: bool,
+
+    /// Additional foreground process basenames that identify this adapter.
+    #[dynamic(default)]
+    pub process_names: Vec<String>,
+
+    /// Additional lowercase title fragments that identify this adapter.
+    #[dynamic(default)]
+    pub title_patterns: Vec<String>,
+}
+
+impl Default for AgentAdapterConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            process_names: Vec::new(),
+            title_patterns: Vec::new(),
+        }
+    }
+}
+
+impl AgentAdapterConfig {
+    fn with_matchers(process_names: &[&str], title_patterns: &[&str]) -> Self {
+        Self {
+            enabled: true,
+            process_names: process_names.iter().map(|name| name.to_string()).collect(),
+            title_patterns: title_patterns
+                .iter()
+                .map(|pattern| pattern.to_string())
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, FromDynamic, ToDynamic)]
+pub struct AgentAdaptersConfig {
+    #[dynamic(default)]
+    pub claude: AgentAdapterConfig,
+    #[dynamic(default)]
+    pub codex: AgentAdapterConfig,
+    #[dynamic(default)]
+    pub gemini: AgentAdapterConfig,
+    #[dynamic(default)]
+    pub opencode: AgentAdapterConfig,
+    #[dynamic(default)]
+    pub copilot: AgentAdapterConfig,
+    #[dynamic(default)]
+    pub cursor: AgentAdapterConfig,
+    #[dynamic(default)]
+    pub amp: AgentAdapterConfig,
+}
+
+impl Default for AgentAdaptersConfig {
+    fn default() -> Self {
+        Self {
+            claude: AgentAdapterConfig::with_matchers(
+                &["claude", "claude-code", "claude_code"],
+                &["claude code", "claude"],
+            ),
+            codex: AgentAdapterConfig::with_matchers(
+                &["codex", "openai-codex", "openai_codex"],
+                &["codex"],
+            ),
+            gemini: AgentAdapterConfig::with_matchers(
+                &["gemini", "gemini-cli", "gemini_cli"],
+                &["gemini"],
+            ),
+            opencode: AgentAdapterConfig::with_matchers(
+                &["opencode", "open-code", "open_code"],
+                &["opencode", "open code"],
+            ),
+            copilot: AgentAdapterConfig::with_matchers(
+                &["copilot", "gh-copilot", "github-copilot"],
+                &["copilot"],
+            ),
+            cursor: AgentAdapterConfig::with_matchers(&["cursor"], &["cursor"]),
+            amp: AgentAdapterConfig::with_matchers(&["amp"], &["amp"]),
+        }
+    }
+}
+
+#[derive(Debug, Clone, FromDynamic, ToDynamic)]
+pub struct AgentUiConfig {
+    /// Enable passive agent detection and UI surfaces.
+    #[dynamic(default = "default_true")]
+    pub enabled: bool,
+
+    /// Show compact agent markers in the sidebar.
+    #[dynamic(default = "default_true")]
+    pub show_sidebar_badges: bool,
+
+    /// Show the active-pane agent toolbelt.
+    #[dynamic(default = "default_true")]
+    pub show_pane_toolbelt: bool,
+
+    /// Detect known agent process and title names in addition to user vars.
+    #[dynamic(default = "default_true")]
+    pub detect_processes: bool,
+
+    /// Placement for the active-pane toolbelt.
+    #[dynamic(default)]
+    pub toolbelt_position: AgentToolbeltPosition,
+
+    /// Per-adapter passive detection switches.
+    #[dynamic(default)]
+    pub adapters: AgentAdaptersConfig,
+}
+
+impl Default for AgentUiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            show_sidebar_badges: true,
+            show_pane_toolbelt: true,
+            detect_processes: true,
+            toolbelt_position: AgentToolbeltPosition::Top,
+            adapters: AgentAdaptersConfig::default(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, FromDynamic, ToDynamic, ConfigMeta)]
 pub struct Config {
     /// The font size, measured in points
@@ -512,8 +754,65 @@ pub struct Config {
     #[dynamic(default)]
     pub hide_tab_bar_if_only_one_tab: bool,
 
+    /// If true, use the vertical sidebar as the primary tab UI.
+    #[dynamic(default = "default_true")]
+    pub sidebar_enabled: bool,
+
+    /// Width of the expanded sidebar in pixels.
+    #[dynamic(default = "default_sidebar_width_px")]
+    pub sidebar_width_px: usize,
+
+    /// Width of the collapsed sidebar in pixels.
+    #[dynamic(default = "default_sidebar_collapsed_width_px")]
+    pub sidebar_collapsed_width_px: usize,
+
+    /// If true, keep the sidebar collapsed until hovered.
+    #[dynamic(default = "default_true")]
+    pub sidebar_auto_hide: bool,
+
+    /// Which side of the window hosts the vertical sidebar.
     #[dynamic(default)]
+    pub sidebar_position: SidebarPosition,
+
+    /// Row density for sidebar tab entries.
+    #[dynamic(default)]
+    pub sidebar_tab_density: SidebarTabDensity,
+
+    /// Source used for sidebar tab titles.
+    #[dynamic(default)]
+    pub sidebar_tab_title_source: SidebarTabTitleSource,
+
+    /// Metadata lines to show for sidebar tabs when available.
+    #[dynamic(default = "default_sidebar_tab_metadata")]
+    pub sidebar_tab_metadata: Vec<SidebarTabMetadata>,
+
+    /// If true, show extra details on sidebar tab hover.
+    #[dynamic(default)]
+    pub sidebar_tab_hover_details: bool,
+
+    /// If true, show a slim scrollbar for the sidebar tab list when tabs overflow.
+    #[dynamic(default = "default_true")]
+    pub sidebar_scroll_bar: bool,
+
+    /// File browser pane behavior.
+    #[dynamic(default)]
+    pub file_browser: FileBrowserConfig,
+
+    /// Vendor-neutral agent telemetry behavior.
+    #[dynamic(default)]
+    pub agent_telemetry: AgentTelemetryConfig,
+
+    /// Vendor-neutral agent detection and lightweight pane controls.
+    #[dynamic(default)]
+    pub agent_ui: AgentUiConfig,
+
+    #[dynamic(default = "default_true")]
     pub enable_scroll_bar: bool,
+
+    /// If true, hide the terminal scroll bar unless it is active, hovered,
+    /// or the viewport is scrolled back.
+    #[dynamic(default)]
+    pub scroll_bar_auto_hide: bool,
 
     #[dynamic(try_from = "crate::units::PixelUnit", default = "default_half_cell")]
     pub min_scroll_bar_height: Dimension,
@@ -1582,6 +1881,8 @@ impl Config {
         cmd.env_remove("APPDIR");
         cmd.env_remove("OWD");
 
+        let user_configured_no_color = self.set_environment_variables.contains_key("NO_COLOR");
+
         for (k, v) in &self.set_environment_variables {
             if k == "WSLENV" {
                 wsl_env.replace(v.clone());
@@ -1603,6 +1904,15 @@ impl Config {
         cmd.umask(umask::UmaskSaver::saved_umask());
         cmd.env("TERM", &self.term);
         cmd.env("COLORTERM", "truecolor");
+        if !user_configured_no_color {
+            cmd.env_remove("NO_COLOR");
+        }
+        if cmd.get_env("CLICOLOR").is_none() {
+            cmd.env("CLICOLOR", "1");
+        }
+        if cmd.get_env("FORCE_COLOR").is_none() && !user_configured_no_color {
+            cmd.env("FORCE_COLOR", "3");
+        }
         // TERM_PROGRAM and TERM_PROGRAM_VERSION are an emerging
         // de-facto standard for identifying the terminal.
         cmd.env("TERM_PROGRAM", "WezTerm");
@@ -1874,8 +2184,92 @@ fn default_tab_max_width() -> usize {
     16
 }
 
+fn default_sidebar_width_px() -> usize {
+    280
+}
+
+fn default_sidebar_collapsed_width_px() -> usize {
+    48
+}
+
+fn default_sidebar_tab_metadata() -> Vec<SidebarTabMetadata> {
+    vec![
+        SidebarTabMetadata::GitBranch,
+        SidebarTabMetadata::WorkingDirectory,
+    ]
+}
+
+fn default_file_browser_list_command() -> Vec<String> {
+    vec![
+        "find".to_string(),
+        ".".to_string(),
+        "-maxdepth".to_string(),
+        "3".to_string(),
+        "-type".to_string(),
+        "f".to_string(),
+    ]
+}
+
+fn default_file_browser_split_size_percent() -> u8 {
+    30
+}
+
+fn default_agent_telemetry_fields() -> Vec<AgentTelemetryField> {
+    vec![
+        AgentTelemetryField::Kind,
+        AgentTelemetryField::Model,
+        AgentTelemetryField::Status,
+        AgentTelemetryField::InputTokens,
+        AgentTelemetryField::OutputTokens,
+        AgentTelemetryField::EstimatedCost,
+    ]
+}
+
 fn default_update_interval() -> u64 {
     86400
+}
+
+#[cfg(test)]
+mod agent_ui_tests {
+    use super::*;
+
+    #[test]
+    fn agent_ui_defaults_to_passive_surfaces_enabled() {
+        let config = Config::default_config();
+
+        assert!(config.agent_ui.enabled);
+        assert!(config.agent_ui.show_sidebar_badges);
+        assert!(config.agent_ui.show_pane_toolbelt);
+        assert!(config.agent_ui.detect_processes);
+        assert_eq!(
+            config.agent_ui.toolbelt_position,
+            AgentToolbeltPosition::Top
+        );
+        assert!(config.agent_ui.adapters.claude.enabled);
+        assert!(config.agent_ui.adapters.codex.enabled);
+        assert!(config.agent_ui.adapters.gemini.enabled);
+        assert!(config.agent_ui.adapters.opencode.enabled);
+        assert!(config.agent_ui.adapters.copilot.enabled);
+        assert!(config.agent_ui.adapters.cursor.enabled);
+        assert!(config.agent_ui.adapters.amp.enabled);
+        assert!(config.sidebar_auto_hide);
+        assert!(config.sidebar_scroll_bar);
+        assert!(config.enable_scroll_bar);
+        assert!(config
+            .agent_ui
+            .adapters
+            .codex
+            .process_names
+            .iter()
+            .any(|name| name == "codex"));
+        assert!(config
+            .agent_ui
+            .adapters
+            .claude
+            .title_patterns
+            .iter()
+            .any(|pattern| pattern == "claude code"));
+    }
 }
 
 fn default_prefer_egl() -> bool {

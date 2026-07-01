@@ -1704,6 +1704,14 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
                 icon: Some("oct_browser"),
             },
         },
+        OpenFileBrowser => CommandDef {
+            brief: "Open File Browser".into(),
+            doc: "Open a file browser split using the configured list and editor commands".into(),
+            keys: vec![],
+            args: &[ArgType::ActivePane],
+            menubar: &["Shell"],
+            icon: Some("md_folder_open"),
+        },
         SendString(text) => CommandDef {
             brief: format!(
                 "Sends `{text}` to the active pane, \
@@ -2036,6 +2044,7 @@ fn compute_default_actions() -> Vec<KeyAssignment> {
             domain: SpawnTabDomain::CurrentPaneDomain,
             ..Default::default()
         }),
+        OpenFileBrowser,
         CloseCurrentTab { confirm: true },
         CloseCurrentPane { confirm: true },
         DetachDomain(SpawnTabDomain::CurrentPaneDomain),

@@ -639,6 +639,7 @@ pub enum KeyAssignment {
 
     ResetTerminal,
     OpenUri(String),
+    OpenFileBrowser,
     ActivateCommandPalette,
     ActivateWindow(usize),
     ActivateWindowRelative(isize),

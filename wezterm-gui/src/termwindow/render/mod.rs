@@ -7,14 +7,15 @@ use crate::quad::{
 };
 use crate::shapecache::*;
 use crate::termwindow::render::paint::AllowImage;
+use crate::termwindow::resize::effective_right_padding;
 use crate::termwindow::{BorrowedShapeCacheKey, RenderState, ShapedInfo, TermWindowNotif};
 use crate::utilsprites::RenderMetrics;
 use ::window::bitmaps::{TextureCoord, TextureRect, TextureSize};
 use ::window::{DeadKeyStatus, PointF, RectF, SizeF, WindowOps};
 use anyhow::{anyhow, Context};
 use config::{
-    BoldBrightening, ConfigHandle, DimensionContext, HorizontalWindowContentAlignment, TextStyle,
-    VerticalWindowContentAlignment, VisualBellTarget,
+    BoldBrightening, ConfigHandle, DimensionContext, HorizontalWindowContentAlignment,
+    SidebarPosition, TextStyle, VerticalWindowContentAlignment, VisualBellTarget,
 };
 use euclid::num::Zero;
 use mux::pane::{Pane, PaneId};
@@ -41,6 +42,7 @@ pub mod fancy_tab_bar;
 pub mod paint;
 pub mod pane;
 pub mod screen_line;
+pub mod sidebar;
 pub mod split;
 pub mod tab_bar;
 pub mod window_buttons;
@@ -366,8 +368,9 @@ impl crate::TermWindow {
         let horizontal_gap = self.dimensions.pixel_width as f32
             - self.terminal_size.pixel_width as f32
             - padding_left
-            - if self.show_scroll_bar && padding_right.is_zero() {
-                h_context.pixel_cell
+            - self.sidebar_reserved_width() as f32
+            - if self.show_scroll_bar {
+                effective_right_padding(&self.config, h_context) as f32
             } else {
                 padding_right.evaluate_as_pixels(h_context)
             };
@@ -375,7 +378,7 @@ impl crate::TermWindow {
             - self.terminal_size.pixel_height as f32
             - padding_top
             - padding_bottom
-            - if self.show_tab_bar {
+            - if self.show_tab_bar && !self.sidebar_is_active() {
                 self.tab_bar_pixel_height().unwrap_or(0.)
             } else {
                 0.
@@ -391,7 +394,21 @@ impl crate::TermWindow {
             VerticalWindowContentAlignment::Bottom => vertical_gap,
         };
 
-        (padding_left + left_gap, padding_top + top_gap)
+        let sidebar_left_offset =
+            if self.sidebar_is_active() && self.config.sidebar_position == SidebarPosition::Left {
+                if self.config.sidebar_auto_hide {
+                    self.sidebar_reserved_width() as f32
+                } else {
+                    self.sidebar_width() as f32
+                }
+            } else {
+                0.
+            };
+
+        (
+            padding_left + left_gap + sidebar_left_offset,
+            padding_top + top_gap,
+        )
     }
 
     fn resolve_lock_glyph(

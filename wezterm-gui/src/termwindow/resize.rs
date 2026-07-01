@@ -163,11 +163,12 @@ impl super::TermWindow {
 
         let config = &self.config;
 
-        let tab_bar_height = if self.show_tab_bar {
+        let tab_bar_height = if self.show_tab_bar && !self.sidebar_is_active() {
             self.tab_bar_pixel_height().unwrap_or(0.)
         } else {
             0.
         };
+        let sidebar_width = self.sidebar_reserved_width();
 
         let border = self.get_os_border();
 
@@ -208,6 +209,7 @@ impl super::TermWindow {
 
             let pixel_width = (cols * self.render_metrics.cell_size.width as usize)
                 + (padding_left + padding_right)
+                + sidebar_width
                 + (border.left + border.right).get() as usize;
 
             let dims = Dimensions {
@@ -249,6 +251,7 @@ impl super::TermWindow {
 
             let avail_width = dimensions.pixel_width.saturating_sub(
                 (padding_left + padding_right) as usize
+                    + sidebar_width
                     + (border.left + border.right).get() as usize,
             );
             let avail_height = dimensions
@@ -290,14 +293,21 @@ impl super::TermWindow {
 
         log::trace!("apply_dimensions computed size {:?}, dims {:?}", size, dims);
 
+        let terminal_cells_changed = self.terminal_size.rows != size.rows
+            || self.terminal_size.cols != size.cols
+            || self.terminal_size.pixel_width != size.pixel_width
+            || self.terminal_size.pixel_height != size.pixel_height
+            || self.terminal_size.dpi != size.dpi;
         self.terminal_size = size;
 
-        let mux = Mux::get();
-        if let Some(window) = mux.get_window(self.mux_window_id) {
-            for tab in window.iter() {
-                tab.resize(size);
-            }
-        };
+        if terminal_cells_changed {
+            let mux = Mux::get();
+            if let Some(window) = mux.get_window(self.mux_window_id) {
+                for tab in window.iter() {
+                    tab.resize(size);
+                }
+            };
+        }
         self.resize_overlays();
         self.invalidate_fancy_tab_bar();
         self.update_title();
@@ -489,11 +499,12 @@ impl super::TermWindow {
         };
 
         let show_tab_bar = config.enable_tab_bar && !config.hide_tab_bar_if_only_one_tab;
-        let tab_bar_height = if show_tab_bar {
+        let tab_bar_height = if show_tab_bar && !config.sidebar_enabled {
             self.tab_bar_pixel_height()? as usize
         } else {
             0
         };
+        let sidebar_width = self.sidebar_reserved_width();
 
         let h_context = DimensionContext {
             dpi: self.dimensions.dpi as f32,
@@ -512,7 +523,8 @@ impl super::TermWindow {
         let dimensions = Dimensions {
             pixel_width: ((terminal_size.cols as usize * render_metrics.cell_size.width as usize)
                 + padding_left
-                + effective_right_padding(&config, h_context)),
+                + effective_right_padding(&config, h_context)
+                + sidebar_width),
             pixel_height: ((terminal_size.rows as usize * render_metrics.cell_size.height as usize)
                 + padding_top
                 + padding_bottom) as usize
@@ -560,9 +572,11 @@ impl super::TermWindow {
 /// enabled the scroll bar then they will expect it to have a reasonable
 /// size unless they've specified differently.
 pub fn effective_right_padding(config: &ConfigHandle, context: DimensionContext) -> usize {
-    if config.enable_scroll_bar && config.window_padding.right.is_zero() {
-        context.pixel_cell as usize
+    let configured = config.window_padding.right.evaluate_as_pixels(context) as usize;
+    if config.enable_scroll_bar {
+        let scaled = ((context.pixel_max * 0.018).ceil() as usize).clamp(64, 120);
+        configured.max(scaled)
     } else {
-        config.window_padding.right.evaluate_as_pixels(context) as usize
+        configured
     }
 }

@@ -56,6 +56,7 @@ use smol::Timer;
 use std::cell::{RefCell, RefMut};
 use std::collections::{HashMap, LinkedList};
 use std::ops::Add;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -152,9 +153,45 @@ pub enum TermWindowNotif {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AgentToolbeltAction {
+    Interrupt,
+    CopyMenu,
+    Attach,
+    Resume,
+    OpenLogs,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AgentCopyAction {
+    Conversation,
+    LastAgentMessage,
+    Summary,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UIItemType {
     TabBar(TabBarItem),
     CloseTab(usize),
+    SidebarTab {
+        tab_idx: usize,
+        active: bool,
+    },
+    SidebarTabList,
+    SidebarScrollTrack,
+    SidebarScrollThumb,
+    SidebarResize {
+        start_width: usize,
+    },
+    SidebarSearch,
+    SidebarWorktreeButton,
+    AgentToolbeltButton {
+        pane_id: PaneId,
+        action: AgentToolbeltAction,
+    },
+    AgentCopyMenuItem {
+        pane_id: PaneId,
+        action: AgentCopyAction,
+    },
     AboveScrollThumb,
     ScrollThumb,
     BelowScrollThumb,
@@ -177,6 +214,18 @@ impl UIItem {
             && y >= self.y as isize
             && y <= (self.y + self.height) as isize
     }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct SidebarSearchState {
+    pub query: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct AgentCopyMenuState {
+    pub pane_id: PaneId,
+    pub x: usize,
+    pub y: usize,
 }
 
 #[derive(Clone, Default)]
@@ -390,10 +439,18 @@ pub struct TermWindow {
     show_tab_bar: bool,
     show_scroll_bar: bool,
     tab_bar: TabBarState,
+    sidebar_drag_width: Option<usize>,
+    sidebar_auto_hide_open: bool,
+    sidebar_auto_hide_close_after: Option<Instant>,
+    sidebar_search: Option<SidebarSearchState>,
+    agent_copy_menu: Option<AgentCopyMenuState>,
+    sidebar_scroll_offset: usize,
+    sidebar_drop_flash: Option<(usize, Instant)>,
     fancy_tab_bar: Option<box_model::ComputedElement>,
     pub right_status: String,
     pub left_status: String,
     last_ui_item: Option<UIItem>,
+    pressed_ui_item: Option<UIItemType>,
     /// Tracks whether the current mouse-down event is part of click-focus.
     /// If so, we ignore mouse events until released
     is_click_to_focus_window: bool,
@@ -604,8 +661,19 @@ impl TermWindow {
         // Initially we have only a single tab, so take that into account
         // for the tab bar state.
         let show_tab_bar = config.enable_tab_bar && !config.hide_tab_bar_if_only_one_tab;
-        let tab_bar_height = if show_tab_bar {
+        let tab_bar_height = if show_tab_bar && !config.sidebar_enabled {
             Self::tab_bar_pixel_height_impl(&config, &fontconfig, &render_metrics)? as usize
+        } else {
+            0
+        };
+        let sidebar_width = if show_tab_bar && config.sidebar_enabled {
+            if config.sidebar_auto_hide {
+                config.sidebar_collapsed_width_px.max(48)
+            } else {
+                config
+                    .sidebar_width_px
+                    .max(config.sidebar_collapsed_width_px)
+            }
         } else {
             0
         };
@@ -658,6 +726,7 @@ impl TermWindow {
                 + tab_bar_height,
             dpi,
         };
+        dimensions.pixel_width += sidebar_width;
 
         let border = Self::get_os_border_impl(&None, &config, &dimensions, &render_metrics);
 
@@ -711,10 +780,18 @@ impl TermWindow {
             show_tab_bar,
             show_scroll_bar: config.enable_scroll_bar,
             tab_bar: TabBarState::default(),
+            sidebar_drag_width: None,
+            sidebar_auto_hide_open: false,
+            sidebar_auto_hide_close_after: None,
+            sidebar_search: None,
+            agent_copy_menu: None,
+            sidebar_scroll_offset: 0,
+            sidebar_drop_flash: None,
             fancy_tab_bar: None,
             right_status: String::new(),
             left_status: String::new(),
             last_mouse_coords: (0, -1),
+            pressed_ui_item: None,
             window_drag_position: None,
             current_mouse_event: None,
             current_modifier_and_leds: Default::default(),
@@ -1969,23 +2046,26 @@ impl TermWindow {
         let active_tab = tabs.iter().find(|t| t.is_active).cloned();
         let active_pane = panes.iter().find(|p| p.is_active).cloned();
 
-        let border = self.get_os_border();
-        let tab_bar_height = self.tab_bar_pixel_height().unwrap_or(0.);
-        let tab_bar_y = if self.config.tab_bar_at_bottom {
-            ((self.dimensions.pixel_height as f32) - (tab_bar_height + border.bottom.get() as f32))
-                .max(0.)
+        let hovering_in_tab_bar = if self.sidebar_is_active() {
+            false
         } else {
-            border.top.get() as f32
-        };
+            let border = self.get_os_border();
+            let tab_bar_height = self.tab_bar_pixel_height().unwrap_or(0.);
+            let tab_bar_y = if self.config.tab_bar_at_bottom {
+                ((self.dimensions.pixel_height as f32)
+                    - (tab_bar_height + border.bottom.get() as f32))
+                    .max(0.)
+            } else {
+                border.top.get() as f32
+            };
 
-        let tab_bar_height = self.tab_bar_pixel_height().unwrap_or(0.);
-
-        let hovering_in_tab_bar = match &self.current_mouse_event {
-            Some(event) => {
-                let mouse_y = event.coords.y as f32;
-                mouse_y >= tab_bar_y as f32 && mouse_y < tab_bar_y as f32 + tab_bar_height
+            match &self.current_mouse_event {
+                Some(event) => {
+                    let mouse_y = event.coords.y as f32;
+                    mouse_y >= tab_bar_y as f32 && mouse_y < tab_bar_y as f32 + tab_bar_height
+                }
+                None => false,
             }
-            None => false,
         };
 
         let new_tab_bar = TabBarState::new(
@@ -2113,11 +2193,13 @@ impl TermWindow {
         if let Some(win) = self.window.as_ref() {
             let cursor = pos.pane.get_cursor_position();
             let top = pos.pane.get_dimensions().physical_top;
-            let tab_bar_height = if self.show_tab_bar && !self.config.tab_bar_at_bottom {
-                self.tab_bar_pixel_height().unwrap()
-            } else {
-                0.0
-            };
+            let tab_bar_height =
+                if self.show_tab_bar && !self.sidebar_is_active() && !self.config.tab_bar_at_bottom
+                {
+                    self.tab_bar_pixel_height().unwrap()
+                } else {
+                    0.0
+                };
             let (padding_left, padding_top) = self.padding_left_top();
 
             let r = Rect::new(
@@ -2513,10 +2595,6 @@ impl TermWindow {
         if let Some(zone) = zone {
             self.set_viewport(pane.pane_id(), Some(zone), dims);
         }
-
-        if let Some(win) = self.window.as_ref() {
-            win.invalidate();
-        }
         Ok(())
     }
 
@@ -2527,9 +2605,6 @@ impl TermWindow {
             .unwrap_or(dims.physical_top) as f64
             + (amount * dims.viewport_rows as f64);
         self.set_viewport(pane.pane_id(), Some(position as isize), dims);
-        if let Some(win) = self.window.as_ref() {
-            win.invalidate();
-        }
         Ok(())
     }
 
@@ -2551,9 +2626,6 @@ impl TermWindow {
             .unwrap_or(dims.physical_top)
             .saturating_add(amount);
         self.set_viewport(pane.pane_id(), Some(position), dims);
-        if let Some(win) = self.window.as_ref() {
-            win.invalidate();
-        }
         Ok(())
     }
 
@@ -2578,6 +2650,339 @@ impl TermWindow {
 
         drop(window);
         self.move_tab(tab)
+    }
+
+    fn file_browser_cwd(&self, pane: &Arc<dyn Pane>) -> Option<PathBuf> {
+        pane.get_current_working_dir(CachePolicy::AllowStale)
+            .and_then(|url| url.to_file_path().ok())
+    }
+
+    fn file_browser_script(&self) -> String {
+        r#"set -e
+printf '\033]0;Worktree\007'
+printf '\033]1337;SetUserVar=tgzterminal.worktree=MQ==\007'
+
+tmp="${TMPDIR:-/tmp}/tgzterminal-worktree.$$"
+trap 'rm -f "$tmp"' EXIT
+target_pane="${TGZTERMINAL_TARGET_PANE:-}"
+wezterm_bin="${TGZTERMINAL_BIN:-tgzterminal}"
+editor_cmd="${TGZTERMINAL_EDITOR_COMMAND:-${VISUAL:-${EDITOR:-vim}}}"
+root=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+root=$(cd "$root" 2>/dev/null && pwd -P || pwd)
+cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/tgzterminal"
+mkdir -p "$cache_dir" 2>/dev/null || true
+cache_key=$(printf '%s' "$root" | cksum | awk '{ print $1 }')
+cache_file="$cache_dir/worktree-$cache_key.tsv"
+stamp_file="$cache_dir/worktree-$cache_key.stamp"
+
+quote_path() {
+  printf "'"
+  printf "%s" "$1" | sed "s/'/'\\\\''/g"
+  printf "'"
+}
+
+git_index_path() {
+  git_dir=$(git -C "$root" rev-parse --git-dir 2>/dev/null || true)
+  case "$git_dir" in
+    '') return 1 ;;
+    /*) printf '%s/index\n' "$git_dir" ;;
+    *) printf '%s/%s/index\n' "$root" "$git_dir" ;;
+  esac
+}
+
+cache_stamp() {
+  git_head=$(git -C "$root" rev-parse HEAD 2>/dev/null || printf 'nogit')
+  git_index=$(git_index_path || true)
+  index_mtime=$(stat -f %m "$git_index" 2>/dev/null || printf '0')
+  root_mtime=$(stat -f %m "$root" 2>/dev/null || printf '0')
+  printf '%s:%s:%s:%s\n' "$root" "$git_head" "$index_mtime" "$root_mtime"
+}
+
+build_git_index() {
+  git -C "$root" ls-files -z --cached --others --exclude-standard 2>/dev/null \
+    | tr '\0' '\n' \
+    | awk -v root="$root" '
+        function base(path, parts, n) {
+          n = split(path, parts, "/")
+          return parts[n]
+        }
+        function indent(depth, s, i) {
+          s = ""
+          for (i = 0; i < depth; i++) {
+            s = s "  "
+          }
+          return s
+        }
+        function emit_dir(rel, depth, abs, label) {
+          if (rel == "" || seen_dir[rel]++) {
+            return
+          }
+          abs = root "/" rel
+          label = indent(depth) base(rel) "/"
+          print label "\t" abs "\td"
+        }
+        BEGIN {
+          print base(root) "/\t" root "\td"
+        }
+        {
+          file = $0
+          if (file == "") {
+            next
+          }
+          n = split(file, parts, "/")
+          rel = ""
+          for (i = 1; i < n; i++) {
+            rel = rel == "" ? parts[i] : rel "/" parts[i]
+            emit_dir(rel, i - 1)
+          }
+          print indent(n - 1) parts[n] "\t" root "/" file "\tf"
+        }
+      ' \
+    | sort -t "$(printf '\t')" -k2,2 -k3,3 -u
+}
+
+build_find_index() {
+  find "$root" -maxdepth 4 \
+    \( -name .git -o -name target -o -name node_modules -o -name .venv -o -name .pytest_cache -o -name .ruff_cache \) -prune \
+    -o \( -type d -o -type f \) -print 2>/dev/null \
+    | awk -v root="$root" '
+        function base(path, parts, n) {
+          n = split(path, parts, "/")
+          return parts[n]
+        }
+        function indent(depth, s, i) {
+          s = ""
+          for (i = 0; i < depth; i++) {
+            s = s "  "
+          }
+          return s
+        }
+        {
+          path = $0
+          rel = path
+          sub("^" root "/?", "", rel)
+          if (path == root || rel == "") {
+            print base(root) "/\t" root "\td"
+          } else {
+            depth = split(rel, parts, "/") - 1
+            kind = path ~ /\/$/ ? "d" : "f"
+            if (system("[ -d " q path q " ]") == 0) {
+              kind = "d"
+            }
+            suffix = kind == "d" ? "/" : ""
+            print indent(depth) parts[depth + 1] suffix "\t" path "\t" kind
+          }
+        }
+      ' q="'\''" \
+    | sort -t "$(printf '\t')" -k2,2 -k3,3 -u
+}
+
+build_list() {
+  stamp=$(cache_stamp)
+  if [ -r "$cache_file" ] && [ -r "$stamp_file" ] && [ "$(cat "$stamp_file" 2>/dev/null)" = "$stamp" ]; then
+    cp "$cache_file" "$tmp" 2>/dev/null && return 0
+  fi
+
+  next_tmp="$tmp.next"
+  if git -C "$root" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    build_git_index > "$next_tmp"
+  else
+    build_find_index > "$next_tmp"
+  fi
+
+  mv "$next_tmp" "$tmp"
+  cp "$tmp" "$cache_file" 2>/dev/null || true
+  printf '%s\n' "$stamp" > "$stamp_file" 2>/dev/null || true
+}
+
+send_folder() {
+  selection="$1"
+  [ -n "$target_pane" ] || return 0
+  [ -d "$selection" ] || return 0
+  quoted=$(quote_path "$selection")
+  printf '\025cd -- %s\nclear\n' "$quoted" \
+    | "$wezterm_bin" cli send-text --pane-id "$target_pane" --no-paste >/dev/null 2>&1 || return 0
+  "$wezterm_bin" cli activate-pane --pane-id "$target_pane" >/dev/null 2>&1 || true
+}
+
+open_file() {
+  selection="$1"
+  [ -n "$target_pane" ] || return 0
+  [ -f "$selection" ] || return 0
+  dir=$(dirname "$selection")
+  quoted=$(quote_path "$selection")
+  "$wezterm_bin" cli split-pane --pane-id "$target_pane" --right --percent 50 --cwd "$dir" -- \
+    sh -lc "printf '\033]0;Editor\007'; $editor_cmd $quoted" >/dev/null 2>&1 || return 0
+}
+
+close_worktree() {
+  if [ -n "${WEZTERM_PANE:-}" ]; then
+    "$wezterm_bin" cli kill-pane --pane-id "$WEZTERM_PANE" >/dev/null 2>&1 || true
+  fi
+  exit 0
+}
+
+build_list
+while :; do
+  if [ ! -s "$tmp" ]; then
+    printf 'No folders found.\n'
+    sleep 2
+    build_list
+    continue
+  fi
+
+  if command -v fzf >/dev/null 2>&1; then
+    selection_line=$(fzf --height=100% --layout=reverse --no-sort --cycle --prompt='Worktree > ' --pointer='>' --marker='+' --border=none --bind="q:execute-silent($wezterm_bin cli kill-pane --pane-id ${WEZTERM_PANE:-})+abort,ctrl-r:execute-silent(rm -f $cache_file $stamp_file)+abort" --color='bg:-1,bg+:#444444,fg:#b8b8b8,fg+:#eeeeee,hl:#d86f8f,hl+:#f18fb0,pointer:#d86f8f,prompt:#8fb4d8,spinner:#d86f8f,info:#d8c06f,border:#555555' --delimiter="$(printf '\t')" --with-nth=1 < "$tmp") || {
+      build_list
+      continue
+    }
+  else
+    awk -F '\t' '{ print NR ": " $1 }' "$tmp"
+    printf 'Worktree folder number: '
+    IFS= read -r number
+    case "$number" in
+      ''|*[!0-9]*) continue ;;
+    esac
+    selection_line=$(sed -n "${number}p" "$tmp")
+  fi
+
+  selection=$(printf '%s\n' "$selection_line" | awk -F '\t' '{ print $2 }')
+  kind=$(printf '%s\n' "$selection_line" | awk -F '\t' '{ print $3 }')
+  if [ "$kind" = f ]; then
+    open_file "$selection"
+  else
+    send_folder "$selection"
+  fi
+done
+"#
+        .to_string()
+    }
+
+    fn find_worktree_pane(&self) -> Option<PaneId> {
+        let mux = Mux::get();
+        let tab = mux.get_active_tab_for_window(self.mux_window_id)?;
+        tab.iter_panes_ignoring_zoom().iter().find_map(|pos| {
+            let pane = &pos.pane;
+            let vars = pane.copy_user_vars();
+            if vars.contains_key("tgzterminal.worktree") || pane.get_title() == "Worktree" {
+                Some(pane.pane_id())
+            } else {
+                None
+            }
+        })
+    }
+
+    fn close_file_browser(&self, pane_id: PaneId) {
+        Mux::get().remove_pane(pane_id);
+    }
+
+    fn pane_command_basename(&self, pane: &Arc<dyn Pane>) -> Option<String> {
+        pane.get_foreground_process_name(CachePolicy::AllowStale)
+            .and_then(|name| {
+                Path::new(&name)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(|name| name.to_ascii_lowercase())
+            })
+    }
+
+    fn is_worktree_pane_for_file_browser(&self, pane: &Arc<dyn Pane>) -> bool {
+        pane.copy_user_vars().contains_key("tgzterminal.worktree")
+            || pane.get_title().trim() == "Worktree"
+    }
+
+    fn is_shell_pane_for_file_browser(&self, pane: &Arc<dyn Pane>) -> bool {
+        matches!(
+            self.pane_command_basename(pane).as_deref(),
+            Some("bash" | "fish" | "nu" | "pwsh" | "powershell" | "sh" | "zsh")
+        )
+    }
+
+    fn file_browser_target_pane(&self, requested: &Arc<dyn Pane>) -> Arc<dyn Pane> {
+        if !self.is_worktree_pane_for_file_browser(requested)
+            && self.is_shell_pane_for_file_browser(requested)
+        {
+            return Arc::clone(requested);
+        }
+
+        let mux = Mux::get();
+        let Some(tab) = mux.get_active_tab_for_window(self.mux_window_id) else {
+            return Arc::clone(requested);
+        };
+
+        if let Some(shell) = tab
+            .iter_panes_ignoring_zoom()
+            .iter()
+            .find(|pos| {
+                !self.is_worktree_pane_for_file_browser(&pos.pane)
+                    && self.is_shell_pane_for_file_browser(&pos.pane)
+            })
+            .map(|pos| pos.pane.clone())
+        {
+            return shell;
+        }
+
+        tab.iter_panes_ignoring_zoom()
+            .iter()
+            .find(|pos| !self.is_worktree_pane_for_file_browser(&pos.pane))
+            .map(|pos| pos.pane.clone())
+            .unwrap_or_else(|| Arc::clone(requested))
+    }
+
+    fn open_file_browser(&self, pane: &Arc<dyn Pane>) {
+        if let Some(pane_id) = self.find_worktree_pane() {
+            self.close_file_browser(pane_id);
+            return;
+        }
+
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        let split_size = self.config.file_browser.split_size_percent.clamp(5, 95);
+        let target_pane = self.file_browser_target_pane(pane);
+        let mut set_environment_variables = HashMap::new();
+        set_environment_variables.insert(
+            "TGZTERMINAL_TARGET_PANE".to_string(),
+            target_pane.pane_id().to_string(),
+        );
+        let bin = std::env::current_exe()
+            .ok()
+            .map(|path| {
+                let cli_path = path
+                    .parent()
+                    .map(|parent| parent.join("tgzterminal"))
+                    .filter(|path| path.exists())
+                    .unwrap_or(path);
+                cli_path.to_string_lossy().to_string()
+            })
+            .unwrap_or_else(|| "tgzterminal".to_string());
+        set_environment_variables.insert("TGZTERMINAL_BIN".to_string(), bin);
+        if let Some(editor_command) = self
+            .config
+            .file_browser
+            .editor_command
+            .as_ref()
+            .and_then(|args| shlex::try_join(args.iter().map(|arg| arg.as_str())).ok())
+        {
+            set_environment_variables
+                .insert("TGZTERMINAL_EDITOR_COMMAND".to_string(), editor_command);
+        }
+
+        let spawn = SpawnCommand {
+            label: Some("Worktree".to_string()),
+            args: Some(vec![shell, "-lc".to_string(), self.file_browser_script()]),
+            cwd: self.file_browser_cwd(&target_pane),
+            set_environment_variables,
+            domain: config::keyassignment::SpawnTabDomain::CurrentPaneDomain,
+            ..Default::default()
+        };
+        self.spawn_command(
+            &spawn,
+            SpawnWhere::SplitPane(SplitRequest {
+                direction: SplitDirection::Horizontal,
+                target_is_second: false,
+                size: MuxSplitSize::Percent(split_size),
+                top_level: false,
+            }),
+        );
     }
 
     pub fn perform_key_assignment(
@@ -3155,6 +3560,9 @@ impl TermWindow {
             OpenUri(link) => {
                 wezterm_open_url::open_url(link);
             }
+            OpenFileBrowser => {
+                self.open_file_browser(pane);
+            }
             ActivateCommandPalette => {
                 let modal = crate::termwindow::palette::CommandPalette::new(self);
                 self.set_modal(Rc::new(modal));
@@ -3241,6 +3649,10 @@ impl TermWindow {
             Some(w) => w,
             None => return,
         };
+
+        if mux_window.len() <= 1 {
+            return;
+        }
 
         let tab = match mux_window.get_by_idx(tab_idx) {
             Some(tab) => Arc::clone(tab),
@@ -3361,8 +3773,8 @@ impl TermWindow {
                     qs.viewport_changed(pos);
                 }
             }
+            self.window.as_ref().unwrap().invalidate();
         }
-        self.window.as_ref().unwrap().invalidate();
     }
 
     fn maybe_scroll_to_bottom_for_input(&mut self, pane: &Arc<dyn Pane>) {

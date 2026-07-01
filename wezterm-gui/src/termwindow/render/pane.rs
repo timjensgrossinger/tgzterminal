@@ -62,7 +62,7 @@ impl crate::TermWindow {
 
         let (padding_left, padding_top) = self.padding_left_top();
 
-        let tab_bar_height = if self.show_tab_bar {
+        let tab_bar_height = if self.show_tab_bar && !self.sidebar_is_active() {
             self.tab_bar_pixel_height()
                 .context("tab_bar_pixel_height")?
         } else {
@@ -241,8 +241,6 @@ impl crate::TermWindow {
             );
             let abs_thumb_top = thumb_y_offset + info.top;
             let thumb_size = info.height;
-            let color = palette.scrollbar_thumb.to_linear();
-
             // Adjust the scrollbar thumb position
             let config = &self.config;
             let padding = self.effective_right_padding(&config) as f32;
@@ -274,19 +272,6 @@ impl crate::TermWindow {
                     .saturating_sub(abs_thumb_top + thumb_size),
                 item_type: UIItemType::BelowScrollThumb,
             });
-
-            self.filled_rectangle(
-                layers,
-                2,
-                euclid::rect(
-                    thumb_x as f32,
-                    abs_thumb_top as f32,
-                    padding,
-                    thumb_size as f32,
-                ),
-                color,
-            )
-            .context("filled_rectangle")?;
         }
 
         let (selrange, rectangular) = {
@@ -588,7 +573,7 @@ impl crate::TermWindow {
         let cell_width = self.render_metrics.cell_size.width as f32;
         let cell_height = self.render_metrics.cell_size.height as f32;
         let (padding_left, padding_top) = self.padding_left_top();
-        let tab_bar_height = if self.show_tab_bar {
+        let tab_bar_height = if self.show_tab_bar && !self.sidebar_is_active() {
             self.tab_bar_pixel_height()?
         } else {
             0.

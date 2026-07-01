@@ -17,11 +17,12 @@ impl crate::TermWindow {
         let cell_height = self.render_metrics.cell_size.height as f32;
 
         let border = self.get_os_border();
-        let first_row_offset = if self.show_tab_bar && !self.config.tab_bar_at_bottom {
-            self.tab_bar_pixel_height()?
-        } else {
-            0.
-        } + border.top.get() as f32;
+        let first_row_offset =
+            if self.show_tab_bar && !self.sidebar_is_active() && !self.config.tab_bar_at_bottom {
+                self.tab_bar_pixel_height()?
+            } else {
+                0.
+            } + border.top.get() as f32;
 
         let (padding_left, padding_top) = self.padding_left_top();
 

@@ -1,4 +1,4 @@
-use crate::termwindow::{RenderFrame, TermWindowNotif};
+use crate::termwindow::{RenderFrame, ScrollHit, TermWindowNotif, UIItemType};
 use ::window::bitmaps::atlas::OutOfTextureSpace;
 use ::window::WindowOps;
 use anyhow::Context;
@@ -246,6 +246,7 @@ impl crate::TermWindow {
             .context("filled_rectangle for window background")?;
         }
 
+        let mut active_agent_pane = None;
         for pos in panes {
             if pos.is_active {
                 self.update_text_cursor(&pos);
@@ -253,9 +254,20 @@ impl crate::TermWindow {
                     pos.pane.advise_focus();
                     mux::Mux::get().record_focus_for_current_identity(pos.pane.pane_id());
                 }
+                active_agent_pane = Some(pos.clone());
             }
             self.paint_pane(&pos, &mut layers).context("paint_pane")?;
         }
+
+        if let Some(pos) = active_agent_pane.as_ref() {
+            self.paint_agent_toolbelt(&mut layers, pos)
+                .context("paint_agent_toolbelt")?;
+        }
+        self.paint_agent_copy_menu(&mut layers)
+            .context("paint_agent_copy_menu")?;
+
+        self.paint_scrollbar_edge_overlay(&mut layers)
+            .context("paint_scrollbar_edge_overlay")?;
 
         if let Some(pane) = self.get_active_pane_or_overlay() {
             let splits = self.get_splits();
@@ -265,7 +277,9 @@ impl crate::TermWindow {
             }
         }
 
-        if self.show_tab_bar {
+        if self.sidebar_is_active() {
+            self.paint_sidebar(&mut layers).context("paint_sidebar")?;
+        } else if self.show_tab_bar {
             self.paint_tab_bar(&mut layers).context("paint_tab_bar")?;
         }
 
@@ -273,6 +287,97 @@ impl crate::TermWindow {
             .context("paint_window_borders")?;
         drop(layers);
         self.paint_modal().context("paint_modal")?;
+
+        Ok(())
+    }
+
+    fn paint_scrollbar_edge_overlay(
+        &mut self,
+        layers: &mut crate::quad::TripleLayerQuadAllocator,
+    ) -> anyhow::Result<()> {
+        if !self.show_scroll_bar {
+            return Ok(());
+        }
+
+        let pane = match self.get_active_pane_or_overlay() {
+            Some(pane) => pane,
+            None => return Ok(()),
+        };
+
+        let border = self.get_os_border();
+        let padding = self.effective_right_padding(&self.config) as f32;
+        if padding <= 0. {
+            return Ok(());
+        }
+
+        let thumb_y_offset = border.top.get();
+        let bottom_offset = border.bottom.get();
+        let track_height = self
+            .dimensions
+            .pixel_height
+            .saturating_sub(thumb_y_offset + bottom_offset);
+        if track_height == 0 {
+            return Ok(());
+        }
+
+        let thumb_x = self
+            .dimensions
+            .pixel_width
+            .saturating_sub(padding as usize + border.right.get());
+        let mouse_over_scrollbar = self.current_mouse_event.as_ref().is_some_and(|event| {
+            event.coords.x >= thumb_x as isize
+                && event.coords.x <= (thumb_x + padding as usize + border.right.get()) as isize
+                && event.coords.y >= thumb_y_offset as isize
+                && event.coords.y <= self.dimensions.pixel_height as isize
+        });
+        let dragging_scrollbar = matches!(
+            self.dragging.as_ref().map(|(item, _)| &item.item_type),
+            Some(UIItemType::ScrollThumb)
+        );
+        let current_viewport = self.get_viewport(pane.pane_id());
+        let expanded = !self.config.scroll_bar_auto_hide
+            || mouse_over_scrollbar
+            || dragging_scrollbar
+            || current_viewport.is_some();
+
+        let dpi_scale = (self.dimensions.dpi as f32 / 96.).clamp(1., 2.5);
+        let edge_gap = (8. * dpi_scale).clamp(8., 20.);
+        let track_width = if expanded {
+            (10. * dpi_scale).clamp(9., 16.)
+        } else {
+            (6. * dpi_scale).clamp(5., 9.)
+        };
+        let visual_right =
+            self.dimensions.pixel_width as f32 - border.right.get() as f32 - edge_gap;
+        let visible_track_x = visual_right - track_width;
+        let foreground = self.palette().foreground.to_linear();
+        let color = foreground.mul_alpha(if expanded { 0.56 } else { 0.44 });
+        let top_inset = (16. * dpi_scale).clamp(16., 32.);
+        let rail_y = thumb_y_offset as f32 + top_inset;
+        let rail_h = (track_height as f32 - top_inset * 2.).max(0.);
+        if rail_h <= 0. {
+            return Ok(());
+        }
+
+        let info = ScrollHit::thumb(
+            &*pane,
+            current_viewport,
+            rail_h as usize,
+            self.min_scroll_bar_height() as usize,
+        );
+
+        self.sidebar_pill_fill(
+            layers,
+            2,
+            euclid::rect(
+                visible_track_x,
+                rail_y + info.top as f32,
+                track_width,
+                info.height as f32,
+            ),
+            track_width * 0.5,
+            color,
+        )?;
 
         Ok(())
     }
