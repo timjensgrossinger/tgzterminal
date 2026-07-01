@@ -1,6 +1,7 @@
 /.tag
 .DS_Store
 dhat-heap.json
+review_*.json
 /docs/_site
 /docs/favicon.png
 /docs/favicon.svg
