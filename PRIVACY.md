@@ -1,16 +1,16 @@
-# Privacy Policy for WezTerm
+# Privacy Policy for TGZTerminal
 
-No data about your device(s) or WezTerm usage leave your device.
+No data about your device(s) or TGZTerminal usage leave your device by default.
 
-## Data Maintained by WezTerm
+## Data Maintained by TGZTerminal
 
-WezTerm maintains some historical data, such as recent searches or action
+TGZTerminal maintains some historical data, such as recent searches or action
 usage, in some of its overlays such as the debug overlay and character
 selector, in order to make your usage more convenient. It is used only
 by the local process, and care is taken to limit access for the associated
 files on disk to only your local user identity.
 
-WezTerm tracks the output from the commands that you have executed in
+TGZTerminal tracks the output from the commands that you have executed in
 a scrollback buffer.  At the time of writing, that scrollback buffer
 is an in-memory structure that is not visible to other users of the machine.
 In the future, if wezterm expands to offload scrollback information to
@@ -20,39 +20,48 @@ same system will not be able to inspect it.
 ## macOS and Data permissions
 
 On macOS, when a GUI application that has a "bundle" launches child processes
-(eg: WezTerm, running your shell, and your shell running the programs which you
+(eg: TGZTerminal, running your shell, and your shell running the programs which you
 direct it to run), any permissioned resource access that may be attempted by
-those child processes will be reported as though WezTerm is attempting to
+those child processes will be reported as though TGZTerminal is attempting to
 access those resources.
 
-The result is that from time to time you may see a dialog about WezTerm
+The result is that from time to time you may see a dialog about TGZTerminal
 accessing your Contacts if run a `find` command that happens to step through
 the portion of your filesystem where the contacts are stored.  Or perhaps you
 are running a utility that accesses your camera; it will appear as though
-WezTerm is accessing those resources, but it is not: there is no logic within
-WezTerm to attempt to access your contacts, camera or any other sensitive
+TGZTerminal is accessing those resources, but it is not: there is no logic within
+TGZTerminal to attempt to access your contacts, camera or any other sensitive
 information.
+
+## Agent UI and Clipboard Actions
+
+Agent detection is passive and local. Copy actions are user-initiated and copy a
+bounded number of recent scrollback lines; copied text may include any terminal
+output visible in that range, including secrets printed by shell commands or
+agent tools.
+
+Resume, attach, and details-opening controls are disabled unless TGZTerminal
+sees trusted agent evidence or you explicitly enable control actions. Adapter
+detail paths are opened only after a user click; Claude log paths are
+canonicalized and must resolve under `~/.claude/projects` before they are
+opened.
 
 ## Update Checking
 
-By default, once every 24 hours, wezterm makes an HTTP request to GitHub's
-release API in order to determine if a newer version is available and to
-notify you if that is the case.
+TGZTerminal disables automatic update checking by default. While this private
+preview is manually installed, updates are expected to come from rebuilding,
+signing, and reinstalling the local macOS bundle.
 
-The content of that request is private between your machine and GitHub.  The
-contributors to WezTerm cannot see inside that request and therefore cannot
-infer any information from it.
-
-If you wish, you can disable update checking. See
-https://wezterm.org/config/lua/config/check_for_updates.html for
-more information on that.
+If you explicitly set `check_for_updates = true`, the compatibility update
+checker may make an HTTP request to GitHub's release API. The request uses a
+TGZTerminal User-Agent string and release notifications use TGZTerminal-branded
+text.
 
 ## Third-Party Builds
 
-The above is true of the wezterm source code and the binaries produced by
-wezterm's CI and made available from https://wezterm.org/ and
-https://github.com/wezterm/wezterm/.
+The above is true of this TGZTerminal source tree and local builds produced from
+it.
 
-If you obtained a pre-built wezterm binary from some other source be aware that
+If you obtained a pre-built TGZTerminal binary from some other source be aware that
 the person(s) building those versions may have modified them to behave
 differently from the source version.

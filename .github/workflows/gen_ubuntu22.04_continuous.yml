@@ -27,6 +27,7 @@ on:
 
 jobs:
   build:
+    if: github.repository == 'wezterm/wezterm'
     runs-on: "ubuntu-latest"
     container: "ubuntu:22.04"
     env:

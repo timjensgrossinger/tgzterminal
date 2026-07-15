@@ -21,6 +21,7 @@ use crate::termwindow::background::{
 use crate::termwindow::keyevent::{KeyTableArgs, KeyTableState};
 use crate::termwindow::modal::Modal;
 use crate::termwindow::render::paint::AllowImage;
+use crate::termwindow::render::sidebar::AgentDetectionCacheEntry;
 use crate::termwindow::render::{
     CachedLineState, LineQuadCacheKey, LineQuadCacheValue, LineToEleShapeCacheKey,
     LineToElementShapeItem,
@@ -51,6 +52,7 @@ use mux::tab::{
 use mux::window::WindowId as MuxWindowId;
 use mux::{Mux, MuxNotification};
 use mux_lua::MuxPane;
+use percent_encoding::percent_decode_str;
 use smol::channel::Sender;
 use smol::Timer;
 use std::cell::{RefCell, RefMut};
@@ -67,6 +69,13 @@ use wezterm_dynamic::Value;
 use wezterm_font::FontConfiguration;
 use wezterm_term::color::ColorPalette;
 use wezterm_term::input::LastMouseClick;
+
+#[derive(Clone, Debug)]
+struct RemoteFileBrowserContext {
+    destination: String,
+    port: Option<u16>,
+    path: String,
+}
 use wezterm_term::{Alert, Progress, StableRowIndex, TerminalConfiguration, TerminalSize};
 
 pub mod background;
@@ -164,6 +173,7 @@ pub enum AgentToolbeltAction {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AgentCopyAction {
     Conversation,
+    Markdown,
     LastAgentMessage,
     Summary,
 }
@@ -444,6 +454,7 @@ pub struct TermWindow {
     sidebar_auto_hide_close_after: Option<Instant>,
     sidebar_search: Option<SidebarSearchState>,
     agent_copy_menu: Option<AgentCopyMenuState>,
+    agent_detection_cache: RefCell<HashMap<PaneId, AgentDetectionCacheEntry>>,
     sidebar_scroll_offset: usize,
     sidebar_drop_flash: Option<(usize, Instant)>,
     fancy_tab_bar: Option<box_model::ComputedElement>,
@@ -785,6 +796,7 @@ impl TermWindow {
             sidebar_auto_hide_close_after: None,
             sidebar_search: None,
             agent_copy_menu: None,
+            agent_detection_cache: RefCell::new(HashMap::new()),
             sidebar_scroll_offset: 0,
             sidebar_drop_flash: None,
             fancy_tab_bar: None,
@@ -2657,6 +2669,45 @@ impl TermWindow {
             .and_then(|url| url.to_file_path().ok())
     }
 
+    fn file_browser_remote_context(
+        &self,
+        pane: &Arc<dyn Pane>,
+    ) -> Option<RemoteFileBrowserContext> {
+        let url = pane.get_current_working_dir(CachePolicy::AllowStale)?;
+        if url.to_file_path().is_ok() {
+            return None;
+        }
+        let host = url.host_str()?.to_string();
+        let path = percent_decode_str(url.path())
+            .decode_utf8()
+            .ok()?
+            .into_owned();
+        if path.is_empty() {
+            return None;
+        }
+
+        match url.scheme() {
+            "ssh" => {
+                let destination = if url.username().is_empty() {
+                    host
+                } else {
+                    format!("{}@{}", url.username(), host)
+                };
+                Some(RemoteFileBrowserContext {
+                    destination,
+                    port: url.port(),
+                    path,
+                })
+            }
+            "file" => Some(RemoteFileBrowserContext {
+                destination: host,
+                port: None,
+                path,
+            }),
+            _ => None,
+        }
+    }
+
     fn file_browser_script(&self) -> String {
         r#"set -e
 printf '\033]0;Worktree\007'
@@ -2667,13 +2718,11 @@ trap 'rm -f "$tmp"' EXIT
 target_pane="${TGZTERMINAL_TARGET_PANE:-}"
 wezterm_bin="${TGZTERMINAL_BIN:-tgzterminal}"
 editor_cmd="${TGZTERMINAL_EDITOR_COMMAND:-${VISUAL:-${EDITOR:-vim}}}"
-root=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
-root=$(cd "$root" 2>/dev/null && pwd -P || pwd)
+remote_dest="${TGZTERMINAL_REMOTE_DEST:-}"
+remote_port="${TGZTERMINAL_REMOTE_PORT:-}"
+remote_cwd="${TGZTERMINAL_REMOTE_CWD:-}"
 cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/tgzterminal"
 mkdir -p "$cache_dir" 2>/dev/null || true
-cache_key=$(printf '%s' "$root" | cksum | awk '{ print $1 }')
-cache_file="$cache_dir/worktree-$cache_key.tsv"
-stamp_file="$cache_dir/worktree-$cache_key.stamp"
 
 quote_path() {
   printf "'"
@@ -2681,8 +2730,53 @@ quote_path() {
   printf "'"
 }
 
+is_remote() {
+  [ -n "$remote_dest" ]
+}
+
+ssh_remote() {
+  if [ -n "$remote_port" ]; then
+    ssh -p "$remote_port" "$remote_dest" "$@"
+  else
+    ssh "$remote_dest" "$@"
+  fi
+}
+
+remote_eval() {
+  ssh_remote "$1"
+}
+
+path_mtime() {
+  path="$1"
+  quoted=$(quote_path "$path")
+  if is_remote; then
+    remote_eval "stat -c %Y -- $quoted 2>/dev/null || stat -f %m -- $quoted 2>/dev/null || printf 0"
+  else
+    stat -f %m "$path" 2>/dev/null || stat -c %Y "$path" 2>/dev/null || printf 0
+  fi
+}
+
+if is_remote; then
+  start_dir="${remote_cwd:-.}"
+  quoted_start=$(quote_path "$start_dir")
+  root=$(remote_eval "cd -- $quoted_start 2>/dev/null && (git rev-parse --show-toplevel 2>/dev/null || pwd -P)" 2>/dev/null | sed -n '1p')
+  [ -n "$root" ] || root="$start_dir"
+else
+  root=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+  root=$(cd "$root" 2>/dev/null && pwd -P || pwd)
+fi
+
+cache_key=$(printf '%s:%s' "$remote_dest" "$root" | cksum | awk '{ print $1 }')
+cache_file="$cache_dir/worktree-$cache_key.tsv"
+stamp_file="$cache_dir/worktree-$cache_key.stamp"
+
 git_index_path() {
-  git_dir=$(git -C "$root" rev-parse --git-dir 2>/dev/null || true)
+  quoted_root=$(quote_path "$root")
+  if is_remote; then
+    git_dir=$(remote_eval "git -C $quoted_root rev-parse --git-dir 2>/dev/null" || true)
+  else
+    git_dir=$(git -C "$root" rev-parse --git-dir 2>/dev/null || true)
+  fi
   case "$git_dir" in
     '') return 1 ;;
     /*) printf '%s/index\n' "$git_dir" ;;
@@ -2691,15 +2785,25 @@ git_index_path() {
 }
 
 cache_stamp() {
-  git_head=$(git -C "$root" rev-parse HEAD 2>/dev/null || printf 'nogit')
+  quoted_root=$(quote_path "$root")
+  if is_remote; then
+    git_head=$(remote_eval "git -C $quoted_root rev-parse HEAD 2>/dev/null" || printf 'nogit')
+  else
+    git_head=$(git -C "$root" rev-parse HEAD 2>/dev/null || printf 'nogit')
+  fi
   git_index=$(git_index_path || true)
-  index_mtime=$(stat -f %m "$git_index" 2>/dev/null || printf '0')
-  root_mtime=$(stat -f %m "$root" 2>/dev/null || printf '0')
+  index_mtime=$(path_mtime "$git_index")
+  root_mtime=$(path_mtime "$root")
   printf '%s:%s:%s:%s\n' "$root" "$git_head" "$index_mtime" "$root_mtime"
 }
 
 build_git_index() {
-  git -C "$root" ls-files -z --cached --others --exclude-standard 2>/dev/null \
+  quoted_root=$(quote_path "$root")
+  if is_remote; then
+    remote_eval "git -C $quoted_root ls-files -z --cached --others --exclude-standard 2>/dev/null"
+  else
+    git -C "$root" ls-files -z --cached --others --exclude-standard 2>/dev/null
+  fi \
     | tr '\0' '\n' \
     | awk -v root="$root" '
         function base(path, parts, n) {
@@ -2742,10 +2846,14 @@ build_git_index() {
 }
 
 build_find_index() {
-  find "$root" -maxdepth 4 \
-    \( -name .git -o -name target -o -name node_modules -o -name .venv -o -name .pytest_cache -o -name .ruff_cache \) -prune \
-    -o \( -type d -o -type f \) -print 2>/dev/null \
-    | awk -v root="$root" '
+  quoted_root=$(quote_path "$root")
+  find_script="find $quoted_root -maxdepth 4 \\( -name .git -o -name target -o -name node_modules -o -name .venv -o -name .pytest_cache -o -name .ruff_cache \\) -prune -o \\( -type d -o -type f \\) -exec sh -c 'for path do if [ -d \"\$path\" ]; then printf \"d\\t%s\\n\" \"\$path\"; else printf \"f\\t%s\\n\" \"\$path\"; fi; done' sh {} +"
+  if is_remote; then
+    remote_eval "$find_script" 2>/dev/null
+  else
+    eval "$find_script" 2>/dev/null
+  fi \
+    | awk -F '\t' -v root="$root" '
         function base(path, parts, n) {
           n = split(path, parts, "/")
           return parts[n]
@@ -2758,22 +2866,19 @@ build_find_index() {
           return s
         }
         {
-          path = $0
+          kind = $1
+          path = $2
           rel = path
           sub("^" root "/?", "", rel)
           if (path == root || rel == "") {
             print base(root) "/\t" root "\td"
           } else {
             depth = split(rel, parts, "/") - 1
-            kind = path ~ /\/$/ ? "d" : "f"
-            if (system("[ -d " q path q " ]") == 0) {
-              kind = "d"
-            }
             suffix = kind == "d" ? "/" : ""
             print indent(depth) parts[depth + 1] suffix "\t" path "\t" kind
           }
         }
-      ' q="'\''" \
+      ' \
     | sort -t "$(printf '\t')" -k2,2 -k3,3 -u
 }
 
@@ -2784,7 +2889,14 @@ build_list() {
   fi
 
   next_tmp="$tmp.next"
-  if git -C "$root" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  quoted_root=$(quote_path "$root")
+  if is_remote; then
+    if remote_eval "git -C $quoted_root rev-parse --is-inside-work-tree >/dev/null 2>&1"; then
+      build_git_index > "$next_tmp"
+    else
+      build_find_index > "$next_tmp"
+    fi
+  elif git -C "$root" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     build_git_index > "$next_tmp"
   else
     build_find_index > "$next_tmp"
@@ -2795,10 +2907,30 @@ build_list() {
   printf '%s\n' "$stamp" > "$stamp_file" 2>/dev/null || true
 }
 
+path_is_dir() {
+  selection="$1"
+  quoted=$(quote_path "$selection")
+  if is_remote; then
+    remote_eval "[ -d $quoted ]"
+  else
+    [ -d "$selection" ]
+  fi
+}
+
+path_is_file() {
+  selection="$1"
+  quoted=$(quote_path "$selection")
+  if is_remote; then
+    remote_eval "[ -f $quoted ]"
+  else
+    [ -f "$selection" ]
+  fi
+}
+
 send_folder() {
   selection="$1"
   [ -n "$target_pane" ] || return 0
-  [ -d "$selection" ] || return 0
+  path_is_dir "$selection" || return 0
   quoted=$(quote_path "$selection")
   printf '\025cd -- %s\nclear\n' "$quoted" \
     | "$wezterm_bin" cli send-text --pane-id "$target_pane" --no-paste >/dev/null 2>&1 || return 0
@@ -2808,7 +2940,7 @@ send_folder() {
 open_file() {
   selection="$1"
   [ -n "$target_pane" ] || return 0
-  [ -f "$selection" ] || return 0
+  path_is_file "$selection" || return 0
   dir=$(dirname "$selection")
   quoted=$(quote_path "$selection")
   "$wezterm_bin" cli split-pane --pane-id "$target_pane" --right --percent 50 --cwd "$dir" -- \
@@ -2938,6 +3070,7 @@ done
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
         let split_size = self.config.file_browser.split_size_percent.clamp(5, 95);
         let target_pane = self.file_browser_target_pane(pane);
+        let remote_context = self.file_browser_remote_context(&target_pane);
         let mut set_environment_variables = HashMap::new();
         set_environment_variables.insert(
             "TGZTERMINAL_TARGET_PANE".to_string(),
@@ -2965,13 +3098,32 @@ done
             set_environment_variables
                 .insert("TGZTERMINAL_EDITOR_COMMAND".to_string(), editor_command);
         }
+        if let Some(remote) = remote_context.as_ref() {
+            set_environment_variables.insert(
+                "TGZTERMINAL_REMOTE_DEST".to_string(),
+                remote.destination.clone(),
+            );
+            set_environment_variables
+                .insert("TGZTERMINAL_REMOTE_CWD".to_string(), remote.path.clone());
+            if let Some(port) = remote.port {
+                set_environment_variables
+                    .insert("TGZTERMINAL_REMOTE_PORT".to_string(), port.to_string());
+            }
+        }
 
         let spawn = SpawnCommand {
             label: Some("Worktree".to_string()),
             args: Some(vec![shell, "-lc".to_string(), self.file_browser_script()]),
-            cwd: self.file_browser_cwd(&target_pane),
+            cwd: remote_context
+                .is_none()
+                .then(|| self.file_browser_cwd(&target_pane))
+                .flatten(),
             set_environment_variables,
-            domain: config::keyassignment::SpawnTabDomain::CurrentPaneDomain,
+            domain: if remote_context.is_some() {
+                config::keyassignment::SpawnTabDomain::DefaultDomain
+            } else {
+                config::keyassignment::SpawnTabDomain::CurrentPaneDomain
+            },
             ..Default::default()
         };
         self.spawn_command(

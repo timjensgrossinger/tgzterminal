@@ -683,7 +683,9 @@ impl super::TermWindow {
         event: MouseEvent,
         context: &dyn WindowOps,
     ) {
-        if self.scroll_sidebar_thumb_to(event.coords.y) {
+        let drag_delta_y = event.coords.y.saturating_sub(start_event.coords.y);
+        let thumb_top = item.y as isize + drag_delta_y;
+        if self.scroll_sidebar_thumb_top_to(thumb_top) {
             context.invalidate();
         }
         self.dragging.replace((item, start_event));
@@ -785,9 +787,15 @@ impl super::TermWindow {
                                     y: event.coords.y.max(0) as usize,
                                 });
                             }
-                            AgentToolbeltAction::Attach
-                            | AgentToolbeltAction::Resume
-                            | AgentToolbeltAction::OpenLogs => {}
+                            AgentToolbeltAction::Attach => {
+                                self.agent_attach_pane(&pane);
+                            }
+                            AgentToolbeltAction::Resume => {
+                                self.agent_resume_pane(&pane);
+                            }
+                            AgentToolbeltAction::OpenLogs => {
+                                self.agent_open_logs_for_pane(&pane);
+                            }
                         }
                     }
                     self.pressed_ui_item.take();
@@ -822,6 +830,10 @@ impl super::TermWindow {
                             AgentCopyAction::Conversation => (
                                 self.agent_pane_conversation_text(&pane),
                                 "Copied the agent conversation",
+                            ),
+                            AgentCopyAction::Markdown => (
+                                self.agent_pane_markdown_text(&pane),
+                                "Copied the agent conversation as Markdown",
                             ),
                             AgentCopyAction::LastAgentMessage => (
                                 self.agent_pane_last_message_text(&pane),

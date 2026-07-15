@@ -27,6 +27,7 @@ on:
 
 jobs:
   build:
+    if: github.repository == 'wezterm/wezterm'
     runs-on: "ubuntu-latest"
     container: "quay.io/centos/centos:stream9"
     env:

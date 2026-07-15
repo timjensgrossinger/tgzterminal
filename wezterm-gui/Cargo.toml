@@ -68,6 +68,7 @@ mux.workspace = true
 nucleo-matcher.workspace = true
 ordered-float.workspace = true
 parking_lot.workspace = true
+percent-encoding.workspace = true
 portable-pty = { workspace=true, features = ["serde_support"]}
 promise.workspace = true
 rangeset.workspace = true

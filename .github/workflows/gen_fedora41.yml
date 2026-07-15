@@ -25,6 +25,7 @@ on:
 
 jobs:
   build:
+    if: github.repository == 'wezterm/wezterm'
     runs-on: "ubuntu-latest"
     container: "fedora:41"
     env:

@@ -48,12 +48,21 @@ Detected agent panes can show a small toolbelt in the active pane. The current
 safe actions are:
 
 - `Stop`: sends `Ctrl-C` to a running or streaming agent pane.
+- `Resume`: starts a configured agent resume command in a new tab.
+- `Attach`: starts a configured attach command when the pane exposes an attach
+  URL.
+- `Logs`/`Details`: opens the first existing configured local details path.
 - `Copy conversation`: copies recent pane scrollback and visible output.
+- `Copy as Markdown`: copies the recent transcript with simple Markdown
+  speaker sections.
 - `Copy last message`: copies a best-effort latest visible assistant response.
 - `Copy agent details`: copies the agent metadata summary.
 
-Agent detection is passive. TGZTerminal does not drive or spawn agent CLIs for
-the toolbelt.
+Agent detection is passive. Resume and log-opening controls are hidden unless
+the adapter has a safe command/path template, the command exists on `PATH`, and
+the pane has trusted process/title/user-variable evidence or you explicitly
+enable control actions. Copy actions are user-initiated and may include recent
+terminal output, including secrets printed in scrollback.
 
 ### Vendor-Neutral Agent Metadata
 
@@ -94,8 +103,18 @@ config.agent_ui = {
   enabled = true,
   show_sidebar_badges = true,
   show_pane_toolbelt = true,
+  enable_control_actions = false,
   detect_processes = true,
+  copy_scrollback_lines = 500,
+  waiting_notification = true,
   toolbelt_position = "Top",
+  adapters = {
+    claude = {
+      resume_command = { "claude", "--resume", "{session_id}" },
+      resume_latest_command = { "claude", "--resume" },
+      detail_paths = { "{home}/.claude/projects/{claude_project_path}" },
+    },
+  },
 }
 ```
 
@@ -121,6 +140,9 @@ cargo build --release -p wezterm-gui
 
 The local bundle is assembled under `dist/TGZTerminal.app` and installed
 manually while this preview is private.
+
+Automatic update checks are off by default in TGZTerminal. While this preview is
+private, update by rebuilding, signing, and reinstalling the bundle manually.
 
 The currently used runtime inside the app bundle is:
 

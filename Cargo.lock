@@ -7064,6 +7064,7 @@ dependencies = [
  "nucleo-matcher",
  "ordered-float 4.6.0",
  "parking_lot",
+ "percent-encoding",
  "portable-pty",
  "promise",
  "rangeset",

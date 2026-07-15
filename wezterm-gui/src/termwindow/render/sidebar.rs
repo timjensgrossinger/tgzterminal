@@ -1,4 +1,5 @@
 use crate::quad::TripleLayerQuadAllocator;
+use crate::spawn::SpawnWhere;
 use crate::tabbar::TabBarItem;
 use crate::termwindow::render::corners::{
     BOTTOM_LEFT_ROUNDED_CORNER, BOTTOM_RIGHT_ROUNDED_CORNER, TOP_LEFT_ROUNDED_CORNER,
@@ -6,21 +7,27 @@ use crate::termwindow::render::corners::{
 };
 use crate::termwindow::render::RenderScreenLineParams;
 use crate::termwindow::{AgentCopyAction, AgentToolbeltAction, UIItem, UIItemType};
+use config::keyassignment::SpawnCommand;
 use config::{
-    AgentAdapterConfig, AgentTelemetryField, AgentToolbeltPosition, SidebarPosition,
-    SidebarTabDensity, SidebarTabMetadata, SidebarTabTitleSource, TabBarColors,
+    default_agent_adapters, AgentAdapterConfig, AgentTelemetryField, AgentToolbeltPosition,
+    SidebarPosition, SidebarTabDensity, SidebarTabMetadata, SidebarTabTitleSource, TabBarColors,
 };
 use mux::pane::{CachePolicy, Pane};
 use mux::renderable::RenderableDimensions;
 use mux::tab::PositionedPane;
 use mux::Mux;
-use std::collections::HashMap;
+use regex::RegexBuilder;
+use std::collections::{HashMap, HashSet};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use std::{env, fs};
 use termwiz::cell::{CellAttributes, Intensity};
 use termwiz::color::ColorAttribute;
 use termwiz::surface::{Line, SEQ_ZERO};
+use url::Url;
 use window::color::LinearRgba;
 use window::{MousePress, RectF};
 
@@ -44,10 +51,85 @@ const AUTO_HIDE_RESIZE_GRIP_W: usize = 8;
 const MIN_AUTO_HIDE_RAIL_W: usize = 48;
 const AGENT_TOOLBELT_H: f32 = 32.;
 const AGENT_TOOLBELT_GAP: f32 = 6.;
-const AGENT_TOOLBELT_BUTTON_W: f32 = 72.;
-const AGENT_TOOLBELT_MAX_W: f32 = 520.;
-const AGENT_COPY_MENU_W: f32 = 216.;
+const AGENT_TOOLBELT_MIN_BUTTON_W: f32 = 88.;
+const AGENT_TOOLBELT_BUTTON_PAD_X: f32 = 24.;
+const AGENT_TOOLBELT_DOT_SIZE: f32 = 7.;
+const AGENT_TOOLBELT_MAX_W: f32 = 760.;
+const AGENT_TOOLBELT_MIN_W: f32 = 360.;
+const AGENT_TOOLBELT_RIGHT_INSET: f32 = 44.;
+const AGENT_COPY_MENU_W: f32 = 360.;
 const AGENT_COPY_MENU_ROW_H: f32 = 28.;
+const MAX_AGENT_PATTERN_LEN: usize = 256;
+const AGENT_PATTERN_REGEX_CACHE_LIMIT: usize = 128;
+const WAITING_NOTIFICATION_THROTTLE: Duration = Duration::from_secs(60);
+const DEFAULT_AGENT_ADAPTER_IDS: [&str; 7] = [
+    "claude", "codex", "gemini", "opencode", "copilot", "cursor", "amp",
+];
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SidebarScrollGeometry {
+    track_y: f32,
+    track_h: f32,
+    thumb_y: f32,
+    thumb_h: f32,
+    max_offset: usize,
+}
+
+impl SidebarScrollGeometry {
+    fn new(
+        track_y: f32,
+        track_h: f32,
+        visible: usize,
+        total: usize,
+        offset: usize,
+        min_thumb_h: f32,
+    ) -> Option<Self> {
+        if total <= visible || visible == 0 || track_h <= 0. {
+            return None;
+        }
+
+        let max_offset = total.saturating_sub(visible);
+        let thumb_h = (track_h * visible as f32 / total as f32)
+            .max(min_thumb_h)
+            .min(track_h);
+        let scroll_range = (track_h - thumb_h).max(0.);
+        let thumb_y = if max_offset == 0 {
+            track_y
+        } else {
+            track_y + scroll_range * offset.min(max_offset) as f32 / max_offset as f32
+        };
+
+        Some(Self {
+            track_y,
+            track_h,
+            thumb_y,
+            thumb_h,
+            max_offset,
+        })
+    }
+
+    fn offset_for_thumb_top(&self, thumb_top: f32) -> Option<usize> {
+        if self.max_offset == 0 {
+            return None;
+        }
+
+        let scroll_range = (self.track_h - self.thumb_h).max(0.);
+        if scroll_range <= 0. {
+            return None;
+        }
+
+        let thumb_top = thumb_top.clamp(self.track_y, self.track_y + scroll_range);
+        Some(
+            (((thumb_top - self.track_y) / scroll_range) * self.max_offset as f32).round() as usize,
+        )
+    }
+}
+
+lazy_static::lazy_static! {
+    static ref BUILT_IN_AGENT_ADAPTERS: config::AgentAdaptersConfig = default_agent_adapters();
+    static ref AGENT_PATTERN_REGEX_CACHE: Mutex<HashMap<String, Option<regex::Regex>>> =
+        Mutex::new(HashMap::new());
+}
 
 fn lerp_rgba(a: LinearRgba, b: LinearRgba, t: f32) -> LinearRgba {
     LinearRgba(
@@ -77,22 +159,329 @@ fn line_to_string(line: &Line) -> String {
 }
 
 fn is_agent_user_prompt_line(line: &str) -> bool {
-    let trimmed = line.trim_start();
-    trimmed.starts_with("> ")
-        || trimmed.starts_with("› ")
-        || trimmed.starts_with("❯ ")
-        || trimmed.starts_with("$ ")
-        || trimmed.starts_with("# ")
+    split_agent_user_prompt_line(line).is_some()
 }
 
-fn is_agent_prompt_or_status_line(line: &str) -> bool {
+fn clean_agent_content_line(line: &str) -> String {
+    let trimmed = line.trim_end();
+    trimmed
+        .strip_prefix("⏺ ")
+        .or_else(|| trimmed.strip_prefix("● "))
+        .map(str::trim_start)
+        .unwrap_or(trimmed)
+        .to_string()
+}
+
+fn split_agent_user_prompt_line(line: &str) -> Option<&str> {
+    let trimmed = line.trim_start();
+    for prefix in ["> ", "› ", "❯ "] {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            return Some(rest.trim_start());
+        }
+    }
+    if matches!(trimmed, ">" | "›" | "❯") {
+        Some("")
+    } else {
+        None
+    }
+}
+
+fn is_agent_separator_line(trimmed: &str) -> bool {
+    let mut count = 0;
+    for ch in trimmed.chars().filter(|ch| !ch.is_whitespace()) {
+        if !matches!(
+            ch,
+            '-' | '=' | '_' | '─' | '━' | '═' | '┄' | '┈' | '•' | '·'
+        ) {
+            return false;
+        }
+        count += 1;
+    }
+    count >= 3
+}
+
+fn starts_with_time_usage(trimmed: &str) -> bool {
+    let mut chars = trimmed.chars();
+    let first = chars.next();
+    let second = chars.next();
+    matches!((first, second), (Some(a), Some(':')) if a.is_ascii_digit())
+        || matches!(
+            (first, second, chars.next(), chars.next()),
+            (Some(a), Some(b), Some(':'), Some(_)) if a.is_ascii_digit() && b.is_ascii_digit()
+        )
+}
+
+fn contains_case_insensitive(haystack: &str, needle: &str) -> bool {
+    !needle.trim().is_empty()
+        && haystack
+            .to_ascii_lowercase()
+            .contains(&needle.to_ascii_lowercase())
+}
+
+fn built_in_agent_adapters() -> &'static config::AgentAdaptersConfig {
+    &BUILT_IN_AGENT_ADAPTERS
+}
+
+fn cached_regex_matches(haystack: &str, pattern: &str) -> bool {
+    let pattern = pattern.trim();
+    if pattern.is_empty() || pattern.len() > MAX_AGENT_PATTERN_LEN {
+        return false;
+    }
+    let mut cache = AGENT_PATTERN_REGEX_CACHE.lock().unwrap();
+    if !cache.contains_key(pattern) {
+        if cache.len() >= AGENT_PATTERN_REGEX_CACHE_LIMIT {
+            cache.clear();
+        }
+        let compiled = match RegexBuilder::new(pattern).case_insensitive(true).build() {
+            Ok(regex) => Some(regex),
+            Err(err) => {
+                log::warn!(
+                    "ignoring invalid agent_ui regex pattern {:?}: {}",
+                    pattern,
+                    err
+                );
+                None
+            }
+        };
+        cache.insert(pattern.to_string(), compiled);
+    }
+    cache
+        .get(pattern)
+        .and_then(|regex| regex.as_ref())
+        .map(|regex| regex.is_match(haystack))
+        .unwrap_or(false)
+}
+
+fn agent_pattern_matches(haystack: &str, pattern: &str) -> bool {
+    let pattern = pattern.trim();
+    if pattern.len() > MAX_AGENT_PATTERN_LEN + 3 {
+        return false;
+    }
+    if let Some(regex) = pattern.strip_prefix("re:") {
+        cached_regex_matches(haystack, regex)
+    } else {
+        contains_case_insensitive(haystack, pattern)
+    }
+}
+
+fn adapter_patterns<'a>(
+    adapter: Option<&'a AgentAdapterConfig>,
+    field: PatternField,
+) -> Vec<String> {
+    match adapter {
+        Some(adapter) => match field {
+            PatternField::Visible => adapter.visible_patterns.clone(),
+            PatternField::Strip => adapter.strip_patterns.clone(),
+            PatternField::Model => adapter.model_patterns.clone(),
+        },
+        None => built_in_agent_adapters()
+            .values()
+            .flat_map(|adapter| match field {
+                PatternField::Visible => adapter.visible_patterns.clone(),
+                PatternField::Strip => adapter.strip_patterns.clone(),
+                PatternField::Model => adapter.model_patterns.clone(),
+            })
+            .collect(),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PatternField {
+    Visible,
+    Strip,
+    Model,
+}
+
+fn is_agent_transcript_chrome_line(line: &str, adapter: Option<&AgentAdapterConfig>) -> bool {
     let trimmed = line.trim();
-    trimmed.is_empty()
-        || is_agent_user_prompt_line(line)
-        || trimmed.contains("ctx:")
-        || trimmed.contains("auto mode")
-        || trimmed.contains("shift+tab")
-        || trimmed.contains("for agents")
+    if trimmed.is_empty() || is_agent_separator_line(trimmed) {
+        return true;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("⏵⏵") || lower.starts_with("▶▶") || lower.starts_with("▸▸") {
+        return true;
+    }
+    if (starts_with_time_usage(trimmed)
+        && (lower.contains("tokens") || lower.contains("reset") || lower.contains("ctx")))
+        || (lower.contains("tokens") && (trimmed.contains('│') || trimmed.contains('┃')))
+        || (lower.contains("% used") && lower.contains("% left"))
+    {
+        return true;
+    }
+    if matches!(trimmed.chars().next(), Some('✻' | '✽' | '✶' | '✢' | '*')) {
+        return true;
+    }
+
+    adapter_patterns(adapter, PatternField::Strip)
+        .iter()
+        .any(|pattern| agent_pattern_matches(trimmed, pattern))
+}
+
+fn trim_blank_edges(lines: &mut Vec<String>) {
+    while lines
+        .first()
+        .map(|line| line.trim().is_empty())
+        .unwrap_or(false)
+    {
+        lines.remove(0);
+    }
+    while lines
+        .last()
+        .map(|line| line.trim().is_empty())
+        .unwrap_or(false)
+    {
+        lines.pop();
+    }
+}
+
+fn push_agent_transcript_line(lines: &mut Vec<String>, text: String) {
+    if text.trim().is_empty() {
+        if !lines.is_empty()
+            && !lines
+                .last()
+                .map(|line| line.trim().is_empty())
+                .unwrap_or(false)
+        {
+            lines.push(String::new());
+        }
+    } else {
+        lines.push(text.trim_end().to_string());
+    }
+}
+
+fn clean_agent_conversation_transcript(raw: &str, adapter: Option<&AgentAdapterConfig>) -> String {
+    let mut lines = Vec::new();
+    let skip_until_first_prompt = raw.lines().any(is_agent_user_prompt_line);
+    let mut seen_prompt = !skip_until_first_prompt;
+    for line in raw.lines() {
+        if !seen_prompt {
+            if is_agent_user_prompt_line(line) {
+                seen_prompt = true;
+            } else {
+                continue;
+            }
+        }
+
+        if line.trim().is_empty() {
+            push_agent_transcript_line(&mut lines, String::new());
+            continue;
+        }
+        if is_agent_transcript_chrome_line(line, adapter) {
+            continue;
+        }
+        if is_agent_user_prompt_line(line) {
+            let prompt = split_agent_user_prompt_line(line).unwrap_or("");
+            push_agent_transcript_line(&mut lines, prompt.to_string());
+        } else {
+            push_agent_transcript_line(&mut lines, clean_agent_content_line(line));
+        }
+    }
+    trim_blank_edges(&mut lines);
+    lines.join("\n")
+}
+
+fn clean_agent_last_message_transcript(raw: &str, adapter: Option<&AgentAdapterConfig>) -> String {
+    let mut current = Vec::new();
+    let mut last_message = Vec::new();
+
+    for line in raw.lines() {
+        if line.trim().is_empty() {
+            push_agent_transcript_line(&mut current, String::new());
+            continue;
+        }
+        if is_agent_transcript_chrome_line(line, adapter) {
+            continue;
+        }
+        if is_agent_user_prompt_line(line) {
+            trim_blank_edges(&mut current);
+            if !current.is_empty() {
+                last_message = current;
+            }
+            current = Vec::new();
+            continue;
+        }
+        push_agent_transcript_line(&mut current, clean_agent_content_line(line));
+    }
+
+    trim_blank_edges(&mut current);
+    if !current.is_empty() {
+        last_message = current;
+    }
+    trim_blank_edges(&mut last_message);
+    last_message.join("\n")
+}
+
+fn agent_copy_payload_from_text(
+    action: &AgentCopyAction,
+    raw_transcript: &str,
+    summary: &str,
+    adapter: Option<&AgentAdapterConfig>,
+) -> String {
+    match action {
+        AgentCopyAction::Conversation => {
+            clean_agent_conversation_transcript(raw_transcript, adapter)
+        }
+        AgentCopyAction::Markdown => clean_agent_markdown_transcript(raw_transcript, adapter),
+        AgentCopyAction::LastAgentMessage => {
+            clean_agent_last_message_transcript(raw_transcript, adapter)
+        }
+        AgentCopyAction::Summary => summary.to_string(),
+    }
+}
+
+fn clean_agent_markdown_transcript(raw: &str, adapter: Option<&AgentAdapterConfig>) -> String {
+    let conversation = clean_agent_conversation_transcript(raw, adapter);
+    if conversation.trim().is_empty() {
+        return String::new();
+    }
+
+    let mut sections = Vec::new();
+    let mut current_heading: Option<&'static str> = None;
+    let mut current = Vec::new();
+    for line in conversation.lines() {
+        let heading = if raw.lines().any(|raw_line| {
+            split_agent_user_prompt_line(raw_line)
+                .map(|prompt| prompt == line)
+                .unwrap_or(false)
+        }) {
+            "User"
+        } else {
+            "Agent"
+        };
+        if current_heading != Some(heading) {
+            if let Some(existing) = current_heading {
+                trim_blank_edges(&mut current);
+                if !current.is_empty() {
+                    sections.push(format!("## {existing}\n\n{}", current.join("\n")));
+                }
+            }
+            current_heading = Some(heading);
+            current = Vec::new();
+        }
+        push_agent_transcript_line(&mut current, line.to_string());
+    }
+    if let Some(existing) = current_heading {
+        trim_blank_edges(&mut current);
+        if !current.is_empty() {
+            sections.push(format!("## {existing}\n\n{}", current.join("\n")));
+        }
+    }
+    sections.join("\n\n")
+}
+
+fn agent_transcript_start(scrollback_top: isize, end: isize, max_rows: isize) -> isize {
+    scrollback_top.max(end.saturating_sub(max_rows.max(1)))
+}
+
+fn agent_toolbelt_button_width(label: &str, cell_width: usize) -> f32 {
+    let text_w = label.chars().count() as f32 * cell_width as f32;
+    (text_w + AGENT_TOOLBELT_BUTTON_PAD_X * 2.).max(AGENT_TOOLBELT_MIN_BUTTON_W)
+}
+
+fn agent_toolbelt_button_area(buttons: &[(&str, AgentToolbeltAction, f32)]) -> f32 {
+    let widths = buttons.iter().map(|(_, _, width)| *width).sum::<f32>();
+    widths + buttons.len().saturating_sub(1) as f32 * AGENT_TOOLBELT_GAP
 }
 
 fn compact_label(value: &str, fallback: &str) -> String {
@@ -112,20 +501,12 @@ fn compact_tab_symbol(
     title: &str,
     tab_idx: usize,
     agent_kind: Option<&AgentKind>,
+    agent_adapter: Option<&AgentAdapterConfig>,
     command: Option<&str>,
     pane_title: Option<&str>,
 ) -> String {
     if let Some(kind) = agent_kind {
-        return match kind {
-            AgentKind::Claude => "Cl".to_string(),
-            AgentKind::Codex => "Cx".to_string(),
-            AgentKind::Gemini => "G".to_string(),
-            AgentKind::OpenCode => "Oc".to_string(),
-            AgentKind::Copilot => "Cp".to_string(),
-            AgentKind::Cursor => "Cu".to_string(),
-            AgentKind::Amp => "A".to_string(),
-            AgentKind::Unknown(value) => compact_label(value, "Ag"),
-        };
+        return adapter_short_label(agent_adapter, kind);
     }
 
     let lower_title = title.to_ascii_lowercase();
@@ -138,13 +519,6 @@ fn compact_tab_symbol(
         .map(|cmd| basename(cmd).to_ascii_lowercase())
         .as_deref()
     {
-        Some("claude" | "claude-code" | "claude_code") => "Cl".to_string(),
-        Some("codex" | "openai-codex" | "openai_codex") => "Cx".to_string(),
-        Some("gemini" | "gemini-cli" | "gemini_cli") => "G".to_string(),
-        Some("opencode" | "open-code" | "open_code") => "Oc".to_string(),
-        Some("copilot" | "gh-copilot" | "github-copilot") => "Cp".to_string(),
-        Some("cursor") => "Cu".to_string(),
-        Some("amp") => "A".to_string(),
         Some("bash" | "fish" | "nu" | "powershell" | "pwsh" | "sh" | "zsh") => "$".to_string(),
         Some("vi" | "vim" | "nvim") => "Vi".to_string(),
         Some("emacs") => "Em".to_string(),
@@ -177,20 +551,12 @@ fn compact_tab_color(
     title: &str,
     tab_idx: usize,
     agent_kind: Option<&AgentKind>,
+    agent_adapter: Option<&AgentAdapterConfig>,
     command: Option<&str>,
     pane_title: Option<&str>,
 ) -> LinearRgba {
     if let Some(kind) = agent_kind {
-        return match kind {
-            AgentKind::Claude => LinearRgba(0.86, 0.48, 0.32, 1.0),
-            AgentKind::Codex => LinearRgba(0.24, 0.64, 0.48, 1.0),
-            AgentKind::Gemini => LinearRgba(0.28, 0.52, 0.92, 1.0),
-            AgentKind::OpenCode => LinearRgba(0.22, 0.66, 0.70, 1.0),
-            AgentKind::Copilot => LinearRgba(0.34, 0.66, 0.38, 1.0),
-            AgentKind::Cursor => LinearRgba(0.44, 0.42, 0.82, 1.0),
-            AgentKind::Amp => LinearRgba(0.74, 0.36, 0.68, 1.0),
-            AgentKind::Unknown(_) => LinearRgba(0.58, 0.50, 0.82, 1.0),
-        };
+        return adapter_color(agent_adapter, kind);
     }
 
     let lower_title = title.to_ascii_lowercase();
@@ -402,6 +768,41 @@ fn pane_working_dir(pane: &Arc<dyn Pane>) -> Option<PathBuf> {
         .and_then(|url| url.to_file_path().ok())
 }
 
+fn encode_claude_project_path(cwd: &Path) -> String {
+    cwd.to_string_lossy()
+        .chars()
+        .map(|ch| match ch {
+            '/' | '\\' | ':' => '-',
+            _ => ch,
+        })
+        .collect()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ClaudeLogsPathError {
+    Missing,
+    OutsideProjects,
+    NotDirectory,
+}
+
+fn resolve_claude_logs_path_under(home: &Path, cwd: &Path) -> Result<PathBuf, ClaudeLogsPathError> {
+    let projects_root = home.join(".claude").join("projects");
+    let project_dir = projects_root.join(encode_claude_project_path(cwd));
+    let root = projects_root
+        .canonicalize()
+        .map_err(|_| ClaudeLogsPathError::Missing)?;
+    let path = project_dir
+        .canonicalize()
+        .map_err(|_| ClaudeLogsPathError::Missing)?;
+    if !path.starts_with(&root) {
+        return Err(ClaudeLogsPathError::OutsideProjects);
+    }
+    if !path.is_dir() {
+        return Err(ClaudeLogsPathError::NotDirectory);
+    }
+    Ok(path)
+}
+
 fn find_git_branch(mut dir: &Path) -> Option<String> {
     loop {
         let git = dir.join(".git");
@@ -446,6 +847,242 @@ fn user_var<'a>(vars: &'a HashMap<String, String>, key: &str) -> Option<&'a str>
         .filter(|value| !value.trim().is_empty())
 }
 
+fn truthy_agent_var(vars: &HashMap<String, String>, key: &str) -> bool {
+    user_var(vars, key)
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn agent_control_actions_allowed(
+    config_enabled: bool,
+    trusted_controls: bool,
+    vars: &HashMap<String, String>,
+) -> bool {
+    trusted_controls || config_enabled || truthy_agent_var(vars, "agent.enable_control_actions")
+}
+
+#[derive(Clone, Debug, Default)]
+struct AgentActionTemplateValues {
+    session_id: Option<String>,
+    cwd: Option<PathBuf>,
+    home: Option<PathBuf>,
+    attach_url: Option<String>,
+}
+
+impl AgentActionTemplateValues {
+    fn from_vars(vars: &HashMap<String, String>, cwd: Option<&Path>) -> Self {
+        Self {
+            session_id: user_var(vars, "agent.session_id")
+                .or_else(|| user_var(vars, "agent.session"))
+                .map(ToString::to_string),
+            cwd: cwd.map(Path::to_path_buf),
+            home: dirs_next::home_dir(),
+            attach_url: user_var(vars, "agent.attach_url")
+                .or_else(|| user_var(vars, "agent.attach"))
+                .map(ToString::to_string),
+        }
+    }
+
+    fn from_agent(agent: &AgentPaneState) -> Self {
+        Self {
+            session_id: agent.session_id.clone(),
+            cwd: agent.cwd.clone(),
+            home: dirs_next::home_dir(),
+            attach_url: agent.attach_url.clone(),
+        }
+    }
+
+    fn value(&self, name: &str) -> Option<String> {
+        match name {
+            "session_id" => self.session_id.clone(),
+            "cwd" => self
+                .cwd
+                .as_ref()
+                .map(|path| path.to_string_lossy().to_string()),
+            "home" => self
+                .home
+                .as_ref()
+                .map(|path| path.to_string_lossy().to_string()),
+            "attach_url" => self.attach_url.clone(),
+            "claude_project_path" => self
+                .cwd
+                .as_ref()
+                .map(|path| encode_claude_project_path(path)),
+            _ => None,
+        }
+    }
+}
+
+fn expand_agent_action_template(
+    template: &str,
+    values: &AgentActionTemplateValues,
+) -> Option<String> {
+    let mut output = String::new();
+    let mut rest = template;
+    while let Some(start) = rest.find('{') {
+        output.push_str(&rest[..start]);
+        let after_start = &rest[start + 1..];
+        let end = after_start.find('}')?;
+        let name = &after_start[..end];
+        output.push_str(&values.value(name)?);
+        rest = &after_start[end + 1..];
+    }
+    if rest.contains('}') {
+        return None;
+    }
+    output.push_str(rest);
+    Some(output)
+}
+
+#[cfg(unix)]
+fn path_is_executable(path: &Path) -> bool {
+    fs::metadata(path)
+        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn path_is_executable(path: &Path) -> bool {
+    fs::metadata(path)
+        .map(|metadata| metadata.is_file())
+        .unwrap_or(false)
+}
+
+fn command_exists_on_path(command: &str) -> bool {
+    let command = command.trim();
+    if command.is_empty() {
+        return false;
+    }
+    let command_path = Path::new(command);
+    if command_path.components().count() > 1 {
+        return path_is_executable(command_path);
+    }
+    env::var_os("PATH")
+        .map(|path| {
+            env::split_paths(&path).any(|dir| {
+                let candidate = dir.join(command);
+                path_is_executable(&candidate)
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn resolve_agent_command(
+    command: Option<&Vec<String>>,
+    values: &AgentActionTemplateValues,
+) -> Option<Vec<String>> {
+    let command = command?;
+    if command.is_empty() {
+        return None;
+    }
+    let argv = command
+        .iter()
+        .map(|arg| expand_agent_action_template(arg, values))
+        .collect::<Option<Vec<_>>>()?;
+    if argv
+        .first()
+        .is_none_or(|command| !command_exists_on_path(command))
+    {
+        return None;
+    }
+    Some(argv)
+}
+
+fn resolve_agent_resume_command(
+    adapter: &AgentAdapterConfig,
+    values: &AgentActionTemplateValues,
+) -> Option<Vec<String>> {
+    if values.session_id.is_some() {
+        resolve_agent_command(adapter.resume_command.as_ref(), values)
+    } else {
+        resolve_agent_command(adapter.resume_latest_command.as_ref(), values)
+    }
+}
+
+fn resolve_agent_attach_command(
+    adapter: &AgentAdapterConfig,
+    values: &AgentActionTemplateValues,
+) -> Option<Vec<String>> {
+    resolve_agent_command(adapter.attach_command.as_ref(), values)
+}
+
+fn expand_agent_detail_path(template: &str, values: &AgentActionTemplateValues) -> Option<PathBuf> {
+    let expanded = expand_agent_action_template(template, values)?;
+    if let Some(stripped) = expanded.strip_prefix("~/") {
+        return values.home.as_ref().map(|home| home.join(stripped));
+    }
+    Some(PathBuf::from(expanded))
+}
+
+fn resolve_agent_detail_path(
+    adapter_id: Option<&str>,
+    adapter: &AgentAdapterConfig,
+    values: &AgentActionTemplateValues,
+) -> Option<PathBuf> {
+    for template in adapter.detail_paths.as_deref().unwrap_or_default() {
+        if adapter_id == Some("claude")
+            && template == "{home}/.claude/projects/{claude_project_path}"
+        {
+            let (Some(home), Some(cwd)) = (&values.home, &values.cwd) else {
+                continue;
+            };
+            if let Ok(path) = resolve_claude_logs_path_under(home, cwd) {
+                return Some(path);
+            }
+            continue;
+        }
+        let Some(path) = expand_agent_detail_path(template, values) else {
+            continue;
+        };
+        if !path.exists() {
+            continue;
+        }
+        let path = path.canonicalize().ok().unwrap_or(path);
+        if adapter_id == Some("claude") {
+            let Some(home) = &values.home else {
+                continue;
+            };
+            let projects_root = home.join(".claude").join("projects");
+            let Ok(root) = projects_root.canonicalize() else {
+                continue;
+            };
+            if !path.starts_with(root) || !path.is_dir() {
+                continue;
+            }
+        }
+        return Some(path);
+    }
+    None
+}
+
+fn agent_detail_button_label(
+    adapter_id: Option<&str>,
+    adapter: Option<&AgentAdapterConfig>,
+) -> &'static str {
+    if adapter_id == Some("claude") {
+        return "Logs";
+    }
+    let only_logs = adapter
+        .and_then(|adapter| adapter.detail_paths.as_deref())
+        .map(|paths| {
+            !paths.is_empty()
+                && paths
+                    .iter()
+                    .all(|path| path.to_ascii_lowercase().contains("log"))
+        })
+        .unwrap_or(false);
+    if only_logs {
+        "Logs"
+    } else {
+        "Details"
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum AgentKind {
     Claude,
@@ -459,18 +1096,31 @@ enum AgentKind {
 }
 
 impl AgentKind {
-    fn from_hint(hint: &str) -> Option<Self> {
-        let lower = basename(hint).to_ascii_lowercase();
-        match lower.as_str() {
-            "claude" | "claude-code" | "claude_code" => Some(Self::Claude),
-            "codex" | "openai-codex" | "openai_codex" => Some(Self::Codex),
-            "gemini" | "gemini-cli" | "gemini_cli" => Some(Self::Gemini),
-            "opencode" | "open-code" | "open_code" => Some(Self::OpenCode),
-            "copilot" | "gh-copilot" | "github-copilot" => Some(Self::Copilot),
+    fn from_adapter_id(id: &str) -> Option<Self> {
+        match id {
+            "claude" => Some(Self::Claude),
+            "codex" => Some(Self::Codex),
+            "gemini" => Some(Self::Gemini),
+            "opencode" => Some(Self::OpenCode),
+            "copilot" => Some(Self::Copilot),
             "cursor" => Some(Self::Cursor),
             "amp" => Some(Self::Amp),
             _ => None,
         }
+    }
+
+    fn from_hint(hint: &str) -> Option<Self> {
+        let lower = basename(hint).to_ascii_lowercase();
+        built_in_agent_adapters().iter().find_map(|(id, adapter)| {
+            adapter
+                .process_names
+                .iter()
+                .any(|process| basename(process).eq_ignore_ascii_case(&lower))
+                .then(|| {
+                    Self::from_adapter_id(id)
+                        .unwrap_or_else(|| Self::Unknown(adapter_label(adapter, id)))
+                })
+        })
     }
 
     fn from_user_var(hint: &str) -> Self {
@@ -501,6 +1151,118 @@ impl AgentKind {
             Self::Amp => Some("amp"),
             Self::Unknown(_) => None,
         }
+    }
+}
+
+fn adapter_label(adapter: &AgentAdapterConfig, id: &str) -> String {
+    adapter
+        .label
+        .as_deref()
+        .filter(|label| !label.trim().is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| title_case_label(id).unwrap_or_else(|| id.to_string()))
+}
+
+fn adapter_short_label(adapter: Option<&AgentAdapterConfig>, kind: &AgentKind) -> String {
+    adapter
+        .and_then(|adapter| adapter.short_label.as_deref())
+        .filter(|label| !label.trim().is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| match kind {
+            AgentKind::Claude => "Cl".to_string(),
+            AgentKind::Codex => "Cx".to_string(),
+            AgentKind::Gemini => "G".to_string(),
+            AgentKind::OpenCode => "Oc".to_string(),
+            AgentKind::Copilot => "Cp".to_string(),
+            AgentKind::Cursor => "Cu".to_string(),
+            AgentKind::Amp => "A".to_string(),
+            AgentKind::Unknown(value) => compact_label(value, "Ag"),
+        })
+}
+
+fn parse_adapter_color(value: &str) -> Option<LinearRgba> {
+    let hex = value.trim().strip_prefix('#').unwrap_or(value.trim());
+    if hex.len() != 6 || !hex.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return None;
+    }
+    let r = u8::from_str_radix(&hex[0..2], 16).ok()? as f32 / 255.;
+    let g = u8::from_str_radix(&hex[2..4], 16).ok()? as f32 / 255.;
+    let b = u8::from_str_radix(&hex[4..6], 16).ok()? as f32 / 255.;
+    Some(LinearRgba(r, g, b, 1.0))
+}
+
+fn adapter_color(adapter: Option<&AgentAdapterConfig>, kind: &AgentKind) -> LinearRgba {
+    if let Some(color) = adapter
+        .and_then(|adapter| adapter.color.as_deref())
+        .and_then(parse_adapter_color)
+    {
+        return color;
+    }
+    match kind {
+        AgentKind::Claude => LinearRgba(0.86, 0.48, 0.32, 1.0),
+        AgentKind::Codex => LinearRgba(0.24, 0.64, 0.48, 1.0),
+        AgentKind::Gemini => LinearRgba(0.28, 0.52, 0.92, 1.0),
+        AgentKind::OpenCode => LinearRgba(0.22, 0.66, 0.70, 1.0),
+        AgentKind::Copilot => LinearRgba(0.34, 0.66, 0.38, 1.0),
+        AgentKind::Cursor => LinearRgba(0.44, 0.42, 0.82, 1.0),
+        AgentKind::Amp => LinearRgba(0.74, 0.36, 0.68, 1.0),
+        AgentKind::Unknown(_) => LinearRgba(0.58, 0.50, 0.82, 1.0),
+    }
+}
+
+fn merge_agent_adapter_config(
+    base: &AgentAdapterConfig,
+    configured: &AgentAdapterConfig,
+) -> AgentAdapterConfig {
+    AgentAdapterConfig {
+        enabled: configured.enabled,
+        label: configured.label.clone().or_else(|| base.label.clone()),
+        short_label: configured
+            .short_label
+            .clone()
+            .or_else(|| base.short_label.clone()),
+        color: configured.color.clone().or_else(|| base.color.clone()),
+        process_names: if configured.process_names.is_empty() {
+            base.process_names.clone()
+        } else {
+            configured.process_names.clone()
+        },
+        title_patterns: if configured.title_patterns.is_empty() {
+            base.title_patterns.clone()
+        } else {
+            configured.title_patterns.clone()
+        },
+        visible_patterns: if configured.visible_patterns.is_empty() {
+            base.visible_patterns.clone()
+        } else {
+            configured.visible_patterns.clone()
+        },
+        strip_patterns: if configured.strip_patterns.is_empty() {
+            base.strip_patterns.clone()
+        } else {
+            configured.strip_patterns.clone()
+        },
+        model_patterns: if configured.model_patterns.is_empty() {
+            base.model_patterns.clone()
+        } else {
+            configured.model_patterns.clone()
+        },
+        resume_command: configured
+            .resume_command
+            .clone()
+            .or_else(|| base.resume_command.clone()),
+        resume_latest_command: configured
+            .resume_latest_command
+            .clone()
+            .or_else(|| base.resume_latest_command.clone()),
+        attach_command: configured
+            .attach_command
+            .clone()
+            .or_else(|| base.attach_command.clone()),
+        detail_paths: configured
+            .detail_paths
+            .clone()
+            .or_else(|| base.detail_paths.clone()),
     }
 }
 
@@ -553,16 +1315,72 @@ struct AgentActions {
 }
 
 #[derive(Clone, Debug)]
-struct AgentPaneState {
+pub(crate) struct AgentPaneState {
+    adapter_id: Option<String>,
     kind: AgentKind,
+    trusted_controls: bool,
     status: AgentStatus,
     model: Option<String>,
     session_id: Option<String>,
+    attach_url: Option<String>,
     cwd: Option<PathBuf>,
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
     cost: Option<String>,
     actions: AgentActions,
+}
+
+fn agent_toolbelt_buttons(
+    agent_ui: &config::AgentUiConfig,
+    agent: &AgentPaneState,
+    adapter: Option<&AgentAdapterConfig>,
+) -> Vec<(&'static str, AgentToolbeltAction)> {
+    if !agent_ui.enabled
+        || !agent_ui.show_pane_toolbelt
+        || adapter.map(|adapter| !adapter.enabled).unwrap_or(false)
+    {
+        return Vec::new();
+    }
+
+    let mut buttons = Vec::new();
+    if agent.actions.interrupt
+        && matches!(agent.status, AgentStatus::Running | AgentStatus::Streaming)
+    {
+        buttons.push(("Stop", AgentToolbeltAction::Interrupt));
+    }
+    if agent.actions.copy_summary {
+        buttons.push(("Copy", AgentToolbeltAction::CopyMenu));
+    }
+    if agent.actions.attach {
+        buttons.push(("Attach", AgentToolbeltAction::Attach));
+    }
+    if agent.actions.resume {
+        buttons.push(("Resume", AgentToolbeltAction::Resume));
+    }
+    if agent.actions.open_logs {
+        buttons.push((
+            agent_detail_button_label(agent.adapter_id.as_deref(), adapter),
+            AgentToolbeltAction::OpenLogs,
+        ));
+    }
+    buttons
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AgentDetectionCacheKey {
+    foreground_process: Option<String>,
+    pane_title: String,
+    relevant_user_vars: Vec<(String, String)>,
+    viewport_top: isize,
+    viewport_rows: usize,
+    visible_fingerprint: u64,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct AgentDetectionCacheEntry {
+    key: AgentDetectionCacheKey,
+    state: Option<AgentPaneState>,
+    last_wait_notification: Option<Instant>,
 }
 
 trait AgentAdapter {
@@ -603,24 +1421,114 @@ fn has_agent_metadata_evidence(vars: &HashMap<String, String>) -> bool {
     .any(|key| user_var(vars, key).is_some())
 }
 
-fn title_agent_hint(title: &str) -> Option<AgentKind> {
+fn adapter_kind_from_id(id: &str, adapter: &AgentAdapterConfig) -> AgentKind {
+    AgentKind::from_adapter_id(id).unwrap_or_else(|| AgentKind::Unknown(adapter_label(adapter, id)))
+}
+
+fn title_agent_hint(title: &str) -> Option<(String, AgentKind)> {
     let lower = title.to_ascii_lowercase();
-    for marker in [
-        "claude code",
-        "claude",
-        "codex",
-        "gemini",
-        "opencode",
-        "open code",
-        "copilot",
-        "cursor",
-        "amp",
-    ] {
-        if lower.contains(marker) {
-            return AgentKind::from_hint(marker);
+    for (id, adapter) in built_in_agent_adapters() {
+        if adapter.title_patterns.iter().any(|pattern| {
+            let pattern = pattern.trim();
+            !pattern.is_empty() && agent_pattern_matches(&lower, pattern)
+        }) {
+            return Some((id.clone(), adapter_kind_from_id(&id, &adapter)));
         }
     }
     None
+}
+
+fn visible_agent_kind_hint(text: &str, adapter: Option<&AgentAdapterConfig>) -> Option<String> {
+    let lower = text.to_ascii_lowercase();
+    adapter_patterns(adapter, PatternField::Visible)
+        .into_iter()
+        .find(|pattern| agent_pattern_matches(&lower, pattern))
+}
+
+fn visible_agent_match_from_adapters(
+    text: &str,
+    adapters: impl Iterator<Item = (String, AgentAdapterConfig)>,
+) -> Option<(String, AgentKind)> {
+    adapters.into_iter().find_map(|(id, adapter)| {
+        if !adapter.enabled {
+            return None;
+        }
+        visible_agent_kind_hint(text, Some(&adapter))
+            .is_some()
+            .then(|| (id.clone(), adapter_kind_from_id(&id, &adapter)))
+    })
+}
+
+fn visible_model_hint(text: &str, adapter: Option<&AgentAdapterConfig>) -> Option<String> {
+    let lower = text.to_ascii_lowercase();
+    adapter_patterns(adapter, PatternField::Model)
+        .into_iter()
+        .find(|pattern| agent_pattern_matches(&lower, pattern))
+}
+
+fn infer_agent_status_from_visible_text(text: &str) -> AgentStatus {
+    let mut saw_content = false;
+    for line in text.lines().rev().take(20) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if matches!(trimmed.chars().next(), Some('✻' | '✽' | '✶')) {
+            return AgentStatus::Running;
+        }
+        if matches!(trimmed, "❯" | ">" | "›")
+            || trimmed.starts_with("❯ ")
+            || trimmed.starts_with("> ")
+            || trimmed.starts_with("› ")
+        {
+            return AgentStatus::WaitingForInput;
+        }
+        saw_content = true;
+    }
+    if saw_content {
+        AgentStatus::Unknown
+    } else {
+        AgentStatus::Unknown
+    }
+}
+
+fn should_load_visible_agent_text(
+    matched_without_visible: bool,
+    detect_processes: bool,
+    explicit_status: Option<&str>,
+) -> bool {
+    detect_processes && (!matched_without_visible || explicit_status.is_none())
+}
+
+fn waiting_notification_update(
+    enabled: bool,
+    current_status: AgentStatus,
+    previous_status: Option<AgentStatus>,
+    previous_wait_notification: Option<Instant>,
+    now: Instant,
+) -> (bool, Option<Instant>) {
+    if current_status != AgentStatus::WaitingForInput {
+        return (false, None);
+    }
+
+    let transitioned_to_waiting = previous_status != Some(AgentStatus::WaitingForInput);
+    let throttle_allows = previous_wait_notification
+        .map(|last| now.duration_since(last) >= WAITING_NOTIFICATION_THROTTLE)
+        .unwrap_or(true);
+    let should_notify = enabled && transitioned_to_waiting && throttle_allows;
+    let last_wait_notification = if should_notify {
+        Some(now)
+    } else {
+        previous_wait_notification
+    };
+
+    (should_notify, last_wait_notification)
+}
+
+fn visible_text_fingerprint(text: &str) -> u64 {
+    text.bytes().fold(0xcbf29ce484222325, |hash, byte| {
+        (hash ^ byte as u64).wrapping_mul(0x100000001b3)
+    })
 }
 
 impl crate::TermWindow {
@@ -815,34 +1723,70 @@ impl crate::TermWindow {
     }
 
     fn agent_adapter_config(&self, kind: &AgentKind) -> Option<&AgentAdapterConfig> {
-        let adapters = &self.config.agent_ui.adapters;
-        match kind.config_key() {
-            Some("claude") => Some(&adapters.claude),
-            Some("codex") => Some(&adapters.codex),
-            Some("gemini") => Some(&adapters.gemini),
-            Some("opencode") => Some(&adapters.opencode),
-            Some("copilot") => Some(&adapters.copilot),
-            Some("cursor") => Some(&adapters.cursor),
-            Some("amp") => Some(&adapters.amp),
-            Some(_) | None => None,
+        kind.config_key()
+            .and_then(|key| self.config.agent_ui.adapters.get(key))
+    }
+
+    fn agent_adapter_config_by_id(&self, id: Option<&str>) -> Option<AgentAdapterConfig> {
+        let id = id?;
+        let base = built_in_agent_adapters().get(id);
+        let configured = self.config.agent_ui.adapters.get(id);
+        match (base, configured) {
+            (Some(base), Some(configured)) => Some(merge_agent_adapter_config(base, configured)),
+            (Some(base), None) => Some(base.clone()),
+            (None, Some(configured)) => Some(configured.clone()),
+            (None, None) => None,
         }
     }
 
-    fn configured_agent_match(&self, process: Option<&str>, title: &str) -> Option<AgentKind> {
+    fn merged_agent_adapters(&self) -> Vec<(String, AgentAdapterConfig)> {
+        let mut adapters = Vec::new();
+        for id in DEFAULT_AGENT_ADAPTER_IDS {
+            if let Some(base) = built_in_agent_adapters().get(id) {
+                let adapter = self
+                    .config
+                    .agent_ui
+                    .adapters
+                    .get(id)
+                    .map(|configured| merge_agent_adapter_config(base, configured))
+                    .unwrap_or_else(|| base.clone());
+                adapters.push((id.to_string(), adapter));
+            }
+        }
+        for (id, adapter) in &self.config.agent_ui.adapters {
+            if !DEFAULT_AGENT_ADAPTER_IDS.contains(&id.as_str()) {
+                adapters.push((id.clone(), adapter.clone()));
+            }
+        }
+        adapters
+    }
+
+    fn process_agent_match(&self, process: Option<&str>) -> Option<(String, AgentKind)> {
+        let process = process.map(|process| basename(process).to_ascii_lowercase());
+        let process = process.as_deref()?;
+        self.merged_agent_adapters()
+            .into_iter()
+            .find_map(|(id, adapter)| {
+                if !adapter.enabled {
+                    return None;
+                }
+                adapter
+                    .process_names
+                    .iter()
+                    .any(|name| basename(name).eq_ignore_ascii_case(process))
+                    .then(|| (id.clone(), adapter_kind_from_id(&id, &adapter)))
+            })
+    }
+
+    fn configured_agent_match(
+        &self,
+        process: Option<&str>,
+        title: &str,
+    ) -> Option<(String, AgentKind)> {
         let process = process.map(|process| basename(process).to_ascii_lowercase());
         let title = title.to_ascii_lowercase();
-        let adapters = &self.config.agent_ui.adapters;
-        let configured = [
-            (&adapters.claude, AgentKind::Claude),
-            (&adapters.codex, AgentKind::Codex),
-            (&adapters.gemini, AgentKind::Gemini),
-            (&adapters.opencode, AgentKind::OpenCode),
-            (&adapters.copilot, AgentKind::Copilot),
-            (&adapters.cursor, AgentKind::Cursor),
-            (&adapters.amp, AgentKind::Amp),
-        ];
 
-        for (adapter, kind) in configured {
+        for (id, adapter) in self.merged_agent_adapters() {
             if !adapter.enabled {
                 continue;
             }
@@ -852,14 +1796,14 @@ impl crate::TermWindow {
                     .iter()
                     .any(|name| basename(name).eq_ignore_ascii_case(process))
                 {
-                    return Some(kind);
+                    return Some((id.clone(), adapter_kind_from_id(&id, &adapter)));
                 }
             }
             if adapter.title_patterns.iter().any(|pattern| {
-                let pattern = pattern.trim().to_ascii_lowercase();
-                !pattern.is_empty() && title.contains(&pattern)
+                let pattern = pattern.trim();
+                !pattern.is_empty() && agent_pattern_matches(&title, pattern)
             }) {
-                return Some(kind);
+                return Some((id.clone(), adapter_kind_from_id(&id, &adapter)));
             }
         }
 
@@ -868,10 +1812,58 @@ impl crate::TermWindow {
 
     fn agent_supported_actions(
         &self,
-        _kind: &AgentKind,
+        adapter_id: Option<&str>,
         vars: &HashMap<String, String>,
+        cwd: Option<&Path>,
+        trusted_controls: bool,
     ) -> AgentActions {
-        PassiveAgentAdapter.supported_actions(vars)
+        let mut actions = PassiveAgentAdapter.supported_actions(vars);
+        actions.attach = false;
+        let controls_allowed = agent_control_actions_allowed(
+            self.config.agent_ui.enable_control_actions,
+            trusted_controls,
+            vars,
+        );
+        if controls_allowed {
+            if let Some(adapter) = self.agent_adapter_config_by_id(adapter_id) {
+                let values = AgentActionTemplateValues::from_vars(vars, cwd);
+                actions.attach = resolve_agent_attach_command(&adapter, &values).is_some();
+                actions.resume = resolve_agent_resume_command(&adapter, &values).is_some();
+                actions.open_logs =
+                    resolve_agent_detail_path(adapter_id, &adapter, &values).is_some();
+            }
+        }
+        actions
+    }
+
+    fn visible_agent_text(&self, pane: &Arc<dyn Pane>) -> String {
+        let dims = pane.get_dimensions();
+        let start = dims.physical_top;
+        let end = dims.physical_top + dims.viewport_rows.min(120) as isize;
+        let mut text = String::new();
+        for logical in pane.get_logical_lines(start..end) {
+            text.push_str(&line_to_string(&logical.logical));
+            text.push('\n');
+        }
+        text
+    }
+
+    fn visible_agent_match(&self, text: &str) -> Option<(String, AgentKind)> {
+        visible_agent_match_from_adapters(text, self.merged_agent_adapters().into_iter())
+    }
+
+    fn relevant_agent_user_vars(vars: &HashMap<String, String>) -> Vec<(String, String)> {
+        let mut relevant = vars
+            .iter()
+            .filter(|(key, _)| {
+                key.starts_with("agent.")
+                    || key.starts_with("agent_")
+                    || matches!(key.as_str(), "WEZTERM_PROG" | "PROG")
+            })
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<Vec<_>>();
+        relevant.sort();
+        relevant
     }
 
     fn detect_agent_pane(&self, pane: &Arc<dyn Pane>) -> Option<AgentPaneState> {
@@ -880,48 +1872,185 @@ impl crate::TermWindow {
         }
 
         let vars = pane.copy_user_vars();
-        let explicit_kind = user_var(&vars, "agent.kind").map(AgentKind::from_user_var);
         let foreground_process = pane.get_foreground_process_name(CachePolicy::AllowStale);
         let pane_title = pane.get_title();
-        let process_kind = if self.config.agent_ui.detect_processes {
-            foreground_process.as_deref().and_then(AgentKind::from_hint)
-        } else {
-            None
+        let dims = pane.get_dimensions();
+        let mut visible_text = String::new();
+        let mut visible_text_loaded = false;
+        let cache_key = AgentDetectionCacheKey {
+            foreground_process: foreground_process.clone(),
+            pane_title: pane_title.clone(),
+            relevant_user_vars: Self::relevant_agent_user_vars(&vars),
+            viewport_top: dims.physical_top,
+            viewport_rows: dims.viewport_rows,
+            visible_fingerprint: 0,
         };
-        let title_kind = if self.config.agent_ui.detect_processes {
-            title_agent_hint(&pane_title)
+        let previous_entry = self
+            .agent_detection_cache
+            .borrow()
+            .get(&pane.pane_id())
+            .cloned();
+        let previous_wait_notification = previous_entry
+            .as_ref()
+            .and_then(|entry| entry.last_wait_notification);
+
+        let explicit_adapter_id = user_var(&vars, "agent.adapter").map(str::to_ascii_lowercase);
+        let explicit_kind = user_var(&vars, "agent.kind").map(|kind| {
+            let kind = AgentKind::from_user_var(kind);
+            let adapter_id = explicit_adapter_id
+                .clone()
+                .or_else(|| kind.config_key().map(ToString::to_string));
+            (adapter_id, kind)
+        });
+        let process_kind = if self.config.agent_ui.detect_processes {
+            self.process_agent_match(foreground_process.as_deref())
+                .map(|(id, kind)| (Some(id), kind))
         } else {
             None
         };
         let configured_kind = if self.config.agent_ui.detect_processes {
             self.configured_agent_match(foreground_process.as_deref(), &pane_title)
+                .map(|(id, kind)| (Some(id), kind))
+        } else {
+            None
+        };
+        let title_kind = if self.config.agent_ui.detect_processes {
+            title_agent_hint(&pane_title).map(|(id, kind)| (Some(id), kind))
         } else {
             None
         };
         let metadata_kind = if has_agent_metadata_evidence(&vars) {
-            Some(AgentKind::Unknown("Agent".to_string()))
+            Some((None, AgentKind::Unknown("Agent".to_string())))
         } else {
             None
         };
+        let explicit_status = user_var(&vars, "agent.status");
+        let matched_without_visible = explicit_kind
+            .as_ref()
+            .or(process_kind.as_ref())
+            .or(title_kind.as_ref())
+            .or(configured_kind.as_ref())
+            .or(metadata_kind.as_ref())
+            .is_some();
+        let visible_kind = if should_load_visible_agent_text(
+            matched_without_visible,
+            self.config.agent_ui.detect_processes,
+            explicit_status,
+        ) {
+            visible_text = self.visible_agent_text(pane);
+            visible_text_loaded = true;
+            if !matched_without_visible {
+                self.visible_agent_match(&visible_text)
+                    .map(|(id, kind)| (Some(id), kind))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let visible_fingerprint = if visible_text_loaded {
+            visible_text_fingerprint(&visible_text)
+        } else {
+            0
+        };
+        let cache_key = AgentDetectionCacheKey {
+            visible_fingerprint,
+            ..cache_key
+        };
+        if let Some(entry) = previous_entry.as_ref() {
+            if entry.key == cache_key {
+                return entry.state.clone();
+            }
+        }
+        let trusted_controls = explicit_kind.is_some()
+            || process_kind.is_some()
+            || title_kind.is_some()
+            || configured_kind.is_some()
+            || truthy_agent_var(&vars, "agent.enable_control_actions");
+        let control_actions_allowed = agent_control_actions_allowed(
+            self.config.agent_ui.enable_control_actions,
+            trusted_controls,
+            &vars,
+        );
 
-        let kind = explicit_kind
+        let Some((adapter_id, kind)) = explicit_kind
             .or(process_kind)
             .or(title_kind)
             .or(configured_kind)
-            .or(metadata_kind)?;
-        if !self.agent_adapter_enabled(&kind) {
+            .or(visible_kind)
+            .or(metadata_kind)
+        else {
+            self.agent_detection_cache.borrow_mut().insert(
+                pane.pane_id(),
+                AgentDetectionCacheEntry {
+                    key: cache_key,
+                    state: None,
+                    last_wait_notification: previous_wait_notification,
+                },
+            );
+            return None;
+        };
+        let adapter = self.agent_adapter_config_by_id(adapter_id.as_deref());
+        if adapter_id.is_some()
+            && !adapter
+                .as_ref()
+                .map(|adapter| adapter.enabled)
+                .unwrap_or(true)
+        {
+            self.agent_detection_cache.borrow_mut().insert(
+                pane.pane_id(),
+                AgentDetectionCacheEntry {
+                    key: cache_key,
+                    state: None,
+                    last_wait_notification: previous_wait_notification,
+                },
+            );
+            return None;
+        }
+        if adapter_id.is_none() && !self.agent_adapter_enabled(&kind) {
+            self.agent_detection_cache.borrow_mut().insert(
+                pane.pane_id(),
+                AgentDetectionCacheEntry {
+                    key: cache_key,
+                    state: None,
+                    last_wait_notification: previous_wait_notification,
+                },
+            );
             return None;
         }
 
-        let status = AgentStatus::from_hint(user_var(&vars, "agent.status"));
         let cwd = pane_working_dir(pane);
-        let actions = self.agent_supported_actions(&kind, &vars);
-        Some(AgentPaneState {
+        let status = if explicit_status.is_some() {
+            AgentStatus::from_hint(explicit_status)
+        } else if visible_text_loaded {
+            infer_agent_status_from_visible_text(&visible_text)
+        } else {
+            AgentStatus::Unknown
+        };
+        let actions = self.agent_supported_actions(
+            adapter_id.as_deref(),
+            &vars,
+            cwd.as_deref(),
+            trusted_controls,
+        );
+        let model = user_var(&vars, "agent.model")
+            .map(ToString::to_string)
+            .or_else(|| {
+                visible_text_loaded
+                    .then(|| visible_model_hint(&visible_text, adapter.as_ref()))
+                    .flatten()
+            });
+        let state = Some(AgentPaneState {
+            adapter_id: adapter_id.clone(),
             kind,
+            trusted_controls: control_actions_allowed,
             status,
-            model: user_var(&vars, "agent.model").map(ToString::to_string),
+            model,
             session_id: user_var(&vars, "agent.session_id")
                 .or_else(|| user_var(&vars, "agent.session"))
+                .map(ToString::to_string),
+            attach_url: user_var(&vars, "agent.attach_url")
+                .or_else(|| user_var(&vars, "agent.attach"))
                 .map(ToString::to_string),
             cwd,
             input_tokens: parse_u64_var(&vars, "agent.input_tokens"),
@@ -930,7 +2059,60 @@ impl crate::TermWindow {
                 .or_else(|| user_var(&vars, "agent.estimated_cost"))
                 .map(ToString::to_string),
             actions,
-        })
+        });
+        let previous_status = previous_entry
+            .as_ref()
+            .and_then(|entry| entry.state.as_ref())
+            .map(|state| state.status.clone());
+        let (should_notify_waiting, last_wait_notification) = waiting_notification_update(
+            self.config.agent_ui.waiting_notification,
+            state.as_ref().unwrap().status.clone(),
+            previous_status,
+            previous_wait_notification,
+            Instant::now(),
+        );
+        if should_notify_waiting {
+            wezterm_toast_notification::show(wezterm_toast_notification::ToastNotification {
+                title: "Agent waiting".to_string(),
+                message: format!(
+                    "{} is waiting for input",
+                    state.as_ref().unwrap().kind.label()
+                ),
+                url: None,
+                timeout: Some(Duration::from_millis(2500)),
+            });
+        }
+        self.agent_detection_cache.borrow_mut().insert(
+            pane.pane_id(),
+            AgentDetectionCacheEntry {
+                key: cache_key,
+                state: state.clone(),
+                last_wait_notification,
+            },
+        );
+        state
+    }
+
+    fn prune_agent_detection_cache(&self) {
+        let mux = Mux::get();
+        let Some(window) = mux.get_window(self.mux_window_id) else {
+            self.agent_detection_cache.borrow_mut().clear();
+            return;
+        };
+        let mut live = HashSet::new();
+        for tab_idx in 0..window.len() {
+            if let Some(tab) = window.get_by_idx(tab_idx) {
+                if let Some(pane) = tab.get_active_pane() {
+                    live.insert(pane.pane_id());
+                }
+                for pos in tab.iter_panes_ignoring_zoom() {
+                    live.insert(pos.pane.pane_id());
+                }
+            }
+        }
+        self.agent_detection_cache
+            .borrow_mut()
+            .retain(|pane_id, _| live.contains(pane_id));
     }
 
     pub(crate) fn agent_pane_summary(&self, pane: &Arc<dyn Pane>) -> String {
@@ -968,11 +2150,11 @@ impl crate::TermWindow {
         lines.join("\n")
     }
 
-    pub(crate) fn agent_pane_conversation_text(&self, pane: &Arc<dyn Pane>) -> String {
+    fn agent_pane_raw_conversation_text(&self, pane: &Arc<dyn Pane>) -> String {
         let dims = pane.get_dimensions();
         let end = dims.physical_top + dims.viewport_rows as isize;
-        let max_rows = 5000;
-        let start = dims.scrollback_top.max(end.saturating_sub(max_rows));
+        let max_rows = self.config.agent_ui.copy_scrollback_lines.max(1) as isize;
+        let start = agent_transcript_start(dims.scrollback_top, end, max_rows);
         let mut lines = Vec::new();
 
         for logical in pane.get_logical_lines(start..end) {
@@ -991,59 +2173,225 @@ impl crate::TermWindow {
         lines.join("\n")
     }
 
+    pub(crate) fn agent_pane_conversation_text(&self, pane: &Arc<dyn Pane>) -> String {
+        let raw = self.agent_pane_raw_conversation_text(pane);
+        let adapter = self
+            .detect_agent_pane(pane)
+            .and_then(|agent| self.agent_adapter_config_by_id(agent.adapter_id.as_deref()));
+        agent_copy_payload_from_text(&AgentCopyAction::Conversation, &raw, "", adapter.as_ref())
+    }
+
+    pub(crate) fn agent_pane_markdown_text(&self, pane: &Arc<dyn Pane>) -> String {
+        let raw = self.agent_pane_raw_conversation_text(pane);
+        let adapter = self
+            .detect_agent_pane(pane)
+            .and_then(|agent| self.agent_adapter_config_by_id(agent.adapter_id.as_deref()));
+        agent_copy_payload_from_text(&AgentCopyAction::Markdown, &raw, "", adapter.as_ref())
+    }
+
     pub(crate) fn agent_pane_last_message_text(&self, pane: &Arc<dyn Pane>) -> String {
-        let conversation = self.agent_pane_conversation_text(pane);
-        if conversation.trim().is_empty() {
+        let raw = self.agent_pane_raw_conversation_text(pane);
+        if raw.trim().is_empty() {
             return self.agent_pane_summary(pane);
         }
 
-        let mut lines: Vec<&str> = conversation.lines().collect();
-        while lines
-            .last()
-            .map(|line| is_agent_prompt_or_status_line(line))
-            .unwrap_or(false)
-        {
-            lines.pop();
-        }
-
-        let Some(last_content_idx) = lines.iter().rposition(|line| !line.trim().is_empty()) else {
-            return conversation;
-        };
-        lines.truncate(last_content_idx + 1);
-
-        let start_idx = lines
-            .iter()
-            .enumerate()
-            .rev()
-            .skip(1)
-            .find_map(|(idx, line)| {
-                if is_agent_user_prompt_line(line) {
-                    Some(idx + 1)
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_else(|| {
-                lines
-                    .iter()
-                    .enumerate()
-                    .rev()
-                    .skip(1)
-                    .find_map(|(idx, line)| {
-                        if line.trim().is_empty() {
-                            Some(idx + 1)
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or(0)
-            });
-
-        let message = lines[start_idx..].join("\n").trim().to_string();
+        let adapter = self
+            .detect_agent_pane(pane)
+            .and_then(|agent| self.agent_adapter_config_by_id(agent.adapter_id.as_deref()));
+        let message = agent_copy_payload_from_text(
+            &AgentCopyAction::LastAgentMessage,
+            &raw,
+            "",
+            adapter.as_ref(),
+        );
         if message.is_empty() {
-            conversation
+            clean_agent_conversation_transcript(&raw, adapter.as_ref())
         } else {
             message
+        }
+    }
+
+    pub(crate) fn agent_resume_pane(&self, pane: &Arc<dyn Pane>) {
+        let Some(agent) = self.detect_agent_pane(pane) else {
+            return;
+        };
+        let Some(adapter_id) = agent.adapter_id.as_deref() else {
+            wezterm_toast_notification::show(wezterm_toast_notification::ToastNotification {
+                title: "Agent control".to_string(),
+                message: "Resume is not configured for this agent".to_string(),
+                url: None,
+                timeout: Some(Duration::from_millis(2200)),
+            });
+            return;
+        };
+        let Some(adapter) = self.agent_adapter_config_by_id(Some(adapter_id)) else {
+            return;
+        };
+        if !agent.trusted_controls {
+            wezterm_toast_notification::show(wezterm_toast_notification::ToastNotification {
+                title: "Agent control".to_string(),
+                message:
+                    "Resume requires trusted agent evidence or explicit agent_ui control enablement"
+                        .to_string(),
+                url: None,
+                timeout: Some(Duration::from_millis(2600)),
+            });
+            return;
+        }
+        if !agent.actions.resume {
+            wezterm_toast_notification::show(wezterm_toast_notification::ToastNotification {
+                title: "Agent control".to_string(),
+                message: "Resume is not configured or its command is not on PATH".to_string(),
+                url: None,
+                timeout: Some(Duration::from_millis(2600)),
+            });
+            return;
+        }
+        let values = AgentActionTemplateValues::from_agent(&agent);
+        let Some(argv) = resolve_agent_resume_command(&adapter, &values) else {
+            return;
+        };
+        let label = adapter_label(&adapter, adapter_id);
+        self.spawn_command(
+            &SpawnCommand {
+                label: Some(format!("{label} Resume")),
+                args: Some(argv),
+                cwd: agent.cwd,
+                ..Default::default()
+            },
+            SpawnWhere::NewTab,
+        );
+        wezterm_toast_notification::show(wezterm_toast_notification::ToastNotification {
+            title: "Agent control".to_string(),
+            message: format!("Started {label} resume in a new tab"),
+            url: None,
+            timeout: Some(Duration::from_millis(2200)),
+        });
+    }
+
+    pub(crate) fn agent_attach_pane(&self, pane: &Arc<dyn Pane>) {
+        let Some(agent) = self.detect_agent_pane(pane) else {
+            return;
+        };
+        let Some(adapter_id) = agent.adapter_id.as_deref() else {
+            return;
+        };
+        let Some(adapter) = self.agent_adapter_config_by_id(Some(adapter_id)) else {
+            return;
+        };
+        if !agent.trusted_controls {
+            wezterm_toast_notification::show(wezterm_toast_notification::ToastNotification {
+                title: "Agent control".to_string(),
+                message:
+                    "Attach requires trusted agent evidence or explicit agent_ui control enablement"
+                        .to_string(),
+                url: None,
+                timeout: Some(Duration::from_millis(2600)),
+            });
+            return;
+        }
+        if !agent.actions.attach {
+            wezterm_toast_notification::show(wezterm_toast_notification::ToastNotification {
+                title: "Agent control".to_string(),
+                message:
+                    "Attach is not configured, missing an attach URL, or its command is not on PATH"
+                        .to_string(),
+                url: None,
+                timeout: Some(Duration::from_millis(2600)),
+            });
+            return;
+        }
+        let values = AgentActionTemplateValues::from_agent(&agent);
+        let Some(argv) = resolve_agent_attach_command(&adapter, &values) else {
+            return;
+        };
+        let label = adapter_label(&adapter, adapter_id);
+        self.spawn_command(
+            &SpawnCommand {
+                label: Some(format!("{label} Attach")),
+                args: Some(argv),
+                cwd: agent.cwd,
+                ..Default::default()
+            },
+            SpawnWhere::NewTab,
+        );
+        wezterm_toast_notification::show(wezterm_toast_notification::ToastNotification {
+            title: "Agent control".to_string(),
+            message: format!("Started {label} attach in a new tab"),
+            url: None,
+            timeout: Some(Duration::from_millis(2200)),
+        });
+    }
+
+    pub(crate) fn agent_open_logs_for_pane(&self, pane: &Arc<dyn Pane>) {
+        let Some(agent) = self.detect_agent_pane(pane) else {
+            return;
+        };
+        let Some(adapter_id) = agent.adapter_id.as_deref() else {
+            wezterm_toast_notification::show(wezterm_toast_notification::ToastNotification {
+                title: "Agent details".to_string(),
+                message: "Details are not configured for this agent".to_string(),
+                url: None,
+                timeout: Some(Duration::from_millis(2200)),
+            });
+            return;
+        };
+        let Some(adapter) = self.agent_adapter_config_by_id(Some(adapter_id)) else {
+            return;
+        };
+        let detail_label = agent_detail_button_label(Some(adapter_id), Some(&adapter));
+        let title = if detail_label == "Logs" {
+            "Agent logs"
+        } else {
+            "Agent details"
+        };
+        if !agent.trusted_controls {
+            wezterm_toast_notification::show(wezterm_toast_notification::ToastNotification {
+                title: title.to_string(),
+                message: format!(
+                    "Opening {detail_label} requires trusted agent evidence or explicit agent_ui control enablement"
+                ),
+                url: None,
+                timeout: Some(Duration::from_millis(2600)),
+            });
+            return;
+        }
+        if !agent.actions.open_logs {
+            wezterm_toast_notification::show(wezterm_toast_notification::ToastNotification {
+                title: title.to_string(),
+                message: format!("{detail_label} are not configured or no details path exists"),
+                url: None,
+                timeout: Some(Duration::from_millis(2600)),
+            });
+            return;
+        }
+        let values = AgentActionTemplateValues::from_agent(&agent);
+        let Some(path) = resolve_agent_detail_path(Some(adapter_id), &adapter, &values) else {
+            return;
+        };
+        let url = if path.is_dir() {
+            Url::from_directory_path(&path)
+        } else {
+            Url::from_file_path(&path)
+        };
+        match url {
+            Ok(url) => {
+                wezterm_open_url::open_url(url.as_str());
+                wezterm_toast_notification::show(wezterm_toast_notification::ToastNotification {
+                    title: title.to_string(),
+                    message: format!("Opening {}", path.display()),
+                    url: None,
+                    timeout: Some(Duration::from_millis(2200)),
+                });
+            }
+            Err(()) => {
+                wezterm_toast_notification::show(wezterm_toast_notification::ToastNotification {
+                    title: title.to_string(),
+                    message: "Agent details path could not be opened".to_string(),
+                    url: None,
+                    timeout: Some(Duration::from_millis(2200)),
+                });
+            }
         }
     }
 
@@ -1200,19 +2548,21 @@ impl crate::TermWindow {
         }
     }
 
-    fn sidebar_scroll_thumb_bounds(&self) -> Option<(f32, f32, usize)> {
+    fn sidebar_scroll_geometry(&self) -> Option<SidebarScrollGeometry> {
         let (track_y, track_h, visible, total) = self.sidebar_scroll_track_bounds()?;
-        let max_offset = total.saturating_sub(visible);
-        let thumb_h = (track_h * visible as f32 / total as f32)
-            .max(self.sidebar_row_height() as f32 * 0.75)
-            .min(track_h);
-        let scroll_range = (track_h - thumb_h).max(0.);
-        let thumb_y = if max_offset == 0 {
-            track_y
-        } else {
-            track_y + scroll_range * self.sidebar_scroll_offset as f32 / max_offset as f32
-        };
-        Some((thumb_y, thumb_h, max_offset))
+        SidebarScrollGeometry::new(
+            track_y,
+            track_h,
+            visible,
+            total,
+            self.sidebar_scroll_offset,
+            self.sidebar_row_height() as f32 * 0.75,
+        )
+    }
+
+    fn sidebar_scroll_thumb_bounds(&self) -> Option<(f32, f32, usize)> {
+        let geometry = self.sidebar_scroll_geometry()?;
+        Some((geometry.thumb_y, geometry.thumb_h, geometry.max_offset))
     }
 
     pub(crate) fn scroll_sidebar_tabs_page_toward(&mut self, y: isize) -> bool {
@@ -1228,23 +2578,14 @@ impl crate::TermWindow {
         }
     }
 
-    pub(crate) fn scroll_sidebar_thumb_to(&mut self, y: isize) -> bool {
-        let Some((track_y, track_h, visible, total)) = self.sidebar_scroll_track_bounds() else {
+    pub(crate) fn scroll_sidebar_thumb_top_to(&mut self, thumb_top: isize) -> bool {
+        let Some(geometry) = self.sidebar_scroll_geometry() else {
             return false;
         };
-        let max_offset = total.saturating_sub(visible);
-        if max_offset == 0 {
+
+        let Some(next) = geometry.offset_for_thumb_top(thumb_top as f32) else {
             return false;
-        }
-        let thumb_h = (track_h * visible as f32 / total as f32)
-            .max(self.sidebar_row_height() as f32 * 0.75)
-            .min(track_h);
-        let scroll_range = (track_h - thumb_h).max(0.);
-        if scroll_range <= 0. {
-            return false;
-        }
-        let thumb_top = (y as f32 - thumb_h * 0.5).clamp(track_y, track_y + scroll_range);
-        let next = (((thumb_top - track_y) / scroll_range) * max_offset as f32).round() as usize;
+        };
         if next == self.sidebar_scroll_offset {
             false
         } else {
@@ -1326,7 +2667,7 @@ impl crate::TermWindow {
                 }
             }
         }
-        if self.config.agent_telemetry.enabled || self.config.agent_ui.enabled {
+        if self.config.agent_telemetry.enabled {
             if let Some(pane) = &pane {
                 if let Some(agent) = self.detect_agent_pane(pane) {
                     metadata.extend(self.sidebar_agent_metadata(&agent));
@@ -1368,7 +2709,14 @@ impl crate::TermWindow {
 
     fn sidebar_compact_tab_icon(&self, tab_idx: usize, title: &str) -> (String, LinearRgba) {
         let pane = self.sidebar_primary_pane_for_tab_idx(tab_idx);
-        let agent = pane.as_ref().and_then(|pane| self.detect_agent_pane(pane));
+        let agent = if self.config.agent_ui.enabled && self.config.agent_ui.show_sidebar_badges {
+            pane.as_ref().and_then(|pane| self.detect_agent_pane(pane))
+        } else {
+            None
+        };
+        let adapter = agent
+            .as_ref()
+            .and_then(|agent| self.agent_adapter_config_by_id(agent.adapter_id.as_deref()));
         let command = pane
             .as_ref()
             .and_then(|pane| pane.get_foreground_process_name(CachePolicy::AllowStale))
@@ -1378,6 +2726,7 @@ impl crate::TermWindow {
             title,
             tab_idx,
             agent.as_ref().map(|agent| &agent.kind),
+            adapter.as_ref(),
             command.as_deref(),
             pane_title.as_deref(),
         );
@@ -1385,6 +2734,7 @@ impl crate::TermWindow {
             title,
             tab_idx,
             agent.as_ref().map(|agent| &agent.kind),
+            adapter.as_ref(),
             command.as_deref(),
             pane_title.as_deref(),
         );
@@ -1393,15 +2743,10 @@ impl crate::TermWindow {
 
     fn sidebar_agent_metadata(&self, agent: &AgentPaneState) -> Vec<String> {
         let mut items = Vec::new();
-        let fields = if self.config.agent_telemetry.enabled {
-            self.config.agent_telemetry.fields.clone()
-        } else {
-            vec![
-                AgentTelemetryField::Kind,
-                AgentTelemetryField::Model,
-                AgentTelemetryField::Status,
-            ]
-        };
+        if !self.config.agent_telemetry.enabled {
+            return items;
+        }
+        let fields = self.config.agent_telemetry.fields.clone();
         for field in &fields {
             match field {
                 AgentTelemetryField::Kind => {
@@ -1480,23 +2825,12 @@ impl crate::TermWindow {
         }
 
         let mut buttons: Vec<(&str, AgentToolbeltAction)> = Vec::new();
-        if agent.actions.interrupt
-            && matches!(agent.status, AgentStatus::Running | AgentStatus::Streaming)
-        {
-            buttons.push(("Stop", AgentToolbeltAction::Interrupt));
-        }
-        if agent.actions.copy_summary {
-            buttons.push(("Copy", AgentToolbeltAction::CopyMenu));
-        }
-        if agent.actions.attach {
-            buttons.push(("Attach", AgentToolbeltAction::Attach));
-        }
-        if agent.actions.resume {
-            buttons.push(("Resume", AgentToolbeltAction::Resume));
-        }
-        if agent.actions.open_logs {
-            buttons.push(("Logs", AgentToolbeltAction::OpenLogs));
-        }
+        let adapter = self.agent_adapter_config_by_id(agent.adapter_id.as_deref());
+        buttons.extend(agent_toolbelt_buttons(
+            &self.config.agent_ui,
+            &agent,
+            adapter.as_ref(),
+        ));
         if buttons.is_empty() {
             return Ok(());
         }
@@ -1511,11 +2845,40 @@ impl crate::TermWindow {
             None => format!("{} agent{}", agent.kind.label(), status),
         };
 
-        let button_area = buttons.len() as f32 * AGENT_TOOLBELT_BUTTON_W
-            + buttons.len().saturating_sub(1) as f32 * AGENT_TOOLBELT_GAP;
-        let desired_w = (190. + button_area + PAD_X * 2.).min(AGENT_TOOLBELT_MAX_W);
-        let tool_w = desired_w.min((pane_w - AGENT_TOOLBELT_GAP * 2.).max(1.));
-        let tool_x = pane_x + pane_w - tool_w - AGENT_TOOLBELT_GAP;
+        let max_tool_w = (pane_w - AGENT_TOOLBELT_RIGHT_INSET - AGENT_TOOLBELT_GAP)
+            .max(1.)
+            .min(AGENT_TOOLBELT_MAX_W);
+        let fixed_controls_w = PAD_X * 2. + AGENT_TOOLBELT_DOT_SIZE + AGENT_TOOLBELT_GAP;
+        let max_button_area = (max_tool_w - fixed_controls_w).max(0.);
+        let mut visible_buttons = buttons
+            .into_iter()
+            .map(|(label, action)| {
+                let width = agent_toolbelt_button_width(label, cell_width);
+                (label, action, width)
+            })
+            .collect::<Vec<_>>();
+        while !visible_buttons.is_empty()
+            && agent_toolbelt_button_area(&visible_buttons) > max_button_area
+        {
+            let remove_idx = visible_buttons
+                .iter()
+                .rposition(|(_, action, _)| action != &AgentToolbeltAction::CopyMenu)
+                .unwrap_or(visible_buttons.len() - 1);
+            visible_buttons.remove(remove_idx);
+        }
+        if visible_buttons.is_empty() {
+            return Ok(());
+        }
+
+        let button_area = agent_toolbelt_button_area(&visible_buttons);
+        let label_target_w = (label.chars().count() as f32 * cell_w_f).min(280.);
+        let desired_w = (fixed_controls_w + button_area + AGENT_TOOLBELT_GAP + label_target_w)
+            .max(AGENT_TOOLBELT_MIN_W)
+            .min(AGENT_TOOLBELT_MAX_W);
+        let tool_w = desired_w
+            .min(max_tool_w)
+            .max(fixed_controls_w + button_area);
+        let tool_x = pane_x + pane_w - tool_w - AGENT_TOOLBELT_RIGHT_INSET;
         let tool_y = match self.config.agent_ui.toolbelt_position {
             AgentToolbeltPosition::Top => pane_y + AGENT_TOOLBELT_GAP,
             AgentToolbeltPosition::Bottom => {
@@ -1535,7 +2898,11 @@ impl crate::TermWindow {
         let bg = opaque(inactive_tab.bg_color.to_linear());
         let hover_bg = lerp_rgba(bg, fg, 0.18);
         let pressed_bg = lerp_rgba(bg, fg, 0.28);
-        let accent = active_tab.fg_color.to_linear();
+        let accent = if agent.status == AgentStatus::WaitingForInput {
+            LinearRgba(0.94, 0.72, 0.26, 1.0)
+        } else {
+            adapter_color(adapter.as_ref(), &agent.kind)
+        };
 
         self.sidebar_rounded_fill(
             layers,
@@ -1544,7 +2911,7 @@ impl crate::TermWindow {
             RADIUS,
             bg,
         )?;
-        let dot_size = 7.;
+        let dot_size = AGENT_TOOLBELT_DOT_SIZE;
         self.sidebar_pill_fill(
             layers,
             1,
@@ -1629,18 +2996,20 @@ impl crate::TermWindow {
 
         let button_start_x = tool_x + tool_w - PAD_X - button_area;
         let label_x = tool_x + PAD_X + dot_size + AGENT_TOOLBELT_GAP;
-        let label_w = (button_start_x - AGENT_TOOLBELT_GAP - label_x).max(cell_width as f32);
-        render_text(
-            self,
-            layers,
-            &label,
-            label_x,
-            tool_y + (AGENT_TOOLBELT_H - cell_h_f) * 0.5,
-            label_w,
-            fg,
-            bg,
-            false,
-        )?;
+        let label_w = button_start_x - AGENT_TOOLBELT_GAP - label_x;
+        if label_w >= (cell_width * 6) as f32 {
+            render_text(
+                self,
+                layers,
+                &label,
+                label_x,
+                tool_y + (AGENT_TOOLBELT_H - cell_h_f) * 0.5,
+                label_w,
+                fg,
+                bg,
+                false,
+            )?;
+        }
 
         let hovered_item = self
             .last_ui_item
@@ -1648,7 +3017,11 @@ impl crate::TermWindow {
             .map(|item| item.item_type.clone());
         let left_pressed = self.current_mouse_buttons.contains(&MousePress::Left);
         let mut button_x = button_start_x;
-        for (button_label, action) in buttons {
+        let button_right_limit = tool_x + tool_w - PAD_X;
+        for (button_label, action, button_w) in visible_buttons {
+            if button_x + button_w > button_right_limit + 0.5 {
+                break;
+            }
             let item_type = UIItemType::AgentToolbeltButton {
                 pane_id: pos.pane.pane_id(),
                 action: action.clone(),
@@ -1670,7 +3043,7 @@ impl crate::TermWindow {
                 euclid::rect(
                     button_x,
                     tool_y + 5. + offset,
-                    AGENT_TOOLBELT_BUTTON_W,
+                    button_w,
                     AGENT_TOOLBELT_H - 10.,
                 ),
                 5.,
@@ -1681,9 +3054,9 @@ impl crate::TermWindow {
                 self,
                 layers,
                 button_label,
-                button_x + 8.,
+                button_x + AGENT_TOOLBELT_BUTTON_PAD_X * 0.5,
                 tool_y + offset + (AGENT_TOOLBELT_H - cell_h_f) * 0.5,
-                AGENT_TOOLBELT_BUTTON_W - 16.,
+                button_w - AGENT_TOOLBELT_BUTTON_PAD_X,
                 button_fg,
                 button_bg,
                 true,
@@ -1691,11 +3064,11 @@ impl crate::TermWindow {
             self.ui_items.push(UIItem {
                 x: button_x as usize,
                 y: tool_y as usize,
-                width: AGENT_TOOLBELT_BUTTON_W as usize,
+                width: button_w.ceil() as usize,
                 height: AGENT_TOOLBELT_H as usize,
                 item_type,
             });
-            button_x += AGENT_TOOLBELT_BUTTON_W + AGENT_TOOLBELT_GAP;
+            button_x += button_w + AGENT_TOOLBELT_GAP;
         }
 
         Ok(())
@@ -1715,6 +3088,7 @@ impl crate::TermWindow {
 
         let items = [
             ("Copy conversation", AgentCopyAction::Conversation),
+            ("Copy as Markdown", AgentCopyAction::Markdown),
             ("Copy last message", AgentCopyAction::LastAgentMessage),
             ("Copy agent details", AgentCopyAction::Summary),
         ];
@@ -1725,7 +3099,7 @@ impl crate::TermWindow {
         let max_y = (self.dimensions.pixel_height as f32 - menu_h - AGENT_TOOLBELT_GAP)
             .max(AGENT_TOOLBELT_GAP);
         let menu_x =
-            (menu.x as f32 - menu_w + AGENT_TOOLBELT_BUTTON_W).clamp(AGENT_TOOLBELT_GAP, max_x);
+            (menu.x as f32 - menu_w + AGENT_TOOLBELT_MIN_BUTTON_W).clamp(AGENT_TOOLBELT_GAP, max_x);
         let menu_y = (menu.y as f32 + AGENT_TOOLBELT_GAP).clamp(AGENT_TOOLBELT_GAP, max_y);
 
         let colors = self
@@ -1870,6 +3244,7 @@ impl crate::TermWindow {
     }
 
     pub fn paint_sidebar(&mut self, layers: &mut TripleLayerQuadAllocator) -> anyhow::Result<()> {
+        self.prune_agent_detection_cache();
         self.settle_sidebar_auto_hide_close();
         let border = self.get_os_border();
         let width = self.sidebar_width();
@@ -2422,11 +3797,13 @@ impl crate::TermWindow {
 
             let agent = self.sidebar_agent_for_tab_idx(tab_idx);
             let agent_badge_w = if agent.is_some() { 12. } else { 0. };
-            if agent.is_some() {
+            if let Some(agent) = &agent {
                 let badge_size = 7.;
                 let badge_x = text_x;
                 let badge_y = y + row_offset + (row_height as f32 - badge_size) * 0.5;
-                let badge_color = if active {
+                let badge_color = if agent.status == AgentStatus::WaitingForInput {
+                    LinearRgba(0.94, 0.72, 0.26, 1.0)
+                } else if active {
                     accent
                 } else {
                     inactive_fg.mul_alpha(0.58)
@@ -2561,34 +3938,41 @@ impl crate::TermWindow {
         }
 
         if self.config.sidebar_scroll_bar && total_tabs > visible_rows && tab_list_height > 0. {
-            let (track_y, track_h, _, _) = self.sidebar_scroll_track_bounds().unwrap_or((
-                tab_list_top,
-                tab_list_height,
-                visible_rows,
-                total_tabs,
-            ));
-            let (thumb_y, thumb_h, _) = self
-                .sidebar_scroll_thumb_bounds()
-                .unwrap_or((track_y, track_h, 0));
+            let geometry = self
+                .sidebar_scroll_geometry()
+                .unwrap_or(SidebarScrollGeometry {
+                    track_y: tab_list_top,
+                    track_h: tab_list_height,
+                    thumb_y: tab_list_top,
+                    thumb_h: tab_list_height,
+                    max_offset: 0,
+                });
+            let thumb_hit_y = geometry.thumb_y.round().max(0.) as usize;
+            let thumb_hit_h = geometry.thumb_h.round().max(1.) as usize;
             self.sidebar_pill_fill(
                 layers,
                 2,
-                euclid::rect(sidebar_scrollbar_x, thumb_y, SIDEBAR_SCROLLBAR_W, thumb_h),
+                euclid::rect(
+                    sidebar_scrollbar_x,
+                    geometry.thumb_y,
+                    SIDEBAR_SCROLLBAR_W,
+                    geometry.thumb_h,
+                ),
                 SIDEBAR_SCROLLBAR_W * 0.5,
                 inactive_fg.mul_alpha(0.42),
             )?;
             self.ui_items.push(UIItem {
                 x: (sidebar_scrollbar_x - 8.).max(0.) as usize,
-                y: track_y as usize,
+                y: geometry.track_y.round().max(0.) as usize,
                 width: (SIDEBAR_SCROLLBAR_W + 16.) as usize,
-                height: track_h as usize,
+                height: geometry.track_h.round().max(1.) as usize,
                 item_type: UIItemType::SidebarScrollTrack,
             });
             self.ui_items.push(UIItem {
                 x: (sidebar_scrollbar_x - 8.).max(0.) as usize,
-                y: thumb_y as usize,
+                y: thumb_hit_y,
                 width: (SIDEBAR_SCROLLBAR_W + 16.) as usize,
-                height: thumb_h as usize,
+                height: thumb_hit_h,
                 item_type: UIItemType::SidebarScrollThumb,
             });
         }
@@ -2880,5 +4264,611 @@ mod tests {
 
         vars.insert("agent.model".to_string(), "gpt-5".to_string());
         assert!(has_agent_metadata_evidence(&vars));
+    }
+
+    #[test]
+    fn visible_agent_kind_detects_claude_header_when_title_changes() {
+        let text = [
+            "Claude Code v2.1.198",
+            "Sonnet 5 with medium effort · Claude Team",
+            "~/Documents/copilot/auto-time-management",
+            "❯ where is my open pla?",
+        ]
+        .join("\n");
+        let adapter = default_agent_adapters().remove("claude").unwrap();
+
+        assert_eq!(
+            visible_agent_kind_hint(&text, Some(&adapter)),
+            Some("claude code".to_string())
+        );
+        assert_eq!(
+            visible_model_hint(&text, Some(&adapter)),
+            Some("sonnet".to_string())
+        );
+    }
+
+    #[test]
+    fn passive_visible_detection_does_not_enable_control_actions() {
+        let text = "Claude Code v2.1.198\n❯ continue\n";
+        assert!(
+            visible_agent_match_from_adapters(text, default_agent_adapters().into_iter()).is_some()
+        );
+        let vars = HashMap::new();
+
+        assert!(!agent_control_actions_allowed(false, false, &vars));
+        assert!(agent_control_actions_allowed(false, true, &vars));
+    }
+
+    #[test]
+    fn explicit_user_var_enables_control_actions() {
+        let mut vars = HashMap::new();
+        vars.insert(
+            "agent.enable_control_actions".to_string(),
+            "true".to_string(),
+        );
+
+        assert!(agent_control_actions_allowed(false, false, &vars));
+    }
+
+    #[test]
+    fn action_command_resolves_templates_and_requires_path_command() {
+        let command = env::current_exe().unwrap().to_string_lossy().to_string();
+        let adapter = AgentAdapterConfig {
+            resume_command: Some(vec![command.clone(), "{session_id}".to_string()]),
+            resume_latest_command: Some(vec![
+                "tgzterminal-definitely-missing-agent-command".to_string()
+            ]),
+            attach_command: Some(vec![command.clone(), "{attach_url}".to_string()]),
+            ..Default::default()
+        };
+        let values = AgentActionTemplateValues {
+            session_id: Some("session-123".to_string()),
+            attach_url: Some("file:///tmp/socket".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            resolve_agent_resume_command(&adapter, &values),
+            Some(vec![command.clone(), "session-123".to_string()])
+        );
+        assert_eq!(
+            resolve_agent_attach_command(&adapter, &values),
+            Some(vec![command.clone(), "file:///tmp/socket".to_string()])
+        );
+
+        let missing_session = AgentActionTemplateValues::default();
+        assert!(resolve_agent_resume_command(&adapter, &missing_session).is_none());
+
+        let missing_attach_url = AgentActionTemplateValues {
+            session_id: Some("session-123".to_string()),
+            ..Default::default()
+        };
+        assert!(resolve_agent_attach_command(&adapter, &missing_attach_url).is_none());
+    }
+
+    #[test]
+    fn detail_path_uses_first_existing_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let existing = temp.path().join(".codex").join("log");
+        std::fs::create_dir_all(&existing).unwrap();
+        let adapter = AgentAdapterConfig {
+            detail_paths: Some(vec![
+                "{home}/.codex/sessions/{session_id}".to_string(),
+                "{home}/.codex/log".to_string(),
+            ]),
+            ..Default::default()
+        };
+        let values = AgentActionTemplateValues {
+            home: Some(temp.path().to_path_buf()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            resolve_agent_detail_path(Some("codex"), &adapter, &values),
+            Some(existing.canonicalize().unwrap())
+        );
+    }
+
+    #[test]
+    fn claude_default_detail_path_keeps_project_root_safety() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = PathBuf::from("/Users/example/project");
+        let projects = temp.path().join(".claude").join("projects");
+        let project = projects.join(encode_claude_project_path(&cwd));
+        std::fs::create_dir_all(&project).unwrap();
+        let adapter = default_agent_adapters().remove("claude").unwrap();
+        let values = AgentActionTemplateValues {
+            cwd: Some(cwd),
+            home: Some(temp.path().to_path_buf()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            resolve_agent_detail_path(Some("claude"), &adapter, &values),
+            Some(project.canonicalize().unwrap())
+        );
+    }
+
+    #[test]
+    fn detail_button_uses_details_for_session_paths() {
+        let codex = default_agent_adapters().remove("codex").unwrap();
+        let claude = default_agent_adapters().remove("claude").unwrap();
+
+        assert_eq!(
+            agent_detail_button_label(Some("codex"), Some(&codex)),
+            "Details"
+        );
+        assert_eq!(
+            agent_detail_button_label(Some("claude"), Some(&claude)),
+            "Logs"
+        );
+    }
+
+    #[test]
+    fn toolbelt_buttons_respect_global_and_adapter_visibility() {
+        let mut agent_ui = config::AgentUiConfig::default();
+        let agent = AgentPaneState {
+            adapter_id: Some("codex".to_string()),
+            kind: AgentKind::Codex,
+            trusted_controls: true,
+            status: AgentStatus::Running,
+            model: None,
+            session_id: Some("session-123".to_string()),
+            attach_url: None,
+            cwd: None,
+            input_tokens: None,
+            output_tokens: None,
+            cost: None,
+            actions: AgentActions {
+                interrupt: true,
+                copy_summary: true,
+                attach: false,
+                resume: true,
+                open_logs: true,
+            },
+        };
+        let adapter = AgentAdapterConfig {
+            detail_paths: Some(vec!["{home}/.codex/sessions".to_string()]),
+            ..Default::default()
+        };
+
+        assert!(!agent_toolbelt_buttons(&agent_ui, &agent, Some(&adapter)).is_empty());
+
+        agent_ui.show_pane_toolbelt = false;
+        assert!(agent_toolbelt_buttons(&agent_ui, &agent, Some(&adapter)).is_empty());
+
+        agent_ui.show_pane_toolbelt = true;
+        let disabled_adapter = AgentAdapterConfig {
+            enabled: false,
+            ..adapter
+        };
+        assert!(agent_toolbelt_buttons(&agent_ui, &agent, Some(&disabled_adapter)).is_empty());
+    }
+
+    #[test]
+    fn shell_prompts_are_not_agent_user_prompts() {
+        assert!(!is_agent_user_prompt_line("$ echo hi"));
+        assert!(!is_agent_user_prompt_line("# apt install ripgrep"));
+        assert!(is_agent_user_prompt_line("❯ hello"));
+    }
+
+    #[test]
+    fn agent_copy_last_message_filters_claude_startup_to_response() {
+        let raw = [
+            "Claude Code v2.0.1",
+            "Model: Claude Sonnet",
+            "CWD: /Users/example/project",
+            "────────────────────────",
+            "❯ explain this",
+            "✻ Brewed for 5s",
+            "The relevant fix is to clean the transcript before copying.",
+            "",
+            "ctx: 12% · 1,204 tokens",
+        ]
+        .join("\n");
+        let adapter = default_agent_adapters().remove("claude").unwrap();
+
+        assert_eq!(
+            clean_agent_last_message_transcript(&raw, Some(&adapter)),
+            "The relevant fix is to clean the transcript before copying."
+        );
+    }
+
+    #[test]
+    fn agent_copy_last_message_filters_current_claude_status_footer() {
+        let raw = [
+            "⏺ Test received. Ready.",
+            "",
+            "✻ Cooked for 3s",
+            "",
+            "",
+            "────────────────────────────────────────────",
+            "❯",
+            "────────────────────────────────────────────",
+            "  █░░░░░░░░░░░░░░░░░░░ 7% used · 93% left (70k/1000k tokens) · tim.grossinger · Sonnet 5 (1x) · 5h: 3% (resets 05:00)  7d: 0% · expires Sun Jul 05 14:00",
+            "▶▶ auto mode on (shift+tab to cycle) · ← for agents",
+        ]
+        .join("\n");
+        let adapter = default_agent_adapters().remove("claude").unwrap();
+
+        assert_eq!(
+            clean_agent_last_message_transcript(&raw, Some(&adapter)),
+            "Test received. Ready."
+        );
+    }
+
+    #[test]
+    fn agent_copy_conversation_filters_prompt_status_token_bar_and_padding() {
+        let raw = [
+            "",
+            "",
+            "❯ write tests",
+            "Done.",
+            "Next line.",
+            "│ token usage 1,120 tokens │",
+            "⏵⏵ auto mode",
+            "",
+            "",
+        ]
+        .join("\n");
+        let adapter = default_agent_adapters().remove("claude").unwrap();
+
+        assert_eq!(
+            clean_agent_conversation_transcript(&raw, Some(&adapter)),
+            "write tests\nDone.\nNext line."
+        );
+    }
+
+    #[test]
+    fn agent_copy_conversation_preserves_meaningful_user_and_agent_content() {
+        let raw = [
+            "Fable 5 is back",
+            "SessionStart:startup says hello",
+            "❯ summarize the change",
+            "It copies semantic agent content now.",
+            "",
+            "❯ what changed in layout",
+            "Buttons are measured from their rendered labels.",
+            "12:45 · reset usage · 3,200 tokens",
+        ]
+        .join("\n");
+        let adapter = default_agent_adapters().remove("claude").unwrap();
+
+        assert_eq!(
+            clean_agent_conversation_transcript(&raw, Some(&adapter)),
+            "summarize the change\nIt copies semantic agent content now.\n\nwhat changed in layout\nButtons are measured from their rendered labels."
+        );
+    }
+
+    #[test]
+    fn agent_copy_conversation_starts_at_first_visible_prompt() {
+        let raw = [
+            "▐▛███▜▌   Claude Code v2.1.198",
+            "▝▜█████▛▘  Sonnet 5 with medium effort · Claude Team",
+            "  ▘▘ ▝▝    ~/Documents/copilot/auto-time-management",
+            "",
+            " ▎ Until July 7, you can use up to 50% of your plan's weekly usage limit on Fable 5.",
+            " ▎ Opus 4.8. Learn more",
+            "",
+            "❯ hello",
+            "",
+            "Hi. Ready. What need?",
+            "",
+            "* Brewed for 2s",
+        ]
+        .join("\n");
+        let adapter = default_agent_adapters().remove("claude").unwrap();
+
+        assert_eq!(
+            clean_agent_conversation_transcript(&raw, Some(&adapter)),
+            "hello\n\nHi. Ready. What need?"
+        );
+    }
+
+    #[test]
+    fn copy_as_markdown_uses_cleaned_verbatim_lines() {
+        let raw = [
+            "❯ show code",
+            "```rust",
+            "fn main() {",
+            "    println!(\"hi\");",
+            "}",
+            "```",
+            "ctx: 1%",
+        ]
+        .join("\n");
+        let adapter = default_agent_adapters().remove("claude").unwrap();
+
+        assert_eq!(
+            agent_copy_payload_from_text(&AgentCopyAction::Markdown, &raw, "", Some(&adapter)),
+            "## User\n\nshow code\n\n## Agent\n\n```rust\nfn main() {\n    println!(\"hi\");\n}\n```"
+        );
+    }
+
+    #[test]
+    fn transcript_start_is_bounded_by_configured_line_limit() {
+        assert_eq!(agent_transcript_start(-5000, 200, 500), -300);
+        assert_eq!(agent_transcript_start(0, 200, 500), 0);
+        assert_eq!(agent_transcript_start(-5000, 200, 0), 199);
+    }
+
+    #[test]
+    fn status_inference_detects_running_and_waiting() {
+        assert_eq!(
+            infer_agent_status_from_visible_text("Thinking\n✻ Brewing"),
+            AgentStatus::Running
+        );
+        assert_eq!(
+            infer_agent_status_from_visible_text("Done\n\n❯"),
+            AgentStatus::WaitingForInput
+        );
+        assert_eq!(
+            infer_agent_status_from_visible_text("Here is the answer."),
+            AgentStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn process_detected_agent_loads_visible_text_for_status() {
+        assert!(should_load_visible_agent_text(true, true, None));
+        assert!(!should_load_visible_agent_text(true, true, Some("running")));
+        assert!(should_load_visible_agent_text(false, true, None));
+        assert!(!should_load_visible_agent_text(true, false, None));
+    }
+
+    #[test]
+    fn waiting_notification_only_fires_on_transition() {
+        let now = Instant::now();
+        let (notify, marker) = waiting_notification_update(
+            true,
+            AgentStatus::WaitingForInput,
+            Some(AgentStatus::Running),
+            None,
+            now,
+        );
+        assert!(notify);
+        assert_eq!(marker, Some(now));
+
+        let (notify, marker) = waiting_notification_update(
+            true,
+            AgentStatus::WaitingForInput,
+            Some(AgentStatus::WaitingForInput),
+            Some(now - Duration::from_secs(120)),
+            now,
+        );
+        assert!(!notify);
+        assert_eq!(marker, Some(now - Duration::from_secs(120)));
+
+        let (notify, marker) = waiting_notification_update(
+            true,
+            AgentStatus::Running,
+            Some(AgentStatus::WaitingForInput),
+            Some(now),
+            now,
+        );
+        assert!(!notify);
+        assert_eq!(marker, None);
+    }
+
+    #[test]
+    fn toolbelt_shrink_keeps_copy_before_lower_priority_actions() {
+        let buttons = vec![
+            ("Stop", AgentToolbeltAction::Interrupt, 88.),
+            ("Copy", AgentToolbeltAction::CopyMenu, 88.),
+            ("Resume", AgentToolbeltAction::Resume, 112.),
+            ("Logs", AgentToolbeltAction::OpenLogs, 88.),
+        ];
+        let mut visible = buttons.clone();
+        while !visible.is_empty() && agent_toolbelt_button_area(&visible) > 190. {
+            let remove_idx = visible
+                .iter()
+                .rposition(|(_, action, _)| action != &AgentToolbeltAction::CopyMenu)
+                .unwrap_or(visible.len() - 1);
+            visible.remove(remove_idx);
+        }
+
+        assert!(visible
+            .iter()
+            .any(|(_, action, _)| action == &AgentToolbeltAction::CopyMenu));
+        assert!(!visible
+            .iter()
+            .any(|(_, action, _)| action == &AgentToolbeltAction::OpenLogs));
+    }
+
+    #[test]
+    fn adapter_color_and_short_label_come_from_config() {
+        let adapter = AgentAdapterConfig {
+            short_label: Some("Mx".to_string()),
+            color: Some("#112233".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            adapter_short_label(Some(&adapter), &AgentKind::Unknown("Mystery".to_string())),
+            "Mx"
+        );
+        assert_eq!(
+            adapter_color(Some(&adapter), &AgentKind::Unknown("Mystery".to_string())),
+            LinearRgba(17. / 255., 34. / 255., 51. / 255., 1.0)
+        );
+    }
+
+    #[test]
+    fn compact_symbol_does_not_use_agent_command_without_detected_agent() {
+        assert_ne!(
+            compact_tab_symbol("shell", 0, None, None, Some("claude"), Some("claude")),
+            "Cl"
+        );
+        assert_ne!(
+            compact_tab_symbol("shell", 0, None, None, Some("codex"), Some("codex")),
+            "Cx"
+        );
+    }
+
+    #[test]
+    fn partial_adapter_config_preserves_default_matchers() {
+        let defaults = default_agent_adapters();
+        let base = defaults.get("claude").unwrap();
+        let configured = AgentAdapterConfig {
+            enabled: false,
+            short_label: Some("Cd".to_string()),
+            ..Default::default()
+        };
+        let merged = merge_agent_adapter_config(base, &configured);
+
+        assert!(!merged.enabled);
+        assert_eq!(merged.short_label.as_deref(), Some("Cd"));
+        assert!(merged
+            .process_names
+            .iter()
+            .any(|process| process == "claude"));
+        assert!(merged
+            .strip_patterns
+            .iter()
+            .any(|pattern| pattern == "auto mode"));
+    }
+
+    #[test]
+    fn configured_custom_visible_match_returns_unknown_label() {
+        let adapter = AgentAdapterConfig {
+            label: Some("My Agent".to_string()),
+            visible_patterns: vec!["my-agent ready".to_string()],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            visible_agent_match_from_adapters(
+                "banner\nmy-agent ready\n",
+                vec![("myagent".to_string(), adapter)].into_iter()
+            ),
+            Some((
+                "myagent".to_string(),
+                AgentKind::Unknown("My Agent".to_string())
+            ))
+        );
+    }
+
+    #[test]
+    fn adapter_patterns_support_cached_regex_prefix() {
+        assert!(agent_pattern_matches(
+            "Claude Sonnet 5",
+            "re:sonnet\\s+\\d+"
+        ));
+        assert!(!agent_pattern_matches("Claude Sonnet", "re:sonnet\\s+\\d+"));
+    }
+
+    #[test]
+    fn regex_patterns_are_bounded_and_invalid_patterns_do_not_match() {
+        AGENT_PATTERN_REGEX_CACHE.lock().unwrap().clear();
+        assert!(!agent_pattern_matches(
+            "anything",
+            &format!("re:{}", "a".repeat(MAX_AGENT_PATTERN_LEN + 1))
+        ));
+        assert!(!agent_pattern_matches("anything", "re:["));
+        for idx in 0..(AGENT_PATTERN_REGEX_CACHE_LIMIT + 10) {
+            let pattern = format!("re:test-{idx}");
+            let _ = agent_pattern_matches("test", &pattern);
+        }
+        assert!(AGENT_PATTERN_REGEX_CACHE.lock().unwrap().len() <= AGENT_PATTERN_REGEX_CACHE_LIMIT);
+    }
+
+    #[test]
+    fn claude_logs_path_must_resolve_under_projects_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = PathBuf::from("/Users/example/project");
+        let projects = temp.path().join(".claude").join("projects");
+        let project = projects.join(encode_claude_project_path(&cwd));
+        std::fs::create_dir_all(&project).unwrap();
+
+        assert_eq!(
+            resolve_claude_logs_path_under(temp.path(), &cwd).unwrap(),
+            project.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn missing_claude_logs_path_is_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = PathBuf::from("/Users/example/project");
+
+        assert_eq!(
+            resolve_claude_logs_path_under(temp.path(), &cwd),
+            Err(ClaudeLogsPathError::Missing)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_logs_symlink_outside_projects_root_is_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = PathBuf::from("/Users/example/project");
+        let projects = temp.path().join(".claude").join("projects");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, projects.join(encode_claude_project_path(&cwd)))
+            .unwrap();
+
+        assert_eq!(
+            resolve_claude_logs_path_under(temp.path(), &cwd),
+            Err(ClaudeLogsPathError::OutsideProjects)
+        );
+    }
+
+    #[test]
+    fn agent_copy_summary_payload_is_metadata_only() {
+        let raw = [
+            "❯ include transcript",
+            "This response should not be appended to details.",
+        ]
+        .join("\n");
+        let summary = "Agent: Claude\nPane: 7\nStatus: running";
+
+        assert_eq!(
+            agent_copy_payload_from_text(&AgentCopyAction::Summary, &raw, summary, None),
+            summary
+        );
+    }
+
+    #[test]
+    fn sidebar_scroll_geometry_preserves_thumb_grab_offset() {
+        let geometry = SidebarScrollGeometry::new(12., 160., 3, 100, 40, 12.).unwrap();
+        let grabbed_near_bottom = geometry.thumb_y + geometry.thumb_h - 1.;
+        let centered_top = grabbed_near_bottom - geometry.thumb_h * 0.5;
+        let drag_delta = 18.;
+        let expected_after_drag = geometry
+            .offset_for_thumb_top(geometry.thumb_y + drag_delta)
+            .unwrap();
+
+        assert_eq!(geometry.offset_for_thumb_top(geometry.thumb_y).unwrap(), 40);
+        assert_ne!(geometry.offset_for_thumb_top(centered_top).unwrap(), 40);
+
+        for grab_offset in [0., geometry.thumb_h * 0.5, geometry.thumb_h - 1.] {
+            let start_y = geometry.thumb_y + grab_offset;
+            let current_y = start_y + drag_delta;
+            let dragged_top = geometry.thumb_y + (current_y - start_y);
+            assert_eq!(
+                geometry.offset_for_thumb_top(dragged_top).unwrap(),
+                expected_after_drag
+            );
+        }
+    }
+
+    #[test]
+    fn sidebar_scroll_geometry_clamps_thumb_top_to_track() {
+        let geometry = SidebarScrollGeometry::new(20., 120., 4, 80, 30, 10.).unwrap();
+
+        assert_eq!(geometry.offset_for_thumb_top(-500.).unwrap(), 0);
+        assert_eq!(
+            geometry.offset_for_thumb_top(500.).unwrap(),
+            geometry.max_offset
+        );
+    }
+
+    #[test]
+    fn sidebar_scroll_geometry_returns_none_without_overflow() {
+        assert!(SidebarScrollGeometry::new(0., 100., 10, 10, 0, 10.).is_none());
+        assert!(SidebarScrollGeometry::new(0., 100., 0, 10, 0, 10.).is_none());
+        assert!(SidebarScrollGeometry::new(0., 0., 1, 10, 0, 10.).is_none());
     }
 }

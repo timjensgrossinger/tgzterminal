@@ -18,6 +18,7 @@ on:
 
 jobs:
   build:
+    if: github.repository == 'wezterm/wezterm'
     runs-on: "windows-2025"
     
     env:

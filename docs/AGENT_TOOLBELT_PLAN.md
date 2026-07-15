@@ -123,10 +123,16 @@ Actions should be opt-in per adapter:
 - `interrupt`
 - `attach`
 - `resume`
-- `open_logs`
+- `open_logs` / `open_details`
 - `copy_summary`
 
 If an adapter cannot perform an action safely, the UI should hide or disable that action.
+Adapter action templates use argv/path arrays and support `{session_id}`,
+`{cwd}`, `{home}`, `{attach_url}`, and `{claude_project_path}`. Runtime action
+buttons are hidden when a required template value is missing, a command is not
+available on `PATH`, or no configured details path exists. Claude keeps the
+`Logs` label for its project directory; other session/state paths are labeled
+`Details`.
 
 ## Config
 
@@ -141,10 +147,24 @@ agent_ui = {
   toolbelt_position = "Top",
   adapters = {
     claude = { enabled = true },
-    codex = { enabled = true },
+    codex = {
+      enabled = true,
+      resume_command = { "codex", "resume", "{session_id}" },
+      resume_latest_command = { "codex", "resume", "--last" },
+      detail_paths = { "{home}/.codex/sessions", "{home}/.codex/log" },
+    },
     gemini = { enabled = true },
-    opencode = { enabled = true },
-    copilot = { enabled = true },
+    opencode = {
+      enabled = true,
+      resume_command = { "opencode", "-s", "{session_id}" },
+      resume_latest_command = { "opencode", "-c" },
+      attach_command = { "opencode", "attach", "{attach_url}" },
+    },
+    copilot = {
+      enabled = true,
+      resume_command = { "copilot", "--resume={session_id}" },
+      resume_latest_command = { "copilot", "--continue" },
+    },
     cursor = { enabled = true },
     amp = { enabled = true },
   },

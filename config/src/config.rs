@@ -31,7 +31,7 @@ use anyhow::Context;
 use luahelper::impl_lua_conversion_dynamic;
 use mlua::FromLua;
 use portable_pty::CommandBuilder;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsStr;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -171,6 +171,15 @@ pub struct AgentAdapterConfig {
     #[dynamic(default = "default_true")]
     pub enabled: bool,
 
+    /// Human-readable label shown in agent UI.
+    pub label: Option<String>,
+
+    /// Compact label used in narrow sidebar tabs.
+    pub short_label: Option<String>,
+
+    /// Optional adapter accent color, as a CSS-style color string.
+    pub color: Option<String>,
+
     /// Additional foreground process basenames that identify this adapter.
     #[dynamic(default)]
     pub process_names: Vec<String>,
@@ -178,76 +187,259 @@ pub struct AgentAdapterConfig {
     /// Additional lowercase title fragments that identify this adapter.
     #[dynamic(default)]
     pub title_patterns: Vec<String>,
+
+    /// Visible text fragments that identify this adapter.
+    #[dynamic(default)]
+    pub visible_patterns: Vec<String>,
+
+    /// Transcript chrome fragments removed from copy actions.
+    #[dynamic(default)]
+    pub strip_patterns: Vec<String>,
+
+    /// Visible text fragments that identify a model name.
+    #[dynamic(default)]
+    pub model_patterns: Vec<String>,
+
+    /// Command argv template used to resume a known agent session.
+    #[dynamic(default)]
+    pub resume_command: Option<Vec<String>>,
+
+    /// Command argv template used to resume the latest agent session.
+    #[dynamic(default)]
+    pub resume_latest_command: Option<Vec<String>>,
+
+    /// Command argv template used to attach to an agent session.
+    #[dynamic(default)]
+    pub attach_command: Option<Vec<String>>,
+
+    /// Local path templates opened by the Details toolbelt action.
+    #[dynamic(default)]
+    pub detail_paths: Option<Vec<String>>,
 }
 
 impl Default for AgentAdapterConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            label: None,
+            short_label: None,
+            color: None,
             process_names: Vec::new(),
             title_patterns: Vec::new(),
+            visible_patterns: Vec::new(),
+            strip_patterns: Vec::new(),
+            model_patterns: Vec::new(),
+            resume_command: None,
+            resume_latest_command: None,
+            attach_command: None,
+            detail_paths: None,
         }
     }
 }
 
 impl AgentAdapterConfig {
-    fn with_matchers(process_names: &[&str], title_patterns: &[&str]) -> Self {
+    fn with_defaults(
+        label: &str,
+        short_label: &str,
+        color: &str,
+        process_names: &[&str],
+        title_patterns: &[&str],
+        visible_patterns: &[&str],
+        strip_patterns: &[&str],
+        model_patterns: &[&str],
+    ) -> Self {
         Self {
             enabled: true,
+            label: Some(label.to_string()),
+            short_label: Some(short_label.to_string()),
+            color: Some(color.to_string()),
             process_names: process_names.iter().map(|name| name.to_string()).collect(),
             title_patterns: title_patterns
                 .iter()
                 .map(|pattern| pattern.to_string())
                 .collect(),
+            visible_patterns: visible_patterns
+                .iter()
+                .map(|pattern| pattern.to_string())
+                .collect(),
+            strip_patterns: strip_patterns
+                .iter()
+                .map(|pattern| pattern.to_string())
+                .collect(),
+            model_patterns: model_patterns
+                .iter()
+                .map(|pattern| pattern.to_string())
+                .collect(),
+            resume_command: None,
+            resume_latest_command: None,
+            attach_command: None,
+            detail_paths: None,
         }
     }
 }
 
-#[derive(Debug, Clone, FromDynamic, ToDynamic)]
-pub struct AgentAdaptersConfig {
-    #[dynamic(default)]
-    pub claude: AgentAdapterConfig,
-    #[dynamic(default)]
-    pub codex: AgentAdapterConfig,
-    #[dynamic(default)]
-    pub gemini: AgentAdapterConfig,
-    #[dynamic(default)]
-    pub opencode: AgentAdapterConfig,
-    #[dynamic(default)]
-    pub copilot: AgentAdapterConfig,
-    #[dynamic(default)]
-    pub cursor: AgentAdapterConfig,
-    #[dynamic(default)]
-    pub amp: AgentAdapterConfig,
-}
+pub type AgentAdaptersConfig = BTreeMap<String, AgentAdapterConfig>;
 
-impl Default for AgentAdaptersConfig {
-    fn default() -> Self {
-        Self {
-            claude: AgentAdapterConfig::with_matchers(
-                &["claude", "claude-code", "claude_code"],
-                &["claude code", "claude"],
-            ),
-            codex: AgentAdapterConfig::with_matchers(
-                &["codex", "openai-codex", "openai_codex"],
-                &["codex"],
-            ),
-            gemini: AgentAdapterConfig::with_matchers(
-                &["gemini", "gemini-cli", "gemini_cli"],
-                &["gemini"],
-            ),
-            opencode: AgentAdapterConfig::with_matchers(
-                &["opencode", "open-code", "open_code"],
-                &["opencode", "open code"],
-            ),
-            copilot: AgentAdapterConfig::with_matchers(
-                &["copilot", "gh-copilot", "github-copilot"],
-                &["copilot"],
-            ),
-            cursor: AgentAdapterConfig::with_matchers(&["cursor"], &["cursor"]),
-            amp: AgentAdapterConfig::with_matchers(&["amp"], &["amp"]),
-        }
-    }
+pub fn default_agent_adapters() -> AgentAdaptersConfig {
+    let mut adapters = AgentAdaptersConfig::new();
+    let mut claude = AgentAdapterConfig::with_defaults(
+        "Claude",
+        "Cl",
+        "#db7a52",
+        &["claude", "claude-code", "claude_code"],
+        &["claude code", "claude"],
+        &["claude code", "claude team"],
+        &[
+            "sessionstart:startup",
+            "auto mode",
+            "shift+tab",
+            "for agents",
+            "token usage",
+            "tokens used",
+            "tokens remaining",
+            "ctx:",
+            "% used",
+            "% left",
+            "tokens",
+            "expires",
+            "reset usage",
+            "reset limit",
+            "cooked for",
+            "brewed for",
+            "claude code",
+            "welcome to claude",
+            "model:",
+            "cwd:",
+            "working directory:",
+            "tips:",
+            "tip:",
+            "fable 5 is back",
+        ],
+        &["sonnet", "opus", "haiku"],
+    );
+    claude.resume_command = Some(vec![
+        "claude".to_string(),
+        "--resume".to_string(),
+        "{session_id}".to_string(),
+    ]);
+    claude.resume_latest_command = Some(vec!["claude".to_string(), "--resume".to_string()]);
+    claude.detail_paths = Some(vec![
+        "{home}/.claude/projects/{claude_project_path}".to_string()
+    ]);
+    adapters.insert("claude".to_string(), claude);
+
+    let mut codex = AgentAdapterConfig::with_defaults(
+        "Codex",
+        "Cx",
+        "#3da37a",
+        &["codex", "openai-codex", "openai_codex"],
+        &["codex"],
+        &["codex", "openai"],
+        &["tokens", "context", "approval", "sandbox"],
+        &["gpt-5", "gpt-4"],
+    );
+    codex.resume_command = Some(vec![
+        "codex".to_string(),
+        "resume".to_string(),
+        "{session_id}".to_string(),
+    ]);
+    codex.resume_latest_command = Some(vec![
+        "codex".to_string(),
+        "resume".to_string(),
+        "--last".to_string(),
+    ]);
+    codex.detail_paths = Some(vec![
+        "{home}/.codex/sessions".to_string(),
+        "{home}/.codex/log".to_string(),
+    ]);
+    adapters.insert("codex".to_string(), codex);
+    adapters.insert(
+        "gemini".to_string(),
+        AgentAdapterConfig::with_defaults(
+            "Gemini",
+            "G",
+            "#4785eb",
+            &["gemini", "gemini-cli", "gemini_cli"],
+            &["gemini"],
+            &["gemini"],
+            &["tokens", "context"],
+            &["gemini"],
+        ),
+    );
+    let mut opencode = AgentAdapterConfig::with_defaults(
+        "OpenCode",
+        "Oc",
+        "#38a8b3",
+        &["opencode", "open-code", "open_code"],
+        &["opencode", "open code"],
+        &["opencode", "open code"],
+        &["tokens", "context"],
+        &["sonnet", "opus", "gpt", "gemini"],
+    );
+    opencode.resume_command = Some(vec![
+        "opencode".to_string(),
+        "-s".to_string(),
+        "{session_id}".to_string(),
+    ]);
+    opencode.resume_latest_command = Some(vec!["opencode".to_string(), "-c".to_string()]);
+    opencode.attach_command = Some(vec![
+        "opencode".to_string(),
+        "attach".to_string(),
+        "{attach_url}".to_string(),
+    ]);
+    opencode.detail_paths = Some(vec![
+        "{home}/.local/share/opencode/log".to_string(),
+        "{home}/.local/share/opencode/storage".to_string(),
+    ]);
+    adapters.insert("opencode".to_string(), opencode);
+
+    let mut copilot = AgentAdapterConfig::with_defaults(
+        "Copilot",
+        "Cp",
+        "#57a85f",
+        &["copilot", "gh-copilot", "github-copilot"],
+        &["copilot"],
+        &["copilot"],
+        &["tokens", "context"],
+        &["gpt", "claude"],
+    );
+    copilot.resume_command = Some(vec![
+        "copilot".to_string(),
+        "--resume={session_id}".to_string(),
+    ]);
+    copilot.resume_latest_command = Some(vec!["copilot".to_string(), "--continue".to_string()]);
+    copilot.detail_paths = Some(vec![
+        "{home}/.copilot/session-state/{session_id}".to_string(),
+        "{home}/.copilot/session-state".to_string(),
+    ]);
+    adapters.insert("copilot".to_string(), copilot);
+    adapters.insert(
+        "cursor".to_string(),
+        AgentAdapterConfig::with_defaults(
+            "Cursor",
+            "Cu",
+            "#706bd1",
+            &["cursor"],
+            &["cursor"],
+            &["cursor"],
+            &["tokens", "context"],
+            &["gpt", "claude"],
+        ),
+    );
+    adapters.insert(
+        "amp".to_string(),
+        AgentAdapterConfig::with_defaults(
+            "Amp",
+            "A",
+            "#bd5cad",
+            &["amp"],
+            &["amp"],
+            &["amp"],
+            &["tokens", "context"],
+            &["sonnet", "opus"],
+        ),
+    );
+    adapters
 }
 
 #[derive(Debug, Clone, FromDynamic, ToDynamic)]
@@ -264,16 +456,28 @@ pub struct AgentUiConfig {
     #[dynamic(default = "default_true")]
     pub show_pane_toolbelt: bool,
 
+    /// Allow agent UI actions that spawn processes or open local files.
+    #[dynamic(default)]
+    pub enable_control_actions: bool,
+
     /// Detect known agent process and title names in addition to user vars.
     #[dynamic(default = "default_true")]
     pub detect_processes: bool,
+
+    /// Maximum scrollback lines copied by agent copy actions.
+    #[dynamic(default = "default_agent_copy_scrollback_lines")]
+    pub copy_scrollback_lines: usize,
+
+    /// Show a throttled notification when an agent appears to wait for input.
+    #[dynamic(default = "default_true")]
+    pub waiting_notification: bool,
 
     /// Placement for the active-pane toolbelt.
     #[dynamic(default)]
     pub toolbelt_position: AgentToolbeltPosition,
 
     /// Per-adapter passive detection switches.
-    #[dynamic(default)]
+    #[dynamic(default = "default_agent_adapters")]
     pub adapters: AgentAdaptersConfig,
 }
 
@@ -283,9 +487,12 @@ impl Default for AgentUiConfig {
             enabled: true,
             show_sidebar_badges: true,
             show_pane_toolbelt: true,
+            enable_control_actions: false,
             detect_processes: true,
+            copy_scrollback_lines: default_agent_copy_scrollback_lines(),
+            waiting_notification: true,
             toolbelt_position: AgentToolbeltPosition::Top,
-            adapters: AgentAdaptersConfig::default(),
+            adapters: default_agent_adapters(),
         }
     }
 }
@@ -1921,7 +2128,7 @@ impl Config {
 }
 
 fn default_check_for_updates() -> bool {
-    cfg!(not(feature = "distro-defaults"))
+    false
 }
 
 fn default_pane_select_fg_color() -> RgbaColor {
@@ -2225,6 +2432,10 @@ fn default_agent_telemetry_fields() -> Vec<AgentTelemetryField> {
     ]
 }
 
+fn default_agent_copy_scrollback_lines() -> usize {
+    500
+}
+
 fn default_update_interval() -> u64 {
     86400
 }
@@ -2233,6 +2444,10 @@ fn default_update_interval() -> u64 {
 mod agent_ui_tests {
     use super::*;
 
+    fn strings(items: &[&str]) -> Vec<String> {
+        items.iter().map(|item| item.to_string()).collect()
+    }
+
     #[test]
     fn agent_ui_defaults_to_passive_surfaces_enabled() {
         let config = Config::default_config();
@@ -2240,35 +2455,129 @@ mod agent_ui_tests {
         assert!(config.agent_ui.enabled);
         assert!(config.agent_ui.show_sidebar_badges);
         assert!(config.agent_ui.show_pane_toolbelt);
+        assert!(!config.agent_ui.enable_control_actions);
         assert!(config.agent_ui.detect_processes);
+        assert_eq!(config.agent_ui.copy_scrollback_lines, 500);
+        assert!(config.agent_ui.waiting_notification);
         assert_eq!(
             config.agent_ui.toolbelt_position,
             AgentToolbeltPosition::Top
         );
-        assert!(config.agent_ui.adapters.claude.enabled);
-        assert!(config.agent_ui.adapters.codex.enabled);
-        assert!(config.agent_ui.adapters.gemini.enabled);
-        assert!(config.agent_ui.adapters.opencode.enabled);
-        assert!(config.agent_ui.adapters.copilot.enabled);
-        assert!(config.agent_ui.adapters.cursor.enabled);
-        assert!(config.agent_ui.adapters.amp.enabled);
+        for adapter in [
+            "claude", "codex", "gemini", "opencode", "copilot", "cursor", "amp",
+        ] {
+            assert!(config.agent_ui.adapters[adapter].enabled);
+        }
         assert!(config.sidebar_auto_hide);
         assert!(config.sidebar_scroll_bar);
         assert!(config.enable_scroll_bar);
         assert!(config
             .agent_ui
             .adapters
-            .codex
+            .get("codex")
+            .unwrap()
             .process_names
             .iter()
             .any(|name| name == "codex"));
         assert!(config
             .agent_ui
             .adapters
-            .claude
+            .get("claude")
+            .unwrap()
             .title_patterns
             .iter()
             .any(|pattern| pattern == "claude code"));
+        assert!(config
+            .agent_ui
+            .adapters
+            .get("claude")
+            .unwrap()
+            .strip_patterns
+            .iter()
+            .any(|pattern| pattern == "auto mode"));
+    }
+
+    #[test]
+    fn agent_adapter_defaults_include_verified_control_actions() {
+        let adapters = default_agent_adapters();
+        let claude = adapters.get("claude").unwrap();
+        assert_eq!(
+            claude.resume_command.as_ref(),
+            Some(&strings(&["claude", "--resume", "{session_id}"]))
+        );
+        assert_eq!(
+            claude.resume_latest_command.as_ref(),
+            Some(&strings(&["claude", "--resume"]))
+        );
+        assert_eq!(
+            claude.detail_paths.as_ref(),
+            Some(&strings(&["{home}/.claude/projects/{claude_project_path}"]))
+        );
+
+        let codex = adapters.get("codex").unwrap();
+        assert_eq!(
+            codex.resume_command.as_ref(),
+            Some(&strings(&["codex", "resume", "{session_id}"]))
+        );
+        assert_eq!(
+            codex.resume_latest_command.as_ref(),
+            Some(&strings(&["codex", "resume", "--last"]))
+        );
+        assert_eq!(
+            codex.detail_paths.as_ref(),
+            Some(&strings(&["{home}/.codex/sessions", "{home}/.codex/log"]))
+        );
+
+        let copilot = adapters.get("copilot").unwrap();
+        assert_eq!(
+            copilot.resume_command.as_ref(),
+            Some(&strings(&["copilot", "--resume={session_id}"]))
+        );
+        assert_eq!(
+            copilot.resume_latest_command.as_ref(),
+            Some(&strings(&["copilot", "--continue"]))
+        );
+        assert_eq!(
+            copilot.detail_paths.as_ref(),
+            Some(&strings(&[
+                "{home}/.copilot/session-state/{session_id}",
+                "{home}/.copilot/session-state",
+            ]))
+        );
+
+        let opencode = adapters.get("opencode").unwrap();
+        assert_eq!(
+            opencode.resume_command.as_ref(),
+            Some(&strings(&["opencode", "-s", "{session_id}"]))
+        );
+        assert_eq!(
+            opencode.resume_latest_command.as_ref(),
+            Some(&strings(&["opencode", "-c"]))
+        );
+        assert_eq!(
+            opencode.attach_command.as_ref(),
+            Some(&strings(&["opencode", "attach", "{attach_url}"]))
+        );
+        assert_eq!(
+            opencode.detail_paths.as_ref(),
+            Some(&strings(&[
+                "{home}/.local/share/opencode/log",
+                "{home}/.local/share/opencode/storage",
+            ]))
+        );
+    }
+
+    #[test]
+    fn cursor_defaults_remain_detection_only() {
+        let adapters = default_agent_adapters();
+        let cursor = adapters.get("cursor").unwrap();
+
+        assert!(cursor.enabled);
+        assert!(cursor.process_names.iter().any(|name| name == "cursor"));
+        assert!(cursor.resume_command.is_none());
+        assert!(cursor.resume_latest_command.is_none());
+        assert!(cursor.attach_command.is_none());
+        assert!(cursor.detail_paths.is_none());
     }
 }
 
