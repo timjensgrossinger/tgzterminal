@@ -67,3 +67,15 @@ review_*.json
 /assets/flatpak/generated-sources.json
 /__pycache__/
 /nix/result
+
+# AI instruction files
+CLAUDE.md
+AGENTS.md
+GEMINI.md
+AIDER_CONVENTIONS.md
+CONVENTIONS.md
+.github/copilot-instructions.md
+.cursorrules
+.windsurfrules
+.clinerules
+.cline_rules
