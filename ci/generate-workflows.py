@@ -1066,6 +1066,7 @@ def generate_actions(namer, jobber, trigger, is_continuous, is_tag=False):
 {trigger_with_paths}
 jobs:
   build:
+    if: github.repository == 'wezterm/wezterm'
     runs-on: {yv(job.runs_on)}
     {container}
 """

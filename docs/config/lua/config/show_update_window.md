@@ -4,17 +4,8 @@ tags:
 ---
 # `show_update_window`
 
-When TGZTerminal checks for an update and detects a new version, this
-option controls whether a window is shown with information about the new
-available version and links to download/install it.
+**Deprecated — this option is a no-op and has no effect.**
 
-See [check_for_updates](check_for_updates.md) for more information on
-the automatic update checks.
-
-```lua
-config.show_update_window = false
-```
-
-{{since('nightly')}}
-
-This option no longer has any effect and will be removed in a future release.
+It is retained for configuration compatibility and will be removed in a future
+release. Use [check_for_updates](check_for_updates.md) to control whether the
+update checker runs at all.

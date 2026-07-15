@@ -22,6 +22,7 @@ use crate::termwindow::keyevent::{KeyTableArgs, KeyTableState};
 use crate::termwindow::modal::Modal;
 use crate::termwindow::render::paint::AllowImage;
 use crate::termwindow::render::sidebar::AgentDetectionCacheEntry;
+use config::AgentAdapterConfig;
 use crate::termwindow::render::{
     CachedLineState, LineQuadCacheKey, LineQuadCacheValue, LineToEleShapeCacheKey,
     LineToElementShapeItem,
@@ -455,6 +456,7 @@ pub struct TermWindow {
     sidebar_search: Option<SidebarSearchState>,
     agent_copy_menu: Option<AgentCopyMenuState>,
     agent_detection_cache: RefCell<HashMap<PaneId, AgentDetectionCacheEntry>>,
+    adapter_cache: RefCell<Option<(usize, Arc<Vec<(String, AgentAdapterConfig)>>)>>,
     sidebar_scroll_offset: usize,
     sidebar_drop_flash: Option<(usize, Instant)>,
     fancy_tab_bar: Option<box_model::ComputedElement>,
@@ -797,6 +799,7 @@ impl TermWindow {
             sidebar_search: None,
             agent_copy_menu: None,
             agent_detection_cache: RefCell::new(HashMap::new()),
+            adapter_cache: RefCell::new(None),
             sidebar_scroll_offset: 0,
             sidebar_drop_flash: None,
             fancy_tab_bar: None,

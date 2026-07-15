@@ -53,12 +53,66 @@ fn get_github_release_info(uri: &str) -> anyhow::Result<Release> {
 }
 
 pub fn get_latest_release_info() -> anyhow::Result<Release> {
-    get_github_release_info("https://api.github.com/repos/wezterm/wezterm/releases/latest")
+    get_github_release_info("https://api.github.com/repos/timjensgrossinger/tgzterminal/releases/latest")
 }
 
 #[allow(unused)]
 pub fn get_nightly_release_info() -> anyhow::Result<Release> {
-    get_github_release_info("https://api.github.com/repos/wezterm/wezterm/releases/tags/nightly")
+    get_github_release_info("https://api.github.com/repos/timjensgrossinger/tgzterminal/releases/tags/nightly")
+}
+
+/// Returns true if `latest_tag` represents a newer release than `current_tag`.
+///
+/// Handles the fork's `tgz-vYYYY.MM.patch` scheme correctly:
+/// strips `tgz-v` or `v` prefixes, splits on `.` and `-`, and compares
+/// components numerically where possible. A tag in upstream format
+/// (`20240203-…`) is never considered newer than a `tgz-v` build.
+pub fn release_tag_is_newer(latest_tag: &str, current_tag: &str) -> bool {
+    fn strip_prefix(tag: &str) -> &str {
+        tag.strip_prefix("tgz-v")
+            .or_else(|| tag.strip_prefix("v"))
+            .unwrap_or(tag)
+    }
+
+    let latest_stripped = strip_prefix(latest_tag);
+    let current_stripped = strip_prefix(current_tag);
+
+    // If one is tgz-v and the other is not, they are incomparable formats.
+    // Never report an upstream-format tag as an update for a tgz build.
+    let latest_is_tgz = latest_tag.starts_with("tgz-");
+    let current_is_tgz = current_tag.starts_with("tgz-");
+    if current_is_tgz && !latest_is_tgz {
+        return false;
+    }
+
+    let parse_parts = |s: &str| -> Vec<Option<u64>> {
+        s.split(|c| c == '.' || c == '-')
+            .map(|part| part.parse::<u64>().ok())
+            .collect()
+    };
+
+    let latest_parts = parse_parts(latest_stripped);
+    let current_parts = parse_parts(current_stripped);
+
+    let len = latest_parts.len().max(current_parts.len());
+    for i in 0..len {
+        let l = latest_parts.get(i).copied().flatten();
+        let c = current_parts.get(i).copied().flatten();
+        match (l, c) {
+            (Some(lv), Some(cv)) => {
+                if lv != cv {
+                    return lv > cv;
+                }
+            }
+            _ => {
+                // Fall back to lexicographic for non-numeric components
+                let ls = latest_stripped;
+                let cs = current_stripped;
+                return ls > cs;
+            }
+        }
+    }
+    false
 }
 
 lazy_static::lazy_static! {
@@ -79,7 +133,7 @@ pub fn load_last_release_info_and_set_banner() {
 
         let current = wezterm_version();
         let force_ui = std::env::var_os("WEZTERM_ALWAYS_SHOW_UPDATE_UI").is_some();
-        if latest.tag_name.as_str() <= current && !force_ui {
+        if !release_tag_is_newer(latest.tag_name.as_str(), current) && !force_ui {
             return;
         }
 
@@ -130,7 +184,7 @@ fn set_banner_from_release_info(latest: &Release) {
 
 fn schedule_set_banner_from_release_info(latest: &Release) {
     let current = wezterm_version();
-    if latest.tag_name.as_str() <= current {
+    if !release_tag_is_newer(latest.tag_name.as_str(), current) {
         return;
     }
     promise::spawn::spawn_into_main_thread({
@@ -181,7 +235,7 @@ fn update_checker() {
             if let Ok(latest) = get_latest_release_info() {
                 schedule_set_banner_from_release_info(&latest);
                 let current = wezterm_version();
-                if latest.tag_name.as_str() > current || force_ui {
+                if release_tag_is_newer(latest.tag_name.as_str(), current) || force_ui {
                     log::info!(
                         "latest release {} is newer than current build {}",
                         latest.tag_name,
@@ -228,5 +282,32 @@ pub fn start_update_checker() {
             .name("update_checker".into())
             .spawn(update_checker)
             .expect("failed to spawn update checker thread");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::release_tag_is_newer;
+
+    #[test]
+    fn tgz_patch_ordering() {
+        assert!(release_tag_is_newer("tgz-v2026.07.10", "tgz-v2026.07.2"));
+        assert!(!release_tag_is_newer("tgz-v2026.07.2", "tgz-v2026.07.10"));
+    }
+
+    #[test]
+    fn tgz_month_ordering() {
+        assert!(release_tag_is_newer("tgz-v2026.08.1", "tgz-v2026.07.10"));
+        assert!(!release_tag_is_newer("tgz-v2026.07.10", "tgz-v2026.08.1"));
+    }
+
+    #[test]
+    fn equal_is_not_newer() {
+        assert!(!release_tag_is_newer("tgz-v2026.07.2", "tgz-v2026.07.2"));
+    }
+
+    #[test]
+    fn upstream_tag_not_newer_than_tgz() {
+        assert!(!release_tag_is_newer("20240203-110809-5046fc22", "tgz-v2026.07.1"));
     }
 }

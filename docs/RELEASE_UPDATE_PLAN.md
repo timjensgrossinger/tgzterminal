@@ -19,7 +19,7 @@ parallel with them.
 ## Current Starting Point
 
 - Private preview branch; update story intentionally manual.
-- Upstream WezTerm CI exists in `.github/workflows` and mostly still works.
+- Upstream WezTerm CI exists in `.github/workflows`; the build jobs are gated behind `if: github.repository == 'wezterm/wezterm'` and do not run in this fork.
 - Fork-specific commits are few and concentrated (sidebar, agent UI, config).
 
 ## Distribution Targets
@@ -71,7 +71,7 @@ The fork tax is the long-term existential risk. Bound it:
      TGZ commit conflicts against which upstream change,
    - on success run the smoke suite below.
 3. Smoke suite (scripted, must pass before the rebase branch lands):
-   - `cargo check -p wezterm-gui -p config -p lua-api-crates`
+   - `cargo check -p wezterm-gui -p config -p wezterm-mux -p wezterm-term`
    - `cargo test -p config -p wezterm-gui`
    - launch, open shell pane, open Claude pane, verify badge + toolbelt
      render (manual checklist in `ci/SMOKE.md` until automated).

@@ -264,6 +264,23 @@ fn agent_pattern_matches(haystack: &str, pattern: &str) -> bool {
     }
 }
 
+/// Like `agent_pattern_matches` but assumes `haystack_lower` is already ASCII-lowercased,
+/// avoiding a redundant allocation inside `contains_case_insensitive`.
+fn agent_pattern_matches_pre_lowered(haystack_lower: &str, pattern: &str) -> bool {
+    let pattern = pattern.trim();
+    if pattern.len() > MAX_AGENT_PATTERN_LEN + 3 {
+        return false;
+    }
+    if let Some(regex) = pattern.strip_prefix("re:") {
+        // regex is built with case_insensitive(true), safe to pass pre-lowered text
+        cached_regex_matches(haystack_lower, regex)
+    } else {
+        // haystack is already lowercase; only lowercase the needle
+        !pattern.trim().is_empty()
+            && haystack_lower.contains(&pattern.to_ascii_lowercase())
+    }
+}
+
 fn adapter_patterns<'a>(
     adapter: Option<&'a AgentAdapterConfig>,
     field: PatternField,
@@ -1123,6 +1140,25 @@ impl AgentKind {
         })
     }
 
+    /// Like [`from_hint`] but also checks `merged_adapters` so user-configured
+    /// adapters are recognized in the explicit `agent.kind` user-var path.
+    fn from_hint_with_adapters(
+        hint: &str,
+        merged_adapters: &[(String, AgentAdapterConfig)],
+    ) -> Option<Self> {
+        let lower = basename(hint).to_ascii_lowercase();
+        merged_adapters.iter().find_map(|(id, adapter)| {
+            adapter
+                .process_names
+                .iter()
+                .any(|process| basename(process).eq_ignore_ascii_case(&lower))
+                .then(|| {
+                    Self::from_adapter_id(id)
+                        .unwrap_or_else(|| Self::Unknown(adapter_label(adapter, id)))
+                })
+        })
+    }
+
     fn from_user_var(hint: &str) -> Self {
         Self::from_hint(hint).unwrap_or_else(|| Self::Unknown(hint.trim().to_string()))
     }
@@ -1381,6 +1417,7 @@ pub(crate) struct AgentDetectionCacheEntry {
     key: AgentDetectionCacheKey,
     state: Option<AgentPaneState>,
     last_wait_notification: Option<Instant>,
+    detected_at: Instant,
 }
 
 trait AgentAdapter {
@@ -1442,7 +1479,7 @@ fn visible_agent_kind_hint(text: &str, adapter: Option<&AgentAdapterConfig>) -> 
     let lower = text.to_ascii_lowercase();
     adapter_patterns(adapter, PatternField::Visible)
         .into_iter()
-        .find(|pattern| agent_pattern_matches(&lower, pattern))
+        .find(|pattern| agent_pattern_matches_pre_lowered(&lower, pattern))
 }
 
 fn visible_agent_match_from_adapters(
@@ -1463,11 +1500,10 @@ fn visible_model_hint(text: &str, adapter: Option<&AgentAdapterConfig>) -> Optio
     let lower = text.to_ascii_lowercase();
     adapter_patterns(adapter, PatternField::Model)
         .into_iter()
-        .find(|pattern| agent_pattern_matches(&lower, pattern))
+        .find(|pattern| agent_pattern_matches_pre_lowered(&lower, pattern))
 }
 
 fn infer_agent_status_from_visible_text(text: &str) -> AgentStatus {
-    let mut saw_content = false;
     for line in text.lines().rev().take(20) {
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -1483,13 +1519,8 @@ fn infer_agent_status_from_visible_text(text: &str) -> AgentStatus {
         {
             return AgentStatus::WaitingForInput;
         }
-        saw_content = true;
     }
-    if saw_content {
-        AgentStatus::Unknown
-    } else {
-        AgentStatus::Unknown
-    }
+    AgentStatus::Unknown
 }
 
 fn should_load_visible_agent_text(
@@ -1717,14 +1748,10 @@ impl crate::TermWindow {
     }
 
     fn agent_adapter_enabled(&self, kind: &AgentKind) -> bool {
-        self.agent_adapter_config(kind)
+        let id = kind.config_key();
+        self.agent_adapter_config_by_id(id)
             .map(|adapter| adapter.enabled)
             .unwrap_or(true)
-    }
-
-    fn agent_adapter_config(&self, kind: &AgentKind) -> Option<&AgentAdapterConfig> {
-        kind.config_key()
-            .and_then(|key| self.config.agent_ui.adapters.get(key))
     }
 
     fn agent_adapter_config_by_id(&self, id: Option<&str>) -> Option<AgentAdapterConfig> {
@@ -1739,7 +1766,16 @@ impl crate::TermWindow {
         }
     }
 
-    fn merged_agent_adapters(&self) -> Vec<(String, AgentAdapterConfig)> {
+    fn merged_agent_adapters(&self) -> Arc<Vec<(String, AgentAdapterConfig)>> {
+        let gen = self.config.generation();
+        {
+            let cached = self.adapter_cache.borrow();
+            if let Some((cached_gen, ref adapters)) = *cached {
+                if cached_gen == gen {
+                    return Arc::clone(adapters);
+                }
+            }
+        }
         let mut adapters = Vec::new();
         for id in DEFAULT_AGENT_ADAPTER_IDS {
             if let Some(base) = built_in_agent_adapters().get(id) {
@@ -1758,24 +1794,9 @@ impl crate::TermWindow {
                 adapters.push((id.clone(), adapter.clone()));
             }
         }
-        adapters
-    }
-
-    fn process_agent_match(&self, process: Option<&str>) -> Option<(String, AgentKind)> {
-        let process = process.map(|process| basename(process).to_ascii_lowercase());
-        let process = process.as_deref()?;
-        self.merged_agent_adapters()
-            .into_iter()
-            .find_map(|(id, adapter)| {
-                if !adapter.enabled {
-                    return None;
-                }
-                adapter
-                    .process_names
-                    .iter()
-                    .any(|name| basename(name).eq_ignore_ascii_case(process))
-                    .then(|| (id.clone(), adapter_kind_from_id(&id, &adapter)))
-            })
+        let result = Arc::new(adapters);
+        *self.adapter_cache.borrow_mut() = Some((gen, Arc::clone(&result)));
+        result
     }
 
     fn configured_agent_match(
@@ -1786,7 +1807,7 @@ impl crate::TermWindow {
         let process = process.map(|process| basename(process).to_ascii_lowercase());
         let title = title.to_ascii_lowercase();
 
-        for (id, adapter) in self.merged_agent_adapters() {
+        for (id, adapter) in self.merged_agent_adapters().iter().cloned() {
             if !adapter.enabled {
                 continue;
             }
@@ -1849,7 +1870,7 @@ impl crate::TermWindow {
     }
 
     fn visible_agent_match(&self, text: &str) -> Option<(String, AgentKind)> {
-        visible_agent_match_from_adapters(text, self.merged_agent_adapters().into_iter())
+        visible_agent_match_from_adapters(text, self.merged_agent_adapters().iter().cloned())
     }
 
     fn relevant_agent_user_vars(vars: &HashMap<String, String>) -> Vec<(String, String)> {
@@ -1894,20 +1915,31 @@ impl crate::TermWindow {
             .as_ref()
             .and_then(|entry| entry.last_wait_notification);
 
+        // Fast path: if cheap fields are unchanged and the cache entry is fresh,
+        // skip all adapter merging, visible-text loading, and FS probing.
+        if let Some(entry) = previous_entry.as_ref() {
+            let k = &entry.key;
+            if k.foreground_process == cache_key.foreground_process
+                && k.pane_title == cache_key.pane_title
+                && k.relevant_user_vars == cache_key.relevant_user_vars
+                && k.viewport_top == cache_key.viewport_top
+                && k.viewport_rows == cache_key.viewport_rows
+                && entry.detected_at.elapsed() < Duration::from_millis(500)
+            {
+                return entry.state.clone();
+            }
+        }
+
         let explicit_adapter_id = user_var(&vars, "agent.adapter").map(str::to_ascii_lowercase);
         let explicit_kind = user_var(&vars, "agent.kind").map(|kind| {
-            let kind = AgentKind::from_user_var(kind);
+            let merged = self.merged_agent_adapters();
+            let resolved = AgentKind::from_hint_with_adapters(kind, &merged)
+                .unwrap_or_else(|| AgentKind::from_user_var(kind));
             let adapter_id = explicit_adapter_id
                 .clone()
-                .or_else(|| kind.config_key().map(ToString::to_string));
-            (adapter_id, kind)
+                .or_else(|| resolved.config_key().map(ToString::to_string));
+            (adapter_id, resolved)
         });
-        let process_kind = if self.config.agent_ui.detect_processes {
-            self.process_agent_match(foreground_process.as_deref())
-                .map(|(id, kind)| (Some(id), kind))
-        } else {
-            None
-        };
         let configured_kind = if self.config.agent_ui.detect_processes {
             self.configured_agent_match(foreground_process.as_deref(), &pane_title)
                 .map(|(id, kind)| (Some(id), kind))
@@ -1927,7 +1959,6 @@ impl crate::TermWindow {
         let explicit_status = user_var(&vars, "agent.status");
         let matched_without_visible = explicit_kind
             .as_ref()
-            .or(process_kind.as_ref())
             .or(title_kind.as_ref())
             .or(configured_kind.as_ref())
             .or(metadata_kind.as_ref())
@@ -1963,7 +1994,6 @@ impl crate::TermWindow {
             }
         }
         let trusted_controls = explicit_kind.is_some()
-            || process_kind.is_some()
             || title_kind.is_some()
             || configured_kind.is_some()
             || truthy_agent_var(&vars, "agent.enable_control_actions");
@@ -1974,7 +2004,6 @@ impl crate::TermWindow {
         );
 
         let Some((adapter_id, kind)) = explicit_kind
-            .or(process_kind)
             .or(title_kind)
             .or(configured_kind)
             .or(visible_kind)
@@ -1986,6 +2015,7 @@ impl crate::TermWindow {
                     key: cache_key,
                     state: None,
                     last_wait_notification: previous_wait_notification,
+                    detected_at: Instant::now(),
                 },
             );
             return None;
@@ -2003,6 +2033,7 @@ impl crate::TermWindow {
                     key: cache_key,
                     state: None,
                     last_wait_notification: previous_wait_notification,
+                    detected_at: Instant::now(),
                 },
             );
             return None;
@@ -2014,6 +2045,7 @@ impl crate::TermWindow {
                     key: cache_key,
                     state: None,
                     last_wait_notification: previous_wait_notification,
+                    detected_at: Instant::now(),
                 },
             );
             return None;
@@ -2072,15 +2104,16 @@ impl crate::TermWindow {
             Instant::now(),
         );
         if should_notify_waiting {
-            wezterm_toast_notification::show(wezterm_toast_notification::ToastNotification {
-                title: "Agent waiting".to_string(),
-                message: format!(
-                    "{} is waiting for input",
-                    state.as_ref().unwrap().kind.label()
-                ),
-                url: None,
-                timeout: Some(Duration::from_millis(2500)),
-            });
+            let label = state.as_ref().unwrap().kind.label().to_string();
+            promise::spawn::spawn_into_main_thread(async move {
+                wezterm_toast_notification::show(wezterm_toast_notification::ToastNotification {
+                    title: "Agent waiting".to_string(),
+                    message: format!("{} is waiting for input", label),
+                    url: None,
+                    timeout: Some(Duration::from_millis(2500)),
+                });
+            })
+            .detach();
         }
         self.agent_detection_cache.borrow_mut().insert(
             pane.pane_id(),
@@ -2088,6 +2121,7 @@ impl crate::TermWindow {
                 key: cache_key,
                 state: state.clone(),
                 last_wait_notification,
+                detected_at: Instant::now(),
             },
         );
         state
@@ -2795,6 +2829,7 @@ impl crate::TermWindow {
         if !self.config.agent_ui.enabled || !self.config.agent_ui.show_pane_toolbelt {
             return Ok(());
         }
+        self.prune_agent_detection_cache();
         let Some(agent) = self.detect_agent_pane(&pos.pane) else {
             return Ok(());
         };
