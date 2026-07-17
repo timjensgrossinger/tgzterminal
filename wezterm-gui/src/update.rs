@@ -53,12 +53,16 @@ fn get_github_release_info(uri: &str) -> anyhow::Result<Release> {
 }
 
 pub fn get_latest_release_info() -> anyhow::Result<Release> {
-    get_github_release_info("https://api.github.com/repos/timjensgrossinger/tgzterminal/releases/latest")
+    get_github_release_info(
+        "https://api.github.com/repos/timjensgrossinger/tgzterminal/releases/latest",
+    )
 }
 
 #[allow(unused)]
 pub fn get_nightly_release_info() -> anyhow::Result<Release> {
-    get_github_release_info("https://api.github.com/repos/timjensgrossinger/tgzterminal/releases/tags/nightly")
+    get_github_release_info(
+        "https://api.github.com/repos/timjensgrossinger/tgzterminal/releases/tags/nightly",
+    )
 }
 
 /// Returns true if `latest_tag` represents a newer release than `current_tag`.
@@ -308,6 +312,9 @@ mod tests {
 
     #[test]
     fn upstream_tag_not_newer_than_tgz() {
-        assert!(!release_tag_is_newer("20240203-110809-5046fc22", "tgz-v2026.07.1"));
+        assert!(!release_tag_is_newer(
+            "20240203-110809-5046fc22",
+            "tgz-v2026.07.1"
+        ));
     }
 }

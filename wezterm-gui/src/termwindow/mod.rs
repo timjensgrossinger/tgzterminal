@@ -22,7 +22,6 @@ use crate::termwindow::keyevent::{KeyTableArgs, KeyTableState};
 use crate::termwindow::modal::Modal;
 use crate::termwindow::render::paint::AllowImage;
 use crate::termwindow::render::sidebar::AgentDetectionCacheEntry;
-use config::AgentAdapterConfig;
 use crate::termwindow::render::{
     CachedLineState, LineQuadCacheKey, LineQuadCacheValue, LineToEleShapeCacheKey,
     LineToElementShapeItem,
@@ -37,8 +36,8 @@ use config::keyassignment::{
 };
 use config::window::WindowLevel;
 use config::{
-    configuration, AudibleBell, ConfigHandle, Dimension, DimensionContext, FrontEndSelection,
-    GeometryOrigin, GuiPosition, TermConfig, WindowCloseConfirmation,
+    configuration, AgentAdapterConfig, AudibleBell, ConfigHandle, Dimension, DimensionContext,
+    FrontEndSelection, GeometryOrigin, GuiPosition, TermConfig, WindowCloseConfirmation,
 };
 use lfucache::*;
 use mlua::{FromLua, LuaSerdeExt, UserData, UserDataFields};
@@ -2672,52 +2671,214 @@ impl TermWindow {
             .and_then(|url| url.to_file_path().ok())
     }
 
-    fn file_browser_remote_context(
-        &self,
-        pane: &Arc<dyn Pane>,
-    ) -> Option<RemoteFileBrowserContext> {
-        let url = pane.get_current_working_dir(CachePolicy::AllowStale)?;
-        if url.to_file_path().is_ok() {
-            return None;
-        }
-        let host = url.host_str()?.to_string();
-        let path = percent_decode_str(url.path())
-            .decode_utf8()
-            .ok()?
-            .into_owned();
-        if path.is_empty() {
+    fn parse_ssh_destination_from_argv(argv: &[String]) -> Option<(String, Option<u16>)> {
+        if !Self::is_ssh_client_argv(argv) {
             return None;
         }
 
-        match url.scheme() {
-            "ssh" => {
-                let destination = if url.username().is_empty() {
-                    host
-                } else {
-                    format!("{}@{}", url.username(), host)
-                };
-                Some(RemoteFileBrowserContext {
-                    destination,
-                    port: url.port(),
-                    path,
-                })
+        let is_mosh = argv.first().is_some_and(|arg| {
+            Path::new(arg)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.eq_ignore_ascii_case("mosh"))
+        });
+        let mut iter = argv.iter().skip(1);
+        let mut port: Option<u16> = None;
+        let mut user: Option<String> = None;
+        let mut after_options = false;
+        while let Some(arg) = iter.next() {
+            if after_options {
+                if arg.is_empty() {
+                    return None;
+                }
+                return Some((
+                    if let Some(user) = user {
+                        format!("{user}@{arg}")
+                    } else {
+                        arg.clone()
+                    },
+                    port,
+                ));
             }
-            "file" => Some(RemoteFileBrowserContext {
-                destination: host,
-                port: None,
-                path,
-            }),
-            _ => None,
+            if arg == "--" {
+                after_options = true;
+                continue;
+            }
+            if arg == "-p" {
+                if let Some(p) = iter.next() {
+                    if !is_mosh {
+                        if let Ok(n) = p.parse::<u16>() {
+                            port = Some(n);
+                        }
+                    }
+                    continue;
+                }
+            }
+            if arg.starts_with("-p") && arg.len() > 2 {
+                if !is_mosh {
+                    if let Ok(n) = arg[2..].parse::<u16>() {
+                        port = Some(n);
+                    }
+                }
+                continue;
+            }
+            if arg == "-l" {
+                user = iter.next().filter(|user| !user.is_empty()).cloned();
+                continue;
+            }
+            if let Some(value) = arg.strip_prefix("-l") {
+                if !value.is_empty() {
+                    user = Some(value.to_string());
+                    continue;
+                }
+            }
+            if arg.starts_with("-o") {
+                let rest = if arg == "-o" {
+                    iter.next().map(String::as_str).unwrap_or_default()
+                } else {
+                    &arg[2..]
+                };
+                if let Some((key, value)) = rest.split_once('=') {
+                    match key.trim().to_ascii_lowercase().as_str() {
+                        "port" => {
+                            if let Ok(n) = value.trim().parse::<u16>() {
+                                port = Some(n);
+                            }
+                        }
+                        "user" if !value.trim().is_empty() => {
+                            user = Some(value.trim().to_string());
+                        }
+                        _ => {}
+                    }
+                }
+                continue;
+            }
+            if arg.starts_with('-') {
+                if matches!(
+                    arg.as_str(),
+                    "-B" | "-c"
+                        | "-D"
+                        | "-E"
+                        | "-F"
+                        | "-I"
+                        | "-i"
+                        | "-J"
+                        | "-L"
+                        | "-m"
+                        | "-O"
+                        | "-Q"
+                        | "-R"
+                        | "-S"
+                        | "-W"
+                        | "-w"
+                ) {
+                    iter.next();
+                }
+                continue;
+            }
+            return Some((
+                if let Some(user) = user {
+                    format!("{user}@{arg}")
+                } else {
+                    arg.clone()
+                },
+                port,
+            ));
         }
+        None
+    }
+
+    fn is_ssh_client_argv(argv: &[String]) -> bool {
+        let Some(executable) = argv
+            .first()
+            .and_then(|arg| Path::new(arg).file_name())
+            .and_then(|name| name.to_str())
+        else {
+            return false;
+        };
+        matches!(executable.to_ascii_lowercase().as_str(), "ssh" | "mosh")
+    }
+
+    fn file_browser_remote_context(
+        &self,
+        pane: &Arc<dyn Pane>,
+    ) -> (Option<RemoteFileBrowserContext>, bool) {
+        let working_dir_url = pane.get_current_working_dir(CachePolicy::AllowStale);
+        let working_dir_path = working_dir_url.as_ref().and_then(|url| {
+            percent_decode_str(url.path())
+                .decode_utf8()
+                .ok()
+                .map(|path| path.into_owned())
+                .filter(|path| !path.is_empty())
+        });
+
+        let mut pane_looks_remote = false;
+        if let Some(url) = working_dir_url.as_ref() {
+            if url.scheme() == "ssh" {
+                pane_looks_remote = true;
+                if let Some(host) = url.host_str().filter(|host| !host.is_empty()) {
+                    let destination = if url.username().is_empty() {
+                        host.to_string()
+                    } else {
+                        format!("{}@{}", url.username(), host)
+                    };
+                    return (
+                        Some(RemoteFileBrowserContext {
+                            destination,
+                            port: url.port(),
+                            path: working_dir_path.clone().unwrap_or_else(|| "~".to_string()),
+                        }),
+                        pane_looks_remote,
+                    );
+                }
+            }
+        }
+
+        if let Some(info) = pane.get_foreground_process_info(CachePolicy::AllowStale) {
+            if Self::is_ssh_client_argv(&info.argv) {
+                pane_looks_remote = true;
+                if let Some((destination, port)) = Self::parse_ssh_destination_from_argv(&info.argv)
+                {
+                    return (
+                        Some(RemoteFileBrowserContext {
+                            destination,
+                            port,
+                            path: working_dir_path.unwrap_or_else(|| "~".to_string()),
+                        }),
+                        pane_looks_remote,
+                    );
+                }
+            }
+        }
+
+        let mux = Mux::get();
+        if let Some(domain) = mux.get_domain(pane.domain_id()) {
+            if let Some(ssh_dom) = domain.downcast_ref::<mux::ssh::RemoteSshDomain>() {
+                pane_looks_remote = true;
+                if let Some(descriptor) = ssh_dom.ssh_connection_descriptor() {
+                    return (
+                        Some(RemoteFileBrowserContext {
+                            destination: descriptor.destination,
+                            port: descriptor.port,
+                            path: working_dir_path.unwrap_or_else(|| "~".to_string()),
+                        }),
+                        pane_looks_remote,
+                    );
+                }
+            }
+        }
+
+        (None, pane_looks_remote)
     }
 
     fn file_browser_script(&self) -> String {
         r#"set -e
+umask 077
 printf '\033]0;Worktree\007'
 printf '\033]1337;SetUserVar=tgzterminal.worktree=MQ==\007'
 
 tmp="${TMPDIR:-/tmp}/tgzterminal-worktree.$$"
-trap 'rm -f "$tmp"' EXIT
+trap 'rm -f "$tmp" "$tmp".*' EXIT
 target_pane="${TGZTERMINAL_TARGET_PANE:-}"
 wezterm_bin="${TGZTERMINAL_BIN:-tgzterminal}"
 editor_cmd="${TGZTERMINAL_EDITOR_COMMAND:-${VISUAL:-${EDITOR:-vim}}}"
@@ -2726,6 +2887,8 @@ remote_port="${TGZTERMINAL_REMOTE_PORT:-}"
 remote_cwd="${TGZTERMINAL_REMOTE_CWD:-}"
 cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/tgzterminal"
 mkdir -p "$cache_dir" 2>/dev/null || true
+connection_key=$(printf '%s:%s' "$remote_dest" "$remote_port" | cksum | awk '{ print $1 }')
+control_path="$cache_dir/worktree-connection-$connection_key.sock"
 
 quote_path() {
   printf "'"
@@ -2738,48 +2901,101 @@ is_remote() {
 }
 
 ssh_remote() {
+  # Reuse one short-lived control socket for all remote checks and actions.
   if [ -n "$remote_port" ]; then
-    ssh -p "$remote_port" "$remote_dest" "$@"
+    ssh -o ControlMaster=auto -o ControlPersist=600s -o ControlPath="$control_path" -o ConnectTimeout=5 -p "$remote_port" "$remote_dest" "$@"
   else
-    ssh "$remote_dest" "$@"
+    ssh -o ControlMaster=auto -o ControlPersist=600s -o ControlPath="$control_path" -o ConnectTimeout=5 "$remote_dest" "$@"
   fi
 }
 
 remote_eval() {
-  ssh_remote "$1"
+  # Quote the complete command once so paths containing shell metacharacters
+  # cannot change the remote command structure.
+  ssh_remote "sh -lc $(quote_path "$1")"
 }
 
-path_mtime() {
+# Awk formatters below run on ALREADY-FETCHED raw listing data so the same
+# formatting works for both the local path and the single remote round trip.
+format_git_index() {
+  awk -v root="$root" '
+      function base(path, parts, n) {
+        n = split(path, parts, "/")
+        return parts[n]
+      }
+      function indent(depth, s, i) {
+        s = ""
+        for (i = 0; i < depth; i++) {
+          s = s "  "
+        }
+        return s
+      }
+      function emit_dir(rel, depth, abs, label) {
+        if (rel == "" || seen_dir[rel]++) {
+          return
+        }
+        abs = root "/" rel
+        label = indent(depth) base(rel) "/"
+        print label "\t" abs "\td"
+      }
+      BEGIN {
+        print base(root) "/\t" root "\td"
+      }
+      {
+        file = $0
+        if (file == "") {
+          next
+        }
+        n = split(file, parts, "/")
+        rel = ""
+        for (i = 1; i < n; i++) {
+          rel = rel == "" ? parts[i] : rel "/" parts[i]
+          emit_dir(rel, i - 1)
+        }
+        print indent(n - 1) parts[n] "\t" root "/" file "\tf"
+      }
+    ' \
+    | sort -t "$(printf '\t')" -k2,2 -k3,3 -u
+}
+
+format_find_index() {
+  awk -F '\t' -v root="$root" '
+      function base(path, parts, n) {
+        n = split(path, parts, "/")
+        return parts[n]
+      }
+      function indent(depth, s, i) {
+        s = ""
+        for (i = 0; i < depth; i++) {
+          s = s "  "
+        }
+        return s
+      }
+      {
+        kind = $1
+        path = $2
+        rel = path
+        sub("^" root "/?", "", rel)
+        if (path == root || rel == "") {
+          print base(root) "/\t" root "\td"
+        } else {
+          depth = split(rel, parts, "/") - 1
+          suffix = kind == "d" ? "/" : ""
+          print indent(depth) parts[depth + 1] suffix "\t" path "\t" kind
+        }
+      }
+    ' \
+    | sort -t "$(printf '\t')" -k2,2 -k3,3 -u
+}
+
+# --- Local-only stamp helpers (the remote side computes its stamp itself). ---
+local_path_mtime() {
   path="$1"
-  quoted=$(quote_path "$path")
-  if is_remote; then
-    remote_eval "stat -c %Y -- $quoted 2>/dev/null || stat -f %m -- $quoted 2>/dev/null || printf 0"
-  else
-    stat -f %m "$path" 2>/dev/null || stat -c %Y "$path" 2>/dev/null || printf 0
-  fi
+  stat -f %m "$path" 2>/dev/null || stat -c %Y "$path" 2>/dev/null || printf 0
 }
 
-if is_remote; then
-  start_dir="${remote_cwd:-.}"
-  quoted_start=$(quote_path "$start_dir")
-  root=$(remote_eval "cd -- $quoted_start 2>/dev/null && (git rev-parse --show-toplevel 2>/dev/null || pwd -P)" 2>/dev/null | sed -n '1p')
-  [ -n "$root" ] || root="$start_dir"
-else
-  root=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
-  root=$(cd "$root" 2>/dev/null && pwd -P || pwd)
-fi
-
-cache_key=$(printf '%s:%s' "$remote_dest" "$root" | cksum | awk '{ print $1 }')
-cache_file="$cache_dir/worktree-$cache_key.tsv"
-stamp_file="$cache_dir/worktree-$cache_key.stamp"
-
-git_index_path() {
-  quoted_root=$(quote_path "$root")
-  if is_remote; then
-    git_dir=$(remote_eval "git -C $quoted_root rev-parse --git-dir 2>/dev/null" || true)
-  else
-    git_dir=$(git -C "$root" rev-parse --git-dir 2>/dev/null || true)
-  fi
+local_git_index_path() {
+  git_dir=$(git -C "$root" rev-parse --git-dir 2>/dev/null || true)
   case "$git_dir" in
     '') return 1 ;;
     /*) printf '%s/index\n' "$git_dir" ;;
@@ -2787,128 +3003,206 @@ git_index_path() {
   esac
 }
 
-cache_stamp() {
-  quoted_root=$(quote_path "$root")
-  if is_remote; then
-    git_head=$(remote_eval "git -C $quoted_root rev-parse HEAD 2>/dev/null" || printf 'nogit')
-  else
-    git_head=$(git -C "$root" rev-parse HEAD 2>/dev/null || printf 'nogit')
-  fi
-  git_index=$(git_index_path || true)
-  index_mtime=$(path_mtime "$git_index")
-  root_mtime=$(path_mtime "$root")
+local_stamp() {
+  git_head=$(git -C "$root" rev-parse HEAD 2>/dev/null || printf 'nogit')
+  git_index=$(local_git_index_path || true)
+  index_mtime=$(local_path_mtime "$git_index")
+  root_mtime=$(local_path_mtime "$root")
   printf '%s:%s:%s:%s\n' "$root" "$git_head" "$index_mtime" "$root_mtime"
 }
 
-build_git_index() {
-  quoted_root=$(quote_path "$root")
-  if is_remote; then
-    remote_eval "git -C $quoted_root ls-files -z --cached --others --exclude-standard 2>/dev/null"
-  else
-    git -C "$root" ls-files -z --cached --others --exclude-standard 2>/dev/null
-  fi \
-    | tr '\0' '\n' \
-    | awk -v root="$root" '
-        function base(path, parts, n) {
-          n = split(path, parts, "/")
-          return parts[n]
-        }
-        function indent(depth, s, i) {
-          s = ""
-          for (i = 0; i < depth; i++) {
-            s = s "  "
-          }
-          return s
-        }
-        function emit_dir(rel, depth, abs, label) {
-          if (rel == "" || seen_dir[rel]++) {
-            return
-          }
-          abs = root "/" rel
-          label = indent(depth) base(rel) "/"
-          print label "\t" abs "\td"
-        }
-        BEGIN {
-          print base(root) "/\t" root "\td"
-        }
-        {
-          file = $0
-          if (file == "") {
-            next
-          }
-          n = split(file, parts, "/")
-          rel = ""
-          for (i = 1; i < n; i++) {
-            rel = rel == "" ? parts[i] : rel "/" parts[i]
-            emit_dir(rel, i - 1)
-          }
-          print indent(n - 1) parts[n] "\t" root "/" file "\tf"
-        }
-      ' \
-    | sort -t "$(printf '\t')" -k2,2 -k3,3 -u
+# --- Single remote round trip -------------------------------------------------
+# One remote program resolves the git/work-tree root, computes the cache stamp,
+# and (for a full fetch) emits the raw listing. Sections are delimited by
+# sentinel lines parsed locally: __TGZ_ROOT__, __TGZ_STAMP__, and either
+# __TGZ_LIST_GIT__ or __TGZ_LIST_FIND__. The whole program is passed as a single
+# quoted `sh -lc` argument (see remote_eval), so paths stay safe.
+# The program bodies are written to temp files via file-redirect heredocs.
+# (A here-doc INSIDE $(...) is miscompiled by bash 3.2, still the /bin/sh on
+# macOS, so we avoid that construct entirely.)
+meta_prog="$tmp.metaprog"
+list_prog="$tmp.listprog"
+cat > "$meta_prog" <<'REMOTE_META'
+root=$(git rev-parse --show-toplevel 2>/dev/null || pwd -P)
+cd -- "$root" 2>/dev/null || true
+head=$(git rev-parse HEAD 2>/dev/null || printf 'nogit')
+gitdir=$(git rev-parse --git-dir 2>/dev/null || true)
+case "$gitdir" in
+  '') index='' ;;
+  /*) index="$gitdir/index" ;;
+  *) index="$root/$gitdir/index" ;;
+esac
+imt=$(stat -c %Y "$index" 2>/dev/null || stat -f %m "$index" 2>/dev/null || printf 0)
+rmt=$(stat -c %Y "$root" 2>/dev/null || stat -f %m "$root" 2>/dev/null || printf 0)
+printf '__TGZ_ROOT__\n%s\n' "$root"
+printf '__TGZ_STAMP__\n%s:%s:%s:%s\n' "$root" "$head" "$imt" "$rmt"
+REMOTE_META
+cat > "$list_prog" <<'REMOTE_LIST'
+if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  printf '__TGZ_LIST_GIT__\n'
+  git ls-files -z --cached --others --exclude-standard 2>/dev/null | tr '\0' '\n'
+else
+  printf '__TGZ_LIST_FIND__\n'
+  find "$root" -maxdepth 4 \( -name .git -o -name target -o -name node_modules -o -name .venv -o -name .pytest_cache -o -name .ruff_cache -o -name Library -o -name .cache -o -name .Trash -o -name .npm -o -name .cargo -o -name .rustup -o -name .gradle -o -name .m2 \) -prune -o \( -type d -o -type f \) -exec sh -c 'for path do if [ -d "$path" ]; then printf "d\t%s\n" "$path"; else printf "f\t%s\n" "$path"; fi; done' sh {} + 2>/dev/null
+fi
+REMOTE_LIST
+
+remote_probe() {
+  # $1 = stamp|full. One ssh exec over the persisted control socket.
+  quoted_start=$(quote_path "$start_dir")
+  {
+    printf 'cd -- %s 2>/dev/null || exit 1\n' "$quoted_start"
+    cat "$meta_prog"
+    if [ "$1" = full ]; then
+      cat "$list_prog"
+    fi
+  } > "$tmp.prog"
+  remote_eval "$(cat "$tmp.prog")"
 }
 
-build_find_index() {
-  quoted_root=$(quote_path "$root")
-  find_script="find $quoted_root -maxdepth 4 \\( -name .git -o -name target -o -name node_modules -o -name .venv -o -name .pytest_cache -o -name .ruff_cache \\) -prune -o \\( -type d -o -type f \\) -exec sh -c 'for path do if [ -d \"\$path\" ]; then printf \"d\\t%s\\n\" \"\$path\"; else printf \"f\\t%s\\n\" \"\$path\"; fi; done' sh {} +"
-  if is_remote; then
-    remote_eval "$find_script" 2>/dev/null
-  else
-    eval "$find_script" 2>/dev/null
-  fi \
-    | awk -F '\t' -v root="$root" '
-        function base(path, parts, n) {
-          n = split(path, parts, "/")
-          return parts[n]
-        }
-        function indent(depth, s, i) {
-          s = ""
-          for (i = 0; i < depth; i++) {
-            s = s "  "
-          }
-          return s
-        }
-        {
-          kind = $1
-          path = $2
-          rel = path
-          sub("^" root "/?", "", rel)
-          if (path == root || rel == "") {
-            print base(root) "/\t" root "\td"
-          } else {
-            depth = split(rel, parts, "/") - 1
-            suffix = kind == "d" ? "/" : ""
-            print indent(depth) parts[depth + 1] suffix "\t" path "\t" kind
-          }
-        }
-      ' \
-    | sort -t "$(printf '\t')" -k2,2 -k3,3 -u
+set_cache_paths() {
+  cache_key=$(printf '%s:%s:%s' "$remote_dest" "$remote_port" "$root" | cksum | awk '{ print $1 }')
+  cache_file="$cache_dir/worktree-$cache_key.tsv"
+  stamp_file="$cache_dir/worktree-$cache_key.stamp"
+  check_file="$cache_dir/worktree-$cache_key.checked"
 }
 
-build_list() {
-  stamp=$(cache_stamp)
-  if [ -r "$cache_file" ] && [ -r "$stamp_file" ] && [ "$(cat "$stamp_file" 2>/dev/null)" = "$stamp" ]; then
+parse_probe_meta() {
+  root=$(awk '/^__TGZ_ROOT__$/ { getline; print; exit }' "$1")
+  stamp=$(awk '/^__TGZ_STAMP__$/ { getline; print; exit }' "$1")
+  [ -n "$root" ] || root="${remote_cwd:-.}"
+  set_cache_paths
+  # Persist the resolved root per connection so the cache key is known before
+  # any ssh call on the next open (enables the zero-exec instant first paint).
+  printf '%s\n' "$root" > "$root_hint_file" 2>/dev/null || true
+}
+
+build_from_probe() {
+  probe="$1"
+  next_tmp="$tmp.next"
+  raw="$tmp.raw"
+  if grep -q '^__TGZ_LIST_GIT__$' "$probe"; then
+    awk 'f { print } /^__TGZ_LIST_GIT__$/ { f = 1 }' "$probe" > "$raw"
+    format_git_index < "$raw" > "$next_tmp" || {
+      rm -f "$raw" "$next_tmp"
+      return 1
+    }
+  elif grep -q '^__TGZ_LIST_FIND__$' "$probe"; then
+    awk 'f { print } /^__TGZ_LIST_FIND__$/ { f = 1 }' "$probe" > "$raw"
+    format_find_index < "$raw" > "$next_tmp" || {
+      rm -f "$raw" "$next_tmp"
+      return 1
+    }
+  else
+    rm -f "$raw"
+    return 1
+  fi
+  rm -f "$raw"
+  mv "$next_tmp" "$tmp"
+  cp "$tmp" "$cache_file" 2>/dev/null || true
+  printf '%s\n' "$stamp" > "$stamp_file" 2>/dev/null || true
+}
+
+build_list_remote() {
+  now=$(date +%s)
+  probe="$tmp.probe"
+  if [ -n "${cache_file:-}" ] && [ -s "$cache_file" ] && [ -r "$stamp_file" ]; then
+    # Warm path: a lightweight stamp-only probe; reuse the cache if unchanged.
+    remote_probe stamp > "$probe" 2>/dev/null || {
+      rm -f "$probe"
+      printf 'Unable to connect to %s.\n' "$remote_dest" >&2
+      return 1
+    }
+    parse_probe_meta "$probe"
+    printf '%s\n' "$now" > "$check_file" 2>/dev/null || true
+    if [ -s "$cache_file" ] && [ "$(cat "$stamp_file" 2>/dev/null)" = "$stamp" ]; then
+      rm -f "$probe"
+      cp "$cache_file" "$tmp" 2>/dev/null && return 0
+    fi
+    rm -f "$probe"
+  fi
+
+  # Cold or changed: one full exec returns root + stamp + raw list together.
+  remote_probe full > "$probe" 2>/dev/null || {
+    rm -f "$probe"
+    printf 'Unable to connect to %s.\n' "$remote_dest" >&2
+    return 1
+  }
+  parse_probe_meta "$probe"
+  printf '%s\n' "$now" > "$check_file" 2>/dev/null || true
+  build_from_probe "$probe" || {
+    rm -f "$probe"
+    return 1
+  }
+  rm -f "$probe"
+}
+
+build_list_local() {
+  now=$(date +%s)
+  stamp=$(local_stamp) || return 1
+  printf '%s\n' "$now" > "$check_file" 2>/dev/null || true
+  if [ -s "$cache_file" ] && [ -r "$stamp_file" ] && [ "$(cat "$stamp_file" 2>/dev/null)" = "$stamp" ]; then
     cp "$cache_file" "$tmp" 2>/dev/null && return 0
   fi
 
   next_tmp="$tmp.next"
   quoted_root=$(quote_path "$root")
-  if is_remote; then
-    if remote_eval "git -C $quoted_root rev-parse --is-inside-work-tree >/dev/null 2>&1"; then
-      build_git_index > "$next_tmp"
-    else
-      build_find_index > "$next_tmp"
-    fi
-  elif git -C "$root" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    build_git_index > "$next_tmp"
+  find_script="find $quoted_root -maxdepth 4 \\( -name .git -o -name target -o -name node_modules -o -name .venv -o -name .pytest_cache -o -name .ruff_cache -o -name Library -o -name .cache -o -name .Trash -o -name .npm -o -name .cargo -o -name .rustup -o -name .gradle -o -name .m2 \\) -prune -o \\( -type d -o -type f \\) -exec sh -c 'for path do if [ -d \"\$path\" ]; then printf \"d\\t%s\\n\" \"\$path\"; else printf \"f\\t%s\\n\" \"\$path\"; fi; done' sh {} +"
+  if git -C "$root" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    git -C "$root" ls-files -z --cached --others --exclude-standard 2>/dev/null \
+      | tr '\0' '\n' \
+      | format_git_index > "$next_tmp" || {
+      rm -f "$next_tmp"
+      return 1
+    }
   else
-    build_find_index > "$next_tmp"
+    eval "$find_script" 2>/dev/null | format_find_index > "$next_tmp" || {
+      rm -f "$next_tmp"
+      return 1
+    }
   fi
 
   mv "$next_tmp" "$tmp"
   cp "$tmp" "$cache_file" 2>/dev/null || true
   printf '%s\n' "$stamp" > "$stamp_file" 2>/dev/null || true
 }
+
+build_list() {
+  now=$(date +%s)
+  # Throttle revalidation: reuse the cache when checked within the last 2s.
+  if [ -n "${cache_file:-}" ] && [ -r "$cache_file" ] && [ -r "$check_file" ]; then
+    checked=$(cat "$check_file" 2>/dev/null || printf 0)
+    case "$checked" in
+      ''|*[!0-9]*) checked=0 ;;
+    esac
+    if [ "$now" -le $((checked + 2)) ]; then
+      cp "$cache_file" "$tmp" 2>/dev/null && return 0
+    fi
+  fi
+
+  if is_remote; then
+    build_list_remote
+  else
+    build_list_local
+  fi
+}
+
+# Resolve cache paths up front WITHOUT any ssh so a cached list can paint
+# instantly. For remote we reuse the root resolved by a previous open.
+if is_remote; then
+  start_dir="${remote_cwd:-.}"
+  root_hint_file="$cache_dir/worktree-connection-$connection_key.root"
+  if [ -r "$root_hint_file" ]; then
+    root=$(sed -n '1p' "$root_hint_file")
+  fi
+  if [ -n "${root:-}" ]; then
+    set_cache_paths
+  fi
+else
+  root=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+  root=$(cd "$root" 2>/dev/null && pwd -P || pwd)
+  set_cache_paths
+fi
 
 path_is_dir() {
   selection="$1"
@@ -2944,10 +3238,22 @@ open_file() {
   selection="$1"
   [ -n "$target_pane" ] || return 0
   path_is_file "$selection" || return 0
-  dir=$(dirname "$selection")
   quoted=$(quote_path "$selection")
-  "$wezterm_bin" cli split-pane --pane-id "$target_pane" --right --percent 50 --cwd "$dir" -- \
-    sh -lc "printf '\033]0;Editor\007'; $editor_cmd $quoted" >/dev/null 2>&1 || return 0
+  if is_remote; then
+    # Run the editor ON the remote host over the persisted control socket so
+    # the selected path resolves remotely rather than on the local machine.
+    if [ -n "$remote_port" ]; then
+      "$wezterm_bin" cli split-pane --pane-id "$target_pane" --right --percent 50 -- \
+        ssh -t -o ControlMaster=auto -o ControlPersist=600s -o ControlPath="$control_path" -o ConnectTimeout=5 -p "$remote_port" "$remote_dest" "$editor_cmd $quoted" >/dev/null 2>&1 || return 0
+    else
+      "$wezterm_bin" cli split-pane --pane-id "$target_pane" --right --percent 50 -- \
+        ssh -t -o ControlMaster=auto -o ControlPersist=600s -o ControlPath="$control_path" -o ConnectTimeout=5 "$remote_dest" "$editor_cmd $quoted" >/dev/null 2>&1 || return 0
+    fi
+  else
+    dir=$(dirname "$selection")
+    "$wezterm_bin" cli split-pane --pane-id "$target_pane" --right --percent 50 --cwd "$dir" -- \
+      sh -lc "printf '\033]0;Editor\007'; $editor_cmd $quoted" >/dev/null 2>&1 || return 0
+  fi
 }
 
 close_worktree() {
@@ -2957,18 +3263,37 @@ close_worktree() {
   exit 0
 }
 
-build_list
+# Instant first paint: if a cached list already exists for this connection and
+# root, show it immediately with ZERO ssh execs, then revalidate on the next
+# loop iteration.
+instant_paint=0
+if [ -n "${cache_file:-}" ] && [ -s "$cache_file" ] && cp "$cache_file" "$tmp" 2>/dev/null; then
+  instant_paint=1
+fi
+
+skip_build=$instant_paint
 while :; do
+  if [ "$skip_build" -eq 1 ]; then
+    skip_build=0
+  else
+    if is_remote && [ ! -s "$tmp" ]; then
+      # Never leave the pane blank while ssh authenticates on a cold open.
+      printf 'Connecting to %s...\n' "$remote_dest"
+    fi
+    if ! build_list; then
+      printf 'Unable to read %s.\n' "${root:-$remote_dest}" >&2
+      sleep 2
+    fi
+  fi
+
   if [ ! -s "$tmp" ]; then
     printf 'No folders found.\n'
     sleep 2
-    build_list
     continue
   fi
 
   if command -v fzf >/dev/null 2>&1; then
-    selection_line=$(fzf --height=100% --layout=reverse --no-sort --cycle --prompt='Worktree > ' --pointer='>' --marker='+' --border=none --bind="q:execute-silent($wezterm_bin cli kill-pane --pane-id ${WEZTERM_PANE:-})+abort,ctrl-r:execute-silent(rm -f $cache_file $stamp_file)+abort" --color='bg:-1,bg+:#444444,fg:#b8b8b8,fg+:#eeeeee,hl:#d86f8f,hl+:#f18fb0,pointer:#d86f8f,prompt:#8fb4d8,spinner:#d86f8f,info:#d8c06f,border:#555555' --delimiter="$(printf '\t')" --with-nth=1 < "$tmp") || {
-      build_list
+    selection_line=$(fzf --height=100% --layout=reverse --no-sort --cycle --prompt='Worktree > ' --pointer='>' --marker='+' --border=none --bind="q:execute-silent($wezterm_bin cli kill-pane --pane-id ${WEZTERM_PANE:-})+abort,ctrl-r:execute-silent(rm -f $cache_file $stamp_file $check_file)+abort" --color='bg:-1,bg+:#444444,fg:#b8b8b8,fg+:#eeeeee,hl:#d86f8f,hl+:#f18fb0,pointer:#d86f8f,prompt:#8fb4d8,spinner:#d86f8f,info:#d8c06f,border:#555555' --delimiter="$(printf '\t')" --with-nth=1 < "$tmp") || {
       continue
     }
   else
@@ -3033,9 +3358,21 @@ done
         )
     }
 
+    fn is_ssh_pane_for_file_browser(&self, pane: &Arc<dyn Pane>) -> bool {
+        if matches!(
+            self.pane_command_basename(pane).as_deref(),
+            Some("ssh" | "mosh")
+        ) {
+            return true;
+        }
+        pane.get_foreground_process_info(CachePolicy::AllowStale)
+            .is_some_and(|info| Self::is_ssh_client_argv(&info.argv))
+    }
+
     fn file_browser_target_pane(&self, requested: &Arc<dyn Pane>) -> Arc<dyn Pane> {
         if !self.is_worktree_pane_for_file_browser(requested)
-            && self.is_shell_pane_for_file_browser(requested)
+            && (self.is_shell_pane_for_file_browser(requested)
+                || self.is_ssh_pane_for_file_browser(requested))
         {
             return Arc::clone(requested);
         }
@@ -3044,6 +3381,20 @@ done
         let Some(tab) = mux.get_active_tab_for_window(self.mux_window_id) else {
             return Arc::clone(requested);
         };
+
+        // Prefer an ssh/mosh pane over a plain shell: it is more likely the
+        // machine the user is actually working on.
+        if let Some(ssh) = tab
+            .iter_panes_ignoring_zoom()
+            .iter()
+            .find(|pos| {
+                !self.is_worktree_pane_for_file_browser(&pos.pane)
+                    && self.is_ssh_pane_for_file_browser(&pos.pane)
+            })
+            .map(|pos| pos.pane.clone())
+        {
+            return ssh;
+        }
 
         if let Some(shell) = tab
             .iter_panes_ignoring_zoom()
@@ -3073,7 +3424,20 @@ done
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
         let split_size = self.config.file_browser.split_size_percent.clamp(5, 95);
         let target_pane = self.file_browser_target_pane(pane);
-        let remote_context = self.file_browser_remote_context(&target_pane);
+        let (remote_context, pane_looks_remote) = self.file_browser_remote_context(&target_pane);
+        // If the pane appears to be a remote/ssh session but we couldn't
+        // resolve a remote context, do not silently fall back to spawning
+        // the browser locally. Bail out early so the user isn't confused.
+        if pane_looks_remote && remote_context.is_none() {
+            log::warn!("pane looks like a remote/ssh session but could not resolve destination; aborting worktree open");
+            wezterm_toast_notification::show(wezterm_toast_notification::ToastNotification {
+                title: "Worktree unavailable".to_string(),
+                message: "Could not resolve the SSH destination for this pane".to_string(),
+                url: None,
+                timeout: Some(Duration::from_millis(3000)),
+            });
+            return;
+        }
         let mut set_environment_variables = HashMap::new();
         set_environment_variables.insert(
             "TGZTERMINAL_TARGET_PANE".to_string(),
@@ -3123,7 +3487,7 @@ done
                 .flatten(),
             set_environment_variables,
             domain: if remote_context.is_some() {
-                config::keyassignment::SpawnTabDomain::DefaultDomain
+                config::keyassignment::SpawnTabDomain::DomainName("local".to_string())
             } else {
                 config::keyassignment::SpawnTabDomain::CurrentPaneDomain
             },
@@ -4192,5 +4556,71 @@ impl Drop for TermWindow {
                 fe.forget_known_window(&window);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_ssh_simple_user_host() {
+        let argv = vec!["ssh".to_string(), "user@host".to_string()];
+        let got = TermWindow::parse_ssh_destination_from_argv(&argv);
+        assert_eq!(got, Some(("user@host".to_string(), None)));
+    }
+
+    #[test]
+    fn parse_ssh_with_p_flag_and_user_host() {
+        let argv = vec![
+            "ssh".to_string(),
+            "-p".to_string(),
+            "2222".to_string(),
+            "user@host".to_string(),
+        ];
+        let got = TermWindow::parse_ssh_destination_from_argv(&argv);
+        assert_eq!(got, Some(("user@host".to_string(), Some(2222))));
+    }
+
+    #[test]
+    fn parse_ssh_with_p_attached_and_host() {
+        let argv = vec!["ssh".to_string(), "-p2222".to_string(), "host".to_string()];
+        let got = TermWindow::parse_ssh_destination_from_argv(&argv);
+        assert_eq!(got, Some(("host".to_string(), Some(2222))));
+    }
+
+    #[test]
+    fn parse_ssh_with_o_port() {
+        let argv = vec![
+            "ssh".to_string(),
+            "-oPort=2222".to_string(),
+            "foo".to_string(),
+        ];
+        let got = TermWindow::parse_ssh_destination_from_argv(&argv);
+        assert_eq!(got, Some(("foo".to_string(), Some(2222))));
+    }
+
+    #[test]
+    fn parse_ssh_with_separate_user_option() {
+        let argv = vec![
+            "ssh".to_string(),
+            "-o".to_string(),
+            "User=alice".to_string(),
+            "foo".to_string(),
+        ];
+        let got = TermWindow::parse_ssh_destination_from_argv(&argv);
+        assert_eq!(got, Some(("alice@foo".to_string(), None)));
+    }
+
+    #[test]
+    fn parse_mosh_does_not_treat_udp_port_as_ssh_port() {
+        let argv = vec![
+            "mosh".to_string(),
+            "-p".to_string(),
+            "60000".to_string(),
+            "user@foo".to_string(),
+        ];
+        let got = TermWindow::parse_ssh_destination_from_argv(&argv);
+        assert_eq!(got, Some(("user@foo".to_string(), None)));
     }
 }

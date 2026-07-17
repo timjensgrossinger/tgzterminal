@@ -276,8 +276,7 @@ fn agent_pattern_matches_pre_lowered(haystack_lower: &str, pattern: &str) -> boo
         cached_regex_matches(haystack_lower, regex)
     } else {
         // haystack is already lowercase; only lowercase the needle
-        !pattern.trim().is_empty()
-            && haystack_lower.contains(&pattern.to_ascii_lowercase())
+        !pattern.trim().is_empty() && haystack_lower.contains(&pattern.to_ascii_lowercase())
     }
 }
 

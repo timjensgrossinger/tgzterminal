@@ -169,6 +169,51 @@ fn format_host_verification_for_terminal(failed: HostVerificationFailed) -> Vec<
     ]
 }
 
+/// Minimal system-`ssh` connection parameters derived from a
+/// [`RemoteSshDomain`]'s explicit configuration.
+///
+/// Unlike the full [`ConfigMap`] returned by
+/// [`RemoteSshDomain::ssh_config`], this struct is built exclusively from
+/// the [`SshDomain`] fields that the user configured — no SSH config files
+/// are read — making it cheap to obtain and infallible.
+///
+/// The fields are ready for use as the `TGZTERMINAL_REMOTE_DEST` and
+/// `TGZTERMINAL_REMOTE_PORT` environment variables consumed by the GUI
+/// Worktree file-browser feature.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshConnectionDescriptor {
+    /// `[user@]host` string suitable for passing directly to `ssh(1)`.
+    pub destination: String,
+    /// Explicit port parsed from the `host:port` part of
+    /// [`SshDomain::remote_address`], or `None` when no port was specified
+    /// (the SSH default of 22 applies).
+    pub port: Option<u16>,
+}
+
+fn parse_remote_address(address: &str) -> anyhow::Result<(&str, Option<u16>)> {
+    if let Some(rest) = address.strip_prefix('[') {
+        let end = rest
+            .find(']')
+            .ok_or_else(|| anyhow!("invalid bracketed SSH address"))?;
+        let host = &rest[..end];
+        let suffix = &rest[end + 1..];
+        let port = suffix
+            .strip_prefix(':')
+            .map(|port| port.parse::<u16>())
+            .transpose()?;
+        return Ok((host, port));
+    }
+
+    if address.matches(':').count() == 1 {
+        let (host, port) = address
+            .split_once(':')
+            .ok_or_else(|| anyhow!("invalid SSH address"))?;
+        return Ok((host, Some(port.parse::<u16>()?)));
+    }
+
+    Ok((address, None))
+}
+
 /// Represents a connection to remote host via ssh.
 /// The domain is created with the ssh config prior to making the
 /// connection.  The connection is established by the first spawn()
@@ -188,15 +233,7 @@ pub fn ssh_domain_to_ssh_config(ssh_dom: &SshDomain) -> anyhow::Result<ConfigMap
     let mut ssh_config = wezterm_ssh::Config::new();
     ssh_config.add_default_config_files();
 
-    let (remote_host_name, port) = {
-        let parts: Vec<&str> = ssh_dom.remote_address.split(':').collect();
-
-        if parts.len() == 2 {
-            (parts[0], Some(parts[1].parse::<u16>()?))
-        } else {
-            (ssh_dom.remote_address.as_str(), None)
-        }
-    };
+    let (remote_host_name, port) = parse_remote_address(&ssh_dom.remote_address)?;
 
     let mut ssh_config = ssh_config.for_host(&remote_host_name);
     ssh_config.insert(
@@ -242,6 +279,52 @@ impl RemoteSshDomain {
 
     pub fn ssh_config(&self) -> anyhow::Result<ConfigMap> {
         ssh_domain_to_ssh_config(&self.dom)
+    }
+
+    /// Returns the minimal SSH connection parameters needed to open a
+    /// **system** `ssh` session to the same host as this domain.
+    ///
+    /// This method reads the explicitly configured [`SshDomain`] fields and
+    /// does **not** read or merge any SSH config files.  It mirrors the
+    /// address parsing used by [`ssh_domain_to_ssh_config`] so that both paths
+    /// see the same host and port.
+    ///
+    /// Returns `None` only when [`SshDomain::remote_address`] is empty (not
+    /// a valid configuration in practice).
+    ///
+    /// # GUI Worktree use
+    ///
+    /// The returned [`SshConnectionDescriptor`] is the source of truth for
+    /// the `TGZTERMINAL_REMOTE_DEST` and `TGZTERMINAL_REMOTE_PORT`
+    /// environment variables injected by the Worktree file-browser feature
+    /// when the active pane belongs to a `RemoteSshDomain` but its CWD URL
+    /// does not carry an `ssh://` scheme (e.g., the remote shell reports a
+    /// plain `file://` CWD via OSC 7).
+    pub fn ssh_connection_descriptor(&self) -> Option<SshConnectionDescriptor> {
+        let (host, inline_port) = parse_remote_address(&self.dom.remote_address).ok()?;
+        let configured_port = self
+            .dom
+            .ssh_option
+            .get("port")
+            .or_else(|| self.dom.ssh_option.get("Port"))
+            .and_then(|port| port.parse::<u16>().ok());
+        let port = configured_port.or(inline_port);
+
+        if host.is_empty() {
+            return None;
+        }
+
+        let configured_user = self
+            .dom
+            .ssh_option
+            .get("user")
+            .or_else(|| self.dom.ssh_option.get("User"));
+        let destination = match configured_user.or(self.dom.username.as_ref()) {
+            Some(u) if !u.is_empty() => format!("{}@{}", u, host),
+            _ => host.to_string(),
+        };
+
+        Some(SshConnectionDescriptor { destination, port })
     }
 
     fn build_command(
@@ -1144,5 +1227,123 @@ impl std::io::Read for PtyReader {
                 _ => res,
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use config::SshDomain;
+
+    fn make_domain(remote_address: &str, username: Option<&str>) -> RemoteSshDomain {
+        RemoteSshDomain::with_ssh_domain(&SshDomain {
+            name: "test".to_string(),
+            remote_address: remote_address.to_string(),
+            username: username.map(|s| s.to_string()),
+            ..Default::default()
+        })
+        .expect("with_ssh_domain must not fail in tests")
+    }
+
+    #[test]
+    fn descriptor_bare_host() {
+        let d = make_domain("example.com", None);
+        assert_eq!(
+            d.ssh_connection_descriptor(),
+            Some(SshConnectionDescriptor {
+                destination: "example.com".to_string(),
+                port: None,
+            })
+        );
+    }
+
+    #[test]
+    fn descriptor_host_with_username() {
+        let d = make_domain("example.com", Some("alice"));
+        assert_eq!(
+            d.ssh_connection_descriptor(),
+            Some(SshConnectionDescriptor {
+                destination: "alice@example.com".to_string(),
+                port: None,
+            })
+        );
+    }
+
+    #[test]
+    fn descriptor_host_with_port() {
+        let d = make_domain("example.com:2222", None);
+        assert_eq!(
+            d.ssh_connection_descriptor(),
+            Some(SshConnectionDescriptor {
+                destination: "example.com".to_string(),
+                port: Some(2222),
+            })
+        );
+    }
+
+    #[test]
+    fn descriptor_host_with_username_and_port() {
+        let d = make_domain("build.example.com:2222", Some("bob"));
+        assert_eq!(
+            d.ssh_connection_descriptor(),
+            Some(SshConnectionDescriptor {
+                destination: "bob@build.example.com".to_string(),
+                port: Some(2222),
+            })
+        );
+    }
+
+    #[test]
+    fn descriptor_empty_address_returns_none() {
+        let d = make_domain("", None);
+        assert_eq!(d.ssh_connection_descriptor(), None);
+    }
+
+    #[test]
+    fn descriptor_empty_username_omitted() {
+        // An explicitly set but empty username string should produce no `user@` prefix.
+        let d = make_domain("example.com", Some(""));
+        assert_eq!(
+            d.ssh_connection_descriptor(),
+            Some(SshConnectionDescriptor {
+                destination: "example.com".to_string(),
+                port: None,
+            })
+        );
+    }
+
+    #[test]
+    fn descriptor_uses_configured_user_and_port() {
+        let mut domain = SshDomain {
+            name: "test".to_string(),
+            remote_address: "example.com".to_string(),
+            ..Default::default()
+        };
+        domain
+            .ssh_option
+            .insert("User".to_string(), "config-user".to_string());
+        domain
+            .ssh_option
+            .insert("Port".to_string(), "2200".to_string());
+        let d = RemoteSshDomain::with_ssh_domain(&domain).unwrap();
+        assert_eq!(
+            d.ssh_connection_descriptor(),
+            Some(SshConnectionDescriptor {
+                destination: "config-user@example.com".to_string(),
+                port: Some(2200),
+            })
+        );
+    }
+
+    #[test]
+    fn descriptor_supports_bracketed_ipv6() {
+        let d = make_domain("[2001:db8::1]:2222", None);
+        assert_eq!(
+            d.ssh_connection_descriptor(),
+            Some(SshConnectionDescriptor {
+                destination: "2001:db8::1".to_string(),
+                port: Some(2222),
+            })
+        );
     }
 }
