@@ -272,6 +272,25 @@ impl super::TermWindow {
             }
         }
 
+        // Clicking inside the docked input band focuses the strip and consumes
+        // the click; clicking above it releases focus back to the terminal but
+        // lets the terminal handle the click.
+        if matches!(&event.kind, WMEK::Press(MousePress::Left)) {
+            if let Some(band_top) = self.docked_input_band_top() {
+                let y = event.coords.y as f32;
+                if y >= band_top {
+                    if !self.docked_input.focused {
+                        self.docked_input.focused = true;
+                        context.invalidate();
+                    }
+                    return;
+                } else if self.docked_input.focused {
+                    self.docked_input.focused = false;
+                    context.invalidate();
+                }
+            }
+        }
+
         if matches!(&event.kind, WMEK::Press(_)) && self.agent_copy_menu.is_some() {
             let on_copy_menu = matches!(
                 &ui_item,
@@ -786,6 +805,27 @@ impl super::TermWindow {
                                     x: event.coords.x.max(0) as usize,
                                     y: event.coords.y.max(0) as usize,
                                 });
+                            }
+                            AgentToolbeltAction::Compose => {
+                                let already_open = self
+                                    .get_modal()
+                                    .map(|m| {
+                                        m.downcast_ref::<crate::termwindow::composer::Composer>()
+                                            .is_some()
+                                    })
+                                    .unwrap_or(false);
+                                if already_open {
+                                    self.cancel_modal();
+                                } else if let Some(modal) =
+                                    crate::termwindow::composer::Composer::new(self, &pane)
+                                {
+                                    self.set_modal(std::rc::Rc::new(modal));
+                                }
+                            }
+                            AgentToolbeltAction::DockInput => {
+                                // The toolbelt only renders on agent panes, so
+                                // this button is inherently agent-only.
+                                self.toggle_docked_input_pane(pane.pane_id());
                             }
                             AgentToolbeltAction::Attach => {
                                 self.agent_attach_pane(&pane);

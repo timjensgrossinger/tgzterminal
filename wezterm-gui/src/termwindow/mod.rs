@@ -82,6 +82,7 @@ pub mod background;
 pub mod box_model;
 pub mod charselect;
 pub mod clipboard;
+pub mod composer;
 pub mod keyevent;
 pub mod modal;
 mod mouseevent;
@@ -165,6 +166,9 @@ pub enum TermWindowNotif {
 pub enum AgentToolbeltAction {
     Interrupt,
     CopyMenu,
+    Compose,
+    /// Toggle the persistent docked input strip for this (agent) pane.
+    DockInput,
     Attach,
     Resume,
     OpenLogs,
@@ -512,6 +516,12 @@ pub struct TermWindow {
 
     modal: RefCell<Option<Rc<dyn Modal>>>,
 
+    /// Ring of previous rich-input composer submissions, oldest first.
+    composer_history: RefCell<Vec<String>>,
+
+    /// Persistent Warp-style docked input strip state (rich_input.docked).
+    docked_input: crate::termwindow::composer::DockedInput,
+
     event_states: HashMap<String, EventState>,
     pub current_event: Option<Value>,
     has_animation: RefCell<Option<Instant>>,
@@ -799,6 +809,8 @@ impl TermWindow {
             agent_copy_menu: None,
             agent_detection_cache: RefCell::new(HashMap::new()),
             adapter_cache: RefCell::new(None),
+            composer_history: RefCell::new(Vec::new()),
+            docked_input: crate::termwindow::composer::DockedInput::new(),
             sidebar_scroll_offset: 0,
             sidebar_drop_flash: None,
             fancy_tab_bar: None,
@@ -2799,6 +2811,32 @@ impl TermWindow {
         matches!(executable.to_ascii_lowercase().as_str(), "ssh" | "mosh")
     }
 
+    fn local_hostname_label() -> Option<String> {
+        hostname::get().ok().and_then(|h| {
+            h.to_str()
+                .map(|s| s.split('.').next().unwrap_or(s).to_ascii_lowercase())
+        })
+    }
+
+    fn host_looks_remote(url_host: &str, local_label: Option<&str>) -> bool {
+        let host = url_host.trim();
+        if host.is_empty() {
+            return false;
+        }
+        let first = host.split('.').next().unwrap_or(host).to_ascii_lowercase();
+        if matches!(first.as_str(), "localhost" | "127.0.0.1" | "::1" | "") {
+            return false;
+        }
+        // host with the ip forms won't split on '.' meaningfully; guard full forms too
+        if matches!(host, "127.0.0.1" | "::1") {
+            return false;
+        }
+        match local_label {
+            Some(local) => first != local,
+            None => true,
+        }
+    }
+
     fn file_browser_remote_context(
         &self,
         pane: &Arc<dyn Pane>,
@@ -2812,10 +2850,43 @@ impl TermWindow {
                 .filter(|path| !path.is_empty())
         });
 
-        let mut pane_looks_remote = false;
+        // A single fresh fetch of the foreground process info; AllowStale can
+        // return an empty argv on macOS (KERN_PROCARGS2 failures), which used
+        // to cause the ssh-argv signal below to silently disappear.
+        let fg_info = pane.get_foreground_process_info(CachePolicy::FetchImmediate);
+
+        let name_is_ssh = matches!(
+            self.pane_command_basename(pane).as_deref(),
+            Some("ssh" | "mosh")
+        );
+        let argv_is_ssh = fg_info
+            .as_ref()
+            .is_some_and(|info| Self::is_ssh_client_argv(&info.argv));
+
+        let ssh_scheme = working_dir_url
+            .as_ref()
+            .is_some_and(|url| url.scheme() == "ssh");
+
+        let mux = Mux::get();
+        let remote_ssh_domain = mux
+            .get_domain(pane.domain_id())
+            .is_some_and(|domain| domain.downcast_ref::<mux::ssh::RemoteSshDomain>().is_some());
+
+        let local_label = Self::local_hostname_label();
+        let osc7_remote_host = working_dir_url.as_ref().is_some_and(|url| {
+            url.scheme() == "file"
+                && url
+                    .host_str()
+                    .filter(|host| !host.is_empty())
+                    .is_some_and(|host| Self::host_looks_remote(host, local_label.as_deref()))
+        });
+
+        let pane_looks_remote =
+            ssh_scheme || name_is_ssh || argv_is_ssh || remote_ssh_domain || osc7_remote_host;
+
+        // 1. ssh:// working-directory URL (e.g. reported via OSC 7 by a remote shell).
         if let Some(url) = working_dir_url.as_ref() {
             if url.scheme() == "ssh" {
-                pane_looks_remote = true;
                 if let Some(host) = url.host_str().filter(|host| !host.is_empty()) {
                     let destination = if url.username().is_empty() {
                         host.to_string()
@@ -2834,16 +2905,16 @@ impl TermWindow {
             }
         }
 
-        if let Some(info) = pane.get_foreground_process_info(CachePolicy::AllowStale) {
-            if Self::is_ssh_client_argv(&info.argv) {
-                pane_looks_remote = true;
+        // 2. `ssh`/`mosh` invocation visible in the foreground process argv.
+        if argv_is_ssh {
+            if let Some(info) = fg_info.as_ref() {
                 if let Some((destination, port)) = Self::parse_ssh_destination_from_argv(&info.argv)
                 {
                     return (
                         Some(RemoteFileBrowserContext {
                             destination,
                             port,
-                            path: working_dir_path.unwrap_or_else(|| "~".to_string()),
+                            path: working_dir_path.clone().unwrap_or_else(|| "~".to_string()),
                         }),
                         pane_looks_remote,
                     );
@@ -2851,10 +2922,26 @@ impl TermWindow {
             }
         }
 
-        let mux = Mux::get();
+        // 3. OSC-7 file:// URL pointing at a host that isn't this machine, but
+        //    only when there is corroborating ssh evidence (process name,
+        //    argv, or ssh:// scheme) so we don't misclassify local panes that
+        //    merely report an unfamiliar hostname.
+        if osc7_remote_host && (name_is_ssh || argv_is_ssh || ssh_scheme) {
+            if let Some(host) = working_dir_url.as_ref().and_then(|url| url.host_str()) {
+                return (
+                    Some(RemoteFileBrowserContext {
+                        destination: host.to_string(),
+                        port: None,
+                        path: working_dir_path.clone().unwrap_or_else(|| "~".to_string()),
+                    }),
+                    pane_looks_remote,
+                );
+            }
+        }
+
+        // 4. Domain-level ssh connection descriptor.
         if let Some(domain) = mux.get_domain(pane.domain_id()) {
             if let Some(ssh_dom) = domain.downcast_ref::<mux::ssh::RemoteSshDomain>() {
-                pane_looks_remote = true;
                 if let Some(descriptor) = ssh_dom.ssh_connection_descriptor() {
                     return (
                         Some(RemoteFileBrowserContext {
@@ -2885,6 +2972,7 @@ editor_cmd="${TGZTERMINAL_EDITOR_COMMAND:-${VISUAL:-${EDITOR:-vim}}}"
 remote_dest="${TGZTERMINAL_REMOTE_DEST:-}"
 remote_port="${TGZTERMINAL_REMOTE_PORT:-}"
 remote_cwd="${TGZTERMINAL_REMOTE_CWD:-}"
+remote_domain_id="${TGZTERMINAL_REMOTE_DOMAIN_ID:-}"
 cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/tgzterminal"
 mkdir -p "$cache_dir" 2>/dev/null || true
 connection_key=$(printf '%s:%s' "$remote_dest" "$remote_port" | cksum | awk '{ print $1 }')
@@ -2900,13 +2988,93 @@ is_remote() {
   [ -n "$remote_dest" ]
 }
 
-ssh_remote() {
-  # Reuse one short-lived control socket for all remote checks and actions.
+# --- SSH connection strategy -------------------------------------------------
+# The worktree browser must never force a second interactive login when the
+# terminal already has a working connection to the host. The strategy is
+# resolved once per open and cached in $ssh_mode:
+#   shared -> reuse the user's OWN connection with ZERO prompts. Attaches to an
+#             existing OpenSSH ControlMaster socket (the one the interactive ssh
+#             in the terminal created, when multiplexing is enabled) or succeeds
+#             via key/agent auth. BatchMode=yes guarantees it never prompts and
+#             fails fast when no reusable connection exists.
+#   owned  -> nothing was reusable, so we stand up our OWN persistent master
+#             exactly once, INTERACTIVELY, so password/2FA/host-key prompts work
+#             (the old code ran every probe non-interactively, so any prompt
+#             turned into an instant "Unable to connect"). ControlPersist keeps
+#             it warm for 600s so later probes reuse it with no further prompts.
+ssh_mode=""
+
+ssh_shared() {
+  # Zero-prompt attempt: reuse the user's existing connection/master, or
+  # passwordless key/agent auth. Never prompts; fails fast otherwise.
+  if [ -n "$remote_port" ]; then
+    ssh -o BatchMode=yes -o ConnectTimeout=5 -p "$remote_port" "$remote_dest" "$@"
+  else
+    ssh -o BatchMode=yes -o ConnectTimeout=5 "$remote_dest" "$@"
+  fi
+}
+
+ssh_owned() {
+  # Over our own persistent control socket (established by ensure_owned_master).
   if [ -n "$remote_port" ]; then
     ssh -o ControlMaster=auto -o ControlPersist=600s -o ControlPath="$control_path" -o ConnectTimeout=5 -p "$remote_port" "$remote_dest" "$@"
   else
     ssh -o ControlMaster=auto -o ControlPersist=600s -o ControlPath="$control_path" -o ConnectTimeout=5 "$remote_dest" "$@"
   fi
+}
+
+owned_master_alive() {
+  if [ -n "$remote_port" ]; then
+    ssh -O check -o ControlPath="$control_path" -p "$remote_port" "$remote_dest" >/dev/null 2>&1
+  else
+    ssh -O check -o ControlPath="$control_path" "$remote_dest" >/dev/null 2>&1
+  fi
+}
+
+ensure_owned_master() {
+  # One-time interactive login that leaves a backgrounded ControlPersist master.
+  # Runs against the controlling terminal so ssh can prompt for a password, 2FA
+  # code, or host-key confirmation even while our stdout is being captured.
+  owned_master_alive && return 0
+  if [ -n "$remote_port" ]; then
+    ssh -t -o ControlMaster=auto -o ControlPersist=600s -o ControlPath="$control_path" -o ConnectTimeout=20 -p "$remote_port" "$remote_dest" true </dev/tty >/dev/tty 2>/dev/tty
+  else
+    ssh -t -o ControlMaster=auto -o ControlPersist=600s -o ControlPath="$control_path" -o ConnectTimeout=20 "$remote_dest" true </dev/tty >/dev/tty 2>/dev/tty
+  fi
+  owned_master_alive
+}
+
+resolve_ssh_mode() {
+  [ -z "$ssh_mode" ] || return 0
+  # 0. wezterm SSH domain: wezterm already holds the authenticated session, so
+  #    list over it via the CLI verb with ZERO re-auth. Probe once; if the
+  #    session is gone, fall through to the ssh transport below.
+  if [ -n "$remote_domain_id" ]; then
+    if printf 'true' | "$wezterm_bin" cli worktree-exec --domain-id "$remote_domain_id" >/dev/null 2>&1; then
+      ssh_mode=domain
+      return 0
+    fi
+  fi
+  # 1. Reuse the terminal's connection with no prompt if we possibly can.
+  if [ -n "$remote_dest" ] && ssh_shared true >/dev/null 2>&1; then
+    ssh_mode=shared
+    return 0
+  fi
+  # 2. Otherwise stand up our own master, authenticating interactively once.
+  if [ -n "$remote_dest" ] && ensure_owned_master; then
+    ssh_mode=owned
+    return 0
+  fi
+  return 1
+}
+
+ssh_remote() {
+  case "$ssh_mode" in
+    domain) printf '%s' "$*" | "$wezterm_bin" cli worktree-exec --domain-id "$remote_domain_id" ;;
+    shared) ssh_shared "$@" ;;
+    owned) ssh_owned "$@" ;;
+    *) return 1 ;;
+  esac
 }
 
 remote_eval() {
@@ -3043,7 +3211,7 @@ if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   git ls-files -z --cached --others --exclude-standard 2>/dev/null | tr '\0' '\n'
 else
   printf '__TGZ_LIST_FIND__\n'
-  find "$root" -maxdepth 4 \( -name .git -o -name target -o -name node_modules -o -name .venv -o -name .pytest_cache -o -name .ruff_cache -o -name Library -o -name .cache -o -name .Trash -o -name .npm -o -name .cargo -o -name .rustup -o -name .gradle -o -name .m2 \) -prune -o \( -type d -o -type f \) -exec sh -c 'for path do if [ -d "$path" ]; then printf "d\t%s\n" "$path"; else printf "f\t%s\n" "$path"; fi; done' sh {} + 2>/dev/null
+  find "$root" -maxdepth 3 \( -name .git -o -name target -o -name node_modules -o -name .venv -o -name .pytest_cache -o -name .ruff_cache -o -name Library -o -name .cache -o -name .Trash -o -name .npm -o -name .cargo -o -name .rustup -o -name .gradle -o -name .m2 \) -prune -o \( -type d -o -type f \) -exec sh -c 'for path do if [ -d "$path" ]; then printf "d\t%s\n" "$path"; else printf "f\t%s\n" "$path"; fi; done' sh {} + 2>/dev/null
 fi
 REMOTE_LIST
 
@@ -3106,6 +3274,10 @@ build_from_probe() {
 build_list_remote() {
   now=$(date +%s)
   probe="$tmp.probe"
+  if ! resolve_ssh_mode; then
+    printf 'Unable to connect to %s.\n' "$remote_dest" >&2
+    return 1
+  fi
   if [ -n "${cache_file:-}" ] && [ -s "$cache_file" ] && [ -r "$stamp_file" ]; then
     # Warm path: a lightweight stamp-only probe; reuse the cache if unchanged.
     remote_probe stamp > "$probe" 2>/dev/null || {
@@ -3147,7 +3319,7 @@ build_list_local() {
 
   next_tmp="$tmp.next"
   quoted_root=$(quote_path "$root")
-  find_script="find $quoted_root -maxdepth 4 \\( -name .git -o -name target -o -name node_modules -o -name .venv -o -name .pytest_cache -o -name .ruff_cache -o -name Library -o -name .cache -o -name .Trash -o -name .npm -o -name .cargo -o -name .rustup -o -name .gradle -o -name .m2 \\) -prune -o \\( -type d -o -type f \\) -exec sh -c 'for path do if [ -d \"\$path\" ]; then printf \"d\\t%s\\n\" \"\$path\"; else printf \"f\\t%s\\n\" \"\$path\"; fi; done' sh {} +"
+  find_script="find $quoted_root -maxdepth 3 \\( -name .git -o -name target -o -name node_modules -o -name .venv -o -name .pytest_cache -o -name .ruff_cache -o -name Library -o -name .cache -o -name .Trash -o -name .npm -o -name .cargo -o -name .rustup -o -name .gradle -o -name .m2 \\) -prune -o \\( -type d -o -type f \\) -exec sh -c 'for path do if [ -d \"\$path\" ]; then printf \"d\\t%s\\n\" \"\$path\"; else printf \"f\\t%s\\n\" \"\$path\"; fi; done' sh {} +"
   if git -C "$root" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     git -C "$root" ls-files -z --cached --others --exclude-standard 2>/dev/null \
       | tr '\0' '\n' \
@@ -3240,14 +3412,34 @@ open_file() {
   path_is_file "$selection" || return 0
   quoted=$(quote_path "$selection")
   if is_remote; then
-    # Run the editor ON the remote host over the persisted control socket so
-    # the selected path resolves remotely rather than on the local machine.
-    if [ -n "$remote_port" ]; then
+    # Run the editor ON the remote host, reusing the same connection strategy
+    # resolved for the listing so opening a file never triggers a second login.
+    resolve_ssh_mode || return 0
+    if [ "$ssh_mode" = domain ]; then
+      # Open the editor natively in the ssh domain: the split-pane inherits the
+      # target pane's domain, reusing the held session via request_pty. No shell
+      # interprets the path here, so pass the raw selection (not the quoted form).
       "$wezterm_bin" cli split-pane --pane-id "$target_pane" --right --percent 50 -- \
-        ssh -t -o ControlMaster=auto -o ControlPersist=600s -o ControlPath="$control_path" -o ConnectTimeout=5 -p "$remote_port" "$remote_dest" "$editor_cmd $quoted" >/dev/null 2>&1 || return 0
+        $editor_cmd "$selection" >/dev/null 2>&1 || return 0
+    elif [ "$ssh_mode" = owned ]; then
+      # Reuse our own persistent master.
+      if [ -n "$remote_port" ]; then
+        "$wezterm_bin" cli split-pane --pane-id "$target_pane" --right --percent 50 -- \
+          ssh -t -o ControlMaster=auto -o ControlPersist=600s -o ControlPath="$control_path" -o ConnectTimeout=5 -p "$remote_port" "$remote_dest" "$editor_cmd $quoted" >/dev/null 2>&1 || return 0
+      else
+        "$wezterm_bin" cli split-pane --pane-id "$target_pane" --right --percent 50 -- \
+          ssh -t -o ControlMaster=auto -o ControlPersist=600s -o ControlPath="$control_path" -o ConnectTimeout=5 "$remote_dest" "$editor_cmd $quoted" >/dev/null 2>&1 || return 0
+      fi
     else
-      "$wezterm_bin" cli split-pane --pane-id "$target_pane" --right --percent 50 -- \
-        ssh -t -o ControlMaster=auto -o ControlPersist=600s -o ControlPath="$control_path" -o ConnectTimeout=5 "$remote_dest" "$editor_cmd $quoted" >/dev/null 2>&1 || return 0
+      # Reuse the user's own connection/master (shared mode); no ControlPath
+      # override so ssh follows their config exactly as the terminal did.
+      if [ -n "$remote_port" ]; then
+        "$wezterm_bin" cli split-pane --pane-id "$target_pane" --right --percent 50 -- \
+          ssh -t -o ConnectTimeout=5 -p "$remote_port" "$remote_dest" "$editor_cmd $quoted" >/dev/null 2>&1 || return 0
+      else
+        "$wezterm_bin" cli split-pane --pane-id "$target_pane" --right --percent 50 -- \
+          ssh -t -o ConnectTimeout=5 "$remote_dest" "$editor_cmd $quoted" >/dev/null 2>&1 || return 0
+      fi
     fi
   else
     dir=$(dirname "$selection")
@@ -3476,6 +3668,20 @@ done
                 set_environment_variables
                     .insert("TGZTERMINAL_REMOTE_PORT".to_string(), port.to_string());
             }
+        }
+        // If the target pane belongs to a wezterm SSH domain, wezterm already
+        // holds the authenticated session. Hand the domain id to the script so
+        // it lists over that live connection (via `cli worktree-exec`) with zero
+        // re-auth, falling back to the ssh transport only if the session is gone.
+        let target_domain_id = target_pane.domain_id();
+        if Mux::get()
+            .get_domain(target_domain_id)
+            .is_some_and(|domain| domain.downcast_ref::<mux::ssh::RemoteSshDomain>().is_some())
+        {
+            set_environment_variables.insert(
+                "TGZTERMINAL_REMOTE_DOMAIN_ID".to_string(),
+                target_domain_id.to_string(),
+            );
         }
 
         let spawn = SpawnCommand {
@@ -4086,6 +4292,14 @@ done
                 let modal = crate::termwindow::palette::CommandPalette::new(self);
                 self.set_modal(Rc::new(modal));
             }
+            ActivateComposer => {
+                if let Some(modal) = crate::termwindow::composer::Composer::new(self, &pane) {
+                    self.set_modal(Rc::new(modal));
+                }
+            }
+            ToggleDockedInput => {
+                self.toggle_docked_input();
+            }
             PromptInputLine(args) => self.show_prompt_input_line(args),
             InputSelector(args) => self.show_input_selector(args),
             Confirmation(args) => self.show_confirmation(args),
@@ -4622,5 +4836,45 @@ mod tests {
         ];
         let got = TermWindow::parse_ssh_destination_from_argv(&argv);
         assert_eq!(got, Some(("user@foo".to_string(), None)));
+    }
+
+    #[test]
+    fn host_looks_remote_when_different_from_local() {
+        assert!(TermWindow::host_looks_remote("build01", Some("mymac")));
+    }
+
+    #[test]
+    fn host_looks_remote_false_when_matches_local_case_insensitive() {
+        assert!(!TermWindow::host_looks_remote("MyMac", Some("mymac")));
+    }
+
+    #[test]
+    fn host_looks_remote_false_when_matches_local_with_domain_suffix() {
+        assert!(!TermWindow::host_looks_remote("mymac.local", Some("mymac")));
+    }
+
+    #[test]
+    fn host_looks_remote_false_when_empty() {
+        assert!(!TermWindow::host_looks_remote("", Some("mymac")));
+    }
+
+    #[test]
+    fn host_looks_remote_false_for_localhost() {
+        assert!(!TermWindow::host_looks_remote("localhost", Some("mymac")));
+    }
+
+    #[test]
+    fn host_looks_remote_false_for_ipv4_loopback() {
+        assert!(!TermWindow::host_looks_remote("127.0.0.1", Some("mymac")));
+    }
+
+    #[test]
+    fn host_looks_remote_false_for_ipv6_loopback() {
+        assert!(!TermWindow::host_looks_remote("::1", Some("mymac")));
+    }
+
+    #[test]
+    fn host_looks_remote_true_when_no_local_label() {
+        assert!(TermWindow::host_looks_remote("build01", None));
     }
 }

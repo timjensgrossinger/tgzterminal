@@ -717,6 +717,14 @@ impl super::TermWindow {
                     }
                 }
 
+                // When the docked input strip owns focus, route editing keys
+                // into its buffer instead of the pane.
+                if self.docked_input_focused() && window_key.key_is_down {
+                    if self.docked_input_key_input(key, modifiers, context) {
+                        return;
+                    }
+                }
+
                 let res = if let Some(encoded) = self.encode_win32_input(&pane, &window_key) {
                     if self.config.debug_key_events {
                         log::info!("win32: Encoded input as {:?}", encoded);
@@ -778,6 +786,12 @@ impl super::TermWindow {
                     return;
                 }
                 self.key_table_state.did_process_key();
+                // Route composed/IME text into the docked strip when focused.
+                if self.docked_input_focused() {
+                    self.docked_input_insert_str(&s);
+                    context.invalidate();
+                    return;
+                }
                 if self.config.debug_key_events {
                     log::info!("send to pane string={:?}", s);
                 }

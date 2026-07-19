@@ -286,6 +286,7 @@ impl crate::TermWindow {
         self.paint_window_borders(&mut layers)
             .context("paint_window_borders")?;
         drop(layers);
+        self.paint_docked_input().context("paint_docked_input")?;
         self.paint_modal().context("paint_modal")?;
 
         Ok(())

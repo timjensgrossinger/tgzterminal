@@ -169,6 +169,8 @@ impl super::TermWindow {
             0.
         };
         let sidebar_width = self.sidebar_reserved_width();
+        // Rows reserved at the bottom for the persistent docked input strip.
+        let docked_input_height = self.docked_input_pixel_height();
 
         let border = self.get_os_border();
 
@@ -205,7 +207,8 @@ impl super::TermWindow {
             let pixel_height = (rows * self.render_metrics.cell_size.height as usize)
                 + (padding_top + padding_bottom)
                 + (border.top + border.bottom).get() as usize
-                + tab_bar_height as usize;
+                + tab_bar_height as usize
+                + docked_input_height as usize;
 
             let pixel_width = (cols * self.render_metrics.cell_size.width as usize)
                 + (padding_left + padding_right)
@@ -260,7 +263,8 @@ impl super::TermWindow {
                     (padding_top + padding_bottom) as usize
                         + (border.top + border.bottom).get() as usize,
                 )
-                .saturating_sub(tab_bar_height as usize);
+                .saturating_sub(tab_bar_height as usize)
+                .saturating_sub(docked_input_height as usize);
 
             let rows = avail_height / self.render_metrics.cell_size.height as usize;
             let cols = avail_width / self.render_metrics.cell_size.width as usize;
@@ -504,6 +508,7 @@ impl super::TermWindow {
         } else {
             0
         };
+        let docked_input_height = self.docked_input_pixel_height() as usize;
         let sidebar_width = self.sidebar_reserved_width();
 
         let h_context = DimensionContext {
@@ -528,7 +533,8 @@ impl super::TermWindow {
             pixel_height: ((terminal_size.rows as usize * render_metrics.cell_size.height as usize)
                 + padding_top
                 + padding_bottom) as usize
-                + tab_bar_height,
+                + tab_bar_height
+                + docked_input_height,
             dpi: self.dimensions.dpi,
         };
 

@@ -641,6 +641,8 @@ pub enum KeyAssignment {
     OpenUri(String),
     OpenFileBrowser,
     ActivateCommandPalette,
+    ActivateComposer,
+    ToggleDockedInput,
     ActivateWindow(usize),
     ActivateWindowRelative(isize),
     ActivateWindowRelativeNoWrap(isize),

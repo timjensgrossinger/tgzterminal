@@ -122,6 +122,56 @@ impl Default for FileBrowserConfig {
     }
 }
 
+#[derive(Debug, Clone, FromDynamic, ToDynamic)]
+pub struct RichInputConfig {
+    /// Enable the optional multiline input composer overlay.
+    #[dynamic(default)]
+    pub enabled: bool,
+
+    /// Only open the composer when the active pane is a detected agent pane.
+    #[dynamic(default = "default_true")]
+    pub agent_panes_only: bool,
+
+    /// Render a persistent multiline input strip docked at the bottom of the
+    /// active pane (Warp-style) instead of only the on-demand overlay modal.
+    /// The docked strip reserves rows from the terminal viewport and is always
+    /// visible while `enabled`; it is not subject to `agent_panes_only`.
+    #[dynamic(default)]
+    pub docked: bool,
+
+    /// Maximum number of visible content rows for the docked input strip. The
+    /// strip grows with typed content up to this many rows, then scrolls
+    /// internally. Clamped to a sane range at render time.
+    #[dynamic(default = "default_rich_input_dock_rows")]
+    pub dock_rows: usize,
+
+    /// Show a character/line summary of what will be sent.
+    #[dynamic(default = "default_true")]
+    pub show_send_preview: bool,
+
+    /// Require a second submit press to send multiline content.
+    #[dynamic(default)]
+    pub require_confirm_for_multiline: bool,
+
+    /// Maximum number of previous submissions kept for history recall.
+    #[dynamic(default = "default_rich_input_history_limit")]
+    pub history_limit: usize,
+}
+
+impl Default for RichInputConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            agent_panes_only: true,
+            show_send_preview: true,
+            require_confirm_for_multiline: false,
+            history_limit: default_rich_input_history_limit(),
+            docked: false,
+            dock_rows: default_rich_input_dock_rows(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, FromDynamic, ToDynamic)]
 pub enum AgentTelemetryField {
     Kind,
@@ -1012,6 +1062,10 @@ pub struct Config {
     /// Vendor-neutral agent detection and lightweight pane controls.
     #[dynamic(default)]
     pub agent_ui: AgentUiConfig,
+
+    /// Optional multiline input composer for agent panes.
+    #[dynamic(default)]
+    pub rich_input: RichInputConfig,
 
     #[dynamic(default = "default_true")]
     pub enable_scroll_bar: bool,
@@ -2436,6 +2490,14 @@ fn default_agent_copy_scrollback_lines() -> usize {
     500
 }
 
+fn default_rich_input_history_limit() -> usize {
+    100
+}
+
+fn default_rich_input_dock_rows() -> usize {
+    3
+}
+
 fn default_update_interval() -> u64 {
     86400
 }
@@ -2495,6 +2557,19 @@ mod agent_ui_tests {
             .strip_patterns
             .iter()
             .any(|pattern| pattern == "auto mode"));
+    }
+
+    #[test]
+    fn rich_input_defaults_off_and_agent_gated() {
+        let config = Config::default_config();
+
+        assert!(!config.rich_input.enabled);
+        assert!(config.rich_input.agent_panes_only);
+        assert!(config.rich_input.show_send_preview);
+        assert!(!config.rich_input.require_confirm_for_multiline);
+        assert_eq!(config.rich_input.history_limit, 100);
+        assert!(!config.rich_input.docked);
+        assert_eq!(config.rich_input.dock_rows, 3);
     }
 
     #[test]

@@ -1,5 +1,15 @@
 # Optional Rich Input Plan
 
+> **Status (implemented):** Both surfaces ship and share one editing core
+> (`ComposerBuffer`). The on-demand overlay composer is `ActivateComposer`. The
+> Warp-style docked strip (`rich_input.docked`) is **agent-only** and **not**
+> persistent: it appears only after activation via the agent-pane toolbelt
+> **Input** button or the `ToggleDockedInput` action (default
+> `Ctrl+Shift+Space`, a no-op on non-agent panes). When shown it reserves
+> `dock_rows` rows from the pane; active-pane-only in V1. See
+> `docs/TGZTERMINAL_CONFIG.md` → "Rich Input Composer". Key bindings use standard
+> WezTerm key-assignments rather than the nested `key_bindings` table below.
+
 ## Goal
 
 Add an optional multiline input composer for agent panes. The composer should make long prompts, pasted text, and file/path context easier to enter while still sending ordinary terminal input to the running CLI.

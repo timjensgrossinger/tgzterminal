@@ -1369,6 +1369,8 @@ fn agent_toolbelt_buttons(
     agent_ui: &config::AgentUiConfig,
     agent: &AgentPaneState,
     adapter: Option<&AgentAdapterConfig>,
+    rich_input_enabled: bool,
+    rich_input_docked: bool,
 ) -> Vec<(&'static str, AgentToolbeltAction)> {
     if !agent_ui.enabled
         || !agent_ui.show_pane_toolbelt
@@ -1397,6 +1399,15 @@ fn agent_toolbelt_buttons(
             agent_detail_button_label(agent.adapter_id.as_deref(), adapter),
             AgentToolbeltAction::OpenLogs,
         ));
+    }
+    if rich_input_enabled {
+        if rich_input_docked {
+            // Button that activates the persistent docked input strip for this
+            // agent pane (the strip is not shown until toggled here).
+            buttons.push(("Input", AgentToolbeltAction::DockInput));
+        } else {
+            buttons.push(("Compose", AgentToolbeltAction::Compose));
+        }
     }
     buttons
 }
@@ -1886,6 +1897,12 @@ impl crate::TermWindow {
         relevant
     }
 
+    /// Whether the given pane is currently detected as an agent pane.
+    /// Exposed for the rich-input composer's agent-only gating.
+    pub(crate) fn pane_is_agent(&self, pane: &Arc<dyn Pane>) -> bool {
+        self.detect_agent_pane(pane).is_some()
+    }
+
     fn detect_agent_pane(&self, pane: &Arc<dyn Pane>) -> Option<AgentPaneState> {
         if !self.config.agent_ui.enabled {
             return None;
@@ -2008,16 +2025,33 @@ impl crate::TermWindow {
             .or(visible_kind)
             .or(metadata_kind)
         else {
+            // Sticky detection: a pane previously detected as an agent should not
+            // vanish just because the identifying banner scrolled out of the
+            // visible region. If the cheap identity fields (foreground process,
+            // pane title, relevant user vars) are unchanged, retain the last known
+            // state so the toolbelt stays stable across streamed messages.
+            let sticky_state = previous_entry.as_ref().and_then(|entry| {
+                let k = &entry.key;
+                if entry.state.is_some()
+                    && k.foreground_process == cache_key.foreground_process
+                    && k.pane_title == cache_key.pane_title
+                    && k.relevant_user_vars == cache_key.relevant_user_vars
+                {
+                    entry.state.clone()
+                } else {
+                    None
+                }
+            });
             self.agent_detection_cache.borrow_mut().insert(
                 pane.pane_id(),
                 AgentDetectionCacheEntry {
                     key: cache_key,
-                    state: None,
+                    state: sticky_state.clone(),
                     last_wait_notification: previous_wait_notification,
                     detected_at: Instant::now(),
                 },
             );
-            return None;
+            return sticky_state;
         };
         let adapter = self.agent_adapter_config_by_id(adapter_id.as_deref());
         if adapter_id.is_some()
@@ -2864,6 +2898,8 @@ impl crate::TermWindow {
             &self.config.agent_ui,
             &agent,
             adapter.as_ref(),
+            self.config.rich_input.enabled,
+            self.config.rich_input.docked,
         ));
         if buttons.is_empty() {
             return Ok(());
@@ -4466,17 +4502,42 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(!agent_toolbelt_buttons(&agent_ui, &agent, Some(&adapter)).is_empty());
+        assert!(
+            !agent_toolbelt_buttons(&agent_ui, &agent, Some(&adapter), false, false).is_empty()
+        );
+
+        // The Compose button appears only when rich_input is enabled and not docked.
+        assert!(
+            !agent_toolbelt_buttons(&agent_ui, &agent, Some(&adapter), false, false)
+                .iter()
+                .any(|(_, action)| action == &AgentToolbeltAction::Compose)
+        );
+        assert!(
+            agent_toolbelt_buttons(&agent_ui, &agent, Some(&adapter), true, false)
+                .iter()
+                .any(|(_, action)| action == &AgentToolbeltAction::Compose)
+        );
+        // With docked enabled, the Input (DockInput) button replaces Compose.
+        let docked_buttons = agent_toolbelt_buttons(&agent_ui, &agent, Some(&adapter), true, true);
+        assert!(docked_buttons
+            .iter()
+            .any(|(_, action)| action == &AgentToolbeltAction::DockInput));
+        assert!(!docked_buttons
+            .iter()
+            .any(|(_, action)| action == &AgentToolbeltAction::Compose));
 
         agent_ui.show_pane_toolbelt = false;
-        assert!(agent_toolbelt_buttons(&agent_ui, &agent, Some(&adapter)).is_empty());
+        assert!(agent_toolbelt_buttons(&agent_ui, &agent, Some(&adapter), false, false).is_empty());
 
         agent_ui.show_pane_toolbelt = true;
         let disabled_adapter = AgentAdapterConfig {
             enabled: false,
             ..adapter
         };
-        assert!(agent_toolbelt_buttons(&agent_ui, &agent, Some(&disabled_adapter)).is_empty());
+        assert!(
+            agent_toolbelt_buttons(&agent_ui, &agent, Some(&disabled_adapter), false, false)
+                .is_empty()
+        );
     }
 
     #[test]

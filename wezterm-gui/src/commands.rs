@@ -2019,6 +2019,24 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             menubar: &["Edit"],
             icon: None,
         },
+        ActivateComposer => CommandDef {
+            brief: "Open Input Composer".into(),
+            doc: "Opens the multiline rich-input composer for the active pane".into(),
+            keys: vec![],
+            args: &[ArgType::ActivePane],
+            menubar: &["Edit"],
+            icon: None,
+        },
+        ToggleDockedInput => CommandDef {
+            brief: "Toggle Docked Input Focus".into(),
+            doc: "Moves keyboard focus between the terminal and the persistent \
+                  docked rich-input strip (rich_input.docked)"
+                .into(),
+            keys: vec![(Modifiers::CTRL.union(Modifiers::SHIFT), "Space".into())],
+            args: &[ArgType::ActivePane],
+            menubar: &["Edit"],
+            icon: None,
+        },
     })
 }
 
@@ -2063,6 +2081,8 @@ fn compute_default_actions() -> Vec<KeyAssignment> {
         ActivateCopyMode,
         ClearKeyTableStack,
         ActivateCommandPalette,
+        ActivateComposer,
+        ToggleDockedInput,
         // ----------------- View
         DecreaseFontSize,
         IncreaseFontSize,

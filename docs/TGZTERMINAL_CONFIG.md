@@ -180,3 +180,117 @@ When enabled, the sidebar reads pane user variables named `agent.kind`,
 `agent.model`, `agent.status`, `agent.input_tokens`, `agent.output_tokens`,
 `agent.total_tokens`, `agent.cost`, and `agent.estimated_cost`. Underscore
 forms such as `agent_model` are accepted as a compatibility fallback.
+
+## Rich Input Composer
+
+```lua
+config.rich_input = {
+  enabled = false,
+  agent_panes_only = true,
+  show_send_preview = true,
+  require_confirm_for_multiline = false,
+  history_limit = 100,
+  docked = false,
+  dock_rows = 3,
+}
+```
+
+`rich_input` adds an optional multiline input composer that opens as a
+bottom-anchored overlay. It is intended for composing long prompts, pasted
+text, and path references before sending them to an agent CLI. It is `false`
+by default and adds no behavior until enabled.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `false` | Master switch for the composer. |
+| `agent_panes_only` | `true` | Only open when the active pane is a detected agent pane. |
+| `show_send_preview` | `true` | Show a `[N lines, M chars]` summary of what will be sent. |
+| `require_confirm_for_multiline` | `false` | Require a second submit press to send multiline content. |
+| `history_limit` | `100` | Maximum previous submissions kept for recall. |
+| `docked` | `false` | Enable the Warp-style docked input strip, activated per agent pane via the toolbelt **Input** button or `ToggleDockedInput` (see below). |
+| `dock_rows` | `3` | Visible content rows reserved for the docked strip when shown (clamped 1–12). |
+
+The composer has no default key binding. Bind the `ActivateComposer` action to
+open it, for example:
+
+```lua
+config.keys = {
+  { key = 'Space', mods = 'CTRL|SHIFT', action = wezterm.action.ActivateComposer },
+}
+```
+
+When `rich_input.enabled = true`, the agent pane toolbelt also shows a **Compose**
+button (next to Copy). Clicking it toggles the composer open/closed for that pane,
+so no key binding is required. The button honors the same gating as
+`ActivateComposer` (`agent_panes_only`), and the toolbelt only appears on detected
+agent panes.
+
+Composer key handling while the overlay is open:
+
+| Key | Action |
+| --- | --- |
+| `Ctrl+Enter` | Send the buffer to the active pane, then submit (sends `Enter`). |
+| `Enter` / `Shift+Enter` | Insert a newline. |
+| `Esc` | Close without sending. |
+| `Backspace` / `Delete` | Edit the buffer. |
+| Arrows / `Home` / `End` | Move the cursor. |
+| `Alt+Up` / `Alt+Down` | Recall previous / next submission from history. |
+| `Ctrl+U` | Clear the buffer. |
+| `Alt+D` | Insert the active pane's working directory as a plain path. |
+| `Alt+S` | Insert the current terminal selection. |
+| Paste | Pasted text is normalized (CRLF → LF) and inserted into the buffer. |
+
+### Sending semantics and safety
+
+On submit the composer sends the buffer as a bracketed paste followed by a
+single carriage return, so multiline content and embedded control characters
+are delivered safely and the CLI's own permission and approval flows stay in
+control. The composer never attaches hidden file contents: `Alt+D` and `Alt+S`
+insert plain text references (a path or the current selection) that remain
+visible and editable before you send. When the composer is closed, terminal
+input is unchanged.
+
+Context helpers for inserting a selected file path or Worktree path from the
+sidebar are planned for a later version; V1 covers working directory and
+terminal selection insertion.
+
+### Docked input strip (Warp-style)
+
+Set `rich_input.docked = true` (with `enabled = true`) to make a Warp-style
+multiline input strip available on **agent CLI panes**. The strip is **not**
+persistent chrome and is **not** shown by default: it appears only after you
+activate it, and only on detected agent panes.
+
+Activate it in one of two ways, both agent-only:
+
+- Click the **Input** button in the agent pane toolbelt (it replaces the
+  "Compose" button when `docked = true`). The toolbelt only appears on detected
+  agent panes, so the button — and therefore the strip — is unavailable
+  elsewhere.
+- Press `Ctrl+Shift+Space` (the `ToggleDockedInput` action, bound by default)
+  while an agent pane is active. On a non-agent pane the key does nothing.
+
+Toggling activates the strip for that pane and focuses it; toggling again hides
+it. When shown, it reserves `dock_rows` rows (plus a header and hint line) from
+that pane's viewport, so the terminal becomes that many rows shorter. The
+reservation is fixed (it does not grow while you type); content beyond
+`dock_rows` scrolls internally.
+
+While the strip is shown:
+
+- Keystrokes edit it: `Ctrl+Enter` sends the buffer to the pane (bracketed paste
+  + `Enter`) and keeps focus for the next prompt, `Enter` inserts a newline,
+  `Esc` releases focus back to the terminal (the strip stays shown). Arrows,
+  `Home`, `End`, `Backspace`, `Delete`, `Ctrl+U` (clear), `Alt+Up`/`Alt+Down`
+  (history), `Alt+D` (cwd) and `Alt+S` (selection) behave as in the overlay
+  composer.
+- Click inside the strip to focus it; click the terminal above it to release
+  focus. While unfocused, terminal input is completely unchanged.
+
+The toolbelt requires `agent_ui.enabled` and `agent_ui.show_pane_toolbelt`
+(both on by default). Split panes: V1 shows a single strip that follows the
+active pane; independent per-pane strips inside splits are not yet supported.
+
+Note: because bound key assignments are handled before the strip, a bound
+clipboard-paste shortcut still pastes into the pane rather than the strip while
+the strip is focused; use the overlay composer if you need paste-into-buffer.

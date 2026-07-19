@@ -142,9 +142,11 @@ impl crate::TermWindow {
                 } else {
                     (pos.width as f32 * cell_width) + width_delta
                 },
-                // Go all the way to the bottom if we're bottom-most
+                // Go all the way to the bottom if we're bottom-most, but stop
+                // short of the band reserved for the docked input strip so the
+                // pane background does not paint over it.
                 if pos.top + pos.height >= self.terminal_size.rows as usize {
-                    self.dimensions.pixel_height as f32 - y
+                    self.dimensions.pixel_height as f32 - y - self.docked_input_pixel_height()
                 } else {
                     (pos.height as f32 * cell_height) + height_delta as f32
                 },
@@ -622,9 +624,10 @@ impl crate::TermWindow {
             } else {
                 (pos.width as f32 * cell_width) + width_delta
             },
-            // Go all the way to the bottom if we're bottom-most
+            // Go all the way to the bottom if we're bottom-most, minus the band
+            // reserved for the docked input strip.
             if pos.top + pos.height >= self.terminal_size.rows as usize {
-                self.dimensions.pixel_height as f32 - y
+                self.dimensions.pixel_height as f32 - y - self.docked_input_pixel_height()
             } else {
                 (pos.height as f32 * cell_height) + height_delta as f32
             },
