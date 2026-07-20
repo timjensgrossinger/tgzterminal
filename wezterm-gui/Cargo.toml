@@ -54,6 +54,7 @@ finl_unicode.workspace = true
 frecency.workspace = true
 futures.workspace = true
 hdrhistogram.workspace = true
+hostname.workspace = true
 http_req.workspace = true
 image.workspace = true
 lazy_static.workspace = true

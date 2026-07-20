@@ -450,6 +450,64 @@ impl SessionHandler {
                 })
                 .detach();
             }
+            Pdu::DomainExec(DomainExec {
+                domain_id,
+                command,
+                env,
+            }) => {
+                spawn_into_main_thread(async move {
+                    // Resolve the domain and clone its live session on the main
+                    // thread, where the Mux lives. Only ssh domains are allowed:
+                    // this is the security gate so the verb can never exec on an
+                    // arbitrary pane/command sink.
+                    let session = {
+                        let mux = Mux::get();
+                        match mux.get_domain(domain_id) {
+                            Some(domain) => {
+                                match domain.downcast_ref::<mux::ssh::RemoteSshDomain>() {
+                                    Some(ssh) => ssh.cloned_session(),
+                                    None => {
+                                        send_response(Err(anyhow!(
+                                            "domain {} is not an ssh domain",
+                                            domain_id
+                                        )));
+                                        return;
+                                    }
+                                }
+                            }
+                            None => {
+                                send_response(Err(anyhow!("no such domain {}", domain_id)));
+                                return;
+                            }
+                        }
+                    };
+                    let session = match session {
+                        Some(session) => session,
+                        None => {
+                            send_response(Err(anyhow!(
+                                "ssh domain {} has no live session",
+                                domain_id
+                            )));
+                            return;
+                        }
+                    };
+                    // The listing does blocking network reads; run it on a
+                    // dedicated thread so the main thread is never blocked.
+                    std::thread::spawn(move || {
+                        let result = mux::ssh::worktree_exec_capture(session, command, env).map(
+                            |(stdout, stderr, exit_code)| {
+                                Pdu::DomainExecResponse(DomainExecResponse {
+                                    stdout,
+                                    stderr,
+                                    exit_code,
+                                })
+                            },
+                        );
+                        send_response(result);
+                    });
+                })
+                .detach();
+            }
             Pdu::EraseScrollbackRequest(EraseScrollbackRequest {
                 pane_id,
                 erase_mode,
@@ -1010,6 +1068,7 @@ impl SessionHandler {
             | Pdu::MovePaneToNewTabResponse { .. }
             | Pdu::TabAddedToWindow { .. }
             | Pdu::GetPaneRenderableDimensionsResponse { .. }
+            | Pdu::DomainExecResponse { .. }
             | Pdu::ErrorResponse { .. } => {
                 send_response(Err(anyhow!("expected a request, got {:?}", decoded.pdu)))
             }

@@ -1360,6 +1360,7 @@ impl Client {
         LivenessResponse
     );
     rpc!(get_lines, GetLines, GetLinesResponse);
+    rpc!(domain_exec, DomainExec, DomainExecResponse);
     rpc!(
         get_dimensions,
         GetPaneRenderableDimensions,

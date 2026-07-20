@@ -7,6 +7,7 @@ mod activate_pane;
 mod activate_pane_direction;
 mod activate_tab;
 mod adjust_pane_size;
+mod domain_exec;
 mod get_pane_direction;
 mod get_text;
 mod kill_pane;
@@ -117,6 +118,12 @@ Outputs the pane-id for the newly created pane on success"
     #[command(name = "send-text", rename_all = "kebab")]
     SendText(send_text::SendText),
 
+    /// Run a command over a wezterm SSH domain's existing authenticated
+    /// connection and print its output. Reads the command from stdin.
+    /// Used internally by the Worktree file browser.
+    #[command(name = "worktree-exec", rename_all = "kebab", hide = true)]
+    WorktreeExec(domain_exec::DomainExec),
+
     /// Retrieves the textual content of a pane and output it to stdout
     #[command(name = "get-text", rename_all = "kebab")]
     GetText(get_text::GetText),
@@ -185,6 +192,7 @@ async fn run_cli_async(opts: &crate::Opt, cli: CliCommand) -> anyhow::Result<()>
         CliSubCommand::MovePaneToNewTab(cmd) => cmd.run(client).await,
         CliSubCommand::SplitPane(cmd) => cmd.run(client).await,
         CliSubCommand::SendText(cmd) => cmd.run(client).await,
+        CliSubCommand::WorktreeExec(cmd) => cmd.run(client).await,
         CliSubCommand::GetText(cmd) => cmd.run(client).await,
         CliSubCommand::SpawnCommand(cmd) => cmd.run(client, &crate::init_config(opts)?).await,
         CliSubCommand::Proxy(cmd) => cmd.run(client, &crate::init_config(opts)?).await,

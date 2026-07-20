@@ -441,7 +441,7 @@ macro_rules! pdu {
 /// The overall version of the codec.
 /// This must be bumped when backwards incompatible changes
 /// are made to the types and protocol.
-pub const CODEC_VERSION: usize = 45;
+pub const CODEC_VERSION: usize = 46;
 
 // Defines the Pdu enum.
 // Each struct has an explicit identifying number.
@@ -502,6 +502,8 @@ pdu! {
     GetPaneDirection: 60,
     GetPaneDirectionResponse: 61,
     AdjustPaneSize: 62,
+    DomainExec: 63,
+    DomainExecResponse: 64,
 }
 
 impl Pdu {
@@ -1107,6 +1109,24 @@ impl From<Vec<(StableRowIndex, Line)>> for SerializedLines {
 pub struct GetLinesResponse {
     pub pane_id: PaneId,
     pub lines: SerializedLines,
+}
+
+/// Run a one-shot command over a wezterm SSH domain's already-authenticated
+/// session and capture its output. Used by the Worktree file browser so it can
+/// list remote folders over the existing connection instead of opening a second
+/// ssh connection. The server only honors this for `RemoteSshDomain` domains.
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct DomainExec {
+    pub domain_id: mux::domain::DomainId,
+    pub command: String,
+    pub env: Option<HashMap<String, String>>,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct DomainExecResponse {
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub exit_code: i32,
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Debug)]

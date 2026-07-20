@@ -7049,6 +7049,7 @@ dependencies = [
  "frecency",
  "futures",
  "hdrhistogram",
+ "hostname",
  "http_req",
  "image",
  "k9",

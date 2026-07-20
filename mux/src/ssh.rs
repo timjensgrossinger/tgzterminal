@@ -266,6 +266,40 @@ pub fn ssh_domain_to_ssh_config(ssh_dom: &SshDomain) -> anyhow::Result<ConfigMap
     Ok(ssh_config)
 }
 
+/// Run `command` over an already-authenticated ssh [`Session`] and capture its
+/// full stdout/stderr and a coarse exit code (0 on success, 1 otherwise). Does
+/// blocking reads, so callers must invoke it on a dedicated thread — never on
+/// the mux main thread. Mirrors the one-shot exec pattern used by
+/// `wezterm-client` for tls creds: drain stderr on a side thread while reading
+/// stdout to EOF to avoid a pipe deadlock on large output.
+pub fn worktree_exec_capture(
+    session: Session,
+    command: String,
+    env: Option<std::collections::HashMap<String, String>>,
+) -> anyhow::Result<(Vec<u8>, Vec<u8>, i32)> {
+    use portable_pty::Child;
+    use std::io::Read;
+    let mut exec = smol::block_on(session.exec(&command, env))
+        .with_context(|| format!("worktree exec `{command}` over ssh session"))?;
+    drop(exec.stdin);
+
+    let mut stderr = exec.stderr;
+    let stderr_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr.read_to_end(&mut buf);
+        buf
+    });
+
+    let mut stdout = Vec::new();
+    exec.stdout
+        .read_to_end(&mut stdout)
+        .context("reading worktree exec stdout")?;
+    let status = exec.child.wait().context("waiting for worktree exec")?;
+    let stderr = stderr_thread.join().unwrap_or_default();
+    let exit_code = if status.success() { 0 } else { 1 };
+    Ok((stdout, stderr, exit_code))
+}
+
 impl RemoteSshDomain {
     pub fn with_ssh_domain(dom: &SshDomain) -> anyhow::Result<Self> {
         let id = alloc_domain_id();
@@ -275,6 +309,15 @@ impl RemoteSshDomain {
             session: Mutex::new(None),
             dom: dom.clone(),
         })
+    }
+
+    /// Clone the live authenticated session, if one has been established.
+    /// Mirrors the lock/clone dance in [`Self::spawn_pane`]. Used by the
+    /// Worktree file browser (via the `worktree-exec` mux CLI verb) to run a
+    /// one-shot listing over the existing connection with zero re-auth, rather
+    /// than opening a second ssh connection.
+    pub fn cloned_session(&self) -> Option<Session> {
+        self.session.lock().unwrap().as_ref().cloned()
     }
 
     pub fn ssh_config(&self) -> anyhow::Result<ConfigMap> {
