@@ -67,6 +67,7 @@ review_*.json
 /assets/flatpak/generated-sources.json
 /__pycache__/
 /nix/result
+*.qcow2
 
 # AI instruction files
 CLAUDE.md

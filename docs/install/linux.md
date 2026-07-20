@@ -17,7 +17,7 @@ hide:
         especially for power users. It is recommended that you graduate
         to a native package if/when you decide to fully embrace wezterm.
 
-    <a href='https://flathub.org/apps/details/org.wezfurlong.wezterm'><img width='240' alt='Download on Flathub' src='https://flathub.org/assets/badges/flathub-badge-en.png'/></a>
+    <a href='https://flathub.org/apps/details/org.wezfurlong.wezterm'><img width='240' alt='Get it on Flathub' src='https://flathub.org/api/badge?locale=en'/></a>
 
     To install using the command line:
 
@@ -282,13 +282,19 @@ hide:
 
     ```console
     $ brew tap wezterm/wezterm-linuxbrew
-    $ brew install wezterm
+    $ brew install wezterm/wezterm-linuxbrew/wezterm
     ```
+
+    !!! note
+        The fully-qualified `wezterm/wezterm-linuxbrew/wezterm` name is
+        required on Linux because `wezterm` in `homebrew-core` is a
+        macOS-only cask and `brew install wezterm` would resolve to
+        that and fail with "macOS is required for this software".
 
     If you'd like to use a nightly build you can perform a head install:
 
     ```console
-    $ brew install --HEAD wezterm
+    $ brew install --HEAD wezterm/wezterm-linuxbrew/wezterm
     ```
 
     to upgrade to a newer nightly, it is simplest to remove then
@@ -296,7 +302,7 @@ hide:
 
     ```console
     $ brew rm wezterm
-    $ brew install --HEAD wezterm
+    $ brew install --HEAD wezterm/wezterm-linuxbrew/wezterm
     ```
 === "Nix/NixOS"
 
@@ -404,6 +410,35 @@ hide:
     ```
 
     Be sure to also install the `nerd-fonts-ttf` package!
+
+=== "Gentoo"
+    ## Gentoo Linux
+
+    WezTerm stable/release is available in main Gentoo tree:
+
+    ```console
+    $ sudo emerge -a x11-terms/wezterm
+    ```
+
+    WezTerm nightly build is available in [Gentoo GURU](https://wiki.gentoo.org/wiki/Project:GURU/Information_for_End_Users) overlay/repository
+
+    First install `app-eselect/eselect-repository` if it is not already installed, and next enable the GURU repository:
+
+    ```console
+    $ sudo emerge -a app-eselect/eselect-repository
+    $ sudo eselect repository enable guru
+    ```
+
+    Install/Update `x11-terms/wezterm-nightly-bin`:
+
+    ```console
+    $ sudo emerge -a x11-terms/wezterm-nightly-bin
+    ```
+
+    !!! note
+        `wezterm-nightly-bin` is a live ebuild, it will pull the latest
+        nightly binary everytime it's merged. Also, it's a binary
+        package and therefore not built from source.
 
 === "Raw"
     ## Raw Linux Binary
