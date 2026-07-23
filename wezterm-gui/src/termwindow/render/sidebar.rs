@@ -40,6 +40,11 @@ const ACTION_ICON_W: f32 = 16.;
 const ACTION_ICON_GAP: f32 = 8.;
 const RADIUS: f32 = 7.;
 const CLOSE_ZONE_W: f32 = 34.;
+// Horizontal space the tab row reserves for the close button when laying out
+// the title text. Smaller than CLOSE_ZONE_W (the hit/hover target) because the
+// × is right-aligned within the zone, so the title can run closer to it before
+// truncating — giving short-sidebar titles more room.
+const CLOSE_TEXT_RESERVE: f32 = 22.;
 const SIDEBAR_SCROLLBAR_GUTTER_W: f32 = 30.;
 const SIDEBAR_SCROLLBAR_W: f32 = 10.;
 const SIDEBAR_SCROLLBAR_INSET_Y: f32 = 12.;
@@ -218,6 +223,33 @@ fn contains_case_insensitive(haystack: &str, needle: &str) -> bool {
             .contains(&needle.to_ascii_lowercase())
 }
 
+/// Case-insensitive whole-word containment. Unlike `contains_case_insensitive`,
+/// the needle must be bounded by non-alphanumeric characters (or the string
+/// edges), so a short agent pattern like "amp" no longer matches inside
+/// ordinary words such as "example" or "sample". Used only on the loose
+/// title/visible-text detection paths, where plain substring matching produced
+/// false positives on normal shell / ssh output. `haystack_lower` is assumed
+/// already ASCII-lowercased; `needle` is lowercased here.
+fn contains_word_lower(haystack_lower: &str, needle: &str) -> bool {
+    let needle = needle.trim().to_ascii_lowercase();
+    if needle.is_empty() {
+        return false;
+    }
+    let bytes = haystack_lower.as_bytes();
+    let mut start = 0;
+    while let Some(pos) = haystack_lower[start..].find(needle.as_str()) {
+        let idx = start + pos;
+        let before_ok = idx == 0 || !bytes[idx - 1].is_ascii_alphanumeric();
+        let after = idx + needle.len();
+        let after_ok = after >= bytes.len() || !bytes[after].is_ascii_alphanumeric();
+        if before_ok && after_ok {
+            return true;
+        }
+        start = idx + 1;
+    }
+    false
+}
+
 fn built_in_agent_adapters() -> &'static config::AgentAdaptersConfig {
     &BUILT_IN_AGENT_ADAPTERS
 }
@@ -277,6 +309,22 @@ fn agent_pattern_matches_pre_lowered(haystack_lower: &str, pattern: &str) -> boo
     } else {
         // haystack is already lowercase; only lowercase the needle
         !pattern.trim().is_empty() && haystack_lower.contains(&pattern.to_ascii_lowercase())
+    }
+}
+
+/// Word-boundary variant of `agent_pattern_matches_pre_lowered`, used by the
+/// title and visible-text detection paths. Regex patterns (`re:`) keep their
+/// exact semantics; plain patterns must match as whole words so a short
+/// literal like "amp" does not fire on "example"/"sample" in ordinary output.
+fn agent_word_pattern_matches_pre_lowered(haystack_lower: &str, pattern: &str) -> bool {
+    let pattern = pattern.trim();
+    if pattern.len() > MAX_AGENT_PATTERN_LEN + 3 {
+        return false;
+    }
+    if let Some(regex) = pattern.strip_prefix("re:") {
+        cached_regex_matches(haystack_lower, regex)
+    } else {
+        contains_word_lower(haystack_lower, pattern)
     }
 }
 
@@ -1478,7 +1526,7 @@ fn title_agent_hint(title: &str) -> Option<(String, AgentKind)> {
     for (id, adapter) in built_in_agent_adapters() {
         if adapter.title_patterns.iter().any(|pattern| {
             let pattern = pattern.trim();
-            !pattern.is_empty() && agent_pattern_matches(&lower, pattern)
+            !pattern.is_empty() && agent_word_pattern_matches_pre_lowered(&lower, pattern)
         }) {
             return Some((id.clone(), adapter_kind_from_id(&id, &adapter)));
         }
@@ -1490,7 +1538,7 @@ fn visible_agent_kind_hint(text: &str, adapter: Option<&AgentAdapterConfig>) -> 
     let lower = text.to_ascii_lowercase();
     adapter_patterns(adapter, PatternField::Visible)
         .into_iter()
-        .find(|pattern| agent_pattern_matches_pre_lowered(&lower, pattern))
+        .find(|pattern| agent_word_pattern_matches_pre_lowered(&lower, pattern))
 }
 
 fn visible_agent_match_from_adapters(
@@ -1612,19 +1660,41 @@ impl crate::TermWindow {
         }
     }
 
+    /// The configured sidebar widths (`sidebar_width_px` /
+    /// `sidebar_collapsed_width_px`) are calibrated for a 2x (Retina) display.
+    /// On lower-density displays we scale the pixel widths down so the sidebar
+    /// keeps a consistent *physical* size (and a consistent ratio to the
+    /// DPI-scaled font) instead of eating the screen. macOS reports DPI on a
+    /// 72 base (Retina ~144, 1x ~72); other platforms use 96 (Retina ~192).
+    /// The result is clamped so extreme/zero DPIs stay sane.
+    fn sidebar_width_scale(&self) -> f32 {
+        #[cfg(target_os = "macos")]
+        let base_dpi = 72.0_f32;
+        #[cfg(not(target_os = "macos"))]
+        let base_dpi = 96.0_f32;
+        let backing_scale = (self.dimensions.dpi as f32 / base_dpi).max(0.1);
+        (backing_scale / 2.0).clamp(0.5, 1.25)
+    }
+
     fn sidebar_expanded_width(&self) -> usize {
-        self.sidebar_drag_width
-            .unwrap_or(self.config.sidebar_width_px)
-            .max(self.sidebar_collapsed_width())
+        // A manual drag-resize is an explicit physical-pixel choice by the
+        // user, so it is kept verbatim; only the configured default scales.
+        let base = match self.sidebar_drag_width {
+            Some(w) => w,
+            None => {
+                (self.config.sidebar_width_px as f32 * self.sidebar_width_scale()).round() as usize
+            }
+        };
+        base.max(self.sidebar_collapsed_width())
     }
 
     pub fn sidebar_collapsed_width(&self) -> usize {
+        let scaled = (self.config.sidebar_collapsed_width_px as f32 * self.sidebar_width_scale())
+            .round() as usize;
         if self.config.sidebar_auto_hide {
-            self.config
-                .sidebar_collapsed_width_px
-                .max(MIN_AUTO_HIDE_RAIL_W)
+            scaled.max(MIN_AUTO_HIDE_RAIL_W)
         } else {
-            self.config.sidebar_collapsed_width_px
+            scaled
         }
     }
 
@@ -2950,10 +3020,27 @@ impl crate::TermWindow {
         } else {
             format!(" {}", agent.status.label())
         };
-        let label = match &agent.model {
-            Some(model) => format!("{} agent {}{}", agent.kind.label(), model, status),
-            None => format!("{} agent{}", agent.kind.label(), status),
-        };
+        let kind = agent.kind.label();
+        // Ordered widest -> narrowest. The render region hard-truncates to whole
+        // cells with no ellipsis, so instead of letting "Claude agent opus" clip
+        // to "Claude agent o", we pick the widest whole variant that fits.
+        let mut label_fallbacks: Vec<String> = Vec::new();
+        match &agent.model {
+            Some(model) => {
+                label_fallbacks.push(format!("{} agent {}{}", kind, model, status));
+                label_fallbacks.push(format!("{} agent {}", kind, model));
+                if !status.is_empty() {
+                    label_fallbacks.push(format!("{} agent{}", kind, status));
+                }
+                label_fallbacks.push(format!("{} agent", kind));
+            }
+            None => {
+                label_fallbacks.push(format!("{} agent{}", kind, status));
+                label_fallbacks.push(format!("{} agent", kind));
+            }
+        }
+        label_fallbacks.push(kind.to_string());
+        let label = label_fallbacks[0].clone();
 
         let max_tool_w = (pane_w - AGENT_TOOLBELT_RIGHT_INSET - AGENT_TOOLBELT_GAP)
             .max(1.)
@@ -3104,11 +3191,19 @@ impl crate::TermWindow {
         let button_start_x = tool_x + tool_w - pad_x - button_area;
         let label_x = tool_x + pad_x + dot_size + AGENT_TOOLBELT_GAP;
         let label_w = button_start_x - AGENT_TOOLBELT_GAP - label_x;
+        // Whole cells that fit; pick the widest fallback that fits so the model
+        // name never clips mid-word (e.g. "Claude agent opus" -> "Claude agent").
+        let label_cols = (label_w / cell_w_f).max(0.) as usize;
+        let fitted_label = label_fallbacks
+            .iter()
+            .find(|candidate| candidate.chars().count() <= label_cols)
+            .cloned()
+            .unwrap_or_else(|| label.clone());
         if label_w >= (cell_width * 6) as f32 {
             render_text(
                 self,
                 layers,
-                &label,
+                &fitted_label,
                 label_x,
                 tool_y + (strip_h - cell_h_f) * 0.5,
                 label_w,
@@ -3479,9 +3574,17 @@ impl crate::TermWindow {
                 item_x + resize_gap + (scrollbar_gutter - SIDEBAR_SCROLLBAR_W).max(0.) * 0.5
             }
         };
-        let text_x = content_x + PAD_X + ACTIVE_TEXT_GAP;
-        let text_w =
-            (content_w - PAD_X * 2. - ACTIVE_TEXT_GAP - CLOSE_ZONE_W).max(cell_width as f32);
+        // The top row reserves a square (row_height) at the content column's
+        // left for the auto-hide toggle; the search box begins just past it.
+        // Tab labels share that same left edge so the "Search tabs..." box and
+        // the "1:" / "2:" labels line up in one column (toggle sits top-left).
+        let toggle_side = row_height as f32;
+        let list_indent = toggle_side + GAP;
+        let text_x = content_x + list_indent;
+        // Keep the same right padding + close-zone as before; text width is
+        // whatever is left between the (indented) label column and the close
+        // button on the right.
+        let text_w = (content_w - list_indent - PAD_X - CLOSE_TEXT_RESERVE).max(cell_width as f32);
         let text_cols = (text_w / cell_width as f32).max(1.) as usize;
         let content_cols =
             ((content_w - PAD_X * 2.).max(cell_width as f32) / cell_width as f32).max(1.) as usize;
@@ -3549,6 +3652,52 @@ impl crate::TermWindow {
             .map(|_| ())
         };
 
+        // Hand-drawn "sidebar panel" icon for the auto-hide toggle: a rounded
+        // rectangle outline with a divider a third of the way in, i.e. a window
+        // split into a narrow sidebar column plus a content area. Drawn from the
+        // same rounded-fill primitives as the Worktree folder icon so it stays
+        // crisp at any DPI — the previous Nerd Font "columns" glyph rendered
+        // blurry and mis-centered inside the small button. `bg` is the button's
+        // own fill, used to hollow out the frame's interior.
+        let draw_toggle_icon = |this: &mut Self,
+                                layers: &mut TripleLayerQuadAllocator,
+                                rect: RectF,
+                                fg: LinearRgba,
+                                bg: LinearRgba|
+         -> anyhow::Result<()> {
+            let base = (cell_height as f32).min(rect.size.height);
+            let iw = (base * 0.82).max(6.);
+            let ih = (base * 0.66).max(5.);
+            let ix = rect.min_x() + (rect.size.width - iw) * 0.5;
+            let iy = rect.min_y() + (rect.size.height - ih) * 0.5;
+            let stroke = (1.5 * dpi_scale).max(1.);
+            let radius = (2.5 * dpi_scale).min(ih * 0.5);
+            // Outer frame, then punch the interior with the button background to
+            // leave a `stroke`-wide rounded border.
+            this.sidebar_rounded_fill(layers, 2, euclid::rect(ix, iy, iw, ih), radius, fg)?;
+            this.sidebar_rounded_fill(
+                layers,
+                2,
+                euclid::rect(
+                    ix + stroke,
+                    iy + stroke,
+                    (iw - 2. * stroke).max(1.),
+                    (ih - 2. * stroke).max(1.),
+                ),
+                (radius - stroke).max(0.5),
+                bg,
+            )?;
+            // Sidebar divider ~1/3 in from the left, spanning the inner height.
+            let divider_x = ix + (iw * 0.34).max(stroke * 2.);
+            this.filled_rectangle(
+                layers,
+                2,
+                euclid::rect(divider_x, iy + stroke, stroke, (ih - 2. * stroke).max(1.)),
+                fg,
+            )?;
+            Ok(())
+        };
+
         if self.config.sidebar_auto_hide && !self.sidebar_auto_hide_open {
             let tabs: Vec<_> = self
                 .tab_bar
@@ -3567,25 +3716,38 @@ impl crate::TermWindow {
             // with the (DPI-scaled) font cell height (keeping the original
             // 46px as a scaled floor) so the glyph never exceeds the box.
             let rail_ceiling = (cell_height as f32 + 12. * dpi_scale).max(46. * dpi_scale);
-            let rail_side = (width as f32 - 10.).clamp(38. * dpi_scale, rail_ceiling);
+            // The box must always fit inside the strip: leave a small margin on
+            // each side and cap at the ceiling. Never force a lower bound that
+            // could exceed the available strip width, or the box would spill
+            // past both edges of a narrow collapsed rail.
+            let rail_side = (width as f32 - 8.).min(rail_ceiling).max(1.);
             let rail_radius = (RADIUS * dpi_scale).min(rail_side * 0.5);
             let rail_x = left + (width as f32 - rail_side) * 0.5;
             let row_stride = rail_side + GAP;
             // Auto-hide toggle occupies the first rail slot so it stays
             // reachable to turn auto-hide back off from the collapsed rail.
             let toggle_top = top + INSET;
-            self.paint_sidebar_autohide_toggle(
+            let toggle_rect = euclid::rect(rail_x, toggle_top, rail_side, rail_side);
+            let toggle_bg = self.paint_sidebar_autohide_toggle(
                 layers,
-                euclid::rect(rail_x, toggle_top, rail_side, rail_side),
+                toggle_rect,
                 dpi_scale,
                 &hovered_item,
                 left_pressed,
                 surface,
                 inactive_fg,
-                accent,
                 hover_fill,
                 pressed_fill,
             )?;
+            let toggle_hovered = hovered_item.as_ref() == Some(&UIItemType::SidebarAutoHideToggle);
+            let toggle_fg = if toggle_hovered {
+                hover_fg
+            } else if self.config.sidebar_auto_hide {
+                accent
+            } else {
+                inactive_fg.mul_alpha(0.75)
+            };
+            draw_toggle_icon(self, layers, toggle_rect, toggle_fg, toggle_bg)?;
             let list_top = toggle_top + row_stride;
             let new_tab_y = top + height - INSET - rail_side;
             let list_height = (new_tab_y - GAP - list_top).max(0.);
@@ -3747,14 +3909,14 @@ impl crate::TermWindow {
         }
 
         let mut y = top + INSET;
-        let toggle_side = row_height as f32;
         if width > 96 {
-            // Auto-hide toggle and search share the top row: the toggle sits
-            // flush at the left of the content column and the search bar fills
-            // the remaining width to its right. Keeping them on one row means
-            // the tab list starts right below with no leftover gap up top.
+            // Auto-hide toggle sits top-left as a square; the search box fills
+            // the rest of the row to its right, its left edge flush with the
+            // tab-label column below (content_x + list_indent). Keeping toggle
+            // and search on one row means the tab list starts right below with
+            // no leftover gap up top.
             let toggle_rect = euclid::rect(content_x, y, toggle_side, toggle_side);
-            self.paint_sidebar_autohide_toggle(
+            let toggle_bg = self.paint_sidebar_autohide_toggle(
                 layers,
                 toggle_rect,
                 dpi_scale,
@@ -3762,14 +3924,25 @@ impl crate::TermWindow {
                 left_pressed,
                 surface,
                 inactive_fg,
-                accent,
                 hover_fill,
                 pressed_fill,
             )?;
+            let toggle_hovered = hovered_item.as_ref() == Some(&UIItemType::SidebarAutoHideToggle);
+            let toggle_fg = if toggle_hovered {
+                hover_fg
+            } else if self.config.sidebar_auto_hide {
+                accent
+            } else {
+                inactive_fg.mul_alpha(0.75)
+            };
+            draw_toggle_icon(self, layers, toggle_rect, toggle_fg, toggle_bg)?;
 
-            // Search bar is shortened by the toggle width + gap.
-            let search_x = content_x + toggle_side + GAP;
-            let search_w = (content_w - toggle_side - GAP).max(1.);
+            let search_x = content_x + list_indent;
+            // Extend the search box to the tab-row pill's right edge
+            // (item_x + item_w) so it lines up with the highlighted tab rows
+            // below, which span the full item width rather than stopping short
+            // at the scrollbar gutter / resize grip.
+            let search_w = (item_x + item_w - search_x).max(1.);
             let search_text_x = search_x + PAD_X + ACTIVE_TEXT_GAP;
             let search_cols = ((search_w - PAD_X * 2.).max(cell_width as f32) / cell_width as f32)
                 .max(1.) as usize;
@@ -3787,7 +3960,8 @@ impl crate::TermWindow {
                 search_fill
             };
             let search_offset = if search_pressed { 1. } else { 0. };
-            let search_rect = euclid::rect(search_x, y + search_offset, search_w, row_height as f32);
+            let search_rect =
+                euclid::rect(search_x, y + search_offset, search_w, row_height as f32);
             // row_height (self.sidebar_row_height()) already derives its
             // height directly from the DPI-scaled cell height, so no
             // additional height derivation is needed here; only the corner
@@ -3843,7 +4017,7 @@ impl crate::TermWindow {
             // Narrow sidebar: no search field is drawn, so the toggle keeps
             // its own row at the top-left of the content column.
             let toggle_rect = euclid::rect(content_x, y, toggle_side, toggle_side);
-            self.paint_sidebar_autohide_toggle(
+            let toggle_bg = self.paint_sidebar_autohide_toggle(
                 layers,
                 toggle_rect,
                 dpi_scale,
@@ -3851,10 +4025,18 @@ impl crate::TermWindow {
                 left_pressed,
                 surface,
                 inactive_fg,
-                accent,
                 hover_fill,
                 pressed_fill,
             )?;
+            let toggle_hovered = hovered_item.as_ref() == Some(&UIItemType::SidebarAutoHideToggle);
+            let toggle_fg = if toggle_hovered {
+                hover_fg
+            } else if self.config.sidebar_auto_hide {
+                accent
+            } else {
+                inactive_fg.mul_alpha(0.75)
+            };
+            draw_toggle_icon(self, layers, toggle_rect, toggle_fg, toggle_bg)?;
             y += toggle_side + GAP;
         }
 
@@ -4089,7 +4271,7 @@ impl crate::TermWindow {
                     layers,
                     1,
                     euclid::rect(
-                        close_x + (CLOSE_ZONE_W - close_button_side) * 0.5,
+                        close_x + CLOSE_ZONE_W - close_button_side - 3.,
                         y + row_offset
                             + (row_height as f32 - close_button_side) * 0.5
                             + close_button_offset,
@@ -4101,7 +4283,7 @@ impl crate::TermWindow {
                 )?;
             }
             let close_line = Line::from_text("×", &CellAttributes::default(), 1, None);
-            let close_glyph_x = close_x + (CLOSE_ZONE_W - cell_width as f32) * 0.5;
+            let close_glyph_x = close_x + CLOSE_ZONE_W - cell_width as f32 - 6.;
             let close_glyph_offset = if close_pressed { 1. } else { 0. };
             render_text(
                 self,
@@ -4314,6 +4496,11 @@ impl crate::TermWindow {
     /// Paint the sidebar auto-hide toggle button into `rect` and register its
     /// hit region. The icon (a "rail + panel" glyph) is filled/accented when
     /// auto-hide is ON and dimmed when OFF, so the button reflects current state.
+    /// Paints the auto-hide toggle's background box and registers its hit
+    /// region. Returns the background color it used so the caller can draw a
+    /// centered glyph on top that blends against the same fill. The glyph
+    /// itself is drawn at the call site (where the `render_text` closure is in
+    /// scope); this method owns only the box.
     fn paint_sidebar_autohide_toggle(
         &mut self,
         layers: &mut TripleLayerQuadAllocator,
@@ -4323,14 +4510,12 @@ impl crate::TermWindow {
         left_pressed: bool,
         surface: LinearRgba,
         inactive_fg: LinearRgba,
-        accent: LinearRgba,
         hover_fill: LinearRgba,
         pressed_fill: LinearRgba,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<LinearRgba> {
         let item_type = UIItemType::SidebarAutoHideToggle;
         let hovered = hovered_item.as_ref() == Some(&item_type);
         let pressed = left_pressed && hovered && self.pressed_ui_item.as_ref() == Some(&item_type);
-        let on = self.config.sidebar_auto_hide;
 
         let bg = if pressed {
             pressed_fill
@@ -4349,30 +4534,6 @@ impl crate::TermWindow {
         let radius = (RADIUS * dpi_scale).min(box_rect.size.height * 0.5);
         self.sidebar_rounded_fill(layers, 1, box_rect, radius, bg)?;
 
-        // Icon: a solid vertical "rail" bar on the left plus an outlined
-        // "panel" to its right. The rail is accented when auto-hide is ON.
-        let pad = (box_rect.size.width * 0.26).max(3.);
-        let inner_h = (box_rect.size.height - pad * 2.).max(1.);
-        let rail_color = if on {
-            accent
-        } else {
-            inactive_fg.mul_alpha(0.55)
-        };
-        let rail_w = (box_rect.size.width * 0.16).max(2.);
-        let rail_rect = euclid::rect(
-            box_rect.min_x() + pad,
-            box_rect.min_y() + pad,
-            rail_w,
-            inner_h,
-        );
-        self.sidebar_rounded_fill(layers, 2, rail_rect, rail_w * 0.4, rail_color)?;
-
-        let panel_x = rail_rect.max_x() + rail_w * 0.6;
-        let panel_w = (box_rect.max_x() - pad - panel_x).max(1.);
-        let panel_rect = euclid::rect(panel_x, box_rect.min_y() + pad, panel_w, inner_h);
-        let panel_color = inactive_fg.mul_alpha(if on { 0.30 } else { 0.18 });
-        self.sidebar_rounded_fill(layers, 2, panel_rect, 2. * dpi_scale, panel_color)?;
-
         self.ui_items.push(UIItem {
             x: rect.min_x() as usize,
             y: rect.min_y() as usize,
@@ -4380,7 +4541,7 @@ impl crate::TermWindow {
             height: rect.size.height as usize,
             item_type,
         });
-        Ok(())
+        Ok(bg)
     }
 
     pub(crate) fn sidebar_rounded_fill(
@@ -5048,6 +5209,36 @@ mod tests {
             "re:sonnet\\s+\\d+"
         ));
         assert!(!agent_pattern_matches("Claude Sonnet", "re:sonnet\\s+\\d+"));
+    }
+
+    #[test]
+    fn word_boundary_matching_ignores_agent_patterns_inside_other_words() {
+        // The reported false positive: an ssh/shell pane whose output merely
+        // contains "example"/"sample" was detected as the Amp agent because its
+        // visible pattern "amp" matched as a bare substring.
+        assert!(!agent_word_pattern_matches_pre_lowered(
+            "run the example script and read the sample output",
+            "amp"
+        ));
+        assert!(!agent_word_pattern_matches_pre_lowered(
+            "browsing the codexes in the archive",
+            "codex"
+        ));
+        // Genuine whole-word / phrase matches still fire.
+        assert!(agent_word_pattern_matches_pre_lowered(
+            "welcome to claude code",
+            "claude code"
+        ));
+        assert!(agent_word_pattern_matches_pre_lowered("amp v0.1", "amp"));
+        assert!(agent_word_pattern_matches_pre_lowered(
+            "starting codex.",
+            "codex"
+        ));
+        // Regex patterns keep their exact semantics through this path.
+        assert!(agent_word_pattern_matches_pre_lowered(
+            "claude sonnet 5",
+            "re:sonnet\\s+\\d+"
+        ));
     }
 
     #[test]
