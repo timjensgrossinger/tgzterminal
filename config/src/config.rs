@@ -1015,11 +1015,15 @@ pub struct Config {
     #[dynamic(default = "default_true")]
     pub sidebar_enabled: bool,
 
-    /// Width of the expanded sidebar in pixels.
+    /// Width of the expanded sidebar in pixels, calibrated for a 2x (Retina)
+    /// display. On lower-density displays it scales down proportionally so the
+    /// sidebar keeps a consistent physical size rather than dominating the
+    /// screen. A manual drag-resize overrides this and is kept verbatim.
     #[dynamic(default = "default_sidebar_width_px")]
     pub sidebar_width_px: usize,
 
-    /// Width of the collapsed sidebar in pixels.
+    /// Width of the collapsed sidebar in pixels, calibrated for a 2x (Retina)
+    /// display; scales with display density like `sidebar_width_px`.
     #[dynamic(default = "default_sidebar_collapsed_width_px")]
     pub sidebar_collapsed_width_px: usize,
 

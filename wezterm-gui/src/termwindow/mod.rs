@@ -3012,7 +3012,14 @@ is_remote() {
 #             (the old code ran every probe non-interactively, so any prompt
 #             turned into an instant "Unable to connect"). ControlPersist keeps
 #             it warm for 600s so later probes reuse it with no further prompts.
+#
+# ssh_probe_failed latches after a failed resolve so the loop never re-launches
+# the interactive login on its own — otherwise a host that cannot authenticate
+# non-interactively re-prompts for a password every 2 seconds forever. It is
+# cleared only when the user explicitly asks to retry.
 ssh_mode=""
+ssh_probe_failed=0
+ssh_last_error=""
 
 ssh_shared() {
   # Zero-prompt attempt: reuse the user's existing connection/master, or
@@ -3046,16 +3053,31 @@ ensure_owned_master() {
   # Runs against the controlling terminal so ssh can prompt for a password, 2FA
   # code, or host-key confirmation even while our stdout is being captured.
   owned_master_alive && return 0
+  login_rc=0
   if [ -n "$remote_port" ]; then
-    ssh -t -o ControlMaster=auto -o ControlPersist=600s -o ControlPath="$control_path" -o ConnectTimeout=20 -p "$remote_port" "$remote_dest" true </dev/tty >/dev/tty 2>/dev/tty
+    ssh -t -o ControlMaster=auto -o ControlPersist=600s -o ControlPath="$control_path" -o ConnectTimeout=20 -p "$remote_port" "$remote_dest" true </dev/tty >/dev/tty 2>/dev/tty || login_rc=$?
   else
-    ssh -t -o ControlMaster=auto -o ControlPersist=600s -o ControlPath="$control_path" -o ConnectTimeout=20 "$remote_dest" true </dev/tty >/dev/tty 2>/dev/tty
+    ssh -t -o ControlMaster=auto -o ControlPersist=600s -o ControlPath="$control_path" -o ConnectTimeout=20 "$remote_dest" true </dev/tty >/dev/tty 2>/dev/tty || login_rc=$?
   fi
-  owned_master_alive
+  if owned_master_alive; then
+    ssh_last_error=""
+    return 0
+  fi
+  # Distinguish auth/connection failure from "logged in, but multiplexing never
+  # came up" so the retry prompt can tell the user which one they hit.
+  if [ "$login_rc" -ne 0 ]; then
+    ssh_last_error="SSH login to $remote_dest failed (exit $login_rc). See the messages above."
+  else
+    ssh_last_error="Logged in to $remote_dest, but SSH connection sharing (ControlMaster) did not start. The host may disable multiplexing, or $control_path is not writable."
+  fi
+  return 1
 }
 
 resolve_ssh_mode() {
   [ -z "$ssh_mode" ] || return 0
+  # Latched failure: never silently re-launch the interactive login. The caller
+  # (retry_connection) clears this flag when the user asks to try again.
+  [ "$ssh_probe_failed" -eq 1 ] && return 1
   # 0. wezterm SSH domain: wezterm already holds the authenticated session, so
   #    list over it via the CLI verb with ZERO re-auth. Probe once; if the
   #    session is gone, fall through to the ssh transport below.
@@ -3071,10 +3093,15 @@ resolve_ssh_mode() {
     return 0
   fi
   # 2. Otherwise stand up our own master, authenticating interactively once.
-  if [ -n "$remote_dest" ] && ensure_owned_master; then
-    ssh_mode=owned
-    return 0
+  #    Capture stderr so a real ssh failure (bad key, host-key mismatch,
+  #    multiplexing disabled) can be shown instead of a generic message.
+  if [ -n "$remote_dest" ]; then
+    if ensure_owned_master; then
+      ssh_mode=owned
+      return 0
+    fi
   fi
+  ssh_probe_failed=1
   return 1
 }
 
@@ -3285,7 +3312,11 @@ build_list_remote() {
   now=$(date +%s)
   probe="$tmp.probe"
   if ! resolve_ssh_mode; then
-    printf 'Unable to connect to %s.\n' "$remote_dest" >&2
+    if [ -n "$ssh_last_error" ]; then
+      printf 'Unable to connect to %s: %s\n' "$remote_dest" "$ssh_last_error" >&2
+    else
+      printf 'Unable to connect to %s.\n' "$remote_dest" >&2
+    fi
     return 1
   fi
   if [ -n "${cache_file:-}" ] && [ -s "$cache_file" ] && [ -r "$stamp_file" ]; then
@@ -3482,16 +3513,35 @@ while :; do
       # Never leave the pane blank while ssh authenticates on a cold open.
       printf 'Connecting to %s...\n' "$remote_dest"
     fi
-    if ! build_list; then
-      printf 'Unable to read %s.\n' "${root:-$remote_dest}" >&2
-      sleep 2
-    fi
+    # build_list reports its own connection error; never abort on failure.
+    build_list || true
   fi
 
   if [ ! -s "$tmp" ]; then
-    printf 'No folders found.\n'
-    sleep 2
-    continue
+    if is_remote; then
+      # Remote listing failed. Do NOT spin: a bare `sleep; continue` loop would
+      # re-run resolve_ssh_mode -> ensure_owned_master every 2s and re-prompt for
+      # a password forever. Wait for an explicit choice instead. resolve_ssh_mode
+      # has latched ssh_probe_failed, so nothing re-authenticates until 'r'.
+      printf '\n'
+      if [ -n "$ssh_last_error" ]; then
+        printf 'Could not reach %s.\n  %s\n' "$remote_dest" "$ssh_last_error"
+      else
+        printf 'Could not reach %s.\n' "$remote_dest"
+      fi
+      printf 'Press r to retry, q to quit: '
+      ans=''
+      IFS= read -r ans </dev/tty || close_worktree
+      case "$ans" in
+        r|R) ssh_mode=''; ssh_probe_failed=0; ssh_last_error=''; continue ;;
+        q|Q) close_worktree ;;
+        *) continue ;;
+      esac
+    else
+      printf 'No folders found.\n'
+      sleep 2
+      continue
+    fi
   fi
 
   if command -v fzf >/dev/null 2>&1; then

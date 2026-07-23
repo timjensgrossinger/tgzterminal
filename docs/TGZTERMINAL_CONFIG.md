@@ -19,7 +19,11 @@ config.sidebar_scroll_bar = true
 ```
 
 `sidebar_enabled` replaces the top tab strip with a vertical sidebar. The
-sidebar reserves horizontal space for the terminal grid. `sidebar_auto_hide`
+sidebar reserves horizontal space for the terminal grid. `sidebar_width_px` and
+`sidebar_collapsed_width_px` are calibrated for a 2x (Retina) display and scale
+down on lower-density displays so the sidebar keeps a consistent physical size
+across monitors; a manual drag-resize overrides `sidebar_width_px` and is kept
+verbatim. `sidebar_auto_hide`
 uses the collapsed width as the reserved size and expands the sidebar as an
 overlay when the collapsed strip is hovered. The tab list scrolls with the
 mouse wheel when there are more tabs than visible rows. `sidebar_scroll_bar`
