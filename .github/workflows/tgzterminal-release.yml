@@ -1,0 +1,85 @@
+name: TGZTerminal Release
+
+# Cut a release by pushing a tag in the updater's scheme, e.g.:
+#
+#     git tag tgz-v2026.07.1 && git push origin tgz-v2026.07.1
+#
+# This builds the universal macOS bundle, bakes the tag into the app's
+# self-reported version (via the repo-root `.tag` file that
+# wezterm-version/build.rs reads), packages dist/TGZTerminal.dmg, and publishes
+# a GitHub Release with the .dmg attached. The in-app updater polls
+# `releases/latest` for this repo and shows an "update available" banner when a
+# newer `tgz-v*` tag exists (see the Updates section of README.md).
+#
+# A manual run (workflow_dispatch) builds and uploads the .dmg as a CI artifact
+# only — it does not publish a Release.
+
+on:
+  push:
+    tags: ["tgz-v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: tgzterminal-release-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  release:
+    name: Build & publish macOS release
+    runs-on: macos-latest
+    if: github.repository != 'wezterm/wezterm'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Bake release version into the bundle
+        # Only on a real tag push. The app reports whatever is in ./.tag, so this
+        # is what the in-app updater compares against releases/latest.
+        if: startsWith(github.ref, 'refs/tags/tgz-v')
+        run: |
+          printf '%s' "${GITHUB_REF_NAME}" > .tag
+          echo "Baked version: $(cat .tag)"
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin,aarch64-apple-darwin
+
+      - name: Cache cargo build outputs
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Install system dependencies
+        run: |
+          if [ -f get-deps ]; then
+            ./get-deps
+          fi
+
+      - name: Build TGZTerminal.app and .dmg
+        run: |
+          chmod +x ci/build-macos-bundle.sh
+          ci/build-macos-bundle.sh --universal --dmg
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TGZTerminal-macos
+          path: dist/TGZTerminal.dmg
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/tgz-v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/TGZTerminal.dmg
+          generate_release_notes: true
+          fail_on_unmatched_files: true

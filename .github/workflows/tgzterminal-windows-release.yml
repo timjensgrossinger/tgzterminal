@@ -1,0 +1,150 @@
+name: TGZTerminal Windows Release
+
+# Windows counterpart to tgzterminal-release.yml. Triggered by the same
+# `tgz-v*` tags so a single release carries both the macOS .dmg and the Windows
+# build. Produces:
+#   * TGZTerminal-windows-portable-<tag>.zip  (guaranteed) — unzip and run
+#     wezterm-gui.exe, no install required. Uses the ANGLE GL backend bundled in
+#     assets/windows.
+#   * TGZTerminal-Setup.exe (best-effort) — Inno Setup installer, only if the
+#     toolchain and all files the installer script requires are present.
+#
+# NOTE: this is the first Windows build of the fork. If the fork's additive code
+# does not yet compile on windows-msvc, the build step is where that surfaces —
+# fix compile errors and re-tag.
+#
+# Manual runs (workflow_dispatch) build and upload the portable zip as a CI
+# artifact only; they do not publish a Release.
+
+on:
+  push:
+    tags: ["tgz-v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: tgzterminal-windows-release-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  windows:
+    name: Build & publish Windows release
+    runs-on: windows-latest
+    if: github.repository != 'wezterm/wezterm'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/tgz-v* ]]; then
+            VERSION="${GITHUB_REF_NAME}"
+            IS_RELEASE=1
+          else
+            VERSION="dev-$(git -c core.abbrev=8 show -s --format=%cd-%h --date=format:%Y%m%d-%H%M%S)"
+            IS_RELEASE=0
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "is_release=${IS_RELEASE}" >> "$GITHUB_OUTPUT"
+          # Bake the version so the in-app updater compares against releases/latest.
+          printf '%s' "${VERSION}" > .tag
+          echo "Baked version: ${VERSION}"
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache cargo build outputs
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Build release binaries
+        shell: cmd
+        run: |
+          PATH C:\Strawberry\perl\bin;%PATH%
+          cargo build --release -p wezterm -p wezterm-gui -p wezterm-mux-server -p strip-ansi-escapes
+
+      - name: Stage portable package
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.ver.outputs.version }}"
+          pkg="TGZTerminal-windows-portable-${VERSION}"
+          rm -rf "$pkg" && mkdir -p "$pkg/mesa"
+          # Core binaries.
+          cp target/release/wezterm.exe \
+             target/release/wezterm-gui.exe \
+             target/release/wezterm-mux-server.exe \
+             target/release/strip-ansi-escapes.exe \
+             "$pkg/"
+          # ConPTY + ANGLE GL runtime (bundled assets — primary Windows backend).
+          cp assets/windows/conhost/conpty.dll \
+             assets/windows/conhost/OpenConsole.exe \
+             assets/windows/angle/libEGL.dll \
+             assets/windows/angle/libGLESv2.dll \
+             "$pkg/"
+          # Mesa software GL is optional; include it only if the build produced it.
+          if [ -f target/release/mesa/opengl32.dll ]; then
+            cp target/release/mesa/opengl32.dll "$pkg/mesa/"
+          else
+            rmdir "$pkg/mesa"
+            echo "note: target/release/mesa/opengl32.dll not present; shipping ANGLE only"
+          fi
+          # Friendly launcher so coworkers don't have to hunt for wezterm-gui.exe.
+          printf '@echo off\r\nstart "" "%%~dp0wezterm-gui.exe" %%*\r\n' > "$pkg/TGZTerminal.cmd"
+          7z a -tzip "${pkg}.zip" "$pkg" >/dev/null
+          echo "PKG_ZIP=${pkg}.zip" >> "$GITHUB_ENV"
+
+      - name: Build installer (best-effort)
+        id: installer
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -uo pipefail
+          VERSION="${{ steps.ver.outputs.version }}"
+          # The Inno script reads files from target/release; stage the runtime
+          # DLLs the .rs build does not place there itself.
+          cp assets/windows/conhost/conpty.dll \
+             assets/windows/conhost/OpenConsole.exe \
+             assets/windows/angle/libEGL.dll \
+             assets/windows/angle/libGLESv2.dll \
+             target/release/ || true
+          if [ ! -f target/release/mesa/opengl32.dll ]; then
+            echo "mesa/opengl32.dll missing — the stock installer script requires it; skipping installer."
+            exit 1
+          fi
+          iscc.exe //DMyAppName=TGZTerminal //DMyAppVersion="${VERSION}" //FTGZTerminal-Setup ci/windows-installer.iss
+          # iscc writes next to the .iss (ci/).
+          if [ -f ci/TGZTerminal-Setup.exe ]; then
+            echo "SETUP_EXE=ci/TGZTerminal-Setup.exe" >> "$GITHUB_ENV"
+          fi
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: TGZTerminal-windows
+          path: |
+            TGZTerminal-windows-portable-*.zip
+            ci/TGZTerminal-Setup.exe
+          if-no-files-found: warn
+
+      - name: Publish to GitHub Release
+        if: steps.ver.outputs.is_release == '1'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            TGZTerminal-windows-portable-*.zip
+            ci/TGZTerminal-Setup.exe
+          fail_on_unmatched_files: false
