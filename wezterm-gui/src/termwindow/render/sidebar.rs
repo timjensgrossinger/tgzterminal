@@ -490,9 +490,10 @@ fn agent_transcript_start(scrollback_top: isize, end: isize, max_rows: isize) ->
     scrollback_top.max(end.saturating_sub(max_rows.max(1)))
 }
 
-fn agent_toolbelt_button_width(label: &str, cell_width: usize) -> f32 {
+fn agent_toolbelt_button_width(label: &str, cell_width: usize, dpi_scale: f32) -> f32 {
     let text_w = label.chars().count() as f32 * cell_width as f32;
-    (text_w + AGENT_TOOLBELT_BUTTON_PAD_X * 2.).max(AGENT_TOOLBELT_MIN_BUTTON_W)
+    (text_w + AGENT_TOOLBELT_BUTTON_PAD_X * dpi_scale * 2.)
+        .max(AGENT_TOOLBELT_MIN_BUTTON_W * dpi_scale)
 }
 
 fn agent_toolbelt_button_area(buttons: &[(&str, AgentToolbeltAction, f32)]) -> f32 {
@@ -1514,13 +1515,36 @@ fn visible_model_hint(text: &str, adapter: Option<&AgentAdapterConfig>) -> Optio
 }
 
 fn infer_agent_status_from_visible_text(text: &str) -> AgentStatus {
-    for line in text.lines().rev().take(20) {
+    let recent: Vec<&str> = text.lines().rev().take(20).collect();
+    // The "esc to interrupt" hint is printed only while the agent is actively
+    // working. It is the authoritative running signal: the input prompt box is
+    // drawn below the spinner, so a bottom-up scan would otherwise read the
+    // prompt and report WaitingForInput mid-run.
+    for line in &recent {
+        let lower = line.to_ascii_lowercase();
+        if lower.contains("esc to interrupt") {
+            return AgentStatus::Running;
+        }
+    }
+    // Spinner glyph on a recent line also indicates active work.
+    for line in &recent {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
-        if matches!(trimmed.chars().next(), Some('✻' | '✽' | '✶')) {
+        if matches!(
+            trimmed.chars().next(),
+            Some('✻' | '✽' | '✶' | '✷' | '✳' | '✢' | '∗')
+        ) {
             return AgentStatus::Running;
+        }
+        break;
+    }
+    // Otherwise, a bare prompt at the bottom means it is waiting for input.
+    for line in &recent {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
         }
         if matches!(trimmed, "❯" | ">" | "›")
             || trimmed.starts_with("❯ ")
@@ -1529,6 +1553,7 @@ fn infer_agent_status_from_visible_text(text: &str) -> AgentStatus {
         {
             return AgentStatus::WaitingForInput;
         }
+        break;
     }
     AgentStatus::Unknown
 }
@@ -2871,6 +2896,21 @@ impl crate::TermWindow {
         let cell_height = self.render_metrics.cell_size.height as usize;
         let cell_w_f = self.render_metrics.cell_size.width as f32;
         let cell_h_f = self.render_metrics.cell_size.height as f32;
+        // DPI-scaled geometry: the strip/button boxes must be derived from the
+        // (DPI-scaled) font cell metrics, not just the unscaled layout
+        // constants below, or the label glyphs spill outside the hand-drawn
+        // rounded rects on HiDPI/Retina displays. Mirrors the dpi_scale idiom
+        // used by paint_scrollbar_edge_overlay in paint.rs.
+        let dpi_scale = (self.dimensions.dpi as f32 / 96.).clamp(1., 2.5);
+        let vpad = 6. * dpi_scale;
+        let strip_h = (cell_h_f + 2. * vpad).max(AGENT_TOOLBELT_H * dpi_scale);
+        let button_margin = 5. * dpi_scale;
+        let button_inner_vpad = 4. * dpi_scale;
+        let button_h = (cell_h_f + button_inner_vpad).min(strip_h - 2. * button_margin);
+        let strip_radius = (RADIUS * dpi_scale).min(strip_h * 0.5);
+        let button_radius = (5. * dpi_scale).min(button_h * 0.5);
+        let pad_x = PAD_X * dpi_scale;
+        let dot_size = AGENT_TOOLBELT_DOT_SIZE * dpi_scale;
         let (padding_left, padding_top) = self.padding_left_top();
         let tab_bar_height = if self.show_tab_bar && !self.sidebar_is_active() {
             self.tab_bar_pixel_height().unwrap_or(0.)
@@ -2888,7 +2928,7 @@ impl crate::TermWindow {
             border.top.get() as f32 + top_bar_height + padding_top + pos.top as f32 * cell_h_f;
         let pane_w = pos.pixel_width as f32;
         let pane_h = pos.pixel_height as f32;
-        if pane_w < 140. || pane_h < AGENT_TOOLBELT_H + AGENT_TOOLBELT_GAP * 2. {
+        if pane_w < 140. || pane_h < strip_h + AGENT_TOOLBELT_GAP * 2. {
             return Ok(());
         }
 
@@ -2918,12 +2958,12 @@ impl crate::TermWindow {
         let max_tool_w = (pane_w - AGENT_TOOLBELT_RIGHT_INSET - AGENT_TOOLBELT_GAP)
             .max(1.)
             .min(AGENT_TOOLBELT_MAX_W);
-        let fixed_controls_w = PAD_X * 2. + AGENT_TOOLBELT_DOT_SIZE + AGENT_TOOLBELT_GAP;
+        let fixed_controls_w = pad_x * 2. + dot_size + AGENT_TOOLBELT_GAP;
         let max_button_area = (max_tool_w - fixed_controls_w).max(0.);
         let mut visible_buttons = buttons
             .into_iter()
             .map(|(label, action)| {
-                let width = agent_toolbelt_button_width(label, cell_width);
+                let width = agent_toolbelt_button_width(label, cell_width, dpi_scale);
                 (label, action, width)
             })
             .collect::<Vec<_>>();
@@ -2941,7 +2981,7 @@ impl crate::TermWindow {
         }
 
         let button_area = agent_toolbelt_button_area(&visible_buttons);
-        let label_target_w = (label.chars().count() as f32 * cell_w_f).min(280.);
+        let label_target_w = (label.chars().count() as f32 * cell_w_f).min(280. * dpi_scale);
         let desired_w = (fixed_controls_w + button_area + AGENT_TOOLBELT_GAP + label_target_w)
             .max(AGENT_TOOLBELT_MIN_W)
             .min(AGENT_TOOLBELT_MAX_W);
@@ -2951,9 +2991,7 @@ impl crate::TermWindow {
         let tool_x = pane_x + pane_w - tool_w - AGENT_TOOLBELT_RIGHT_INSET;
         let tool_y = match self.config.agent_ui.toolbelt_position {
             AgentToolbeltPosition::Top => pane_y + AGENT_TOOLBELT_GAP,
-            AgentToolbeltPosition::Bottom => {
-                pane_y + pane_h - AGENT_TOOLBELT_H - AGENT_TOOLBELT_GAP
-            }
+            AgentToolbeltPosition::Bottom => pane_y + pane_h - strip_h - AGENT_TOOLBELT_GAP,
         };
 
         let colors = self
@@ -2977,17 +3015,16 @@ impl crate::TermWindow {
         self.sidebar_rounded_fill(
             layers,
             1,
-            euclid::rect(tool_x, tool_y, tool_w, AGENT_TOOLBELT_H),
-            RADIUS,
+            euclid::rect(tool_x, tool_y, tool_w, strip_h),
+            strip_radius,
             bg,
         )?;
-        let dot_size = AGENT_TOOLBELT_DOT_SIZE;
         self.sidebar_pill_fill(
             layers,
             1,
             euclid::rect(
-                tool_x + PAD_X,
-                tool_y + (AGENT_TOOLBELT_H - dot_size) * 0.5,
+                tool_x + pad_x,
+                tool_y + (strip_h - dot_size) * 0.5,
                 dot_size,
                 dot_size,
             ),
@@ -3064,8 +3101,8 @@ impl crate::TermWindow {
             .map(|_| ())
         };
 
-        let button_start_x = tool_x + tool_w - PAD_X - button_area;
-        let label_x = tool_x + PAD_X + dot_size + AGENT_TOOLBELT_GAP;
+        let button_start_x = tool_x + tool_w - pad_x - button_area;
+        let label_x = tool_x + pad_x + dot_size + AGENT_TOOLBELT_GAP;
         let label_w = button_start_x - AGENT_TOOLBELT_GAP - label_x;
         if label_w >= (cell_width * 6) as f32 {
             render_text(
@@ -3073,7 +3110,7 @@ impl crate::TermWindow {
                 layers,
                 &label,
                 label_x,
-                tool_y + (AGENT_TOOLBELT_H - cell_h_f) * 0.5,
+                tool_y + (strip_h - cell_h_f) * 0.5,
                 label_w,
                 fg,
                 bg,
@@ -3087,7 +3124,7 @@ impl crate::TermWindow {
             .map(|item| item.item_type.clone());
         let left_pressed = self.current_mouse_buttons.contains(&MousePress::Left);
         let mut button_x = button_start_x;
-        let button_right_limit = tool_x + tool_w - PAD_X;
+        let button_right_limit = tool_x + tool_w - pad_x;
         for (button_label, action, button_w) in visible_buttons {
             if button_x + button_w > button_right_limit + 0.5 {
                 break;
@@ -3107,35 +3144,35 @@ impl crate::TermWindow {
                 lerp_rgba(bg, fg, 0.08)
             };
             let offset = if pressed { 1. } else { 0. };
+            // Button box is centered within the strip and sized to enclose
+            // the (DPI-scaled) glyph height; hit-rect below must track this
+            // exact rect so clicks keep landing on the drawn box.
+            let button_box_y = tool_y + (strip_h - button_h) * 0.5;
             self.sidebar_rounded_fill(
                 layers,
                 1,
-                euclid::rect(
-                    button_x,
-                    tool_y + 5. + offset,
-                    button_w,
-                    AGENT_TOOLBELT_H - 10.,
-                ),
-                5.,
+                euclid::rect(button_x, button_box_y + offset, button_w, button_h),
+                button_radius,
                 button_bg,
             )?;
             let button_fg = contrast_label_color(button_bg);
+            let button_side_pad = AGENT_TOOLBELT_BUTTON_PAD_X * dpi_scale * 0.5;
             render_text(
                 self,
                 layers,
                 button_label,
-                button_x + AGENT_TOOLBELT_BUTTON_PAD_X * 0.5,
-                tool_y + offset + (AGENT_TOOLBELT_H - cell_h_f) * 0.5,
-                button_w - AGENT_TOOLBELT_BUTTON_PAD_X,
+                button_x + button_side_pad,
+                button_box_y + offset + (button_h - cell_h_f) * 0.5,
+                (button_w - button_side_pad * 2.).max(1.),
                 button_fg,
                 button_bg,
                 true,
             )?;
             self.ui_items.push(UIItem {
                 x: button_x as usize,
-                y: tool_y as usize,
+                y: button_box_y as usize,
                 width: button_w.ceil() as usize,
-                height: AGENT_TOOLBELT_H as usize,
+                height: button_h.ceil() as usize,
                 item_type,
             });
             button_x += button_w + AGENT_TOOLBELT_GAP;
@@ -3162,8 +3199,22 @@ impl crate::TermWindow {
             ("Copy last message", AgentCopyAction::LastAgentMessage),
             ("Copy agent details", AgentCopyAction::Summary),
         ];
+        let cell_width = self.render_metrics.cell_size.width;
+        let cell_height = self.render_metrics.cell_size.height;
+        let cell_h_f = cell_height as f32;
+        // DPI-scaled geometry: row height must enclose the (DPI-scaled) font
+        // cell height, not just the fixed AGENT_COPY_MENU_ROW_H constant, or
+        // labels spill outside the row on HiDPI/Retina displays.
+        let dpi_scale = (self.dimensions.dpi as f32 / 96.).clamp(1., 2.5);
+        let row_vpad = 6. * dpi_scale;
+        let row_h = (cell_h_f + 2. * row_vpad).max(AGENT_COPY_MENU_ROW_H * dpi_scale);
+        let menu_pad = 8. * dpi_scale;
+        let menu_radius = (RADIUS * dpi_scale).min(row_h * 0.5);
+        let row_radius = (5. * dpi_scale).min(row_h * 0.5);
+        let row_inset = 4. * dpi_scale;
+        let row_text_inset = 12. * dpi_scale;
         let menu_w = AGENT_COPY_MENU_W;
-        let menu_h = items.len() as f32 * AGENT_COPY_MENU_ROW_H + 8.;
+        let menu_h = items.len() as f32 * row_h + menu_pad;
         let max_x = (self.dimensions.pixel_width as f32 - menu_w - AGENT_TOOLBELT_GAP)
             .max(AGENT_TOOLBELT_GAP);
         let max_y = (self.dimensions.pixel_height as f32 - menu_h - AGENT_TOOLBELT_GAP)
@@ -3189,7 +3240,7 @@ impl crate::TermWindow {
             layers,
             1,
             euclid::rect(menu_x, menu_y, menu_w, menu_h),
-            RADIUS,
+            menu_radius,
             bg,
         )?;
 
@@ -3197,9 +3248,6 @@ impl crate::TermWindow {
         let gl_state = self.render_state.as_ref().unwrap();
         let white_space = gl_state.util_sprites.white_space.texture_coords();
         let filled_box = gl_state.util_sprites.filled_box.texture_coords();
-        let cell_width = self.render_metrics.cell_size.width;
-        let cell_height = self.render_metrics.cell_size.height;
-        let cell_h_f = cell_height as f32;
         let render_text = |this: &mut Self,
                            layers: &mut TripleLayerQuadAllocator,
                            text: &str,
@@ -3271,7 +3319,7 @@ impl crate::TermWindow {
                 pane_id: menu.pane_id,
                 action: action.clone(),
             };
-            let row_y = menu_y + 4. + idx as f32 * AGENT_COPY_MENU_ROW_H;
+            let row_y = menu_y + menu_pad * 0.5 + idx as f32 * row_h;
             let hovered = hovered_item.as_ref() == Some(&item_type);
             let pressed =
                 hovered && left_pressed && self.pressed_ui_item.as_ref() == Some(&item_type);
@@ -3286,8 +3334,8 @@ impl crate::TermWindow {
                 self.sidebar_rounded_fill(
                     layers,
                     1,
-                    euclid::rect(menu_x + 4., row_y, menu_w - 8., AGENT_COPY_MENU_ROW_H),
-                    5.,
+                    euclid::rect(menu_x + row_inset, row_y, menu_w - row_inset * 2., row_h),
+                    row_radius,
                     row_bg,
                 )?;
             }
@@ -3295,17 +3343,17 @@ impl crate::TermWindow {
                 self,
                 layers,
                 label,
-                menu_x + 12.,
-                row_y + (AGENT_COPY_MENU_ROW_H - cell_h_f) * 0.5,
-                menu_w - 24.,
+                menu_x + row_text_inset,
+                row_y + (row_h - cell_h_f) * 0.5,
+                menu_w - row_text_inset * 2.,
                 contrast_label_color(row_bg),
                 row_bg,
             )?;
             self.ui_items.push(UIItem {
-                x: (menu_x + 4.) as usize,
+                x: (menu_x + row_inset) as usize,
                 y: row_y as usize,
-                width: (menu_w - 8.) as usize,
-                height: AGENT_COPY_MENU_ROW_H as usize,
+                width: (menu_w - row_inset * 2.) as usize,
+                height: row_h.ceil() as usize,
                 item_type,
             });
         }
@@ -3404,6 +3452,11 @@ impl crate::TermWindow {
         self.filled_rectangle(layers, 2, euclid::rect(divider_x, top, 1., height), divider)?;
         let cell_width = self.render_metrics.cell_size.width as usize;
         let cell_height = self.render_metrics.cell_size.height as usize;
+        // DPI-scaled geometry for the fixed-size hand-drawn boxes below
+        // (compact rail buttons, "+" new-tab button); row_height (used by the
+        // expanded search field / tab rows further down) already derives
+        // from cell_height directly so it does not need this adjustment.
+        let dpi_scale = (self.dimensions.dpi as f32 / 96.).clamp(1., 2.5);
         let row_height = self.sidebar_row_height();
         let resize_gap = RESIZE_GRIP_W as f32;
         let item_x = left + INSET;
@@ -3510,10 +3563,30 @@ impl crate::TermWindow {
                 })
                 .collect();
 
-            let rail_side = (width as f32 - 10.).clamp(38., 46.);
+            // The rail button is a square icon box; its ceiling must grow
+            // with the (DPI-scaled) font cell height (keeping the original
+            // 46px as a scaled floor) so the glyph never exceeds the box.
+            let rail_ceiling = (cell_height as f32 + 12. * dpi_scale).max(46. * dpi_scale);
+            let rail_side = (width as f32 - 10.).clamp(38. * dpi_scale, rail_ceiling);
+            let rail_radius = (RADIUS * dpi_scale).min(rail_side * 0.5);
             let rail_x = left + (width as f32 - rail_side) * 0.5;
             let row_stride = rail_side + GAP;
-            let list_top = top + INSET;
+            // Auto-hide toggle occupies the first rail slot so it stays
+            // reachable to turn auto-hide back off from the collapsed rail.
+            let toggle_top = top + INSET;
+            self.paint_sidebar_autohide_toggle(
+                layers,
+                euclid::rect(rail_x, toggle_top, rail_side, rail_side),
+                dpi_scale,
+                &hovered_item,
+                left_pressed,
+                surface,
+                inactive_fg,
+                accent,
+                hover_fill,
+                pressed_fill,
+            )?;
+            let list_top = toggle_top + row_stride;
             let new_tab_y = top + height - INSET - rail_side;
             let list_height = (new_tab_y - GAP - list_top).max(0.);
             let visible_rows = ((list_height + GAP) / row_stride).floor().max(0.) as usize;
@@ -3555,7 +3628,7 @@ impl crate::TermWindow {
                     layers,
                     1,
                     euclid::rect(rail_x, rail_y + tab_offset, rail_side, rail_side),
-                    RADIUS,
+                    rail_radius,
                     tab_bg,
                 )?;
                 if active {
@@ -3630,7 +3703,7 @@ impl crate::TermWindow {
                 layers,
                 1,
                 euclid::rect(rail_x, new_tab_y + new_tab_offset, rail_side, rail_side),
-                RADIUS,
+                rail_radius,
                 new_tab_bg,
             )?;
             let plus_line = Line::from_text("+", &CellAttributes::default(), 1, None);
@@ -3674,7 +3747,33 @@ impl crate::TermWindow {
         }
 
         let mut y = top + INSET;
+        let toggle_side = row_height as f32;
         if width > 96 {
+            // Auto-hide toggle and search share the top row: the toggle sits
+            // flush at the left of the content column and the search bar fills
+            // the remaining width to its right. Keeping them on one row means
+            // the tab list starts right below with no leftover gap up top.
+            let toggle_rect = euclid::rect(content_x, y, toggle_side, toggle_side);
+            self.paint_sidebar_autohide_toggle(
+                layers,
+                toggle_rect,
+                dpi_scale,
+                &hovered_item,
+                left_pressed,
+                surface,
+                inactive_fg,
+                accent,
+                hover_fill,
+                pressed_fill,
+            )?;
+
+            // Search bar is shortened by the toggle width + gap.
+            let search_x = content_x + toggle_side + GAP;
+            let search_w = (content_w - toggle_side - GAP).max(1.);
+            let search_text_x = search_x + PAD_X + ACTIVE_TEXT_GAP;
+            let search_cols = ((search_w - PAD_X * 2.).max(cell_width as f32) / cell_width as f32)
+                .max(1.) as usize;
+
             let focused = self.sidebar_search.is_some();
             let search_hovered = hovered_item.as_ref() == Some(&UIItemType::SidebarSearch);
             let search_pressed = search_hovered && left_pressed;
@@ -3688,7 +3787,12 @@ impl crate::TermWindow {
                 search_fill
             };
             let search_offset = if search_pressed { 1. } else { 0. };
-            let search_rect = euclid::rect(item_x, y + search_offset, item_w, row_height as f32);
+            let search_rect = euclid::rect(search_x, y + search_offset, search_w, row_height as f32);
+            // row_height (self.sidebar_row_height()) already derives its
+            // height directly from the DPI-scaled cell height, so no
+            // additional height derivation is needed here; only the corner
+            // radius (an unscaled px constant) needs the dpi_scale idiom.
+            let search_radius = (RADIUS * dpi_scale).min(row_height as f32 * 0.5);
             if focused {
                 self.sidebar_rounded_fill(
                     layers,
@@ -3699,11 +3803,11 @@ impl crate::TermWindow {
                         search_rect.width() + 2.,
                         search_rect.height() + 2.,
                     ),
-                    RADIUS + 1.,
+                    search_radius + dpi_scale,
                     accent.mul_alpha(0.45),
                 )?;
             }
-            self.sidebar_rounded_fill(layers, 1, search_rect, RADIUS, search_bg)?;
+            self.sidebar_rounded_fill(layers, 1, search_rect, search_radius, search_bg)?;
 
             let search_text = match &self.sidebar_search {
                 Some(state) if state.query.is_empty() => "|".to_string(),
@@ -3720,21 +3824,38 @@ impl crate::TermWindow {
                 self,
                 layers,
                 &search_line,
-                text_x,
+                search_text_x,
                 y + search_offset + (row_height as f32 - cell_height as f32) * 0.5,
-                content_cols,
-                content_w - PAD_X * 2.,
+                search_cols,
+                search_w - PAD_X * 2.,
                 search_fg,
                 search_bg,
             )?;
             self.ui_items.push(UIItem {
-                x: item_x as usize,
+                x: search_x as usize,
                 y: y as usize,
-                width: content_w as usize,
+                width: search_w as usize,
                 height: row_height,
                 item_type: UIItemType::SidebarSearch,
             });
             y += row_height as f32 + GAP;
+        } else {
+            // Narrow sidebar: no search field is drawn, so the toggle keeps
+            // its own row at the top-left of the content column.
+            let toggle_rect = euclid::rect(content_x, y, toggle_side, toggle_side);
+            self.paint_sidebar_autohide_toggle(
+                layers,
+                toggle_rect,
+                dpi_scale,
+                &hovered_item,
+                left_pressed,
+                surface,
+                inactive_fg,
+                accent,
+                hover_fill,
+                pressed_fill,
+            )?;
+            y += toggle_side + GAP;
         }
 
         let query = self
@@ -3765,6 +3886,11 @@ impl crate::TermWindow {
             .collect();
 
         let tab_list_top = y;
+        // row_height (self.sidebar_row_height()) already derives its height
+        // directly from the DPI-scaled cell height, so rows already enclose
+        // the glyphs; only the corner radius (an unscaled px constant) needs
+        // dpi_scale applied.
+        let tab_row_radius = (RADIUS * dpi_scale).min(row_height as f32 * 0.5);
         let bottom_button_rows = if self.sidebar_width() > 180 { 2. } else { 1. };
         let new_tab_y = top + height - INSET - row_height as f32;
         let tab_list_bottom =
@@ -3833,7 +3959,7 @@ impl crate::TermWindow {
                     layers,
                     1,
                     euclid::rect(item_x, y + row_offset, item_w, row_height as f32),
-                    RADIUS,
+                    tab_row_radius,
                     row_bg,
                 )?;
             }
@@ -4182,6 +4308,78 @@ impl crate::TermWindow {
             item_type: UIItemType::SidebarResize { start_width: width },
         });
 
+        Ok(())
+    }
+
+    /// Paint the sidebar auto-hide toggle button into `rect` and register its
+    /// hit region. The icon (a "rail + panel" glyph) is filled/accented when
+    /// auto-hide is ON and dimmed when OFF, so the button reflects current state.
+    fn paint_sidebar_autohide_toggle(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+        rect: RectF,
+        dpi_scale: f32,
+        hovered_item: &Option<UIItemType>,
+        left_pressed: bool,
+        surface: LinearRgba,
+        inactive_fg: LinearRgba,
+        accent: LinearRgba,
+        hover_fill: LinearRgba,
+        pressed_fill: LinearRgba,
+    ) -> anyhow::Result<()> {
+        let item_type = UIItemType::SidebarAutoHideToggle;
+        let hovered = hovered_item.as_ref() == Some(&item_type);
+        let pressed = left_pressed && hovered && self.pressed_ui_item.as_ref() == Some(&item_type);
+        let on = self.config.sidebar_auto_hide;
+
+        let bg = if pressed {
+            pressed_fill
+        } else if hovered {
+            hover_fill
+        } else {
+            lerp_rgba(surface, inactive_fg, 0.07)
+        };
+        let offset = if pressed { 1. } else { 0. };
+        let box_rect = euclid::rect(
+            rect.min_x(),
+            rect.min_y() + offset,
+            rect.size.width,
+            rect.size.height,
+        );
+        let radius = (RADIUS * dpi_scale).min(box_rect.size.height * 0.5);
+        self.sidebar_rounded_fill(layers, 1, box_rect, radius, bg)?;
+
+        // Icon: a solid vertical "rail" bar on the left plus an outlined
+        // "panel" to its right. The rail is accented when auto-hide is ON.
+        let pad = (box_rect.size.width * 0.26).max(3.);
+        let inner_h = (box_rect.size.height - pad * 2.).max(1.);
+        let rail_color = if on {
+            accent
+        } else {
+            inactive_fg.mul_alpha(0.55)
+        };
+        let rail_w = (box_rect.size.width * 0.16).max(2.);
+        let rail_rect = euclid::rect(
+            box_rect.min_x() + pad,
+            box_rect.min_y() + pad,
+            rail_w,
+            inner_h,
+        );
+        self.sidebar_rounded_fill(layers, 2, rail_rect, rail_w * 0.4, rail_color)?;
+
+        let panel_x = rail_rect.max_x() + rail_w * 0.6;
+        let panel_w = (box_rect.max_x() - pad - panel_x).max(1.);
+        let panel_rect = euclid::rect(panel_x, box_rect.min_y() + pad, panel_w, inner_h);
+        let panel_color = inactive_fg.mul_alpha(if on { 0.30 } else { 0.18 });
+        self.sidebar_rounded_fill(layers, 2, panel_rect, 2. * dpi_scale, panel_color)?;
+
+        self.ui_items.push(UIItem {
+            x: rect.min_x() as usize,
+            y: rect.min_y() as usize,
+            width: rect.size.width as usize,
+            height: rect.size.height as usize,
+            item_type,
+        });
         Ok(())
     }
 

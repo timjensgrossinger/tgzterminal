@@ -49,6 +49,7 @@ impl super::TermWindow {
             | UIItemType::CloseTab(_)
             | UIItemType::SidebarResize { .. }
             | UIItemType::SidebarSearch
+            | UIItemType::SidebarAutoHideToggle
             | UIItemType::SidebarWorktreeButton
             | UIItemType::AgentToolbeltButton { .. }
             | UIItemType::AgentCopyMenuItem { .. }
@@ -69,6 +70,7 @@ impl super::TermWindow {
             | UIItemType::CloseTab(_)
             | UIItemType::SidebarResize { .. }
             | UIItemType::SidebarSearch
+            | UIItemType::SidebarAutoHideToggle
             | UIItemType::SidebarWorktreeButton
             | UIItemType::AgentToolbeltButton { .. }
             | UIItemType::AgentCopyMenuItem { .. }
@@ -513,6 +515,9 @@ impl super::TermWindow {
             UIItemType::SidebarSearch => {
                 self.mouse_event_sidebar_search(event, context);
             }
+            UIItemType::SidebarAutoHideToggle => {
+                self.mouse_event_sidebar_autohide_toggle(event, context);
+            }
             UIItemType::SidebarWorktreeButton => {
                 self.mouse_event_sidebar_worktree_button(pane, event, context);
             }
@@ -760,6 +765,47 @@ impl super::TermWindow {
             context.invalidate();
         }
         context.set_cursor(Some(MouseCursor::Text));
+    }
+
+    fn mouse_event_sidebar_autohide_toggle(&mut self, event: MouseEvent, context: &dyn WindowOps) {
+        let item_type = UIItemType::SidebarAutoHideToggle;
+        match event.kind {
+            WMEK::Press(MousePress::Left) => {
+                self.pressed_ui_item.replace(item_type);
+                context.invalidate();
+            }
+            WMEK::Release(MousePress::Left) => {
+                if self.pressed_ui_item.as_ref() == Some(&item_type) {
+                    let new_val = !self.config.sidebar_auto_hide;
+
+                    // Merge the new value into any existing per-window config
+                    // overrides so every read site of self.config.sidebar_auto_hide
+                    // picks it up on the next paint.
+                    use wezterm_dynamic::Value;
+                    let mut map: std::collections::BTreeMap<Value, Value> = match &self
+                        .config_overrides
+                    {
+                        Value::Object(o) => o.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                        _ => Default::default(),
+                    };
+                    map.insert(
+                        Value::String("sidebar_auto_hide".to_string()),
+                        Value::Bool(new_val),
+                    );
+                    self.config_overrides = Value::Object(map.into());
+
+                    // Persist across restarts, then rebuild self.config from the
+                    // overrides (config_was_reloaded also relayouts + invalidates).
+                    crate::termwindow::tgz_ui_state::save_sidebar_auto_hide(new_val);
+                    self.config_was_reloaded();
+
+                    self.pressed_ui_item.take();
+                    context.invalidate();
+                }
+            }
+            _ => {}
+        }
+        context.set_cursor(Some(MouseCursor::Arrow));
     }
 
     fn mouse_event_agent_toolbelt_button(

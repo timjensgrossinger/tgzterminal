@@ -39,7 +39,10 @@ fn get_github_release_info(uri: &str) -> anyhow::Result<Release> {
     let mut latest = Vec::new();
     let _res = Request::new(&uri)
         .version(HttpVersion::Http10)
-        .header("User-Agent", &format!("TGZTerminal/{}", wezterm_version()))
+        .header(
+            "User-Agent",
+            &format!("{}/{}", crate::brand::PRODUCT_NAME, wezterm_version()),
+        )
         .send(&mut latest)
         .map_err(|e| anyhow!("failed to query github releases: {}", e))?;
 
@@ -53,16 +56,20 @@ fn get_github_release_info(uri: &str) -> anyhow::Result<Release> {
 }
 
 pub fn get_latest_release_info() -> anyhow::Result<Release> {
-    get_github_release_info(
-        "https://api.github.com/repos/timjensgrossinger/tgzterminal/releases/latest",
-    )
+    let uri = format!(
+        "https://api.github.com/repos/{}/releases/latest",
+        crate::brand::GITHUB_REPO
+    );
+    get_github_release_info(&uri)
 }
 
 #[allow(unused)]
 pub fn get_nightly_release_info() -> anyhow::Result<Release> {
-    get_github_release_info(
-        "https://api.github.com/repos/timjensgrossinger/tgzterminal/releases/tags/nightly",
-    )
+    let uri = format!(
+        "https://api.github.com/repos/{}/releases/tags/nightly",
+        crate::brand::GITHUB_REPO
+    );
+    get_github_release_info(&uri)
 }
 
 /// Returns true if `latest_tag` represents a newer release than `current_tag`.
@@ -174,9 +181,10 @@ fn set_banner_from_release_info(latest: &Release) {
     let reset = CSI::Sgr(Sgr::Reset);
     let link_off = OperatingSystemCommand::SetHyperlink(None);
     mux.set_banner(Some(format!(
-        "{}{}TGZTerminal Update Available\r\n{}{}{}{}Click to see release details{}{}\r\n",
+        "{}{}{} Update Available\r\n{}{}{}{}Click to see release details{}{}\r\n",
         icon,
         top_line_pos,
+        crate::brand::PRODUCT_NAME,
         second_line_pos,
         link_on,
         underline_color,
@@ -250,7 +258,7 @@ fn update_checker() {
 
                     if force_ui || socks.is_empty() || socks[0] == my_sock {
                         persistent_toast_notification_with_click_to_open_url(
-                            "TGZTerminal Update Available",
+                            &format!("{} Update Available", crate::brand::PRODUCT_NAME),
                             "Click to see release details",
                             &url,
                         );

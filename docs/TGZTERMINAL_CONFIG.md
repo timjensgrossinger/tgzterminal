@@ -294,3 +294,31 @@ active pane; independent per-pane strips inside splits are not yet supported.
 Note: because bound key assignments are handled before the strip, a bound
 clipboard-paste shortcut still pastes into the pane rather than the strip while
 the strip is focused; use the overlay composer if you need paste-into-buffer.
+
+## Branding (build-time)
+
+These are compile/package-time environment variables, not Lua config keys. Each
+defaults to the standard TGZTerminal value, so a build with none of them set is
+identical to the default TGZTerminal build. They exist so an overlay fork can
+rebrand without patching source.
+
+`ci/build-macos-bundle.sh` reads:
+
+| Env var | Default | Controls |
+|---|---|---|
+| `BRAND_APP_NAME` | `TGZTerminal` | `.app` and `.dmg` names, `CFBundleName`, `CFBundleDisplayName`, DMG volume name |
+| `BRAND_BUNDLE_ID` | `com.tgzterminal.app` | `CFBundleIdentifier` |
+| `BRAND_CLI_BIN` | `tgzterminal` | CLI binary name in `Contents/MacOS` (the `wezterm` compatibility symlink is always kept) |
+| `BRAND_ICON` | _(unset)_ | Path to a `.icns` copied over `Contents/Resources/terminal.icns`; the build fails if set but missing. `CFBundleIconFile` stays `terminal.icns`. |
+
+`wezterm-gui` reads these at compile time (via `option_env!`, resolved in
+`wezterm-gui/src/brand.rs`):
+
+| Env var | Default | Controls |
+|---|---|---|
+| `BRAND_GITHUB_REPO` | `timjensgrossinger/tgzterminal` | `owner/repo` used for update/release queries |
+| `BRAND_PRODUCT_NAME` | `TGZTerminal` | Product name in the update User-Agent and "… Update Available" notifications |
+
+`CFBundleExecutable` stays `wezterm-gui`, and the internal namespaces
+(`tgzterminal.worktree` user var, `TGZTERMINAL_BIN`, `.cache/tgzterminal`) are
+unaffected by branding.

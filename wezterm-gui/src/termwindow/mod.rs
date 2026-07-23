@@ -93,6 +93,7 @@ pub mod render;
 pub mod resize;
 mod selection;
 pub mod spawn;
+pub mod tgz_ui_state;
 pub mod webgpu;
 use crate::spawn::SpawnWhere;
 use prevcursor::PrevCursorPos;
@@ -197,6 +198,7 @@ pub enum UIItemType {
         start_width: usize,
     },
     SidebarSearch,
+    SidebarAutoHideToggle,
     SidebarWorktreeButton,
     AgentToolbeltButton {
         pane_id: PaneId,
@@ -666,6 +668,14 @@ impl TermWindow {
 impl TermWindow {
     pub async fn new_window(mux_window_id: MuxWindowId) -> anyhow::Result<()> {
         let config = configuration();
+        // Apply any TGZTerminal persisted UI toggles (e.g. sidebar auto-hide)
+        // as a seeded config override so the very first frame reflects them.
+        let config_overrides = tgz_ui_state::seed_config_overrides();
+        let config = if config_overrides == wezterm_dynamic::Value::Null {
+            config
+        } else {
+            config::overridden_config(&config_overrides).unwrap_or(config)
+        };
         let dpi = config.dpi.unwrap_or_else(|| ::window::default_dpi()) as usize;
         let fontconfig = Rc::new(FontConfiguration::new(Some(config.clone()), dpi)?);
 
@@ -785,7 +795,7 @@ impl TermWindow {
             window: None,
             window_background,
             config: config.clone(),
-            config_overrides: wezterm_dynamic::Value::default(),
+            config_overrides,
             palette: None,
             focused: None,
             mux_window_id,

@@ -1,0 +1,64 @@
+name: TGZTerminal Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: tgzterminal-build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  bundle:
+    name: Build macOS bundle
+    runs-on: macos-latest
+    if: github.repository != 'wezterm/wezterm'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin,aarch64-apple-darwin
+
+      - name: Cache cargo build outputs
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Install system dependencies
+        run: |
+          if [ -f get-deps ]; then
+            ./get-deps
+          fi
+
+      - name: Build TGZTerminal.app and .dmg
+        run: |
+          chmod +x ci/build-macos-bundle.sh
+          ci/build-macos-bundle.sh --universal --dmg
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TGZTerminal-macos
+          path: dist/TGZTerminal.dmg
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/TGZTerminal.dmg
