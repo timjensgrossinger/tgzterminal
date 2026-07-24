@@ -3727,10 +3727,13 @@ impl crate::TermWindow {
             // 46px as a scaled floor) so the glyph never exceeds the box.
             let rail_ceiling = (cell_height as f32 + 12. * dpi_scale).max(46. * dpi_scale);
             // The box must always fit inside the strip: leave a small margin on
-            // each side and cap at the ceiling. Never force a lower bound that
-            // could exceed the available strip width, or the box would spill
-            // past both edges of a narrow collapsed rail.
-            let rail_side = (width as f32 - 8.).min(rail_ceiling).max(1.);
+            // each side and cap at the ceiling. Floored at cell_height so a
+            // narrow collapsed rail can't squeeze the box shorter than the
+            // glyph's line height — otherwise ascenders (e.g. "l" in the
+            // Claude "Cl" badge) poke out past the rounded pill, which is
+            // only visible now that the glyph cell is drawn transparent.
+            let min_fit = (cell_height as f32 + 4.).min(width as f32 - 2.).max(1.);
+            let rail_side = (width as f32 - 8.).max(min_fit).min(rail_ceiling).max(1.);
             let rail_radius = (RADIUS * dpi_scale).min(rail_side * 0.5);
             let rail_x = left + (width as f32 - rail_side) * 0.5;
             let row_stride = rail_side + GAP;

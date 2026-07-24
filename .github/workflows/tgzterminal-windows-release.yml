@@ -83,8 +83,10 @@ jobs:
           VERSION="${{ steps.ver.outputs.version }}"
           pkg="TGZTerminal-windows-portable-${VERSION}"
           rm -rf "$pkg" && mkdir -p "$pkg/mesa"
-          # Core binaries.
-          cp target/release/wezterm.exe \
+          # Core binaries. The `wezterm` package's [[bin]] is renamed to
+          # `tgzterminal` (see wezterm/Cargo.toml), so that's what cargo
+          # actually produces here — not wezterm.exe.
+          cp target/release/tgzterminal.exe \
              target/release/wezterm-gui.exe \
              target/release/wezterm-mux-server.exe \
              target/release/strip-ansi-escapes.exe \
