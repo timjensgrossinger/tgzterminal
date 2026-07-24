@@ -3579,12 +3579,16 @@ impl crate::TermWindow {
         // Tab labels share that same left edge so the "Search tabs..." box and
         // the "1:" / "2:" labels line up in one column (toggle sits top-left).
         let toggle_side = row_height as f32;
+        // Only the search box (which shares the search row with the toggle)
+        // indents past the toggle; tab labels and "+ New Tab" keep the plain
+        // content-column left edge so they line up with the Worktree row
+        // instead of being shoved a full toggle-width to the right.
         let list_indent = toggle_side + GAP;
-        let text_x = content_x + list_indent;
-        // Keep the same right padding + close-zone as before; text width is
-        // whatever is left between the (indented) label column and the close
-        // button on the right.
-        let text_w = (content_w - list_indent - PAD_X - CLOSE_TEXT_RESERVE).max(cell_width as f32);
+        let text_x = content_x + PAD_X + ACTIVE_TEXT_GAP;
+        // Title width runs from the label column to the (reduced) close reserve
+        // on the right.
+        let text_w =
+            (content_w - PAD_X * 2. - ACTIVE_TEXT_GAP - CLOSE_TEXT_RESERVE).max(cell_width as f32);
         let text_cols = (text_w / cell_width as f32).max(1.) as usize;
         let content_cols =
             ((content_w - PAD_X * 2.).max(cell_width as f32) / cell_width as f32).max(1.) as usize;
@@ -3638,7 +3642,13 @@ impl crate::TermWindow {
                     cursor_is_default_color: true,
                     white_space,
                     filled_box,
-                    window_is_transparent: false,
+                    // Rail icons draw over a rounded pill fill; a default-bg
+                    // glyph cell must stay transparent so the pill shows
+                    // through. With `false`, render_screen_line resolves the
+                    // default bg to palette.background and paints it opaque,
+                    // leaving a dark cell-sized band inside the pill (visible
+                    // once the DPI-scaled rail grew wider than the glyph cell).
+                    window_is_transparent: true,
                     default_bg,
                     style: None,
                     font: None,
