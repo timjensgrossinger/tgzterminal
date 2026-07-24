@@ -67,11 +67,17 @@ pub fn save_sidebar_auto_hide(value: bool) {
 /// Build a config-override `Value` seeded from persisted UI state, suitable for
 /// `config::overridden_config`. Returns `Value::Null` when nothing is persisted.
 pub fn seed_config_overrides() -> wezterm_dynamic::Value {
+    overrides_from_state(&TgzUiState {
+        sidebar_auto_hide: load_sidebar_auto_hide(),
+    })
+}
+
+fn overrides_from_state(state: &TgzUiState) -> wezterm_dynamic::Value {
     use std::collections::BTreeMap;
     use wezterm_dynamic::Value;
 
     let mut map: BTreeMap<Value, Value> = BTreeMap::new();
-    if let Some(v) = load_sidebar_auto_hide() {
+    if let Some(v) = state.sidebar_auto_hide {
         map.insert(
             Value::String("sidebar_auto_hide".to_string()),
             Value::Bool(v),
@@ -82,5 +88,60 @@ pub fn seed_config_overrides() -> wezterm_dynamic::Value {
         Value::Null
     } else {
         Value::Object(map.into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wezterm_dynamic::Value;
+
+    #[test]
+    fn default_state_has_no_persisted_toggles() {
+        assert_eq!(TgzUiState::default().sidebar_auto_hide, None);
+    }
+
+    #[test]
+    fn json_round_trip_preserves_sidebar_auto_hide() {
+        let state = TgzUiState {
+            sidebar_auto_hide: Some(true),
+        };
+        let json = serde_json::to_string_pretty(&state).unwrap();
+        let parsed: TgzUiState = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.sidebar_auto_hide, Some(true));
+    }
+
+    #[test]
+    fn absent_field_deserializes_to_none() {
+        let parsed: TgzUiState = serde_json::from_str("{}").unwrap();
+        assert_eq!(parsed.sidebar_auto_hide, None);
+    }
+
+    #[test]
+    fn corrupt_json_fails_to_parse_so_callers_fall_back_to_default() {
+        // Mirrors the fallback in `read_state`: a parse error must be
+        // recoverable, not a panic, so a corrupt file just loses the toggle.
+        assert!(serde_json::from_str::<TgzUiState>("not json").is_err());
+    }
+
+    #[test]
+    fn overrides_from_state_is_null_when_nothing_persisted() {
+        assert_eq!(
+            overrides_from_state(&TgzUiState::default()),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn overrides_from_state_includes_persisted_sidebar_auto_hide() {
+        let overrides = overrides_from_state(&TgzUiState {
+            sidebar_auto_hide: Some(false),
+        });
+        match overrides {
+            Value::Object(map) => {
+                assert_eq!(map.get_by_str("sidebar_auto_hide"), Some(&Value::Bool(false)));
+            }
+            other => panic!("expected Value::Object, got {other:?}"),
+        }
     }
 }

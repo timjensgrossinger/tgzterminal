@@ -562,6 +562,23 @@ fn compact_label(value: &str, fallback: &str) -> String {
     }
 }
 
+/// Side length (px) of the square icon box in the collapsed auto-hide rail
+/// (toggle button, per-tab icon, "+ New Tab"). Must be tall enough to fully
+/// enclose a text glyph's line height (`cell_height`) — otherwise ascenders
+/// (e.g. the "l" in the Claude "Cl" badge) poke past the rounded pill fill,
+/// which is visible because the glyph cell itself renders transparent.
+fn sidebar_rail_icon_side(rail_width: f32, cell_height: f32, dpi_scale: f32) -> f32 {
+    // Ceiling grows with the (DPI-scaled) font cell height, keeping the
+    // original 46px as a scaled floor, so the box has room to grow.
+    let rail_ceiling = (cell_height + 12. * dpi_scale).max(46. * dpi_scale);
+    // Preferred size leaves a small margin on each side of the strip. Floored
+    // at cell_height (+4px) so a narrow collapsed rail can't squeeze the box
+    // shorter than the glyph's line height; that floor is itself capped just
+    // inside rail_width so the box never spills past both edges of the strip.
+    let min_fit = (cell_height + 4.).min(rail_width - 2.).max(1.);
+    (rail_width - 8.).max(min_fit).min(rail_ceiling).max(1.)
+}
+
 fn compact_tab_symbol(
     title: &str,
     tab_idx: usize,
@@ -3722,18 +3739,7 @@ impl crate::TermWindow {
                 })
                 .collect();
 
-            // The rail button is a square icon box; its ceiling must grow
-            // with the (DPI-scaled) font cell height (keeping the original
-            // 46px as a scaled floor) so the glyph never exceeds the box.
-            let rail_ceiling = (cell_height as f32 + 12. * dpi_scale).max(46. * dpi_scale);
-            // The box must always fit inside the strip: leave a small margin on
-            // each side and cap at the ceiling. Floored at cell_height so a
-            // narrow collapsed rail can't squeeze the box shorter than the
-            // glyph's line height — otherwise ascenders (e.g. "l" in the
-            // Claude "Cl" badge) poke out past the rounded pill, which is
-            // only visible now that the glyph cell is drawn transparent.
-            let min_fit = (cell_height as f32 + 4.).min(width as f32 - 2.).max(1.);
-            let rail_side = (width as f32 - 8.).max(min_fit).min(rail_ceiling).max(1.);
+            let rail_side = sidebar_rail_icon_side(width as f32, cell_height as f32, dpi_scale);
             let rail_radius = (RADIUS * dpi_scale).min(rail_side * 0.5);
             let rail_x = left + (width as f32 - rail_side) * 0.5;
             let row_stride = rail_side + GAP;
@@ -4579,22 +4585,31 @@ impl crate::TermWindow {
         let w = rect.size.width;
         let h = rect.size.height;
 
+        // Overlap adjacent pieces by up to 1px so fractional-pixel edges (and
+        // the corner sprite's floored `r as isize` cell) never leave a hairline
+        // of the layer beneath showing through as a seam. On the collapsed rail
+        // the layer under an opaque tab pill is the dark window, so an
+        // uncovered seam reads as a dark line straight across the icon box.
+        // Colors here are opaque, so overlapping is idempotent (no double-blend).
+        let o = 1.0_f32.min(r);
+        // Full-width middle band, extended to overlap both end caps vertically.
         self.filled_rectangle(
             layers,
             layer_num,
-            euclid::rect(x, y + r, w, h - 2.0 * r),
+            euclid::rect(x, y + r - o, w, (h - 2.0 * (r - o)).max(0.0)),
+            color,
+        )?;
+        // Top + bottom caps, widened to overlap the corner discs horizontally.
+        self.filled_rectangle(
+            layers,
+            layer_num,
+            euclid::rect(x + r - o, y, (w - 2.0 * (r - o)).max(0.0), r),
             color,
         )?;
         self.filled_rectangle(
             layers,
             layer_num,
-            euclid::rect(x + r, y, w - 2.0 * r, r),
-            color,
-        )?;
-        self.filled_rectangle(
-            layers,
-            layer_num,
-            euclid::rect(x + r, y + h - r, w - 2.0 * r, r),
+            euclid::rect(x + r - o, y + h - r, (w - 2.0 * (r - o)).max(0.0), r),
             color,
         )?;
 
@@ -4706,6 +4721,89 @@ mod tests {
 
         vars.insert("agent.model".to_string(), "gpt-5".to_string());
         assert!(has_agent_metadata_evidence(&vars));
+    }
+
+    #[test]
+    fn rail_icon_side_fits_normal_cell_height() {
+        // Rail width and font size both modest enough that neither the
+        // ceiling nor the cell_height floor kicks in: just the usual
+        // margin-trimmed size (width - 8).
+        assert_eq!(sidebar_rail_icon_side(40., 20., 1.), 32.);
+    }
+
+    #[test]
+    fn rail_icon_side_floors_at_cell_height_on_narrow_rail() {
+        // Regression for the "l" ascender in the Claude "Cl" badge poking
+        // past the rounded pill: a narrow collapsed rail used to shrink the
+        // icon box below the glyph's line height.
+        let width = 44.;
+        let cell_height = 40.;
+        let side = sidebar_rail_icon_side(width, cell_height, 1.);
+        assert!(
+            side >= cell_height,
+            "rail icon side {side} must be >= cell_height {cell_height}"
+        );
+    }
+
+    #[test]
+    fn rail_icon_side_never_exceeds_rail_width() {
+        // The cell_height floor must not push the box wider than the strip
+        // itself, even in an extreme narrow-rail-plus-huge-font case.
+        let width = 20.;
+        let side = sidebar_rail_icon_side(width, 200., 1.);
+        assert!(side <= width, "rail icon side {side} must fit within rail width {width}");
+    }
+
+    #[test]
+    fn rail_icon_side_respects_dpi_scaled_ceiling() {
+        // Generous rail width shouldn't let the icon grow past the
+        // DPI-scaled ceiling.
+        let side = sidebar_rail_icon_side(500., 20., 2.);
+        assert_eq!(side, 46. * 2.);
+    }
+
+    #[test]
+    fn compact_tab_symbol_prefers_agent_kind_over_title() {
+        assert_eq!(
+            compact_tab_symbol("1: bash", 0, Some(&AgentKind::Claude), None, Some("bash"), None),
+            "Cl"
+        );
+        assert_eq!(
+            compact_tab_symbol("1: node", 0, Some(&AgentKind::Codex), None, Some("node"), None),
+            "Cx"
+        );
+    }
+
+    #[test]
+    fn compact_tab_symbol_detects_worktree_from_title_or_pane_title() {
+        assert_eq!(compact_tab_symbol("Worktree: foo", 0, None, None, None, None), "Wt");
+        assert_eq!(
+            compact_tab_symbol("1: bash", 0, None, None, Some("bash"), Some("worktree foo")),
+            "Wt"
+        );
+    }
+
+    #[test]
+    fn compact_tab_symbol_falls_back_to_known_commands() {
+        assert_eq!(compact_tab_symbol("1: zsh", 0, None, None, Some("zsh"), None), "$");
+        assert_eq!(compact_tab_symbol("1: vim", 0, None, None, Some("vim"), None), "Vi");
+        assert_eq!(compact_tab_symbol("1: cargo", 0, None, None, Some("cargo"), None), "Rs");
+    }
+
+    #[test]
+    fn compact_tab_color_prefers_agent_kind_over_command() {
+        assert_eq!(
+            compact_tab_color("1: bash", 0, Some(&AgentKind::Claude), None, Some("bash"), None),
+            adapter_color(None, &AgentKind::Claude)
+        );
+    }
+
+    #[test]
+    fn compact_tab_color_detects_worktree_before_command_lookup() {
+        assert_eq!(
+            compact_tab_color("Worktree: foo", 0, None, None, Some("git"), None),
+            LinearRgba(0.50, 0.58, 0.42, 1.0)
+        );
     }
 
     #[test]
