@@ -229,6 +229,27 @@ chmod +x "$APP_PATH/Contents/MacOS/wezterm-mux-server"
 place_binary strip-ansi-escapes "$APP_PATH/Contents/MacOS/strip-ansi-escapes"
 chmod +x "$APP_PATH/Contents/MacOS/strip-ansi-escapes"
 
+# Vendor fzf so the worktree/file-browser feature (sidebar.rs's Worktree pane)
+# always has a real fzf UI, without requiring the user to `brew install fzf`
+# themselves. See ci/fetch-fzf.sh for the pinned version + checksums.
+log "Vendoring fzf into Contents/MacOS/fzf"
+FZF_DEST="$APP_PATH/Contents/MacOS/fzf"
+if [[ "$BUILD_MODE" == "native" ]]; then
+  case "$(uname -m)" in
+    arm64) HOST_ARCH=arm64 ;;
+    x86_64) HOST_ARCH=amd64 ;;
+    *) fail "unsupported host architecture for fzf vendoring: $(uname -m)" ;;
+  esac
+  "$SCRIPT_DIR/fetch-fzf.sh" darwin "$HOST_ARCH" "$FZF_DEST"
+else
+  FZF_TMP=$(mktemp -d)
+  "$SCRIPT_DIR/fetch-fzf.sh" darwin amd64 "$FZF_TMP/fzf-amd64"
+  "$SCRIPT_DIR/fetch-fzf.sh" darwin arm64 "$FZF_TMP/fzf-arm64"
+  lipo "$FZF_TMP/fzf-amd64" "$FZF_TMP/fzf-arm64" -output "$FZF_DEST" -create
+  rm -rf "$FZF_TMP"
+fi
+chmod +x "$FZF_DEST"
+
 # Shell integration, completions, and terminfo, matching upstream deploy.sh.
 log "Copying shell integration, completions, and terminfo"
 if [[ -d "assets/shell-integration" ]]; then

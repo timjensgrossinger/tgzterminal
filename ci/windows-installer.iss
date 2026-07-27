@@ -52,6 +52,7 @@ Source: "..\target\release\libGLESv2.dll"; DestDir: "{app}"; Flags: ignoreversio
 Source: "..\target\release\conpty.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\target\release\OpenConsole.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\target\release\strip-ansi-escapes.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\target\release\fzf.exe"; DestDir: "{app}"; Flags: ignoreversion
 ; NOTE: Don't use "Flags: ignoreversion" on any shared system files
 
 [Icons]

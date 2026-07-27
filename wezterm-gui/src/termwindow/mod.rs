@@ -2978,6 +2978,7 @@ tmp="${TMPDIR:-/tmp}/tgzterminal-worktree.$$"
 trap 'rm -f "$tmp" "$tmp".*' EXIT
 target_pane="${TGZTERMINAL_TARGET_PANE:-}"
 wezterm_bin="${TGZTERMINAL_BIN:-tgzterminal}"
+fzf_bin="${TGZTERMINAL_FZF_BIN:-fzf}"
 editor_cmd="${TGZTERMINAL_EDITOR_COMMAND:-${VISUAL:-${EDITOR:-vim}}}"
 remote_dest="${TGZTERMINAL_REMOTE_DEST:-}"
 remote_port="${TGZTERMINAL_REMOTE_PORT:-}"
@@ -3544,8 +3545,8 @@ while :; do
     fi
   fi
 
-  if command -v fzf >/dev/null 2>&1; then
-    selection_line=$(fzf --height=100% --layout=reverse --no-sort --cycle --prompt='Worktree > ' --pointer='>' --marker='+' --border=none --bind="q:execute-silent($wezterm_bin cli kill-pane --pane-id ${WEZTERM_PANE:-})+abort,ctrl-r:execute-silent(rm -f $cache_file $stamp_file $check_file)+abort" --color='bg:-1,bg+:#444444,fg:#b8b8b8,fg+:#eeeeee,hl:#d86f8f,hl+:#f18fb0,pointer:#d86f8f,prompt:#8fb4d8,spinner:#d86f8f,info:#d8c06f,border:#555555' --delimiter="$(printf '\t')" --with-nth=1 < "$tmp") || {
+  if command -v "$fzf_bin" >/dev/null 2>&1; then
+    selection_line=$("$fzf_bin" --height=100% --layout=reverse --no-sort --cycle --prompt='Worktree > ' --pointer='>' --marker='+' --border=none --bind="q:execute-silent($wezterm_bin cli kill-pane --pane-id ${WEZTERM_PANE:-})+abort,ctrl-r:execute-silent(rm -f $cache_file $stamp_file $check_file)+abort" --color='bg:-1,bg+:#444444,fg:#b8b8b8,fg+:#eeeeee,hl:#d86f8f,hl+:#f18fb0,pointer:#d86f8f,prompt:#8fb4d8,spinner:#d86f8f,info:#d8c06f,border:#555555' --delimiter="$(printf '\t')" --with-nth=1 < "$tmp") || {
       continue
     }
   else
@@ -3707,6 +3708,20 @@ done
             })
             .unwrap_or_else(|| "tgzterminal".to_string());
         set_environment_variables.insert("TGZTERMINAL_BIN".to_string(), bin);
+        // Prefer the fzf binary vendored alongside the app (see
+        // ci/fetch-fzf.sh + ci/build-macos-bundle.sh / the Windows release
+        // workflow) over whatever may or may not be on $PATH, so the
+        // worktree picker's fzf UI works out of the box on every platform.
+        if let Some(fzf_bin) = std::env::current_exe().ok().and_then(|path| {
+            let fzf_name = if cfg!(windows) { "fzf.exe" } else { "fzf" };
+            let candidate = path.parent()?.join(fzf_name);
+            candidate.exists().then_some(candidate)
+        }) {
+            set_environment_variables.insert(
+                "TGZTERMINAL_FZF_BIN".to_string(),
+                fzf_bin.to_string_lossy().to_string(),
+            );
+        }
         if let Some(editor_command) = self
             .config
             .file_browser

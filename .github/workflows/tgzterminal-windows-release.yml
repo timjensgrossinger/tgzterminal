@@ -97,6 +97,10 @@ jobs:
              assets/windows/angle/libEGL.dll \
              assets/windows/angle/libGLESv2.dll \
              "$pkg/"
+          # fzf, so the worktree/file-browser feature works out of the box —
+          # see ci/fetch-fzf.sh for the pinned version + checksum.
+          chmod +x ci/fetch-fzf.sh
+          ci/fetch-fzf.sh windows amd64 "$pkg/fzf.exe"
           # Mesa software GL is optional; include it only if the build produced it.
           if [ -f target/release/mesa/opengl32.dll ]; then
             cp target/release/mesa/opengl32.dll "$pkg/mesa/"
@@ -123,6 +127,8 @@ jobs:
              assets/windows/angle/libEGL.dll \
              assets/windows/angle/libGLESv2.dll \
              target/release/ || true
+          chmod +x ci/fetch-fzf.sh
+          ci/fetch-fzf.sh windows amd64 target/release/fzf.exe || true
           if [ ! -f target/release/mesa/opengl32.dll ]; then
             echo "mesa/opengl32.dll missing — the stock installer script requires it; skipping installer."
             exit 1
