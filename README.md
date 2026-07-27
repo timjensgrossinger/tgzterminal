@@ -2,7 +2,7 @@
 
 # TGZTerminal
 
-**A macOS-first fork of [WezTerm](https://github.com/wezterm/wezterm), for people whose therapist has started asking "and how did that make you feel, relative to your `$SHELL`?"**
+**A fork of [WezTerm](https://github.com/wezterm/wezterm), for people whose therapist has started asking "and how did that make you feel, relative to your `$SHELL`?"**
 
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20(beta)-000000?logo=apple&logoColor=white)
 ![Built on WezTerm](https://img.shields.io/badge/built%20on-WezTerm-4E49EE)
