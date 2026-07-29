@@ -265,6 +265,18 @@ pub struct AgentAdapterConfig {
     /// Local path templates opened by the Details toolbelt action.
     #[dynamic(default)]
     pub detail_paths: Option<Vec<String>>,
+
+    /// Command argv used by the sidebar launcher to start a fresh session.
+    /// Unlike the resume/attach templates this takes no substitutions: the
+    /// working directory is supplied by the launcher, not baked into argv.
+    #[dynamic(default)]
+    pub launch_command: Option<Vec<String>>,
+
+    /// Domain this adapter launches into, overriding
+    /// `agent_ui.launcher.domain`. Useful when one agent lives in WSL and
+    /// another on the Windows host.
+    #[dynamic(default)]
+    pub launch_domain: Option<String>,
 }
 
 impl Default for AgentAdapterConfig {
@@ -283,6 +295,8 @@ impl Default for AgentAdapterConfig {
             resume_latest_command: None,
             attach_command: None,
             detail_paths: None,
+            launch_command: None,
+            launch_domain: None,
         }
     }
 }
@@ -324,7 +338,16 @@ impl AgentAdapterConfig {
             resume_latest_command: None,
             attach_command: None,
             detail_paths: None,
+            launch_command: None,
+            launch_domain: None,
         }
+    }
+
+    /// Set the launcher argv from a single command name. Built-in adapters all
+    /// launch a bare CLI with no arguments; the launcher supplies the cwd.
+    fn with_launch(mut self, command: &str) -> Self {
+        self.launch_command = Some(vec![command.to_string()]);
+        self
     }
 }
 
@@ -376,6 +399,7 @@ pub fn default_agent_adapters() -> AgentAdaptersConfig {
     claude.detail_paths = Some(vec![
         "{home}/.claude/projects/{claude_project_path}".to_string()
     ]);
+    claude.launch_command = Some(vec!["claude".to_string()]);
     adapters.insert("claude".to_string(), claude);
 
     let mut codex = AgentAdapterConfig::with_defaults(
@@ -402,6 +426,7 @@ pub fn default_agent_adapters() -> AgentAdaptersConfig {
         "{home}/.codex/sessions".to_string(),
         "{home}/.codex/log".to_string(),
     ]);
+    codex.launch_command = Some(vec!["codex".to_string()]);
     adapters.insert("codex".to_string(), codex);
     adapters.insert(
         "gemini".to_string(),
@@ -414,7 +439,8 @@ pub fn default_agent_adapters() -> AgentAdaptersConfig {
             &["gemini"],
             &["tokens", "context"],
             &["gemini"],
-        ),
+        )
+        .with_launch("gemini"),
     );
     let mut opencode = AgentAdapterConfig::with_defaults(
         "OpenCode",
@@ -441,6 +467,7 @@ pub fn default_agent_adapters() -> AgentAdaptersConfig {
         "{home}/.local/share/opencode/log".to_string(),
         "{home}/.local/share/opencode/storage".to_string(),
     ]);
+    opencode.launch_command = Some(vec!["opencode".to_string()]);
     adapters.insert("opencode".to_string(), opencode);
 
     let mut copilot = AgentAdapterConfig::with_defaults(
@@ -462,6 +489,7 @@ pub fn default_agent_adapters() -> AgentAdaptersConfig {
         "{home}/.copilot/session-state/{session_id}".to_string(),
         "{home}/.copilot/session-state".to_string(),
     ]);
+    copilot.launch_command = Some(vec!["copilot".to_string()]);
     adapters.insert("copilot".to_string(), copilot);
     adapters.insert(
         "cursor".to_string(),
@@ -474,7 +502,10 @@ pub fn default_agent_adapters() -> AgentAdaptersConfig {
             &["cursor"],
             &["tokens", "context"],
             &["gpt", "claude"],
-        ),
+        )
+        // The Cursor terminal agent ships as `cursor-agent`; plain `cursor`
+        // is the GUI editor launcher and would not start an agent session.
+        .with_launch("cursor-agent"),
     );
     adapters.insert(
         "amp".to_string(),
@@ -487,9 +518,201 @@ pub fn default_agent_adapters() -> AgentAdaptersConfig {
             &["amp"],
             &["tokens", "context"],
             &["sonnet", "opus"],
-        ),
+        )
+        .with_launch("amp"),
     );
     adapters
+}
+
+/// Working directory rule used when the sidebar launcher starts an agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromDynamic, ToDynamic)]
+pub enum AgentLauncherCwd {
+    /// Use the active pane's current working directory verbatim.
+    ActivePane,
+    /// Walk up from the active pane's directory to the nearest project root.
+    ProjectRoot,
+}
+
+impl Default for AgentLauncherCwd {
+    fn default() -> Self {
+        Self::ActivePane
+    }
+}
+
+/// Where the sidebar launcher puts a freshly started agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromDynamic, ToDynamic)]
+pub enum AgentLaunchTarget {
+    /// Open the agent in a new tab.
+    NewTab,
+    /// Split the active pane and put the agent beside it.
+    SplitPane,
+}
+
+impl Default for AgentLaunchTarget {
+    fn default() -> Self {
+        Self::SplitPane
+    }
+}
+
+/// What the launcher does when the active pane is an SSH/remote session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromDynamic, ToDynamic)]
+pub enum AgentRemoteBehavior {
+    /// Always run the agent on this machine, in the newest local pane's
+    /// directory. The agent CLI and its credentials normally live here, not on
+    /// the box you happen to be shelled into.
+    ForceLocal,
+    /// Launch into the active pane's domain, so an SSH pane starts the agent on
+    /// the remote host.
+    FollowPane,
+}
+
+impl Default for AgentRemoteBehavior {
+    fn default() -> Self {
+        Self::ForceLocal
+    }
+}
+
+/// Split orientation used when `AgentLaunchTarget::SplitPane` is in effect.
+/// Mirrors `mux::tab::SplitDirection`, which the `config` crate cannot name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromDynamic, ToDynamic)]
+pub enum AgentSplitDirection {
+    /// Side by side.
+    Horizontal,
+    /// Stacked.
+    Vertical,
+}
+
+impl Default for AgentSplitDirection {
+    fn default() -> Self {
+        Self::Horizontal
+    }
+}
+
+pub fn default_agent_split_size_percent() -> u8 {
+    50
+}
+
+pub fn default_project_markers() -> Vec<String> {
+    vec![
+        ".git".to_string(),
+        ".hg".to_string(),
+        ".svn".to_string(),
+        ".jj".to_string(),
+    ]
+}
+
+#[derive(Debug, Clone, FromDynamic, ToDynamic)]
+pub struct AgentLauncherConfig {
+    /// Show the sidebar agent launch button.
+    #[dynamic(default = "default_true")]
+    pub enabled: bool,
+
+    /// Adapter id launched by a plain click. Defaults to Claude Code; when the
+    /// named adapter is not installed, the first enabled adapter whose launch
+    /// command is found on PATH is used. Set to `nil`/`""` for pure
+    /// first-installed-wins behaviour.
+    #[dynamic(default = "default_launcher_adapter")]
+    pub default_adapter: Option<String>,
+
+    /// Initial working directory rule. The sidebar toggle persists a runtime
+    /// override that takes precedence once the user changes it.
+    #[dynamic(default)]
+    pub cwd: AgentLauncherCwd,
+
+    /// Where a launched agent lands. Defaults to a split so the agent sits
+    /// beside the shell it was started from; holding Alt while clicking the
+    /// launcher picks the other target for that one launch.
+    #[dynamic(default)]
+    pub open_in: AgentLaunchTarget,
+
+    /// Orientation for `open_in = "SplitPane"`.
+    #[dynamic(default)]
+    pub split_direction: AgentSplitDirection,
+
+    /// Percentage of the split assigned to the agent pane. Clamped to 5..=95.
+    #[dynamic(default = "default_agent_split_size_percent")]
+    pub split_size_percent: u8,
+
+    /// What to do when the active pane is a remote/SSH session. Defaults to
+    /// running the agent locally regardless.
+    #[dynamic(default)]
+    pub remote_behavior: AgentRemoteBehavior,
+
+    /// Directory entries that mark a project root for `ProjectRoot` mode.
+    #[dynamic(default = "default_project_markers")]
+    pub project_markers: Vec<String>,
+
+    /// Exact domain name to launch agents into, for example `"WSL:Ubuntu"`.
+    /// Takes precedence over `prefer_wsl`. A name that is not registered falls
+    /// back to the active pane's domain rather than failing the spawn.
+    #[dynamic(default)]
+    pub domain: Option<String>,
+
+    /// When no explicit domain is set, launch agents into the first registered
+    /// WSL domain if there is one. Defaults to true on Windows, where agent
+    /// CLIs are typically installed inside a distro rather than on the host.
+    #[dynamic(default = "default_prefer_wsl")]
+    pub prefer_wsl: bool,
+}
+
+pub fn default_prefer_wsl() -> bool {
+    cfg!(windows)
+}
+
+/// Claude Code leads the launcher out of the box; an uninstalled default still
+/// falls through to the first installed agent, so this only picks the winner
+/// when several agents are present.
+pub fn default_launcher_adapter() -> Option<String> {
+    Some("claude".to_string())
+}
+
+impl Default for AgentLauncherConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            default_adapter: default_launcher_adapter(),
+            cwd: AgentLauncherCwd::ActivePane,
+            open_in: AgentLaunchTarget::default(),
+            split_direction: AgentSplitDirection::default(),
+            split_size_percent: default_agent_split_size_percent(),
+            remote_behavior: AgentRemoteBehavior::default(),
+            project_markers: default_project_markers(),
+            domain: None,
+            prefer_wsl: default_prefer_wsl(),
+        }
+    }
+}
+
+/// Sidebar new-tab dropdown: the shells and domains offered by the chevron
+/// next to the `+ New Tab` button.
+#[derive(Debug, Clone, FromDynamic, ToDynamic)]
+pub struct NewTabMenuConfig {
+    /// Show the chevron next to the sidebar new-tab button.
+    #[dynamic(default = "default_true")]
+    pub enabled: bool,
+
+    /// List registered spawnable domains (local, WSL distros, SSH, mux).
+    #[dynamic(default = "default_true")]
+    pub show_domains: bool,
+
+    /// List shells discovered on this machine.
+    #[dynamic(default = "default_true")]
+    pub show_shells: bool,
+
+    /// List `launch_menu` entries.
+    #[dynamic(default = "default_true")]
+    pub show_launch_menu: bool,
+}
+
+impl Default for NewTabMenuConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            show_domains: true,
+            show_shells: true,
+            show_launch_menu: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, FromDynamic, ToDynamic)]
@@ -529,6 +752,10 @@ pub struct AgentUiConfig {
     /// Per-adapter passive detection switches.
     #[dynamic(default = "default_agent_adapters")]
     pub adapters: AgentAdaptersConfig,
+
+    /// Sidebar button that starts a fresh agent session.
+    #[dynamic(default)]
+    pub launcher: AgentLauncherConfig,
 }
 
 impl Default for AgentUiConfig {
@@ -543,6 +770,7 @@ impl Default for AgentUiConfig {
             waiting_notification: true,
             toolbelt_position: AgentToolbeltPosition::Top,
             adapters: default_agent_adapters(),
+            launcher: AgentLauncherConfig::default(),
         }
     }
 }
@@ -1066,6 +1294,10 @@ pub struct Config {
     /// Vendor-neutral agent detection and lightweight pane controls.
     #[dynamic(default)]
     pub agent_ui: AgentUiConfig,
+
+    /// Shells and domains offered by the sidebar new-tab dropdown.
+    #[dynamic(default)]
+    pub new_tab_menu: NewTabMenuConfig,
 
     /// Optional multiline input composer for agent panes.
     #[dynamic(default)]
@@ -2571,6 +2803,156 @@ mod agent_ui_tests {
     }
 
     #[test]
+    fn agent_launcher_defaults_to_active_pane_cwd() {
+        let launcher = Config::default_config().agent_ui.launcher;
+
+        assert!(launcher.enabled);
+        assert_eq!(launcher.default_adapter.as_deref(), Some("claude"));
+        assert_eq!(launcher.cwd, AgentLauncherCwd::ActivePane);
+        assert_eq!(
+            launcher.project_markers,
+            strings(&[".git", ".hg", ".svn", ".jj"])
+        );
+    }
+
+    #[test]
+    fn agent_launcher_defaults_to_a_local_split() {
+        // The agent is meant to sit beside the shell it was started from, and
+        // to run on this machine even when that shell is an SSH session.
+        let launcher = Config::default_config().agent_ui.launcher;
+
+        assert_eq!(launcher.open_in, AgentLaunchTarget::SplitPane);
+        assert_eq!(launcher.remote_behavior, AgentRemoteBehavior::ForceLocal);
+        assert_eq!(launcher.split_direction, AgentSplitDirection::Horizontal);
+        assert_eq!(launcher.split_size_percent, 50);
+    }
+
+    #[test]
+    fn agent_launch_target_round_trips_through_dynamic() {
+        for value in [AgentLaunchTarget::NewTab, AgentLaunchTarget::SplitPane] {
+            let dynamic = value.to_dynamic();
+            assert_eq!(
+                AgentLaunchTarget::from_dynamic(&dynamic, Default::default()).unwrap(),
+                value
+            );
+        }
+    }
+
+    #[test]
+    fn agent_remote_behavior_round_trips_through_dynamic() {
+        for value in [
+            AgentRemoteBehavior::ForceLocal,
+            AgentRemoteBehavior::FollowPane,
+        ] {
+            let dynamic = value.to_dynamic();
+            assert_eq!(
+                AgentRemoteBehavior::from_dynamic(&dynamic, Default::default()).unwrap(),
+                value
+            );
+        }
+    }
+
+    #[test]
+    fn agent_split_direction_round_trips_through_dynamic() {
+        for value in [
+            AgentSplitDirection::Horizontal,
+            AgentSplitDirection::Vertical,
+        ] {
+            let dynamic = value.to_dynamic();
+            assert_eq!(
+                AgentSplitDirection::from_dynamic(&dynamic, Default::default()).unwrap(),
+                value
+            );
+        }
+    }
+
+    #[test]
+    fn every_built_in_adapter_has_a_launch_command() {
+        let adapters = default_agent_adapters();
+
+        for id in [
+            "claude", "codex", "gemini", "opencode", "copilot", "cursor", "amp",
+        ] {
+            let argv = adapters[id]
+                .launch_command
+                .as_ref()
+                .unwrap_or_else(|| panic!("{id} has no launch_command"));
+            assert!(!argv.is_empty(), "{} launch_command is empty", id);
+            assert!(
+                !argv[0].trim().is_empty(),
+                "{} launch_command has a blank program",
+                id
+            );
+        }
+
+        // The Cursor CLI agent is `cursor-agent`; plain `cursor` opens the
+        // GUI editor and must not be used as the launch program.
+        assert_eq!(
+            adapters["cursor"].launch_command,
+            Some(strings(&["cursor-agent"]))
+        );
+    }
+
+    #[test]
+    fn launch_command_survives_a_partial_user_adapter_table() {
+        // A user table that only flips `enabled` must not drop the built-in
+        // launch command, mirroring how resume/attach templates merge.
+        let user: AgentAdapterConfig = AgentAdapterConfig {
+            enabled: true,
+            ..AgentAdapterConfig::default()
+        };
+
+        assert_eq!(user.launch_command, None);
+        let merged = user
+            .launch_command
+            .clone()
+            .or_else(|| default_agent_adapters()["claude"].launch_command.clone());
+        assert_eq!(merged, Some(strings(&["claude"])));
+    }
+
+    #[test]
+    fn agent_launcher_domain_defaults_prefer_wsl_only_on_windows() {
+        let launcher = Config::default_config().agent_ui.launcher;
+
+        assert_eq!(launcher.domain, None);
+        // Agent CLIs on Windows generally live inside a distro, so WSL is the
+        // sensible default there and nowhere else.
+        assert_eq!(launcher.prefer_wsl, cfg!(windows));
+    }
+
+    #[test]
+    fn adapters_have_no_launch_domain_by_default() {
+        // An unset launch_domain is what lets agent_ui.launcher.domain apply
+        // to every adapter; a built-in default here would shadow it.
+        for (id, adapter) in default_agent_adapters() {
+            assert_eq!(adapter.launch_domain, None, "{} has a launch_domain", id);
+        }
+    }
+
+    #[test]
+    fn new_tab_menu_defaults_to_everything_shown() {
+        let menu = Config::default_config().new_tab_menu;
+
+        assert!(menu.enabled);
+        assert!(menu.show_domains);
+        assert!(menu.show_shells);
+        assert!(menu.show_launch_menu);
+    }
+
+    #[test]
+    fn agent_launcher_cwd_round_trips_through_dynamic() {
+        use wezterm_dynamic::{FromDynamic, ToDynamic};
+
+        for value in [AgentLauncherCwd::ActivePane, AgentLauncherCwd::ProjectRoot] {
+            let dynamic = value.to_dynamic();
+            assert_eq!(
+                AgentLauncherCwd::from_dynamic(&dynamic, Default::default()).unwrap(),
+                value
+            );
+        }
+    }
+
+    #[test]
     fn rich_input_defaults_off_and_agent_gated() {
         let config = Config::default_config();
 
@@ -2664,6 +3046,10 @@ mod agent_ui_tests {
         assert!(cursor.resume_latest_command.is_none());
         assert!(cursor.attach_command.is_none());
         assert!(cursor.detail_paths.is_none());
+        // `launch_command` is deliberately exempt: it starts a fresh session
+        // from a user click and never acts on a detected session, so it is not
+        // one of the trust-gated control actions this test guards.
+        assert!(cursor.launch_command.is_some());
     }
 }
 

@@ -34,6 +34,12 @@ jobs:
     name: Build & publish macOS release
     runs-on: macos-latest
     if: github.repository != 'wezterm/wezterm'
+    env:
+      # Job-level so the signing step's own `if:` can see them; a step's own
+      # `env:` is not in scope for its condition.
+      MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+      MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+      MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -65,6 +71,42 @@ jobs:
             ./get-deps
           fi
 
+      # Optional. Without a signing certificate the bundle is signed ad-hoc,
+      # which makes macOS pin every privacy grant (Documents/Desktop/Downloads,
+      # Full Disk Access, ...) to the binary's code directory hash. That hash
+      # changes with every release, so users have to re-approve each permission
+      # after every update. Signing with the same certificate each time keeps
+      # the grants. Set these repository secrets to enable it:
+      #   MACOS_CERT_P12         base64 of a code signing .p12
+      #                          (`base64 -i cert.p12 | pbcopy`)
+      #   MACOS_CERT_PASSWORD    the .p12 export password
+      #   MACOS_SIGN_IDENTITY    identity name, e.g.
+      #                          "Developer ID Application: You (TEAMID)"
+      - name: Import signing certificate
+        if: env.MACOS_CERT_P12 != ''
+        run: |
+          set -euo pipefail
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          KEYCHAIN_PASSWORD=$(uuidgen)
+          echo "$MACOS_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" \
+            -P "$MACOS_CERT_PASSWORD" -A -T /usr/bin/codesign
+          # Without this codesign blocks on a GUI "allow key use" dialog that
+          # no one is there to answer.
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" > /dev/null
+          # Keep the login keychain in the search list so system roots resolve.
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
+          rm -f "$RUNNER_TEMP/cert.p12"
+
+          security find-identity -v -p codesigning "$KEYCHAIN"
+
+      # MACOS_SIGN_IDENTITY comes from the job env; empty means "sign ad-hoc",
+      # matching the previous behavior.
       - name: Build TGZTerminal.app and .dmg
         run: |
           chmod +x ci/build-macos-bundle.sh

@@ -1,7 +1,7 @@
 use crate::tabbar::TabBarItem;
 use crate::termwindow::{
-    AgentCopyAction, AgentCopyMenuState, AgentToolbeltAction, GuiWin, MouseCapture,
-    PositionedSplit, ScrollHit, TermWindowNotif, UIItem, UIItemType, TMB,
+    AgentCopyAction, AgentCopyMenuState, AgentLaunchMenuState, AgentToolbeltAction, GuiWin,
+    MouseCapture, PositionedSplit, ScrollHit, TermWindowNotif, UIItem, UIItemType, TMB,
 };
 use ::window::{
     MouseButtons as WMB, MouseCursor, MouseEvent, MouseEventKind as WMEK, MousePress,
@@ -11,7 +11,7 @@ use config::keyassignment::{
     ClipboardCopyDestination, KeyAssignment, MouseEventTrigger, SpawnTabDomain,
 };
 use config::MouseEventAltScreen;
-use mux::pane::{Pane, WithPaneLines};
+use mux::pane::{Pane, PaneId, WithPaneLines};
 use mux::tab::SplitDirection;
 use mux::Mux;
 use mux_lua::MuxPane;
@@ -43,6 +43,9 @@ impl super::TermWindow {
                 self.update_title_post_status();
             }
             UIItemType::SidebarTab { .. }
+            | UIItemType::SidebarTabExpand { .. }
+            | UIItemType::SidebarPaneRow { .. }
+            | UIItemType::SidebarPaneClose { .. }
             | UIItemType::SidebarTabList
             | UIItemType::SidebarScrollTrack
             | UIItemType::SidebarScrollThumb
@@ -51,6 +54,11 @@ impl super::TermWindow {
             | UIItemType::SidebarSearch
             | UIItemType::SidebarAutoHideToggle
             | UIItemType::SidebarWorktreeButton
+            | UIItemType::SidebarAgentLaunchButton
+            | UIItemType::SidebarAgentMenuItem { .. }
+            | UIItemType::SidebarAgentMenuProjectRootToggle
+            | UIItemType::SidebarNewTabMenuButton
+            | UIItemType::SidebarNewTabMenuItem { .. }
             | UIItemType::AgentToolbeltButton { .. }
             | UIItemType::AgentCopyMenuItem { .. }
             | UIItemType::AboveScrollThumb
@@ -64,6 +72,9 @@ impl super::TermWindow {
         match item.item_type {
             UIItemType::TabBar(_) => {}
             UIItemType::SidebarTab { .. }
+            | UIItemType::SidebarTabExpand { .. }
+            | UIItemType::SidebarPaneRow { .. }
+            | UIItemType::SidebarPaneClose { .. }
             | UIItemType::SidebarTabList
             | UIItemType::SidebarScrollTrack
             | UIItemType::SidebarScrollThumb
@@ -72,6 +83,11 @@ impl super::TermWindow {
             | UIItemType::SidebarSearch
             | UIItemType::SidebarAutoHideToggle
             | UIItemType::SidebarWorktreeButton
+            | UIItemType::SidebarAgentLaunchButton
+            | UIItemType::SidebarAgentMenuItem { .. }
+            | UIItemType::SidebarAgentMenuProjectRootToggle
+            | UIItemType::SidebarNewTabMenuButton
+            | UIItemType::SidebarNewTabMenuItem { .. }
             | UIItemType::AgentToolbeltButton { .. }
             | UIItemType::AgentCopyMenuItem { .. }
             | UIItemType::AboveScrollThumb
@@ -311,6 +327,39 @@ impl super::TermWindow {
             }
         }
 
+        if matches!(&event.kind, WMEK::Press(_)) && self.agent_launch_menu.is_some() {
+            let on_launch_menu = matches!(
+                &ui_item,
+                Some(item)
+                    if matches!(
+                        item.item_type,
+                        UIItemType::SidebarAgentLaunchButton
+                            | UIItemType::SidebarAgentMenuItem { .. }
+                            | UIItemType::SidebarAgentMenuProjectRootToggle
+                    )
+            );
+            if !on_launch_menu {
+                self.agent_launch_menu = None;
+                context.invalidate();
+            }
+        }
+
+        if matches!(&event.kind, WMEK::Press(_)) && self.new_tab_menu.is_some() {
+            let on_new_tab_menu = matches!(
+                &ui_item,
+                Some(item)
+                    if matches!(
+                        item.item_type,
+                        UIItemType::SidebarNewTabMenuButton
+                            | UIItemType::SidebarNewTabMenuItem { .. }
+                    )
+            );
+            if !on_new_tab_menu {
+                self.new_tab_menu = None;
+                context.invalidate();
+            }
+        }
+
         if let Some(item) = ui_item.clone() {
             if capture_mouse {
                 self.current_mouse_capture = Some(MouseCapture::UI);
@@ -500,6 +549,15 @@ impl super::TermWindow {
             UIItemType::SidebarTab { tab_idx, .. } => {
                 self.mouse_event_sidebar_tab(item, tab_idx, event, context);
             }
+            UIItemType::SidebarTabExpand { tab_idx } => {
+                self.mouse_event_sidebar_tab_expand(tab_idx, event, context);
+            }
+            UIItemType::SidebarPaneRow { pane_id } => {
+                self.mouse_event_sidebar_pane_row(pane_id, event, context);
+            }
+            UIItemType::SidebarPaneClose { pane_id } => {
+                self.mouse_event_sidebar_pane_close(pane_id, event, context);
+            }
             UIItemType::SidebarTabList => {
                 self.mouse_event_sidebar_tab_list(event, context);
             }
@@ -520,6 +578,21 @@ impl super::TermWindow {
             }
             UIItemType::SidebarWorktreeButton => {
                 self.mouse_event_sidebar_worktree_button(pane, event, context);
+            }
+            UIItemType::SidebarAgentLaunchButton => {
+                self.mouse_event_sidebar_agent_launch_button(item, event, context);
+            }
+            UIItemType::SidebarAgentMenuItem { adapter_id } => {
+                self.mouse_event_sidebar_agent_menu_item(&adapter_id, event, context);
+            }
+            UIItemType::SidebarAgentMenuProjectRootToggle => {
+                self.mouse_event_sidebar_agent_menu_project_root_toggle(event, context);
+            }
+            UIItemType::SidebarNewTabMenuButton => {
+                self.mouse_event_sidebar_new_tab_menu_button(item, event, context);
+            }
+            UIItemType::SidebarNewTabMenuItem { index } => {
+                self.mouse_event_sidebar_new_tab_menu_item(index, event, context);
             }
             UIItemType::AgentToolbeltButton { pane_id, action } => {
                 self.mouse_event_agent_toolbelt_button(pane_id, action, event, context);
@@ -598,6 +671,45 @@ impl super::TermWindow {
         }
     }
 
+    fn mouse_event_sidebar_tab_expand(
+        &mut self,
+        tab_idx: usize,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        if event.kind == WMEK::Release(MousePress::Left) {
+            self.pressed_ui_item = None;
+            self.toggle_sidebar_tab_expanded(tab_idx);
+        }
+        context.invalidate();
+    }
+
+    fn mouse_event_sidebar_pane_row(
+        &mut self,
+        pane_id: PaneId,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        if event.kind == WMEK::Release(MousePress::Left) {
+            self.pressed_ui_item = None;
+            self.activate_sidebar_pane(pane_id);
+        }
+        context.invalidate();
+    }
+
+    fn mouse_event_sidebar_pane_close(
+        &mut self,
+        pane_id: PaneId,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        if event.kind == WMEK::Release(MousePress::Left) {
+            self.pressed_ui_item = None;
+            self.close_sidebar_pane(pane_id);
+        }
+        context.invalidate();
+    }
+
     fn mouse_event_sidebar_worktree_button(
         &mut self,
         pane: Arc<dyn Pane>,
@@ -607,6 +719,105 @@ impl super::TermWindow {
         if event.kind == WMEK::Release(MousePress::Left) {
             self.open_file_browser(&pane);
             self.pressed_ui_item = None;
+        }
+        context.invalidate();
+    }
+
+    /// Left-click launches the default agent; right-click opens the picker.
+    /// This mirrors the new-tab button, where right-click already means
+    /// "show me the alternatives" (see `do_new_tab_button_click`).
+    fn mouse_event_sidebar_agent_launch_button(
+        &mut self,
+        item: UIItem,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        match event.kind {
+            WMEK::Release(MousePress::Left) => {
+                self.pressed_ui_item = None;
+                // A left-click while the menu is open acts as a dismiss, so
+                // the button does not re-launch out from under the picker.
+                if self.agent_launch_menu.take().is_none() {
+                    if let Some(entry) = self.agent_launcher_default() {
+                        let invert = event.modifiers.contains(KeyModifiers::ALT);
+                        self.launch_agent(&entry, invert);
+                    }
+                }
+            }
+            WMEK::Press(MousePress::Right) => {
+                self.agent_launch_menu = match self.agent_launch_menu.take() {
+                    Some(_) => None,
+                    None => Some(AgentLaunchMenuState {
+                        x: item.x,
+                        y: item.y,
+                    }),
+                };
+            }
+            _ => {}
+        }
+        context.invalidate();
+    }
+
+    fn mouse_event_sidebar_agent_menu_item(
+        &mut self,
+        adapter_id: &str,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        if event.kind == WMEK::Release(MousePress::Left) {
+            self.agent_launch_menu = None;
+            self.pressed_ui_item = None;
+            let invert = event.modifiers.contains(KeyModifiers::ALT);
+            self.launch_agent_by_id(adapter_id, invert);
+        }
+        context.invalidate();
+    }
+
+    /// Chevron beside the sidebar new-tab button: toggles the shell/domain
+    /// picker. The `+` label itself is untouched and still spawns a tab.
+    fn mouse_event_sidebar_new_tab_menu_button(
+        &mut self,
+        item: UIItem,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        if event.kind == WMEK::Release(MousePress::Left) {
+            self.pressed_ui_item = None;
+            self.new_tab_menu = match self.new_tab_menu.take() {
+                Some(_) => None,
+                None => Some(AgentLaunchMenuState {
+                    x: item.x,
+                    y: item.y,
+                }),
+            };
+        }
+        context.invalidate();
+    }
+
+    fn mouse_event_sidebar_new_tab_menu_item(
+        &mut self,
+        index: usize,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        if event.kind == WMEK::Release(MousePress::Left) {
+            self.new_tab_menu = None;
+            self.pressed_ui_item = None;
+            self.spawn_new_tab_menu_entry(index);
+        }
+        context.invalidate();
+    }
+
+    fn mouse_event_sidebar_agent_menu_project_root_toggle(
+        &mut self,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        if event.kind == WMEK::Release(MousePress::Left) {
+            self.pressed_ui_item = None;
+            // Deliberately leaves the menu open: the user can see the tick
+            // change and then pick an agent in the same interaction.
+            self.toggle_agent_launcher_project_root();
         }
         context.invalidate();
     }

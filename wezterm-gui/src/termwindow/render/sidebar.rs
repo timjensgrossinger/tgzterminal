@@ -6,15 +6,19 @@ use crate::termwindow::render::corners::{
     TOP_RIGHT_ROUNDED_CORNER,
 };
 use crate::termwindow::render::RenderScreenLineParams;
-use crate::termwindow::{AgentCopyAction, AgentToolbeltAction, UIItem, UIItemType};
-use config::keyassignment::SpawnCommand;
-use config::{
-    default_agent_adapters, AgentAdapterConfig, AgentTelemetryField, AgentToolbeltPosition,
-    SidebarPosition, SidebarTabDensity, SidebarTabMetadata, SidebarTabTitleSource, TabBarColors,
+use crate::termwindow::{
+    wsl_paths, AgentCopyAction, AgentLauncherEntry, AgentToolbeltAction, NewTabMenuEntry,
+    NewTabTarget, UIItem, UIItemType,
 };
-use mux::pane::{CachePolicy, Pane};
+use config::keyassignment::{SpawnCommand, SpawnTabDomain};
+use config::{
+    default_agent_adapters, AgentAdapterConfig, AgentLaunchTarget, AgentRemoteBehavior,
+    AgentSplitDirection, AgentTelemetryField, AgentToolbeltPosition, SidebarPosition,
+    SidebarTabDensity, SidebarTabMetadata, SidebarTabTitleSource, TabBarColors,
+};
+use mux::pane::{CachePolicy, Pane, PaneId};
 use mux::renderable::RenderableDimensions;
-use mux::tab::PositionedPane;
+use mux::tab::{PositionedPane, SplitDirection, SplitRequest, SplitSize as MuxSplitSize};
 use mux::Mux;
 use regex::RegexBuilder;
 use std::collections::{HashMap, HashSet};
@@ -36,6 +40,10 @@ const GAP: f32 = 4.;
 const PAD_X: f32 = 10.;
 const ACTIVE_RAIL_W: f32 = 3.;
 const ACTIVE_TEXT_GAP: f32 = 7.;
+/// Horizontal step a pane row is inset from its parent tab row.
+const PANE_ROW_INDENT: f32 = 14.;
+/// Space between the expand chevron and the label that follows it.
+const CHEVRON_GAP: f32 = 4.;
 const ACTION_ICON_W: f32 = 16.;
 const ACTION_ICON_GAP: f32 = 8.;
 const RADIUS: f32 = 7.;
@@ -63,6 +71,8 @@ const AGENT_TOOLBELT_MAX_W: f32 = 760.;
 const AGENT_TOOLBELT_MIN_W: f32 = 360.;
 const AGENT_TOOLBELT_RIGHT_INSET: f32 = 44.;
 const AGENT_COPY_MENU_W: f32 = 360.;
+/// Narrower than the copy menu: rows are short agent names, not sentences.
+const AGENT_LAUNCH_MENU_W: f32 = 200.;
 const AGENT_COPY_MENU_ROW_H: f32 = 28.;
 const MAX_AGENT_PATTERN_LEN: usize = 256;
 const AGENT_PATTERN_REGEX_CACHE_LIMIT: usize = 128;
@@ -816,6 +826,136 @@ fn pane_app_title(pane: &Arc<dyn Pane>, command: Option<&str>) -> Option<String>
     command.and_then(title_case_command)
 }
 
+/// One drawable line of the expanded sidebar list.
+///
+/// Built by `TermWindow::sidebar_rows`. Flattening tabs and their panes into a
+/// single sequence is what lets the scroll offset, the visible-row window and
+/// the scrollbar all speak in the same units.
+#[derive(Debug, Clone)]
+pub(crate) enum SidebarRow {
+    Tab {
+        tab_idx: usize,
+        active: bool,
+        title: String,
+        metadata: Vec<String>,
+        /// Panes in this tab. A count above one is what earns an expand
+        /// chevron; single-pane tabs stay exactly as they were.
+        pane_count: usize,
+        expanded: bool,
+    },
+    Pane {
+        pane_id: PaneId,
+        active: bool,
+        label: String,
+        /// Marks a pane living on another host, so a local agent split off an
+        /// SSH shell is visibly distinct from the shell it sits beside.
+        is_remote: bool,
+    },
+}
+
+/// A tab and its panes, gathered from the mux before row assembly.
+pub(crate) struct SidebarTabInput {
+    tab_idx: usize,
+    active: bool,
+    title: String,
+    metadata: Vec<String>,
+    panes: Vec<SidebarRow>,
+}
+
+/// Flatten tabs and their panes into the sidebar's row sequence.
+///
+/// Split out from `TermWindow::sidebar_rows` so the ordering, filtering and
+/// expansion rules can be tested without a live window: everything above this
+/// point is mux lookups, everything below is pure list assembly.
+fn assemble_sidebar_rows(
+    tabs: Vec<SidebarTabInput>,
+    expanded_tabs: &HashSet<usize>,
+    query: Option<&str>,
+) -> Vec<SidebarRow> {
+    let query = query.filter(|query| !query.is_empty());
+    let mut rows = Vec::new();
+
+    for tab in tabs {
+        if let Some(query) = query {
+            if !query_matches(&tab.title, &tab.metadata, query) {
+                continue;
+            }
+        }
+
+        // A tab matching the search keeps its pane children, so expanding a
+        // filtered result still shows what is inside it. A single-pane tab is
+        // never expandable: its one pane is what the tab row already describes.
+        let pane_count = tab.panes.len();
+        let expanded = pane_count > 1 && expanded_tabs.contains(&tab.tab_idx);
+
+        rows.push(SidebarRow::Tab {
+            tab_idx: tab.tab_idx,
+            active: tab.active,
+            title: tab.title,
+            metadata: tab.metadata,
+            pane_count,
+            expanded,
+        });
+        if expanded {
+            rows.extend(tab.panes);
+        }
+    }
+
+    rows
+}
+
+/// Case-insensitive substring match of `query` against a tab's title or any of
+/// its metadata fields.
+fn query_matches(title: &str, metadata: &[String], query: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    let query = query.to_lowercase();
+    title.to_lowercase().contains(&query)
+        || metadata
+            .iter()
+            .any(|item| item.to_lowercase().contains(&query))
+}
+
+/// Whether a launch should be pulled back to this machine.
+///
+/// Split out from `TermWindow` so the policy is testable without a window: the
+/// two inputs are the configured behavior and whether the active pane looks
+/// like a session elsewhere.
+fn agent_launch_forced_local(behavior: AgentRemoteBehavior, pane_looks_remote: bool) -> bool {
+    matches!(behavior, AgentRemoteBehavior::ForceLocal) && pane_looks_remote
+}
+
+/// Turn the configured launch target into a spawn target, applying the
+/// Alt-click inversion.
+fn agent_spawn_where(
+    open_in: AgentLaunchTarget,
+    direction: AgentSplitDirection,
+    size_percent: u8,
+    invert_target: bool,
+) -> SpawnWhere {
+    let split = match open_in {
+        AgentLaunchTarget::SplitPane => !invert_target,
+        AgentLaunchTarget::NewTab => invert_target,
+    };
+    if !split {
+        return SpawnWhere::NewTab;
+    }
+    SpawnWhere::SplitPane(SplitRequest {
+        direction: match direction {
+            AgentSplitDirection::Horizontal => SplitDirection::Horizontal,
+            AgentSplitDirection::Vertical => SplitDirection::Vertical,
+        },
+        // The agent goes in the new half, so the shell the user was already
+        // typing in keeps its position.
+        target_is_second: true,
+        // A 0% or 100% split would make one half unusable; the config is free
+        // text so clamp rather than trust it.
+        size: MuxSplitSize::Percent(size_percent.clamp(5, 95)),
+        top_level: false,
+    })
+}
+
 fn is_worktree_pane(pane: &Arc<dyn Pane>) -> bool {
     pane.copy_user_vars().contains_key("tgzterminal.worktree")
         || pane.get_title().trim() == "Worktree"
@@ -1035,23 +1175,59 @@ fn path_is_executable(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn command_exists_on_path(command: &str) -> bool {
+/// Directories probed after `$PATH` when resolving an agent command.
+///
+/// A GUI app launched from Finder/Dock inherits launchd's minimal PATH
+/// (`/usr/bin:/bin:/usr/sbin:/sbin`), not the login shell's, so an agent
+/// installed under the user's home — Claude Code lands in `~/.local/bin` — is
+/// invisible to a plain PATH probe and its launcher button never appears.
+fn fallback_command_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
+        for rel in [
+            ".local/bin",
+            "bin",
+            ".claude/local",
+            ".bun/bin",
+            ".cargo/bin",
+            ".volta/bin",
+            ".npm-global/bin",
+            ".yarn/bin",
+        ] {
+            dirs.push(home.join(rel));
+        }
+    }
+    dirs.push(PathBuf::from("/opt/homebrew/bin"));
+    dirs.push(PathBuf::from("/usr/local/bin"));
+    dirs
+}
+
+/// Absolute path of an installed command, or `None` when it is not installed.
+///
+/// Callers spawn the resolved path rather than the bare name: the child
+/// inherits this process's PATH, so a name found only through
+/// `fallback_command_dirs` would fail to exec.
+fn resolve_command_path(command: &str) -> Option<PathBuf> {
     let command = command.trim();
     if command.is_empty() {
-        return false;
+        return None;
     }
     let command_path = Path::new(command);
     if command_path.components().count() > 1 {
-        return path_is_executable(command_path);
+        return path_is_executable(command_path).then(|| command_path.to_path_buf());
     }
-    env::var_os("PATH")
-        .map(|path| {
-            env::split_paths(&path).any(|dir| {
-                let candidate = dir.join(command);
-                path_is_executable(&candidate)
-            })
-        })
-        .unwrap_or(false)
+    let path_dirs: Vec<PathBuf> = env::var_os("PATH")
+        .map(|path| env::split_paths(&path).collect())
+        .unwrap_or_default();
+    path_dirs
+        .into_iter()
+        .chain(fallback_command_dirs())
+        .map(|dir| dir.join(command))
+        .find(|candidate| path_is_executable(candidate))
+}
+
+fn command_exists_on_path(command: &str) -> bool {
+    resolve_command_path(command).is_some()
 }
 
 fn resolve_agent_command(
@@ -1062,16 +1238,13 @@ fn resolve_agent_command(
     if command.is_empty() {
         return None;
     }
-    let argv = command
+    let mut argv = command
         .iter()
         .map(|arg| expand_agent_action_template(arg, values))
         .collect::<Option<Vec<_>>>()?;
-    if argv
-        .first()
-        .is_none_or(|command| !command_exists_on_path(command))
-    {
-        return None;
-    }
+    // Absolute path, not the bare name: see `resolve_command_path`.
+    let program = resolve_command_path(argv.first()?)?;
+    argv[0] = program.to_string_lossy().into_owned();
     Some(argv)
 }
 
@@ -1364,7 +1537,120 @@ fn merge_agent_adapter_config(
             .detail_paths
             .clone()
             .or_else(|| base.detail_paths.clone()),
+        launch_command: configured
+            .launch_command
+            .clone()
+            .or_else(|| base.launch_command.clone()),
+        launch_domain: configured
+            .launch_domain
+            .clone()
+            .or_else(|| base.launch_domain.clone()),
     }
+}
+
+/// Shells present on this machine, as `(label, argv)`.
+///
+/// WezTerm ships an empty `launch_menu` on every platform, so without this the
+/// new-tab dropdown would have nothing to offer but domains.
+fn discovered_shells() -> Vec<(String, Vec<String>)> {
+    let mut shells = Vec::new();
+    let mut seen = HashSet::new();
+    let mut push = |label: &str, argv: Vec<String>, shells: &mut Vec<(String, Vec<String>)>| {
+        if seen.insert(argv.clone()) {
+            shells.push((label.to_string(), argv));
+        }
+    };
+
+    #[cfg(windows)]
+    {
+        // Friendly names rather than executable names: this list is read by
+        // people, not shells.
+        for (label, program) in [
+            ("PowerShell", "powershell.exe"),
+            ("PowerShell 7", "pwsh.exe"),
+            ("Command Prompt", "cmd.exe"),
+        ] {
+            if command_exists_on_path(program) {
+                push(label, vec![program.to_string()], &mut shells);
+            }
+        }
+        // Git Bash is not on PATH in a default install, so probe the two
+        // standard locations directly.
+        for candidate in [
+            r"C:\Program Files\Git\bin\bash.exe",
+            r"C:\Program Files (x86)\Git\bin\bash.exe",
+        ] {
+            if path_is_executable(Path::new(candidate)) {
+                push("Git Bash", vec![candidate.to_string()], &mut shells);
+                break;
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        // /etc/shells is the system's own list of login shells; anything in it
+        // is by definition intended to be used interactively.
+        let listed = fs::read_to_string("/etc/shells").unwrap_or_default();
+        for line in listed.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let path = Path::new(line);
+            if !path_is_executable(path) {
+                continue;
+            }
+            let label = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| line.to_string());
+            push(&label, vec![line.to_string()], &mut shells);
+        }
+    }
+
+    shells
+}
+
+/// One row in a sidebar dropdown. `dot_color` and `checkbox` are mutually
+/// exclusive leading markers; a row with neither is plain text.
+struct SidebarDropdownRow {
+    label: String,
+    dot_color: Option<LinearRgba>,
+    checkbox: Option<bool>,
+    /// Draw a separator band above this row.
+    divider_above: bool,
+    item_type: UIItemType,
+}
+
+/// Walk up from `start` to the nearest directory containing one of `markers`.
+///
+/// Returns `None` when no marker is found before the filesystem root. The depth
+/// cap is a cheap guard against pathological symlink/mount layouts; real trees
+/// are nowhere near it.
+fn nearest_project_root(start: &Path, markers: &[String]) -> Option<PathBuf> {
+    const MAX_DEPTH: usize = 64;
+
+    if markers.is_empty() {
+        return None;
+    }
+    let mut dir = Some(start);
+    for _ in 0..MAX_DEPTH {
+        let current = dir?;
+        for marker in markers {
+            let marker = marker.trim();
+            // A blank or path-shaped marker would let a config typo escape the
+            // walk (e.g. "../x"); only plain directory entry names are valid.
+            if marker.is_empty() || Path::new(marker).components().count() != 1 {
+                continue;
+            }
+            if current.join(marker).exists() {
+                return Some(current.to_path_buf());
+            }
+        }
+        dir = current.parent();
+    }
+    None
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1494,6 +1780,59 @@ pub(crate) struct AgentDetectionCacheEntry {
     state: Option<AgentPaneState>,
     last_wait_notification: Option<Instant>,
     detected_at: Instant,
+}
+
+/// Agent identity carried over from this pane's previous detection.
+#[derive(Clone, Debug, PartialEq)]
+struct StickyAgentIdentity {
+    adapter_id: Option<String>,
+    kind: AgentKind,
+    trusted_controls: bool,
+}
+
+/// Interactive shells, which never *are* the agent: an agent CLI running in a
+/// shell is the tty's foreground process, so seeing a shell there means no
+/// agent is running in the foreground of that pane.
+fn is_shell_process(name: &str) -> bool {
+    matches!(
+        basename(name).to_ascii_lowercase().as_str(),
+        "bash" | "fish" | "nu" | "powershell" | "pwsh" | "sh" | "zsh" | "csh" | "tcsh" | "ksh"
+    )
+}
+
+/// Identity to reuse when the current frame found no fresh evidence.
+///
+/// Title and visible-text evidence are both transient: agents rewrite the pane
+/// title as their task changes, and the identifying startup banner scrolls out
+/// of the visible region. Neither means the agent went away, so the badge must
+/// not flicker off. An unchanged, non-shell foreground process (plus unchanged
+/// agent user vars) is enough to say it is still the same agent, whatever the
+/// title now says. With no such process to anchor on — unknown process, or a
+/// shell-wrapped agent — the stricter "title unchanged" guard is kept.
+fn sticky_agent_identity(
+    previous: Option<&AgentDetectionCacheEntry>,
+    key: &AgentDetectionCacheKey,
+) -> Option<StickyAgentIdentity> {
+    let entry = previous?;
+    let state = entry.state.as_ref()?;
+    let previous_key = &entry.key;
+    if previous_key.relevant_user_vars != key.relevant_user_vars
+        || previous_key.foreground_process != key.foreground_process
+    {
+        return None;
+    }
+    let process_anchored = key
+        .foreground_process
+        .as_deref()
+        .is_some_and(|process| !is_shell_process(process));
+    if !process_anchored && previous_key.pane_title != key.pane_title {
+        return None;
+    }
+    Some(StickyAgentIdentity {
+        adapter_id: state.adapter_id.clone(),
+        kind: state.kind.clone(),
+        trusted_controls: state.trusted_controls,
+    })
 }
 
 trait AgentAdapter {
@@ -1921,6 +2260,445 @@ impl crate::TermWindow {
         result
     }
 
+    /// Installed agents offered by the sidebar launcher, in merged-adapter
+    /// order (built-ins first, so Claude leads by default).
+    ///
+    /// Building this probes `$PATH` with filesystem metadata calls, so the
+    /// result is cached per config generation and must never be rebuilt per
+    /// frame — see the P1 finding in `docs/REPO_AUDIT_FIX_PLAN.md`.
+    pub fn agent_launcher_entries(&self) -> Arc<Vec<AgentLauncherEntry>> {
+        let gen = self.config.generation();
+        {
+            let cached = self.launcher_cache.borrow();
+            if let Some((cached_gen, ref entries)) = *cached {
+                if cached_gen == gen {
+                    return Arc::clone(entries);
+                }
+            }
+        }
+
+        let mut entries = Vec::new();
+        if self.config.agent_ui.enabled && self.config.agent_ui.launcher.enabled {
+            for (id, adapter) in self.merged_agent_adapters().iter() {
+                if !adapter.enabled {
+                    continue;
+                }
+                let Some(argv) = adapter.launch_command.as_ref() else {
+                    continue;
+                };
+                let Some(program) = argv.first() else {
+                    continue;
+                };
+                // Availability is the whole discovery mechanism: an agent the
+                // user has not installed simply never appears in the UI. The
+                // resolved absolute path is what gets spawned — see
+                // `resolve_command_path`.
+                let Some(resolved) = resolve_command_path(program) else {
+                    continue;
+                };
+                let mut argv = argv.clone();
+                argv[0] = resolved.to_string_lossy().into_owned();
+                let kind = adapter_kind_from_id(id, adapter);
+                entries.push(AgentLauncherEntry {
+                    adapter_id: id.clone(),
+                    label: adapter_label(adapter, id),
+                    short_label: adapter_short_label(Some(adapter), &kind),
+                    color: adapter_color(Some(adapter), &kind),
+                    launch_domain: adapter.launch_domain.clone(),
+                    argv,
+                });
+            }
+        }
+
+        let result = Arc::new(entries);
+        *self.launcher_cache.borrow_mut() = Some((gen, Arc::clone(&result)));
+        result
+    }
+
+    /// Shells and domains offered by the new-tab dropdown.
+    ///
+    /// Probing for shells walks `$PATH` and stats files, so like
+    /// `agent_launcher_entries` this is cached per config generation. It is
+    /// only called while the menu is open, so a closed menu costs nothing.
+    pub fn new_tab_menu_entries(&self) -> Arc<Vec<NewTabMenuEntry>> {
+        let gen = self.config.generation();
+        {
+            let cached = self.new_tab_menu_cache.borrow();
+            if let Some((cached_gen, ref entries)) = *cached {
+                if cached_gen == gen {
+                    return Arc::clone(entries);
+                }
+            }
+        }
+
+        let mut entries: Vec<NewTabMenuEntry> = Vec::new();
+        let menu = &self.config.new_tab_menu;
+
+        if menu.enabled {
+            if menu.show_shells {
+                for (label, argv) in discovered_shells() {
+                    entries.push(NewTabMenuEntry {
+                        label,
+                        target: NewTabTarget::Program(argv),
+                        group: 0,
+                    });
+                }
+            }
+
+            if menu.show_domains {
+                for domain in Mux::get().iter_domains() {
+                    if !domain.spawnable() {
+                        continue;
+                    }
+                    let name = domain.domain_name().to_string();
+                    // `domain_label()` is async and paint cannot await, so the
+                    // name is the label. Strip the WSL: prefix so a distro
+                    // reads like the shell entries beside it.
+                    let label = name
+                        .strip_prefix("WSL:")
+                        .map(str::to_string)
+                        .unwrap_or_else(|| name.clone());
+                    entries.push(NewTabMenuEntry {
+                        label,
+                        target: NewTabTarget::Domain(name),
+                        group: 1,
+                    });
+                }
+            }
+
+            if menu.show_launch_menu {
+                for item in &self.config.launch_menu {
+                    let argv = match item.args.as_ref() {
+                        Some(args) if !args.is_empty() => args.clone(),
+                        // A launch_menu entry with no args means "the default
+                        // shell", which the plain + button already covers.
+                        _ => continue,
+                    };
+                    entries.push(NewTabMenuEntry {
+                        label: item.label.clone().unwrap_or_else(|| argv.join(" ")),
+                        target: NewTabTarget::Program(argv),
+                        group: 2,
+                    });
+                }
+            }
+        }
+
+        let result = Arc::new(entries);
+        *self.new_tab_menu_cache.borrow_mut() = Some((gen, Arc::clone(&result)));
+        result
+    }
+
+    /// Open a new tab from a dropdown row, carrying the current directory
+    /// across a domain change where that is meaningful.
+    pub fn spawn_new_tab_menu_entry(&mut self, index: usize) {
+        let Some(entry) = self.new_tab_menu_entries().get(index).cloned() else {
+            return;
+        };
+        let (domain, args) = match entry.target {
+            NewTabTarget::Domain(name) => (SpawnTabDomain::DomainName(name), None),
+            NewTabTarget::Program(argv) => (SpawnTabDomain::CurrentPaneDomain, Some(argv)),
+        };
+        let cwd = crate::termwindow::composer::active_pane_cwd(self)
+            .and_then(|cwd| self.translate_cwd_for_domain(PathBuf::from(cwd), &domain));
+        self.spawn_command(
+            &SpawnCommand {
+                label: Some(entry.label),
+                args,
+                cwd,
+                domain,
+                ..Default::default()
+            },
+            SpawnWhere::NewTab,
+        );
+    }
+
+    /// The agent launched by a plain click: the configured `default_adapter`
+    /// when it is installed, otherwise the first installed agent.
+    pub fn agent_launcher_default(&self) -> Option<AgentLauncherEntry> {
+        let entries = self.agent_launcher_entries();
+        let configured = self.config.agent_ui.launcher.default_adapter.as_deref();
+        if let Some(id) = configured.map(str::trim).filter(|id| !id.is_empty()) {
+            if let Some(entry) = entries.iter().find(|entry| entry.adapter_id == id) {
+                return Some(entry.clone());
+            }
+        }
+        entries.first().cloned()
+    }
+
+    /// Domain name of the active pane, if it can be resolved.
+    fn active_pane_domain_name(&self) -> Option<String> {
+        let pane = self.get_active_pane_or_overlay()?;
+        Mux::get()
+            .get_domain(pane.domain_id())
+            .map(|domain| domain.domain_name().to_string())
+    }
+
+    fn domain_is_registered(&self, name: &str) -> bool {
+        Mux::get().get_domain_by_name(name).is_some()
+    }
+
+    /// First registered WSL domain, used by `launcher.prefer_wsl`.
+    ///
+    /// `WslDistro::is_default` is parsed by the config crate but dropped by
+    /// `WslDomain::default_domains()`, so "the default distro" is not
+    /// available here without editing an upstream struct. Registration order
+    /// follows `wsl.exe -l -v` output; pin a specific distro with
+    /// `agent_ui.launcher.domain` if that order is not what you want.
+    fn first_wsl_domain_name(&self) -> Option<String> {
+        Mux::get()
+            .iter_domains()
+            .iter()
+            .filter(|domain| domain.spawnable())
+            .map(|domain| domain.domain_name().to_string())
+            .find(|name| wsl_paths::is_wsl_domain(name, &self.config))
+    }
+
+    /// Domain a launched agent should spawn into.
+    ///
+    /// Precedence: the adapter's own `launch_domain`, then
+    /// `agent_ui.launcher.domain`, then `prefer_wsl`, then the active pane's
+    /// domain. A configured name that is not registered warns and falls
+    /// through rather than failing the spawn — `resolve_spawn_tab_domain`
+    /// returns an error for unknown names, which would surface as a silent
+    /// no-op on click.
+    /// True when the launch must be pulled back to this machine: the user asked
+    /// for `ForceLocal` and the active pane is a session somewhere else.
+    ///
+    /// The agent CLI and its credentials live on the workstation, so following
+    /// an SSH pane onto the remote host almost always fails or starts an
+    /// unrelated install. Probing costs a foreground-process fetch, so this is
+    /// evaluated once per launch and threaded into the domain and cwd choices
+    /// rather than being re-asked by each.
+    fn agent_launch_forced_local(&self) -> bool {
+        if self.config.agent_ui.launcher.remote_behavior != AgentRemoteBehavior::ForceLocal {
+            return false;
+        }
+        // Only probe the pane once the policy says the answer could matter;
+        // `pane_looks_remote` costs a foreground-process fetch.
+        let pane_looks_remote = self
+            .get_active_pane_or_overlay()
+            .is_some_and(|pane| self.pane_looks_remote(&pane));
+        agent_launch_forced_local(
+            self.config.agent_ui.launcher.remote_behavior,
+            pane_looks_remote,
+        )
+    }
+
+    fn agent_launch_domain(
+        &self,
+        entry: &AgentLauncherEntry,
+        forced_local: bool,
+    ) -> SpawnTabDomain {
+        let launcher = &self.config.agent_ui.launcher;
+        for configured in [entry.launch_domain.as_deref(), launcher.domain.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            let name = configured.trim();
+            if name.is_empty() {
+                continue;
+            }
+            if self.domain_is_registered(name) {
+                return SpawnTabDomain::DomainName(name.to_string());
+            }
+            log::warn!(
+                "agent launcher: domain {:?} is not registered; \
+                 falling back to the active pane's domain",
+                name
+            );
+        }
+
+        if launcher.prefer_wsl {
+            // Already inside a distro: stay there rather than hopping to
+            // whichever distro happens to be registered first.
+            let already_wsl = self
+                .active_pane_domain_name()
+                .map(|name| wsl_paths::is_wsl_domain(&name, &self.config))
+                .unwrap_or(false);
+            if !already_wsl {
+                if let Some(name) = self.first_wsl_domain_name() {
+                    return SpawnTabDomain::DomainName(name);
+                }
+            }
+        }
+
+        // Checked last so an explicitly configured domain, and the WSL
+        // preference on Windows, still win — both already name a local target.
+        if forced_local {
+            return SpawnTabDomain::DomainName("local".to_string());
+        }
+
+        SpawnTabDomain::CurrentPaneDomain
+    }
+
+    /// Rewrite `cwd` so it means the same directory inside `target`.
+    ///
+    /// `None` drops the cwd from the spawn, letting the target domain use its
+    /// own default — the right answer whenever the path cannot be expressed in
+    /// the target's filesystem.
+    pub fn translate_cwd_for_domain(
+        &self,
+        cwd: PathBuf,
+        target: &SpawnTabDomain,
+    ) -> Option<PathBuf> {
+        let source = self.active_pane_domain_name();
+        let target_name = match target {
+            SpawnTabDomain::DomainName(name) => Some(name.clone()),
+            // CurrentPaneDomain and the id/default forms all resolve to
+            // something we cannot name cheaply; treat them as "same domain".
+            _ => source.clone(),
+        };
+        let (Some(source), Some(target_name)) = (source, target_name) else {
+            return Some(cwd);
+        };
+        if source == target_name {
+            return Some(cwd);
+        }
+
+        let source_distro = wsl_paths::distro_for_domain(&source, &self.config);
+        let target_distro = wsl_paths::distro_for_domain(&target_name, &self.config);
+        match (source_distro, target_distro) {
+            // Host -> WSL needs no work: fixup_command hands the path to
+            // `wsl.exe --cd`, which accepts Windows paths and translates them.
+            (None, Some(_)) => Some(cwd),
+            (Some(distro), None) => wsl_paths::wsl_to_windows(&cwd.to_string_lossy(), &distro),
+            (Some(source_distro), Some(target_distro)) if source_distro == target_distro => {
+                Some(cwd)
+            }
+            // Distro A's paths generally do not exist in distro B.
+            (Some(_), Some(_)) => None,
+            // Two different non-WSL domains, e.g. local -> SSH. A local path
+            // is meaningless on the remote, so don't send one.
+            (None, None) => None,
+        }
+    }
+
+    /// Apply the project-root walk, staying in the right filesystem view.
+    fn project_root_for(&self, cwd: &str, source_distro: Option<&str>) -> PathBuf {
+        let markers = &self.config.agent_ui.launcher.project_markers;
+        match source_distro {
+            // The pane lives inside a distro, so the marker walk has to stat
+            // the distro's filesystem. From the Windows side that is only
+            // reachable through the UNC share, so walk there and map back.
+            Some(distro) => wsl_paths::wsl_to_windows(cwd, distro)
+                .and_then(|probe| nearest_project_root(&probe, markers))
+                .and_then(|root| wsl_paths::windows_to_wsl(&root.to_string_lossy(), distro))
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(cwd)),
+            None => {
+                let cwd = PathBuf::from(cwd);
+                nearest_project_root(&cwd, markers).unwrap_or(cwd)
+            }
+        }
+    }
+
+    /// Directory a launched agent should start in, honoring the sticky
+    /// project-root toggle and the target domain. `None` means "let the domain
+    /// decide".
+    fn agent_launch_cwd(&self, target: &SpawnTabDomain, forced_local: bool) -> Option<PathBuf> {
+        if forced_local {
+            // The active pane's directory names a path on the remote host and
+            // means nothing here, so borrow the newest local pane's directory
+            // instead. With no local pane to borrow from, fall back to the home
+            // directory rather than letting the domain inherit a remote path.
+            let raw = self
+                .newest_local_pane_cwd()
+                .unwrap_or_else(|| config::HOME_DIR.clone())
+                .to_string_lossy()
+                .into_owned();
+            let cwd = if self.agent_launcher_project_root {
+                self.project_root_for(&raw, None)
+            } else {
+                PathBuf::from(raw)
+            };
+            return Some(cwd);
+        }
+
+        let raw = crate::termwindow::composer::active_pane_cwd(self)?;
+        let source_distro = self
+            .active_pane_domain_name()
+            .and_then(|name| wsl_paths::distro_for_domain(&name, &self.config));
+
+        let cwd = if self.agent_launcher_project_root {
+            // Falls back to the pane directory when the pane is not inside a
+            // project; refusing to launch would be worse than launching here.
+            self.project_root_for(&raw, source_distro.as_deref())
+        } else {
+            PathBuf::from(raw)
+        };
+
+        self.translate_cwd_for_domain(cwd, target)
+    }
+
+    /// Start a fresh agent session in a new tab.
+    ///
+    /// The argv comes only from config (built-in defaults or user Lua), never
+    /// from pane text, and the action is always user-initiated — so unlike
+    /// Resume/Attach this is deliberately not gated by
+    /// `agent_ui.enable_control_actions`.
+    pub fn launch_agent(&mut self, entry: &AgentLauncherEntry, invert_target: bool) {
+        if entry.argv.is_empty() {
+            return;
+        }
+        let forced_local = self.agent_launch_forced_local();
+        // Passing cwd explicitly is required: `Mux::resolve_cwd` would
+        // otherwise inherit the pane directory, ignore project-root mode, and
+        // drop the cwd entirely whenever the target domain differs.
+        let domain = self.agent_launch_domain(entry, forced_local);
+        let cwd = self.agent_launch_cwd(&domain, forced_local);
+        let spawn_where = self.agent_spawn_where(invert_target);
+        self.spawn_command(
+            &SpawnCommand {
+                label: Some(format!("{} agent", entry.label)),
+                args: Some(entry.argv.clone()),
+                cwd,
+                domain,
+                ..Default::default()
+            },
+            spawn_where,
+        );
+    }
+
+    /// Resolve `agent_ui.launcher.open_in` into a spawn target.
+    ///
+    /// `invert_target` is the Alt-click escape hatch: whichever target is
+    /// configured, holding Alt gets the other one for that launch only, so
+    /// switching between "beside this shell" and "its own tab" never requires
+    /// a config edit.
+    fn agent_spawn_where(&self, invert_target: bool) -> SpawnWhere {
+        let launcher = &self.config.agent_ui.launcher;
+        agent_spawn_where(
+            launcher.open_in,
+            launcher.split_direction,
+            launcher.split_size_percent,
+            invert_target,
+        )
+    }
+
+    /// Launch the agent with the given adapter id, if it is still installed.
+    pub fn launch_agent_by_id(&mut self, adapter_id: &str, invert_target: bool) {
+        let entry = self
+            .agent_launcher_entries()
+            .iter()
+            .find(|entry| entry.adapter_id == adapter_id)
+            .cloned();
+        if let Some(entry) = entry {
+            self.launch_agent(&entry, invert_target);
+        }
+    }
+
+    /// Flip and persist the sticky project-root launch preference.
+    pub fn toggle_agent_launcher_project_root(&mut self) {
+        self.agent_launcher_project_root = !self.agent_launcher_project_root;
+        crate::termwindow::tgz_ui_state::save_agent_launcher_project_root(
+            self.agent_launcher_project_root,
+        );
+    }
+
+    pub fn agent_launcher_project_root_enabled(&self) -> bool {
+        self.agent_launcher_project_root
+    }
+
     fn configured_agent_match(
         &self,
         process: Option<&str>,
@@ -2121,49 +2899,48 @@ impl crate::TermWindow {
                 return entry.state.clone();
             }
         }
-        let trusted_controls = explicit_kind.is_some()
+        let evidence_trusted = explicit_kind.is_some()
             || title_kind.is_some()
             || configured_kind.is_some()
             || truthy_agent_var(&vars, "agent.enable_control_actions");
+        let fresh_identity = explicit_kind
+            .or(title_kind)
+            .or(configured_kind)
+            .or(visible_kind)
+            .or(metadata_kind);
+        // Sticky detection: a pane previously detected as an agent should not
+        // vanish because the identifying banner scrolled out of the visible
+        // region, nor because the agent rewrote the pane title to name its
+        // current task. Reusing only the *identity* (not the whole cached
+        // state) keeps status, model and telemetry live.
+        let sticky_identity = if fresh_identity.is_none() {
+            sticky_agent_identity(previous_entry.as_ref(), &cache_key)
+        } else {
+            None
+        };
+        let trusted_controls = evidence_trusted
+            || sticky_identity
+                .as_ref()
+                .is_some_and(|sticky| sticky.trusted_controls);
         let control_actions_allowed = agent_control_actions_allowed(
             self.config.agent_ui.enable_control_actions,
             trusted_controls,
             &vars,
         );
 
-        let Some((adapter_id, kind)) = explicit_kind
-            .or(title_kind)
-            .or(configured_kind)
-            .or(visible_kind)
-            .or(metadata_kind)
+        let Some((adapter_id, kind)) = fresh_identity
+            .or_else(|| sticky_identity.map(|sticky| (sticky.adapter_id, sticky.kind)))
         else {
-            // Sticky detection: a pane previously detected as an agent should not
-            // vanish just because the identifying banner scrolled out of the
-            // visible region. If the cheap identity fields (foreground process,
-            // pane title, relevant user vars) are unchanged, retain the last known
-            // state so the toolbelt stays stable across streamed messages.
-            let sticky_state = previous_entry.as_ref().and_then(|entry| {
-                let k = &entry.key;
-                if entry.state.is_some()
-                    && k.foreground_process == cache_key.foreground_process
-                    && k.pane_title == cache_key.pane_title
-                    && k.relevant_user_vars == cache_key.relevant_user_vars
-                {
-                    entry.state.clone()
-                } else {
-                    None
-                }
-            });
             self.agent_detection_cache.borrow_mut().insert(
                 pane.pane_id(),
                 AgentDetectionCacheEntry {
                     key: cache_key,
-                    state: sticky_state.clone(),
+                    state: None,
                     last_wait_notification: previous_wait_notification,
                     detected_at: Instant::now(),
                 },
             );
-            return sticky_state;
+            return None;
         };
         let adapter = self.agent_adapter_config_by_id(adapter_id.as_deref());
         if adapter_id.is_some()
@@ -2610,36 +3387,78 @@ impl crate::TermWindow {
         }
     }
 
-    fn sidebar_tab_count(&self) -> usize {
+    /// Every row the expanded sidebar list will draw, in order.
+    ///
+    /// One row per tab, plus an indented child row per pane for tabs that are
+    /// split and expanded. This is the single source of truth for the list:
+    /// the paint pass, the wheel-scroll clamp and the scrollbar all measure
+    /// from it, so none of them can disagree about how long the list is.
+    pub(crate) fn sidebar_rows(&self) -> Vec<SidebarRow> {
         let query = self
             .sidebar_search
             .as_ref()
             .map(|state| state.query.as_str());
-        self.tab_bar
+        let tabs: Vec<SidebarTabInput> = self
+            .tab_bar
             .items()
             .iter()
-            .filter(|entry| match entry.item {
-                TabBarItem::Tab { tab_idx, .. } => match query {
-                    Some(query) if !query.is_empty() => {
-                        let (title, metadata) = self.sidebar_tab_labels(tab_idx, &entry.title);
-                        self.sidebar_query_matches(&title, &metadata, query)
-                    }
-                    _ => true,
-                },
-                _ => false,
+            .filter_map(|entry| {
+                let TabBarItem::Tab { tab_idx, active } = entry.item else {
+                    return None;
+                };
+                let (title, metadata) = self.sidebar_tab_labels(tab_idx, &entry.title);
+                Some(SidebarTabInput {
+                    tab_idx,
+                    active,
+                    title,
+                    metadata,
+                    panes: self.sidebar_pane_rows_for_tab_idx(tab_idx),
+                })
             })
-            .count()
+            .collect();
+
+        assemble_sidebar_rows(tabs, &self.sidebar_expanded_tabs, query)
+    }
+
+    /// Number of rows the list scrolls over.
+    ///
+    /// The collapsed rail draws icons per tab and has no pane children, so it
+    /// counts tabs; the expanded list counts every row.
+    fn sidebar_row_count(&self) -> usize {
+        let collapsed = self.config.sidebar_auto_hide && !self.sidebar_auto_hide_open;
+        let rows = self.sidebar_rows();
+        if collapsed {
+            rows.iter()
+                .filter(|row| matches!(row, SidebarRow::Tab { .. }))
+                .count()
+        } else {
+            rows.len()
+        }
     }
 
     fn sidebar_query_matches(&self, title: &str, metadata: &[String], query: &str) -> bool {
-        if query.is_empty() {
-            return true;
+        query_matches(title, metadata, query)
+    }
+
+    /// Rows reserved below the tab list for the bottom buttons.
+    ///
+    /// Expanded: "+ New Tab" plus the shared Worktree/agent row. Collapsed:
+    /// the "+" rail icon plus the agent launcher slot when an agent is
+    /// installed. Kept in one place so the paint pass, the wheel-scroll
+    /// clamp and the scrollbar cannot disagree.
+    fn sidebar_bottom_button_rows(&self) -> f32 {
+        let collapsed = self.config.sidebar_auto_hide && !self.sidebar_auto_hide_open;
+        if collapsed {
+            if self.agent_launcher_default().is_some() {
+                2.
+            } else {
+                1.
+            }
+        } else if self.sidebar_width() > 180 {
+            2.
+        } else {
+            1.
         }
-        let query = query.to_lowercase();
-        title.to_lowercase().contains(&query)
-            || metadata
-                .iter()
-                .any(|item| item.to_lowercase().contains(&query))
     }
 
     fn sidebar_tab_row_capacity(&self) -> usize {
@@ -2659,7 +3478,7 @@ impl crate::TermWindow {
         if width > 96 {
             list_top += row_height + GAP;
         }
-        let bottom_button_rows = if self.sidebar_width() > 180 { 2. } else { 1. };
+        let bottom_button_rows = self.sidebar_bottom_button_rows();
         let new_tab_y = top + height - INSET - row_height;
         let list_height =
             (new_tab_y - GAP - (bottom_button_rows - 1.) * (row_height + GAP) - list_top).max(0.);
@@ -2667,7 +3486,7 @@ impl crate::TermWindow {
     }
 
     pub(crate) fn scroll_sidebar_tabs(&mut self, wheel_delta: isize) -> bool {
-        let total = self.sidebar_tab_count();
+        let total = self.sidebar_row_count();
         let visible = self.sidebar_tab_row_capacity();
         let max_offset = total.saturating_sub(visible);
         if max_offset == 0 {
@@ -2697,7 +3516,7 @@ impl crate::TermWindow {
             return None;
         }
 
-        let total = self.sidebar_tab_count();
+        let total = self.sidebar_row_count();
         let visible = self.sidebar_tab_row_capacity();
         if total <= visible || visible == 0 {
             return None;
@@ -2714,7 +3533,7 @@ impl crate::TermWindow {
         if self.sidebar_width() > 96 {
             list_top += row_height + GAP;
         }
-        let bottom_button_rows = if self.sidebar_width() > 180 { 2. } else { 1. };
+        let bottom_button_rows = self.sidebar_bottom_button_rows();
         let new_tab_y = top + height - INSET - row_height;
         let list_height =
             (new_tab_y - GAP - (bottom_button_rows - 1.) * (row_height + GAP) - list_top).max(0.);
@@ -2857,6 +3676,70 @@ impl crate::TermWindow {
         metadata.dedup();
 
         (title, metadata)
+    }
+
+    /// Panes of `tab_idx` as sidebar child rows, in split order.
+    ///
+    /// Unlike `sidebar_primary_pane_for_tab_idx`, worktree panes are kept: a
+    /// tab row summarizes one pane and should ignore the transient file
+    /// picker, but the pane list is the place where every pane in the tab has
+    /// to be reachable — including the picker, so it can be closed by hand if
+    /// it ever outlives its fzf process.
+    fn sidebar_pane_rows_for_tab_idx(&self, tab_idx: usize) -> Vec<SidebarRow> {
+        let Some(tab) = Mux::get()
+            .get_window(self.mux_window_id)
+            .and_then(|window| window.get_by_idx(tab_idx).cloned())
+        else {
+            return Vec::new();
+        };
+
+        tab.iter_panes_ignoring_zoom()
+            .iter()
+            .map(|pos| SidebarRow::Pane {
+                pane_id: pos.pane.pane_id(),
+                active: pos.is_active,
+                label: self.sidebar_pane_label(&pos.pane),
+                is_remote: self.pane_looks_remote_cached(&pos.pane),
+            })
+            .collect()
+    }
+
+    /// Short human label for a pane row: the agent name when one is detected,
+    /// otherwise the foreground command, otherwise the pane title.
+    fn sidebar_pane_label(&self, pane: &Arc<dyn Pane>) -> String {
+        if is_worktree_pane(pane) {
+            return "Worktree".to_string();
+        }
+        if self.config.agent_ui.enabled {
+            if let Some(agent) = self.detect_agent_pane(pane) {
+                return agent.kind.label().to_string();
+            }
+        }
+        if let Some(command) = pane
+            .get_foreground_process_name(CachePolicy::AllowStale)
+            .map(|name| basename(&name))
+            .filter(|name| !name.is_empty())
+        {
+            return command;
+        }
+        let title = pane.get_title();
+        if title.trim().is_empty() {
+            format!("pane {}", pane.pane_id())
+        } else {
+            title
+        }
+    }
+
+    /// Remote check for pane rows, which run every frame.
+    ///
+    /// `pane_looks_remote` costs a `FetchImmediate` process lookup and must
+    /// never be on the paint path. The domain check alone is free and catches
+    /// the case the row marker exists for: a pane belonging to a wezterm SSH
+    /// domain sitting next to a local agent.
+    fn pane_looks_remote_cached(&self, pane: &Arc<dyn Pane>) -> bool {
+        Mux::get()
+            .get_domain(pane.domain_id())
+            .is_some_and(|domain| domain.downcast_ref::<mux::ssh::RemoteSshDomain>().is_some())
     }
 
     fn sidebar_agent_for_tab_idx(&self, tab_idx: usize) -> Option<AgentPaneState> {
@@ -3473,6 +4356,357 @@ impl crate::TermWindow {
         Ok(())
     }
 
+    /// Dropdown opened from the sidebar agent launch button: one row per
+    /// installed agent, plus the sticky project-root toggle.
+    pub fn paint_agent_launch_menu(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+    ) -> anyhow::Result<()> {
+        let Some(menu) = self.agent_launch_menu.clone() else {
+            return Ok(());
+        };
+        let entries = self.agent_launcher_entries();
+        if entries.is_empty() {
+            // Every agent disappeared (config reload, uninstall) while the
+            // menu was open; nothing left to show.
+            self.agent_launch_menu = None;
+            return Ok(());
+        }
+
+        let mut rows: Vec<SidebarDropdownRow> = entries
+            .iter()
+            .map(|entry| SidebarDropdownRow {
+                label: entry.label.clone(),
+                dot_color: Some(entry.color),
+                checkbox: None,
+                divider_above: false,
+                item_type: UIItemType::SidebarAgentMenuItem {
+                    adapter_id: entry.adapter_id.clone(),
+                },
+            })
+            .collect();
+        rows.push(SidebarDropdownRow {
+            label: "Project root".to_string(),
+            dot_color: None,
+            checkbox: Some(self.agent_launcher_project_root),
+            divider_above: true,
+            item_type: UIItemType::SidebarAgentMenuProjectRootToggle,
+        });
+
+        self.paint_sidebar_dropdown(layers, menu.x as f32, menu.y as f32, &rows)
+    }
+
+    /// Dropdown opened by the chevron beside the sidebar new-tab button: the
+    /// shells and domains available on this machine.
+    pub fn paint_new_tab_menu(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+    ) -> anyhow::Result<()> {
+        let Some(menu) = self.new_tab_menu.clone() else {
+            return Ok(());
+        };
+        let entries = self.new_tab_menu_entries();
+        if entries.is_empty() {
+            self.new_tab_menu = None;
+            return Ok(());
+        }
+
+        let mut previous_group = None;
+        let rows: Vec<SidebarDropdownRow> = entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| {
+                let divider_above = previous_group.is_some_and(|group| group != entry.group);
+                previous_group = Some(entry.group);
+                SidebarDropdownRow {
+                    label: entry.label.clone(),
+                    dot_color: None,
+                    checkbox: None,
+                    divider_above,
+                    item_type: UIItemType::SidebarNewTabMenuItem { index },
+                }
+            })
+            .collect();
+
+        self.paint_sidebar_dropdown(layers, menu.x as f32, menu.y as f32, &rows)
+    }
+
+    /// Downward chevron centered on `(cx, cy)`, drawn as stacked rounded bars
+    /// of decreasing width. Hand-drawn rather than a `▾` glyph, which is not
+    /// guaranteed to be in the user's font.
+    fn draw_sidebar_chevron(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        cx: f32,
+        cy: f32,
+        dpi_scale: f32,
+        color: LinearRgba,
+    ) -> anyhow::Result<()> {
+        let bar_h = (1.6 * dpi_scale).max(1.5);
+        let widest = 9. * dpi_scale;
+        const STEPS: usize = 4;
+        // Bars shrink from `widest` to a point, stacked downward, so the
+        // silhouette reads as a triangle at any DPI.
+        for step in 0..STEPS {
+            let t = step as f32 / STEPS as f32;
+            let w = widest * (1. - t);
+            if w < 1. {
+                break;
+            }
+            let y = cy - (widest * 0.25) + step as f32 * bar_h;
+            self.sidebar_rounded_fill(
+                layers,
+                2,
+                euclid::rect(cx - w * 0.5, y, w, bar_h),
+                bar_h * 0.5,
+                color,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Shared renderer for the sidebar's small anchored dropdowns.
+    ///
+    /// Rows may carry an adapter-colored dot, a checkbox, or neither, and may
+    /// request a divider above them. Geometry matches `paint_agent_copy_menu`
+    /// so all three menus look identical.
+    fn paint_sidebar_dropdown(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+        anchor_x: f32,
+        anchor_y: f32,
+        rows: &[SidebarDropdownRow],
+    ) -> anyhow::Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        let cell_width = self.render_metrics.cell_size.width;
+        let cell_height = self.render_metrics.cell_size.height;
+        let cell_h_f = cell_height as f32;
+        let dpi_scale = (self.dimensions.dpi as f32 / 96.).clamp(1., 2.5);
+        let row_vpad = 6. * dpi_scale;
+        let row_h = (cell_h_f + 2. * row_vpad).max(AGENT_COPY_MENU_ROW_H * dpi_scale);
+        let menu_pad = 8. * dpi_scale;
+        let menu_radius = (RADIUS * dpi_scale).min(row_h * 0.5);
+        let row_radius = (5. * dpi_scale).min(row_h * 0.5);
+        let row_inset = 4. * dpi_scale;
+        let row_text_inset = 12. * dpi_scale;
+        let divider_h = (1. * dpi_scale).max(1.);
+        let divider_gap = 4. * dpi_scale;
+        let divider_band = divider_gap * 2. + divider_h;
+        let menu_w = AGENT_LAUNCH_MENU_W * dpi_scale;
+        let divider_count = rows.iter().filter(|row| row.divider_above).count();
+        let menu_h = rows.len() as f32 * row_h + divider_count as f32 * divider_band + menu_pad;
+
+        let max_x = (self.dimensions.pixel_width as f32 - menu_w - AGENT_TOOLBELT_GAP)
+            .max(AGENT_TOOLBELT_GAP);
+        let max_y = (self.dimensions.pixel_height as f32 - menu_h - AGENT_TOOLBELT_GAP)
+            .max(AGENT_TOOLBELT_GAP);
+        // Anchor to the button, opening upwards: these buttons sit near the
+        // bottom of the sidebar, so a downward menu would fall off-screen.
+        let menu_x = anchor_x.clamp(AGENT_TOOLBELT_GAP, max_x);
+        let menu_y = (anchor_y - menu_h - AGENT_TOOLBELT_GAP).clamp(AGENT_TOOLBELT_GAP, max_y);
+
+        let colors = self
+            .config
+            .resolved_palette
+            .tab_bar
+            .clone()
+            .unwrap_or_else(TabBarColors::default);
+        let active_tab = colors.active_tab();
+        let inactive_tab = colors.inactive_tab();
+        let fg = active_tab.fg_color.to_linear();
+        let bg = opaque(inactive_tab.bg_color.to_linear());
+        let hover_bg = lerp_rgba(bg, fg, 0.18);
+        let pressed_bg = lerp_rgba(bg, fg, 0.28);
+
+        self.sidebar_rounded_fill(
+            layers,
+            1,
+            euclid::rect(menu_x, menu_y, menu_w, menu_h),
+            menu_radius,
+            bg,
+        )?;
+
+        let palette = self.palette().clone();
+        let gl_state = self.render_state.as_ref().unwrap();
+        let white_space = gl_state.util_sprites.white_space.texture_coords();
+        let filled_box = gl_state.util_sprites.filled_box.texture_coords();
+        let render_text = |this: &mut Self,
+                           layers: &mut TripleLayerQuadAllocator,
+                           text: &str,
+                           x: f32,
+                           y: f32,
+                           pixel_width: f32,
+                           fg: LinearRgba,
+                           default_bg: LinearRgba|
+         -> anyhow::Result<()> {
+            let cols = (pixel_width / cell_width as f32).max(1.) as usize;
+            let mut attrs = CellAttributes::default();
+            attrs.set_foreground(ColorAttribute::TrueColorWithDefaultFallback(fg.to_srgb()));
+            let mut line = Line::from_text(text, &attrs, 1, None);
+            line.resize(cols.max(1), SEQ_ZERO);
+            this.render_screen_line(
+                RenderScreenLineParams {
+                    top_pixel_y: y,
+                    left_pixel_x: x,
+                    pixel_width,
+                    stable_line_idx: None,
+                    line: &line,
+                    selection: 0..0,
+                    cursor: &Default::default(),
+                    palette: &palette,
+                    dims: &RenderableDimensions {
+                        cols,
+                        physical_top: 0,
+                        scrollback_rows: 0,
+                        scrollback_top: 0,
+                        viewport_rows: 1,
+                        dpi: this.terminal_size.dpi,
+                        pixel_height: cell_height as usize,
+                        pixel_width: pixel_width as usize,
+                        reverse_video: false,
+                    },
+                    config: &this.config,
+                    cursor_border_color: LinearRgba::default(),
+                    foreground: fg,
+                    pane: None,
+                    is_active: true,
+                    selection_fg: LinearRgba::default(),
+                    selection_bg: LinearRgba::default(),
+                    cursor_fg: LinearRgba::default(),
+                    cursor_bg: LinearRgba::default(),
+                    cursor_is_default_color: true,
+                    white_space,
+                    filled_box,
+                    window_is_transparent: true,
+                    default_bg,
+                    style: None,
+                    font: None,
+                    use_pixel_positioning: this.config.experimental_pixel_positioning,
+                    render_metrics: this.render_metrics,
+                    shape_key: None,
+                    password_input: false,
+                },
+                layers,
+            )
+            .map(|_| ())
+        };
+
+        let hovered_item = self
+            .last_ui_item
+            .as_ref()
+            .map(|item| item.item_type.clone());
+        let left_pressed = self.current_mouse_buttons.contains(&MousePress::Left);
+        let dot_size = (cell_h_f * 0.42).clamp(5., 10.);
+
+        let box_size = (cell_h_f * 0.62).clamp(9., 16.);
+        let mut row_y = menu_y + menu_pad * 0.5;
+
+        for row in rows {
+            if row.divider_above {
+                let divider_y = row_y + divider_gap;
+                self.filled_rectangle(
+                    layers,
+                    2,
+                    euclid::rect(
+                        menu_x + row_text_inset,
+                        divider_y,
+                        (menu_w - row_text_inset * 2.).max(1.),
+                        divider_h,
+                    ),
+                    lerp_rgba(bg, fg, 0.20),
+                )?;
+                row_y = divider_y + divider_h + divider_gap;
+            }
+
+            let item_type = row.item_type.clone();
+            let hovered = hovered_item.as_ref() == Some(&item_type);
+            let pressed =
+                hovered && left_pressed && self.pressed_ui_item.as_ref() == Some(&item_type);
+            let row_bg = if pressed {
+                pressed_bg
+            } else if hovered {
+                hover_bg
+            } else {
+                bg
+            };
+            if hovered || pressed {
+                self.sidebar_rounded_fill(
+                    layers,
+                    1,
+                    euclid::rect(menu_x + row_inset, row_y, menu_w - row_inset * 2., row_h),
+                    row_radius,
+                    row_bg,
+                )?;
+            }
+
+            // Leading marker: an adapter-colored dot, a checkbox, or nothing.
+            let mut text_x = menu_x + row_text_inset;
+            if let Some(color) = row.dot_color {
+                self.sidebar_rounded_fill(
+                    layers,
+                    2,
+                    euclid::rect(text_x, row_y + (row_h - dot_size) * 0.5, dot_size, dot_size),
+                    dot_size * 0.5,
+                    color,
+                )?;
+                text_x += dot_size + ACTION_ICON_GAP;
+            } else if let Some(checked) = row.checkbox {
+                // Hand-drawn checkbox rather than a ☑ glyph, which is not
+                // guaranteed to exist in the user's font.
+                let box_y = row_y + (row_h - box_size) * 0.5;
+                let box_radius = (2. * dpi_scale).min(box_size * 0.5);
+                self.sidebar_rounded_fill(
+                    layers,
+                    2,
+                    euclid::rect(text_x, box_y, box_size, box_size),
+                    box_radius,
+                    lerp_rgba(bg, fg, if hovered { 0.70 } else { 0.45 }),
+                )?;
+                if !checked {
+                    // Punch the interior back out to leave an outline-only box.
+                    let inset = (1.5 * dpi_scale).min(box_size * 0.4);
+                    self.sidebar_rounded_fill(
+                        layers,
+                        2,
+                        euclid::rect(
+                            text_x + inset,
+                            box_y + inset,
+                            (box_size - inset * 2.).max(1.),
+                            (box_size - inset * 2.).max(1.),
+                        ),
+                        (box_radius - inset * 0.5).max(0.),
+                        row_bg,
+                    )?;
+                }
+                text_x += box_size + ACTION_ICON_GAP;
+            }
+
+            render_text(
+                self,
+                layers,
+                &row.label,
+                text_x,
+                row_y + (row_h - cell_h_f) * 0.5,
+                (menu_x + menu_w - row_text_inset - text_x).max(1.),
+                contrast_label_color(row_bg),
+                row_bg,
+            )?;
+            self.ui_items.push(UIItem {
+                x: (menu_x + row_inset) as usize,
+                y: row_y as usize,
+                width: (menu_w - row_inset * 2.) as usize,
+                height: row_h.ceil() as usize,
+                item_type,
+            });
+            row_y += row_h;
+        }
+
+        Ok(())
+    }
+
     pub fn paint_sidebar(&mut self, layers: &mut TripleLayerQuadAllocator) -> anyhow::Result<()> {
         self.prune_agent_detection_cache();
         self.settle_sidebar_auto_hide_close();
@@ -3769,7 +5003,12 @@ impl crate::TermWindow {
             draw_toggle_icon(self, layers, toggle_rect, toggle_fg, toggle_bg)?;
             let list_top = toggle_top + row_stride;
             let new_tab_y = top + height - INSET - rail_side;
-            let list_height = (new_tab_y - GAP - list_top).max(0.);
+            // The launcher takes the slot directly above "+", so the tab list
+            // must give up that stride or it would paint over the button.
+            let rail_launcher_entry = self.agent_launcher_default();
+            let rail_launch_y = rail_launcher_entry.as_ref().map(|_| new_tab_y - row_stride);
+            let list_bottom = rail_launch_y.unwrap_or(new_tab_y);
+            let list_height = (list_bottom - GAP - list_top).max(0.);
             let visible_rows = ((list_height + GAP) / row_stride).floor().max(0.) as usize;
             let max_offset = tabs.len().saturating_sub(visible_rows);
             if self.sidebar_scroll_offset > max_offset {
@@ -3869,6 +5108,62 @@ impl crate::TermWindow {
                 rail_y += row_stride;
             }
 
+            if let (Some(entry), Some(launch_y)) = (rail_launcher_entry, rail_launch_y) {
+                let launch_type = UIItemType::SidebarAgentLaunchButton;
+                let launch_hovered = hovered_item.as_ref() == Some(&launch_type);
+                let launch_pressed = launch_hovered
+                    && left_pressed
+                    && self.pressed_ui_item.as_ref() == Some(&launch_type);
+                let launch_bg = if launch_pressed {
+                    pressed_fill
+                } else if launch_hovered {
+                    hover_fill
+                } else {
+                    search_fill
+                };
+                let launch_offset = if launch_pressed { 1. } else { 0. };
+                self.sidebar_rounded_fill(
+                    layers,
+                    1,
+                    euclid::rect(rail_x, launch_y + launch_offset, rail_side, rail_side),
+                    rail_radius,
+                    launch_bg,
+                )?;
+                // Same 2-char badge the tab icons use, dropping to 1 char when
+                // the rail is too narrow for both glyphs.
+                let mut symbol = entry.short_label.clone();
+                let symbol_w = symbol.chars().count().max(1) as f32 * cell_width as f32;
+                let symbol_w = if symbol_w + 4. > rail_side {
+                    symbol = symbol.chars().take(1).collect();
+                    cell_width as f32
+                } else {
+                    symbol_w
+                };
+                let symbol_line = Line::from_text(&symbol, &CellAttributes::default(), 1, None);
+                render_text(
+                    self,
+                    layers,
+                    &symbol_line,
+                    rail_x + (rail_side - symbol_w) * 0.5,
+                    launch_y + launch_offset + (rail_side - cell_height as f32) * 0.5,
+                    symbol.chars().count().max(1),
+                    symbol_w,
+                    if launch_hovered {
+                        entry.color
+                    } else {
+                        entry.color.mul_alpha(0.88)
+                    },
+                    launch_bg,
+                )?;
+                self.ui_items.push(UIItem {
+                    x: left as usize,
+                    y: launch_y as usize,
+                    width,
+                    height: rail_side as usize,
+                    item_type: launch_type,
+                });
+            }
+
             let new_tab_type = UIItemType::TabBar(TabBarItem::NewTabButton);
             let new_tab_hovered = hovered_item.as_ref() == Some(&new_tab_type);
             let new_tab_pressed = new_tab_hovered && left_pressed;
@@ -3910,6 +5205,36 @@ impl crate::TermWindow {
                 height: rail_side as usize,
                 item_type: new_tab_type,
             });
+
+            // No room for a side-by-side chevron on the rail, so it takes the
+            // icon's bottom-right corner. Pushed after the "+" item because
+            // hit testing walks ui_items in reverse: last pushed wins the
+            // overlap.
+            if self.config.new_tab_menu.enabled && !self.new_tab_menu_entries().is_empty() {
+                let chevron_type = UIItemType::SidebarNewTabMenuButton;
+                let chevron_hovered = hovered_item.as_ref() == Some(&chevron_type);
+                let corner = rail_side * 0.42;
+                let corner_x = rail_x + rail_side - corner;
+                let corner_y = new_tab_y + new_tab_offset + rail_side - corner;
+                self.draw_sidebar_chevron(
+                    layers,
+                    corner_x + corner * 0.5,
+                    corner_y + corner * 0.5,
+                    dpi_scale,
+                    if chevron_hovered {
+                        hover_fg
+                    } else {
+                        inactive_fg.mul_alpha(0.75)
+                    },
+                )?;
+                self.ui_items.push(UIItem {
+                    x: corner_x as usize,
+                    y: corner_y as usize,
+                    width: corner as usize,
+                    height: corner as usize,
+                    item_type: chevron_type,
+                });
+            }
 
             self.ui_items.push(UIItem {
                 x: match self.config.sidebar_position {
@@ -4059,32 +5384,7 @@ impl crate::TermWindow {
             y += toggle_side + GAP;
         }
 
-        let query = self
-            .sidebar_search
-            .as_ref()
-            .map(|state| state.query.clone());
-        let tabs: Vec<_> = self
-            .tab_bar
-            .items()
-            .iter()
-            .filter_map(|entry| match entry.item {
-                TabBarItem::Tab { tab_idx, active } => {
-                    let (title, metadata) = self.sidebar_tab_labels(tab_idx, &entry.title);
-                    Some((tab_idx, active, title, metadata))
-                }
-                _ => None,
-            })
-            .filter(|(_, _, title, metadata)| match &query {
-                Some(query) if !query.is_empty() => {
-                    let query = query.to_lowercase();
-                    title.to_lowercase().contains(&query)
-                        || metadata
-                            .iter()
-                            .any(|item| item.to_lowercase().contains(&query))
-                }
-                _ => true,
-            })
-            .collect();
+        let rows = self.sidebar_rows();
 
         let tab_list_top = y;
         // row_height (self.sidebar_row_height()) already derives its height
@@ -4092,14 +5392,14 @@ impl crate::TermWindow {
         // the glyphs; only the corner radius (an unscaled px constant) needs
         // dpi_scale applied.
         let tab_row_radius = (RADIUS * dpi_scale).min(row_height as f32 * 0.5);
-        let bottom_button_rows = if self.sidebar_width() > 180 { 2. } else { 1. };
+        let bottom_button_rows = self.sidebar_bottom_button_rows();
         let new_tab_y = top + height - INSET - row_height as f32;
         let tab_list_bottom =
             new_tab_y - GAP - (bottom_button_rows - 1.) * (row_height as f32 + GAP);
         let tab_list_height = (tab_list_bottom - tab_list_top).max(0.);
         let row_stride = row_height as f32 + GAP;
         let visible_rows = ((tab_list_height + GAP) / row_stride).floor().max(0.) as usize;
-        let max_offset = tabs.len().saturating_sub(visible_rows);
+        let max_offset = rows.len().saturating_sub(visible_rows);
         if self.sidebar_scroll_offset > max_offset {
             self.sidebar_scroll_offset = max_offset;
         }
@@ -4112,12 +5412,148 @@ impl crate::TermWindow {
             item_type: UIItemType::SidebarTabList,
         });
 
-        let total_tabs = tabs.len();
-        for (tab_idx, active, title, metadata) in tabs
+        let total_tabs = rows.len();
+        for row in rows
             .into_iter()
             .skip(self.sidebar_scroll_offset)
             .take(visible_rows)
         {
+            let (tab_idx, active, title, metadata, pane_count, expanded) = match row {
+                SidebarRow::Tab {
+                    tab_idx,
+                    active,
+                    title,
+                    metadata,
+                    pane_count,
+                    expanded,
+                } => (tab_idx, active, title, metadata, pane_count, expanded),
+                SidebarRow::Pane {
+                    pane_id,
+                    active,
+                    label,
+                    is_remote,
+                } => {
+                    let row_type = UIItemType::SidebarPaneRow { pane_id };
+                    let close_type = UIItemType::SidebarPaneClose { pane_id };
+                    let row_hovered = hovered_item.as_ref() == Some(&row_type);
+                    let close_hovered = hovered_item.as_ref() == Some(&close_type);
+                    let row_pressed = left_pressed
+                        && row_hovered
+                        && self.pressed_ui_item.as_ref() == Some(&row_type);
+                    let close_pressed = left_pressed
+                        && close_hovered
+                        && self.pressed_ui_item.as_ref() == Some(&close_type);
+                    // Child rows sit a step in from their tab so the hierarchy
+                    // reads without needing tree lines.
+                    let indent = PANE_ROW_INDENT;
+                    let row_x = item_x + indent;
+                    let row_w = (item_w - indent).max(1.);
+                    let row_bg = if active {
+                        active_fill
+                    } else if row_pressed {
+                        pressed_fill
+                    } else if row_hovered || close_hovered {
+                        hover_fill
+                    } else {
+                        surface
+                    };
+                    let row_offset = if row_pressed { 1. } else { 0. };
+                    if active || row_hovered || close_hovered {
+                        self.sidebar_rounded_fill(
+                            layers,
+                            1,
+                            euclid::rect(row_x, y + row_offset, row_w, row_height as f32),
+                            tab_row_radius,
+                            row_bg,
+                        )?;
+                    }
+                    if active {
+                        let rail_h = (row_height as f32 * 0.45).max(cell_height as f32 * 0.5);
+                        let rail_y = y + row_offset + (row_height as f32 - rail_h) * 0.5;
+                        let rail_x = match self.config.sidebar_position {
+                            SidebarPosition::Left => row_x + 2.,
+                            SidebarPosition::Right => row_x + row_w - ACTIVE_RAIL_W - 2.,
+                        };
+                        self.sidebar_rounded_fill(
+                            layers,
+                            2,
+                            euclid::rect(rail_x, rail_y, ACTIVE_RAIL_W, rail_h),
+                            ACTIVE_RAIL_W * 0.5,
+                            accent,
+                        )?;
+                    }
+
+                    // A pane on another host next to a local one is the whole
+                    // point of the force-local launch, so say so rather than
+                    // leaving two identical-looking rows.
+                    let label = if is_remote {
+                        format!("{} (remote)", label)
+                    } else {
+                        label
+                    };
+                    let label_line = Line::from_text(&label, &CellAttributes::default(), 1, None);
+                    let label_x = content_x + indent + PAD_X + ACTIVE_TEXT_GAP;
+                    let label_w =
+                        (content_w - indent - PAD_X * 2. - ACTIVE_TEXT_GAP - CLOSE_TEXT_RESERVE)
+                            .max(cell_width as f32);
+                    render_text(
+                        self,
+                        layers,
+                        &label_line,
+                        label_x,
+                        y + row_offset + (row_height as f32 - cell_height as f32) * 0.5,
+                        (label_w / cell_width as f32).max(1.) as usize,
+                        label_w,
+                        if active || row_hovered || close_hovered {
+                            inactive_fg
+                        } else {
+                            inactive_fg.mul_alpha(0.66)
+                        },
+                        row_bg,
+                    )?;
+                    self.ui_items.push(UIItem {
+                        x: (content_x + indent) as usize,
+                        y: y as usize,
+                        width: (content_w - indent - CLOSE_ZONE_W).max(0.) as usize,
+                        height: row_height,
+                        item_type: row_type,
+                    });
+
+                    let close_x = content_x + content_w - CLOSE_ZONE_W;
+                    // Only drawn on hover: a persistent × on every pane row
+                    // would crowd an already indented line.
+                    if row_hovered || close_hovered {
+                        let close_line = Line::from_text("×", &CellAttributes::default(), 1, None);
+                        render_text(
+                            self,
+                            layers,
+                            &close_line,
+                            close_x + CLOSE_ZONE_W - cell_width as f32 - 6.,
+                            y + row_offset
+                                + (row_height as f32 - cell_height as f32) * 0.5
+                                + if close_pressed { 1. } else { 0. },
+                            1,
+                            cell_width as f32,
+                            if close_hovered {
+                                hover_fg
+                            } else {
+                                inactive_fg.mul_alpha(0.70)
+                            },
+                            LinearRgba::default(),
+                        )?;
+                    }
+                    self.ui_items.push(UIItem {
+                        x: close_x as usize,
+                        y: y as usize,
+                        width: CLOSE_ZONE_W as usize,
+                        height: row_height,
+                        item_type: close_type,
+                    });
+
+                    y += row_height as f32 + GAP;
+                    continue;
+                }
+            };
             let tab_type = UIItemType::SidebarTab { tab_idx, active };
             let close_type = UIItemType::CloseTab(tab_idx);
             let tab_hovered = hovered_item.as_ref() == Some(&tab_type);
@@ -4192,11 +5628,45 @@ impl crate::TermWindow {
                 )?;
             }
 
+            // Split tabs get a chevron that shows or hides their pane rows.
+            // Single-pane tabs keep the layout they always had — there is
+            // nothing to expand, so nothing is drawn and nothing shifts.
+            let expand_type = UIItemType::SidebarTabExpand { tab_idx };
+            let expand_hovered = hovered_item.as_ref() == Some(&expand_type);
+            let chevron_w = if pane_count > 1 {
+                cell_width as f32 + CHEVRON_GAP
+            } else {
+                0.
+            };
+            if pane_count > 1 {
+                let chevron_line = Line::from_text(
+                    if expanded { "⌄" } else { "›" },
+                    &CellAttributes::default(),
+                    1,
+                    None,
+                );
+                render_text(
+                    self,
+                    layers,
+                    &chevron_line,
+                    text_x,
+                    y + row_offset + (row_height as f32 - cell_height as f32) * 0.5,
+                    1,
+                    cell_width as f32,
+                    if expand_hovered {
+                        hover_fg
+                    } else {
+                        inactive_fg.mul_alpha(0.70)
+                    },
+                    row_bg,
+                )?;
+            }
+
             let agent = self.sidebar_agent_for_tab_idx(tab_idx);
             let agent_badge_w = if agent.is_some() { 12. } else { 0. };
             if let Some(agent) = &agent {
                 let badge_size = 7.;
-                let badge_x = text_x;
+                let badge_x = text_x + chevron_w;
                 let badge_y = y + row_offset + (row_height as f32 - badge_size) * 0.5;
                 let badge_color = if agent.status == AgentStatus::WaitingForInput {
                     LinearRgba(0.94, 0.72, 0.26, 1.0)
@@ -4237,7 +5707,7 @@ impl crate::TermWindow {
                 text_x + agent_badge_w,
                 primary_y,
                 text_cols,
-                (text_w - agent_badge_w).max(cell_width as f32),
+                (text_w - chevron_w - agent_badge_w).max(cell_width as f32),
                 if active || tab_hovered || close_hovered {
                     inactive_fg
                 } else {
@@ -4252,10 +5722,10 @@ impl crate::TermWindow {
                     self,
                     layers,
                     &metadata_line,
-                    text_x + agent_badge_w,
+                    text_x + chevron_w + agent_badge_w,
                     primary_y + cell_height as f32,
                     text_cols,
-                    (text_w - agent_badge_w).max(cell_width as f32),
+                    (text_w - chevron_w - agent_badge_w).max(cell_width as f32),
                     if active || tab_hovered || close_hovered {
                         inactive_fg.mul_alpha(0.60)
                     } else {
@@ -4271,6 +5741,18 @@ impl crate::TermWindow {
                 height: row_height,
                 item_type: tab_type,
             });
+            // Pushed after the tab row so hit-testing, which takes the last
+            // matching item, resolves clicks on the chevron to the chevron and
+            // not to the tab underneath it.
+            if pane_count > 1 {
+                self.ui_items.push(UIItem {
+                    x: text_x as usize,
+                    y: y as usize,
+                    width: chevron_w as usize,
+                    height: row_height,
+                    item_type: expand_type,
+                });
+            }
 
             let close_x = content_x + content_w - CLOSE_ZONE_W;
             let close_bg = if close_pressed {
@@ -4376,6 +5858,31 @@ impl crate::TermWindow {
 
         let worktree_y = new_tab_y - row_height as f32 - GAP;
         if width > 180 {
+            // The row is shared: Worktree on the left, the agent launcher on
+            // the right. With no agent installed the worktree button keeps the
+            // full width it had before the launcher existed.
+            let launcher_entry = self.agent_launcher_default();
+            // Below this width two full words do not fit side by side, so both
+            // halves fall back to their two-letter forms.
+            let compact_labels = width <= 260;
+            // Both fills are derived from the single split point so they can
+            // never overlap, whichever side the scrollbar gutter is on (the
+            // content column is narrower than the row, and not centered in it).
+            let (worktree_fill_w, worktree_content_w, agent_x, agent_w) = match launcher_entry {
+                Some(_) => {
+                    let content_half = (content_w - GAP) * 0.5;
+                    let agent_x = content_x + content_half + GAP;
+                    (
+                        (agent_x - GAP - item_x).max(1.),
+                        content_half,
+                        agent_x,
+                        content_w - content_half - GAP,
+                    )
+                }
+                None => (item_w, content_w, 0., 0.),
+            };
+            let cols_for = |pixel_width: f32| (pixel_width / cell_width as f32).max(1.) as usize;
+
             let worktree_type = UIItemType::SidebarWorktreeButton;
             let worktree_hovered = hovered_item.as_ref() == Some(&worktree_type);
             let worktree_pressed = worktree_hovered
@@ -4395,7 +5902,7 @@ impl crate::TermWindow {
                 euclid::rect(
                     item_x,
                     worktree_y + worktree_offset,
-                    item_w,
+                    worktree_fill_w,
                     row_height as f32,
                 ),
                 RADIUS,
@@ -4425,16 +5932,20 @@ impl crate::TermWindow {
                 3.,
                 folder_color,
             )?;
-            let worktree_line = Line::from_text("Worktree", &CellAttributes::default(), 1, None);
+            let worktree_label = if compact_labels { "Wt" } else { "Worktree" };
+            let worktree_line =
+                Line::from_text(worktree_label, &CellAttributes::default(), 1, None);
             let worktree_text_x = icon_x + ACTION_ICON_W + ACTION_ICON_GAP;
+            let worktree_text_w =
+                (worktree_content_w - PAD_X * 2. - ACTION_ICON_W - ACTION_ICON_GAP).max(1.);
             render_text(
                 self,
                 layers,
                 &worktree_line,
                 worktree_text_x,
                 worktree_y + worktree_offset + (row_height as f32 - cell_height as f32) * 0.5,
-                content_cols,
-                content_w - PAD_X * 2. - ACTION_ICON_W - ACTION_ICON_GAP,
+                cols_for(worktree_text_w).min(content_cols),
+                worktree_text_w,
                 if worktree_hovered {
                     hover_fg
                 } else {
@@ -4445,11 +5956,109 @@ impl crate::TermWindow {
             self.ui_items.push(UIItem {
                 x: content_x as usize,
                 y: worktree_y as usize,
-                width: content_w as usize,
+                width: worktree_content_w as usize,
                 height: row_height,
                 item_type: worktree_type,
             });
+
+            if let Some(entry) = launcher_entry {
+                let agent_type = UIItemType::SidebarAgentLaunchButton;
+                let agent_hovered = hovered_item.as_ref() == Some(&agent_type);
+                let agent_pressed = agent_hovered
+                    && left_pressed
+                    && self.pressed_ui_item.as_ref() == Some(&agent_type);
+                let agent_bg = if agent_pressed {
+                    pressed_fill
+                } else if agent_hovered {
+                    hover_fill
+                } else {
+                    search_fill
+                };
+                let agent_offset = if agent_pressed { 1. } else { 0. };
+                // The fill starts at the content column but must still reach
+                // the row's right edge, which is item_x + item_w.
+                let agent_fill_w = (item_x + item_w - agent_x).max(1.);
+                self.sidebar_rounded_fill(
+                    layers,
+                    1,
+                    euclid::rect(
+                        agent_x,
+                        worktree_y + agent_offset,
+                        agent_fill_w,
+                        row_height as f32,
+                    ),
+                    RADIUS,
+                    agent_bg,
+                )?;
+
+                // Adapter-colored dot, vertically centered on the text row.
+                let dot_size = (cell_height as f32 * 0.42).clamp(5., 10.);
+                let dot_x = agent_x + PAD_X;
+                let dot_y = worktree_y + agent_offset + (row_height as f32 - dot_size) * 0.5;
+                self.sidebar_rounded_fill(
+                    layers,
+                    2,
+                    euclid::rect(dot_x, dot_y, dot_size, dot_size),
+                    dot_size * 0.5,
+                    if agent_hovered {
+                        entry.color
+                    } else {
+                        entry.color.mul_alpha(0.88)
+                    },
+                )?;
+
+                let agent_label = if compact_labels {
+                    entry.short_label.as_str()
+                } else {
+                    entry.label.as_str()
+                };
+                let agent_line = Line::from_text(agent_label, &CellAttributes::default(), 1, None);
+                let agent_text_x = dot_x + dot_size + ACTION_ICON_GAP;
+                let agent_text_w = (agent_x + agent_w - PAD_X - agent_text_x).max(1.);
+                render_text(
+                    self,
+                    layers,
+                    &agent_line,
+                    agent_text_x,
+                    worktree_y + agent_offset + (row_height as f32 - cell_height as f32) * 0.5,
+                    cols_for(agent_text_w).min(content_cols),
+                    agent_text_w,
+                    if agent_hovered {
+                        hover_fg
+                    } else {
+                        inactive_fg.mul_alpha(0.86)
+                    },
+                    agent_bg,
+                )?;
+                // Hit region matches the drawn pill (which reaches the row's
+                // right edge), not the narrower content column.
+                self.ui_items.push(UIItem {
+                    x: agent_x as usize,
+                    y: worktree_y as usize,
+                    width: agent_fill_w as usize,
+                    height: row_height,
+                    item_type: agent_type,
+                });
+            }
         }
+
+        // Windows-Terminal-style split button: the label opens a tab, the
+        // chevron on the right opens the shell/domain picker. Right-clicking
+        // the label still opens WezTerm's full launcher overlay.
+        let show_chevron =
+            self.config.new_tab_menu.enabled && !self.new_tab_menu_entries().is_empty();
+        let chevron_w = if show_chevron {
+            (row_height as f32 * 0.85).clamp(20., 34.)
+        } else {
+            0.
+        };
+        let new_tab_fill_w = (item_w - chevron_w).max(1.);
+        let chevron_x = item_x + new_tab_fill_w;
+        // Both hit regions key off the drawn geometry. Deriving them from the
+        // content column instead put the chevron's hit box a full button width
+        // left of the glyph: the fills span the whole item width, while the
+        // content column stops short of the resize grip + scrollbar gutter.
+        let new_tab_hit_w = (chevron_x - content_x).max(1.);
 
         let new_tab_type = UIItemType::TabBar(TabBarItem::NewTabButton);
         let new_tab_hovered = hovered_item.as_ref() == Some(&new_tab_type);
@@ -4468,13 +6077,14 @@ impl crate::TermWindow {
             euclid::rect(
                 item_x,
                 new_tab_y + new_tab_offset,
-                item_w,
+                new_tab_fill_w,
                 row_height as f32,
             ),
             RADIUS,
             new_tab_bg,
         )?;
         let new_tab_line = Line::from_text("+ New Tab", &CellAttributes::default(), 1, None);
+        let new_tab_text_w = (new_tab_hit_w - PAD_X * 2. - ACTIVE_TEXT_GAP).max(1.);
         render_text(
             self,
             layers,
@@ -4482,7 +6092,7 @@ impl crate::TermWindow {
             text_x,
             new_tab_y + new_tab_offset + (row_height as f32 - cell_height as f32) * 0.5,
             content_cols,
-            content_w - PAD_X * 2. - ACTIVE_TEXT_GAP,
+            new_tab_text_w,
             if new_tab_hovered {
                 hover_fg
             } else {
@@ -4493,10 +6103,56 @@ impl crate::TermWindow {
         self.ui_items.push(UIItem {
             x: content_x as usize,
             y: new_tab_y as usize,
-            width: content_w as usize,
+            width: new_tab_hit_w as usize,
             height: row_height,
             item_type: new_tab_type,
         });
+
+        if show_chevron {
+            let chevron_type = UIItemType::SidebarNewTabMenuButton;
+            let chevron_hovered = hovered_item.as_ref() == Some(&chevron_type);
+            let chevron_pressed = chevron_hovered
+                && left_pressed
+                && self.pressed_ui_item.as_ref() == Some(&chevron_type);
+            let chevron_bg = if chevron_pressed {
+                pressed_fill
+            } else if chevron_hovered {
+                hover_fill
+            } else {
+                search_fill
+            };
+            let chevron_offset = if chevron_pressed { 1. } else { 0. };
+            self.sidebar_rounded_fill(
+                layers,
+                1,
+                euclid::rect(
+                    chevron_x,
+                    new_tab_y + chevron_offset,
+                    chevron_w,
+                    row_height as f32,
+                ),
+                RADIUS,
+                chevron_bg,
+            )?;
+            self.draw_sidebar_chevron(
+                layers,
+                chevron_x + chevron_w * 0.5,
+                new_tab_y + chevron_offset + row_height as f32 * 0.5,
+                dpi_scale,
+                if chevron_hovered {
+                    hover_fg
+                } else {
+                    inactive_fg.mul_alpha(0.86)
+                },
+            )?;
+            self.ui_items.push(UIItem {
+                x: chevron_x as usize,
+                y: new_tab_y as usize,
+                width: chevron_w as usize,
+                height: row_height,
+                item_type: chevron_type,
+            });
+        }
 
         self.ui_items.push(UIItem {
             x: match self.config.sidebar_position {
@@ -4711,6 +6367,383 @@ impl crate::TermWindow {
 mod tests {
     use super::*;
 
+    fn pane_row(pane_id: PaneId) -> SidebarRow {
+        SidebarRow::Pane {
+            pane_id,
+            active: false,
+            label: format!("pane {pane_id}"),
+            is_remote: false,
+        }
+    }
+
+    fn tab_input(tab_idx: usize, title: &str, pane_ids: &[PaneId]) -> SidebarTabInput {
+        SidebarTabInput {
+            tab_idx,
+            active: false,
+            title: title.to_string(),
+            metadata: Vec::new(),
+            panes: pane_ids.iter().copied().map(pane_row).collect(),
+        }
+    }
+
+    fn expanded(tabs: &[usize]) -> HashSet<usize> {
+        tabs.iter().copied().collect()
+    }
+
+    fn pane_ids(rows: &[SidebarRow]) -> Vec<PaneId> {
+        rows.iter()
+            .filter_map(|row| match row {
+                SidebarRow::Pane { pane_id, .. } => Some(*pane_id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn single_pane_tabs_have_no_pane_rows() {
+        // Nothing to expand, so the list looks exactly as it did before pane
+        // rows existed even if the tab somehow ends up in the expanded set.
+        let rows = assemble_sidebar_rows(vec![tab_input(0, "shell", &[1])], &expanded(&[0]), None);
+
+        assert_eq!(rows.len(), 1);
+        assert!(pane_ids(&rows).is_empty());
+        match &rows[0] {
+            SidebarRow::Tab {
+                pane_count,
+                expanded,
+                ..
+            } => {
+                assert_eq!(*pane_count, 1);
+                assert!(!expanded);
+            }
+            other => panic!("expected a tab row, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn split_tabs_emit_pane_rows_only_when_expanded() {
+        let tabs = || vec![tab_input(0, "shell", &[1, 2])];
+
+        let collapsed = assemble_sidebar_rows(tabs(), &expanded(&[]), None);
+        assert_eq!(collapsed.len(), 1);
+        assert!(pane_ids(&collapsed).is_empty());
+
+        let open = assemble_sidebar_rows(tabs(), &expanded(&[0]), None);
+        assert_eq!(open.len(), 3);
+        assert_eq!(pane_ids(&open), vec![1, 2]);
+    }
+
+    #[test]
+    fn pane_rows_follow_their_own_tab() {
+        // Ordering matters: a pane row belongs directly under its tab, or the
+        // indentation would attach it to the wrong parent on screen.
+        let rows = assemble_sidebar_rows(
+            vec![
+                tab_input(0, "first", &[1, 2]),
+                tab_input(1, "second", &[3, 4]),
+            ],
+            &expanded(&[1]),
+            None,
+        );
+
+        assert_eq!(rows.len(), 4);
+        assert!(matches!(rows[0], SidebarRow::Tab { tab_idx: 0, .. }));
+        assert!(matches!(rows[1], SidebarRow::Tab { tab_idx: 1, .. }));
+        assert_eq!(pane_ids(&rows), vec![3, 4]);
+    }
+
+    #[test]
+    fn search_keeps_the_pane_children_of_matching_tabs() {
+        let rows = assemble_sidebar_rows(
+            vec![
+                tab_input(0, "editor", &[1, 2]),
+                tab_input(1, "logs", &[3, 4]),
+            ],
+            &expanded(&[0, 1]),
+            Some("edit"),
+        );
+
+        // Only the matching tab survives, and it brings its panes with it.
+        assert_eq!(rows.len(), 3);
+        assert!(matches!(rows[0], SidebarRow::Tab { tab_idx: 0, .. }));
+        assert_eq!(pane_ids(&rows), vec![1, 2]);
+    }
+
+    #[test]
+    fn an_empty_query_filters_nothing() {
+        let rows = assemble_sidebar_rows(
+            vec![tab_input(0, "editor", &[1]), tab_input(1, "logs", &[2])],
+            &expanded(&[]),
+            Some(""),
+        );
+
+        assert_eq!(rows.len(), 2);
+    }
+
+    fn split_percent(spawn: SpawnWhere) -> Option<u8> {
+        match spawn {
+            SpawnWhere::SplitPane(SplitRequest {
+                size: MuxSplitSize::Percent(pct),
+                ..
+            }) => Some(pct),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn agent_spawn_where_follows_the_configured_target() {
+        assert_eq!(
+            agent_spawn_where(
+                AgentLaunchTarget::NewTab,
+                AgentSplitDirection::Horizontal,
+                50,
+                false
+            ),
+            SpawnWhere::NewTab
+        );
+        assert!(matches!(
+            agent_spawn_where(
+                AgentLaunchTarget::SplitPane,
+                AgentSplitDirection::Horizontal,
+                50,
+                false
+            ),
+            SpawnWhere::SplitPane(_)
+        ));
+    }
+
+    #[test]
+    fn agent_spawn_where_inverts_for_alt_click() {
+        // Alt is the escape hatch in both directions, so neither configured
+        // value can strand the user without the other target.
+        assert!(matches!(
+            agent_spawn_where(
+                AgentLaunchTarget::NewTab,
+                AgentSplitDirection::Horizontal,
+                50,
+                true
+            ),
+            SpawnWhere::SplitPane(_)
+        ));
+        assert_eq!(
+            agent_spawn_where(
+                AgentLaunchTarget::SplitPane,
+                AgentSplitDirection::Horizontal,
+                50,
+                true
+            ),
+            SpawnWhere::NewTab
+        );
+    }
+
+    #[test]
+    fn agent_split_puts_the_agent_in_the_new_half() {
+        // target_is_second keeps the shell the user was typing in where it was.
+        match agent_spawn_where(
+            AgentLaunchTarget::SplitPane,
+            AgentSplitDirection::Vertical,
+            30,
+            false,
+        ) {
+            SpawnWhere::SplitPane(request) => {
+                assert!(request.target_is_second);
+                assert_eq!(request.direction, SplitDirection::Vertical);
+                assert!(!request.top_level);
+            }
+            other => panic!("expected a split, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn agent_split_size_is_clamped_to_a_usable_range() {
+        let split = |pct| {
+            split_percent(agent_spawn_where(
+                AgentLaunchTarget::SplitPane,
+                AgentSplitDirection::Horizontal,
+                pct,
+                false,
+            ))
+        };
+        assert_eq!(split(0), Some(5));
+        assert_eq!(split(100), Some(95));
+        assert_eq!(split(30), Some(30));
+    }
+
+    #[test]
+    fn force_local_only_applies_to_remote_panes() {
+        assert!(agent_launch_forced_local(
+            AgentRemoteBehavior::ForceLocal,
+            true
+        ));
+        assert!(!agent_launch_forced_local(
+            AgentRemoteBehavior::ForceLocal,
+            false
+        ));
+    }
+
+    #[test]
+    fn follow_pane_never_forces_local() {
+        // The opt-out exists for agents installed on the far side of the ssh
+        // connection; it must hold even when the pane is plainly remote.
+        assert!(!agent_launch_forced_local(
+            AgentRemoteBehavior::FollowPane,
+            true
+        ));
+    }
+
+    /// Unique scratch directory for the project-root walk tests. Avoids a
+    /// tempfile dev-dependency for four tests.
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = env::temp_dir().join("tgz-launcher-tests").join(format!(
+            "{}-{}",
+            name,
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create scratch dir");
+        // Resolve symlinks (/var -> /private/var on macOS) so the paths the
+        // walk returns compare equal to the ones the test built.
+        dir.canonicalize().unwrap_or(dir)
+    }
+
+    fn markers() -> Vec<String> {
+        config::default_project_markers()
+    }
+
+    #[test]
+    fn command_resolution_returns_an_absolute_path() {
+        // An explicit path resolves to itself; a name is looked up. /bin/sh
+        // exists on every supported unix and lives on the launchd-minimal PATH
+        // a GUI-launched bundle inherits.
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                resolve_command_path("/bin/sh"),
+                Some(PathBuf::from("/bin/sh"))
+            );
+            // Not compared to a fixed path: distros ship /usr/bin/sh too, and
+            // PATH order decides which one wins.
+            let resolved = resolve_command_path("sh").expect("sh is installed");
+            assert!(resolved.is_absolute(), "{resolved:?} is not absolute");
+            assert_eq!(resolved.file_name().and_then(|n| n.to_str()), Some("sh"));
+        }
+        assert_eq!(resolve_command_path("  "), None);
+        assert_eq!(
+            resolve_command_path("tgz-definitely-not-an-installed-agent"),
+            None
+        );
+    }
+
+    #[test]
+    fn fallback_dirs_cover_the_claude_code_install_location() {
+        // Claude Code installs to ~/.local/bin, which launchd's PATH omits, so
+        // the launcher button depends on this fallback list.
+        let Some(home) = env::var_os("HOME").map(PathBuf::from) else {
+            return;
+        };
+        let dirs = fallback_command_dirs();
+        assert!(dirs.contains(&home.join(".local/bin")));
+        assert!(dirs.contains(&home.join(".claude/local")));
+    }
+
+    #[test]
+    fn project_root_found_in_a_parent_directory() {
+        let root = scratch_dir("parent");
+        fs::create_dir_all(root.join(".git")).unwrap();
+        let deep = root.join("crate/src/inner");
+        fs::create_dir_all(&deep).unwrap();
+
+        assert_eq!(nearest_project_root(&deep, &markers()), Some(root.clone()));
+        // A directory that is itself the root resolves to itself.
+        assert_eq!(nearest_project_root(&root, &markers()), Some(root.clone()));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn project_root_recognizes_non_git_markers() {
+        let root = scratch_dir("svn");
+        fs::create_dir_all(root.join(".svn")).unwrap();
+        let deep = root.join("a/b");
+        fs::create_dir_all(&deep).unwrap();
+
+        assert_eq!(nearest_project_root(&deep, &markers()), Some(root.clone()));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn project_root_returns_none_outside_a_project() {
+        // The scratch tree has no marker anywhere, and the walk stops at the
+        // filesystem root rather than looping.
+        let root = scratch_dir("bare");
+        let deep = root.join("x/y");
+        fs::create_dir_all(&deep).unwrap();
+
+        assert_eq!(nearest_project_root(&deep, &markers()), None);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn project_root_ignores_empty_and_path_shaped_markers() {
+        let root = scratch_dir("bad-markers");
+        fs::create_dir_all(root.join(".git")).unwrap();
+        let deep = root.join("a");
+        fs::create_dir_all(&deep).unwrap();
+
+        // A path-shaped marker must not be honored: it would let a config
+        // typo match outside the directory being probed.
+        let bad = vec!["".to_string(), "  ".to_string(), "../.git".to_string()];
+        assert_eq!(nearest_project_root(&deep, &bad), None);
+        // Empty marker list short-circuits.
+        assert_eq!(nearest_project_root(&deep, &[]), None);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn project_root_walk_crosses_into_a_distro_view_and_back() {
+        // Mirrors `project_root_for` for a WSL source: the marker walk runs
+        // against the UNC view because Windows cannot stat a Linux path, and
+        // the result is mapped back so the spawn gets a path the distro
+        // understands. Exercised here through the pure path helpers, since a
+        // real \\wsl.localhost share does not exist on this host.
+        let probe = wsl_paths::wsl_to_windows("/home/tim/proj/src", "Ubuntu").unwrap();
+        assert_eq!(
+            probe,
+            PathBuf::from(r"\\wsl.localhost\Ubuntu\home\tim\proj\src")
+        );
+
+        let found_root = PathBuf::from(r"\\wsl.localhost\Ubuntu\home\tim\proj");
+        assert_eq!(
+            wsl_paths::windows_to_wsl(&found_root.to_string_lossy(), "Ubuntu"),
+            Some("/home/tim/proj".to_string())
+        );
+    }
+
+    #[test]
+    fn discovered_shells_are_executable_and_unique() {
+        // Runs against whatever this machine actually has; the invariants
+        // hold regardless of which shells are installed.
+        let shells = discovered_shells();
+        let mut seen = HashSet::new();
+        for (label, argv) in &shells {
+            assert!(!label.is_empty(), "shell entry has a blank label");
+            assert_eq!(argv.len(), 1, "{} should be a bare program", label);
+            assert!(
+                seen.insert(argv.clone()),
+                "{} was discovered twice",
+                argv[0]
+            );
+            assert!(
+                path_is_executable(Path::new(&argv[0])) || command_exists_on_path(&argv[0]),
+                "{} is not executable",
+                argv[0]
+            );
+        }
+    }
+
     #[test]
     fn agent_metadata_evidence_requires_agent_fields() {
         let mut vars = HashMap::new();
@@ -4751,7 +6784,10 @@ mod tests {
         // itself, even in an extreme narrow-rail-plus-huge-font case.
         let width = 20.;
         let side = sidebar_rail_icon_side(width, 200., 1.);
-        assert!(side <= width, "rail icon side {side} must fit within rail width {width}");
+        assert!(
+            side <= width,
+            "rail icon side {side} must fit within rail width {width}"
+        );
     }
 
     #[test]
@@ -4765,18 +6801,35 @@ mod tests {
     #[test]
     fn compact_tab_symbol_prefers_agent_kind_over_title() {
         assert_eq!(
-            compact_tab_symbol("1: bash", 0, Some(&AgentKind::Claude), None, Some("bash"), None),
+            compact_tab_symbol(
+                "1: bash",
+                0,
+                Some(&AgentKind::Claude),
+                None,
+                Some("bash"),
+                None
+            ),
             "Cl"
         );
         assert_eq!(
-            compact_tab_symbol("1: node", 0, Some(&AgentKind::Codex), None, Some("node"), None),
+            compact_tab_symbol(
+                "1: node",
+                0,
+                Some(&AgentKind::Codex),
+                None,
+                Some("node"),
+                None
+            ),
             "Cx"
         );
     }
 
     #[test]
     fn compact_tab_symbol_detects_worktree_from_title_or_pane_title() {
-        assert_eq!(compact_tab_symbol("Worktree: foo", 0, None, None, None, None), "Wt");
+        assert_eq!(
+            compact_tab_symbol("Worktree: foo", 0, None, None, None, None),
+            "Wt"
+        );
         assert_eq!(
             compact_tab_symbol("1: bash", 0, None, None, Some("bash"), Some("worktree foo")),
             "Wt"
@@ -4785,15 +6838,31 @@ mod tests {
 
     #[test]
     fn compact_tab_symbol_falls_back_to_known_commands() {
-        assert_eq!(compact_tab_symbol("1: zsh", 0, None, None, Some("zsh"), None), "$");
-        assert_eq!(compact_tab_symbol("1: vim", 0, None, None, Some("vim"), None), "Vi");
-        assert_eq!(compact_tab_symbol("1: cargo", 0, None, None, Some("cargo"), None), "Rs");
+        assert_eq!(
+            compact_tab_symbol("1: zsh", 0, None, None, Some("zsh"), None),
+            "$"
+        );
+        assert_eq!(
+            compact_tab_symbol("1: vim", 0, None, None, Some("vim"), None),
+            "Vi"
+        );
+        assert_eq!(
+            compact_tab_symbol("1: cargo", 0, None, None, Some("cargo"), None),
+            "Rs"
+        );
     }
 
     #[test]
     fn compact_tab_color_prefers_agent_kind_over_command() {
         assert_eq!(
-            compact_tab_color("1: bash", 0, Some(&AgentKind::Claude), None, Some("bash"), None),
+            compact_tab_color(
+                "1: bash",
+                0,
+                Some(&AgentKind::Claude),
+                None,
+                Some("bash"),
+                None
+            ),
             adapter_color(None, &AgentKind::Claude)
         );
     }
@@ -5179,6 +7248,111 @@ mod tests {
         assert!(!should_load_visible_agent_text(true, true, Some("running")));
         assert!(should_load_visible_agent_text(false, true, None));
         assert!(!should_load_visible_agent_text(true, false, None));
+    }
+
+    fn detection_key(process: Option<&str>, title: &str) -> AgentDetectionCacheKey {
+        AgentDetectionCacheKey {
+            foreground_process: process.map(ToString::to_string),
+            pane_title: title.to_string(),
+            relevant_user_vars: Vec::new(),
+            viewport_top: 0,
+            viewport_rows: 40,
+            visible_fingerprint: 0,
+        }
+    }
+
+    fn detection_entry(
+        key: AgentDetectionCacheKey,
+        state: Option<AgentPaneState>,
+    ) -> AgentDetectionCacheEntry {
+        AgentDetectionCacheEntry {
+            key,
+            state,
+            last_wait_notification: None,
+            detected_at: Instant::now(),
+        }
+    }
+
+    fn claude_state() -> AgentPaneState {
+        AgentPaneState {
+            adapter_id: Some("claude".to_string()),
+            kind: AgentKind::Claude,
+            trusted_controls: true,
+            status: AgentStatus::Running,
+            model: None,
+            session_id: None,
+            attach_url: None,
+            cwd: None,
+            input_tokens: None,
+            output_tokens: None,
+            cost: None,
+            actions: AgentActions::default(),
+        }
+    }
+
+    #[test]
+    fn sticky_identity_survives_agent_retitling_its_pane() {
+        let previous = detection_entry(
+            detection_key(Some("claude"), "claude"),
+            Some(claude_state()),
+        );
+        let sticky = sticky_agent_identity(
+            Some(&previous),
+            &detection_key(Some("claude"), "✳ fixing the sidebar badge"),
+        )
+        .expect("identity should stick across a title rewrite");
+        assert_eq!(sticky.adapter_id.as_deref(), Some("claude"));
+        assert_eq!(sticky.kind, AgentKind::Claude);
+        assert!(sticky.trusted_controls);
+    }
+
+    #[test]
+    fn sticky_identity_drops_when_the_agent_process_exits() {
+        let previous = detection_entry(
+            detection_key(Some("claude"), "claude"),
+            Some(claude_state()),
+        );
+        assert!(
+            sticky_agent_identity(Some(&previous), &detection_key(Some("zsh"), "claude")).is_none()
+        );
+    }
+
+    #[test]
+    fn sticky_identity_without_a_process_anchor_still_requires_the_same_title() {
+        // Shell-wrapped and unknown-process panes have nothing to anchor on, so
+        // they keep the stricter pre-existing guard.
+        for process in [None, Some("zsh")] {
+            let previous = detection_entry(detection_key(process, "claude"), Some(claude_state()));
+            assert!(
+                sticky_agent_identity(Some(&previous), &detection_key(process, "claude")).is_some()
+            );
+            assert!(sticky_agent_identity(
+                Some(&previous),
+                &detection_key(process, "~/Documents/tgzterminal")
+            )
+            .is_none());
+        }
+    }
+
+    #[test]
+    fn sticky_identity_needs_a_previously_detected_agent() {
+        let previous = detection_entry(detection_key(Some("claude"), "claude"), None);
+        assert!(
+            sticky_agent_identity(Some(&previous), &detection_key(Some("claude"), "other"))
+                .is_none()
+        );
+        assert!(sticky_agent_identity(None, &detection_key(Some("claude"), "claude")).is_none());
+    }
+
+    #[test]
+    fn sticky_identity_drops_when_agent_user_vars_change() {
+        let previous = detection_entry(
+            detection_key(Some("claude"), "claude"),
+            Some(claude_state()),
+        );
+        let mut key = detection_key(Some("claude"), "claude");
+        key.relevant_user_vars = vec![("agent.kind".to_string(), "codex".to_string())];
+        assert!(sticky_agent_identity(Some(&previous), &key).is_none());
     }
 
     #[test]

@@ -31,8 +31,9 @@ It keeps the entire upstream WezTerm engine untouched — GPU renderer, multiple
 escape-sequence handling, Lua config, all of it, still exactly WezTerm under the hood —
 and bolts on the parts a person who never leaves the terminal actually wants: a sidebar
 that behaves like a real tab list, awareness of the coding agents running in your panes,
-a file browser that doesn't require you to `cd` and pray, and an input box that isn't a
-single unforgiving line.
+a one-click way to start a new agent right where you're already standing, a file browser
+that doesn't require you to `cd` and pray, and an input box that isn't a single
+unforgiving line.
 
 Nothing here changes what upstream WezTerm keys do. If you've been running WezTerm
 config since 2019, it still works exactly the same. We just added furniture to the room.
@@ -54,17 +55,24 @@ config since 2019, it still works exactly the same. We just added furniture to t
 | | Feature | What it does | Why an admin would care |
 |---|---|---|---|
 | 🗂️ | **Vertical sidebar** | Docked, resizable replacement for the top tab bar — configurable density, title source, auto-hide, and search. | Twenty panes stop looking like twenty identical rectangles. |
-| 🤖 | **Agent awareness** | Vendor-neutral detection of running coding agents (Claude, Codex, Gemini, OpenCode, Copilot, Cursor, Amp, …) from process, title, or explicit OSC user variables. Surfaces status, model, and token/cost metadata. Detection is cached per pane to stay off the render hot path. | You stop `Cmd+Tab`-ing between six windows to find out which agent is stuck waiting on you. |
+| 🌲 | **Pane rows** | Split tabs get a chevron that expands into indented pane rows: click to focus, hover for a per-pane `×`, `(remote)` on anything running on another host. Which tabs are expanded survives a restart. | The tab list finally admits that a "tab" is three panes, one of which is the one you actually wanted. |
+| 🤖 | **Agent awareness** | Vendor-neutral detection of running coding agents (Claude, Codex, Gemini, OpenCode, Copilot, Cursor, Amp, …) from process, title, or explicit OSC user variables. Surfaces status, model, and token/cost metadata. Detection is cached per pane and sticks to a session even when the agent rewrites its own pane title. | You stop `Cmd+Tab`-ing between six windows to find out which agent is stuck waiting on you. |
+| 🚀 | **Agent launcher** | Sidebar button that starts a fresh agent. The menu is *discovered*, not configured — an agent shows up only if its CLI actually resolves on `PATH` or in the usual install dirs (`~/.local/bin`, `~/.claude/local`, `~/.bun/bin`, Homebrew, …). Left-click launches the default, Alt-click flips split↔new-tab, right-click lists everything installed plus a sticky **Project root** toggle. | One click to put an agent beside the shell you were already in, in the directory you were already in — including from an SSH pane, where it runs *locally* by default because that's where the CLI and its credentials live. |
 | 🧰 | **Agent toolbelt** | Per-pane strip with a live status dot plus context actions — Copy conversation · Stop · Attach · Resume · open logs · compose input. | The nuclear-launch-codes buttons (Stop/Resume/Attach) are locked behind a config flag and real evidence, not vibes — see below. |
+| ➕ | **New-tab dropdown** | Chevron beside `+ New Tab` opens a grouped picker of what this machine actually has: discovered shells (`/etc/shells`, or PowerShell / PowerShell 7 / cmd / Git Bash on Windows), every registered domain including each WSL distro, and your own `launch_menu` entries. | Opening a tab in a specific distro or on a specific host stops being a `wezterm cli` invocation you have to remember. |
 | 📁 | **File-browser pane** | Lightweight worktree browser that also works inside SSH sessions. | You can look at a file tree on a box three hops away without giving up your terminal identity. |
 | ⌨️ | **Rich input composer** | On-demand bottom-anchored modal plus a persistent Warp-style docked input strip. Both insert plain text references only and submit visible text as ordinary bracketed-paste input. | Multi-line prompts stop looking like you're arguing with `readline`. |
+| 🪟 | **WSL-aware paths** | Launching across a domain boundary carries the working directory with it: Windows→WSL hands the path to `wsl.exe --cd`, WSL→Windows becomes `C:\…` or a `\\wsl.localhost\…` UNC path, and a path with no meaning in the target is dropped instead of guessed. | The agent starts in the repo you were looking at, not in `/home/you` or `C:\Windows\System32`. |
 
 > **Security model** — Control actions (Stop / Resume / Attach) are gated behind **both**
 > an explicit config opt-in **and** trusted evidence (process name or explicit user
 > variable) — never visible terminal text alone. A pane printing the word "claude" in a
 > `cat`'d log file does not get to press your buttons. Copy actions are always
 > user-initiated and need no trust gate — copying is not a privileged operation, it's
-> just Tuesday.
+> just Tuesday. The launcher is deliberately outside that gate for the same reason:
+> its argv comes from config only, never from pane titles or visible text, and it
+> only ever runs on a click. Starting a new process is not the same category of act
+> as reaching into a session you merely *think* you detected.
 
 ## Download & install
 
@@ -76,16 +84,28 @@ manager ritual required, no `brew install` incantation to memorize and forget.
 1. Download `TGZTerminal.dmg` from the latest release.
 2. Open it, drag **TGZTerminal** onto **Applications**, feel a brief sense of
    accomplishment.
-3. First launch: right-click the app → **Open** (the build is ad-hoc signed, so
-   Gatekeeper wants a manual blessing exactly once). If macOS is still being difficult:
+3. First launch: right-click the app → **Open** (the build is ad-hoc signed unless the
+   release was built with a signing certificate, so Gatekeeper wants a manual blessing
+   exactly once). If macOS is still being difficult:
 
    ```sh
    xattr -dr com.apple.quarantine /Applications/TGZTerminal.app
    ```
 
    Yes, this is the "turn it off and on again" of code signing. It works.
+4. Also on first launch, macOS asks once for access to **Documents**, **Desktop** and
+   **Downloads**. That's deliberate: the app touches each folder up front so the
+   prompts land during setup instead of ambushing you twenty minutes into an incident,
+   the first time a pane's cwd happens to be `~/Documents` and the sidebar looks for
+   git state. Say no and nothing breaks — the sidebar just stays quiet about those
+   directories.
 
 Universal binary — runs natively on Apple Silicon and Intel, no Rosetta tax.
+
+> **If a release re-asks for folder access after every update**, that release was
+> signed ad-hoc. macOS pins privacy grants of an unsigned bundle to the binary's code
+> hash, which changes on every single build. Nothing you can fix from the outside; the
+> signing knobs are in [Cutting a release](#cutting-a-release).
 
 ### Windows (beta)
 
@@ -138,6 +158,26 @@ cp -R dist/TGZTerminal.app /Applications/
 open /Applications/TGZTerminal.app
 ```
 
+### Sign local builds once, stop re-approving permissions
+
+macOS pins the privacy (TCC) grants of an **ad-hoc** signed bundle to the binary's code
+directory hash, so every single rebuild silently revokes them and the app re-prompts for
+Documents / Desktop / Downloads on the next launch. Rebuild ten times in an afternoon,
+answer ten rounds of dialogs. Create one stable local identity instead — the build
+script picks it up automatically (Developer ID if you have one, else this self-signed
+cert, else ad-hoc with a loud warning):
+
+```sh
+ci/macos-signing-cert.sh create      # one-time; asks for your login password
+ci/macos-signing-cert.sh status      # what builds will sign with
+ci/macos-signing-cert.sh reset-tcc   # forget the grants so the app asks once more
+```
+
+The bundle is signed inside-out (nested Mach-O first, bundle last) rather than with
+`--deep`, which Apple discourages and which does not reliably reseal nested code — an
+unstable signature is an unstable TCC identity, which puts you right back in the
+dialog loop.
+
 On Windows, build the binaries with `cargo build --release -p wezterm-gui` (plus
 `wezterm`, `wezterm-mux-server`, `strip-ansi-escapes`) — the release workflow has the
 full packaging steps if `cargo build` alone leaves you a pile of loose `.exe` files.
@@ -163,7 +203,22 @@ config.agent_ui = {
   show_sidebar_badges = true,
   show_pane_toolbelt = true,
   enable_control_actions = false, -- flip this on only once you trust the blast radius
+
+  -- Sidebar button that starts a fresh agent session
+  launcher = {
+    enabled = true,
+    default_adapter = 'claude',  -- nil/"" = first installed agent wins
+    cwd = 'ActivePane',          -- or 'ProjectRoot' (walks up to .git/.hg/.svn/.jj)
+    open_in = 'SplitPane',       -- or 'NewTab'; Alt-click uses the other one
+    split_direction = 'Horizontal',
+    split_size_percent = 50,
+    remote_behavior = 'ForceLocal', -- SSH pane? run the agent here anyway
+    -- domain = 'WSL:Ubuntu',    -- pin a distro if you have several
+  },
 }
+
+-- Grouped shell/domain picker on the sidebar's + New Tab chevron
+config.new_tab_menu = { enabled = true, show_shells = true, show_domains = true }
 
 -- Rich multiline input
 config.rich_input = { enabled = true, docked = true }
@@ -217,7 +272,19 @@ git push origin tgz-v2026.07.2
 - [`tgzterminal-windows-release.yml`](.github/workflows/tgzterminal-windows-release.yml)
   builds the Windows portable `.zip` (and a best-effort installer).
 
-Both bake the tag into the app's self-reported version (via a generated `.tag` file), so
+The macOS release signs with a real certificate when three repository secrets are set,
+and falls back to ad-hoc signing when they aren't:
+
+| Secret | What goes in it |
+|---|---|
+| `MACOS_CERT_P12` | base64 of a code-signing `.p12` (`base64 -i cert.p12 \| pbcopy`) |
+| `MACOS_CERT_PASSWORD` | the `.p12` export password |
+| `MACOS_SIGN_IDENTITY` | e.g. `Developer ID Application: You (TEAMID)` |
+
+Worth doing: signing every release with the *same* certificate is the only thing that
+lets users keep their folder-access grants across updates.
+
+Both workflows bake the tag into the app's self-reported version (via a generated `.tag` file), so
 a shipped build knows whether a later release supersedes it — no more "wait, which build
 am I even running" archaeology.
 [`tgzterminal-build.yml`](.github/workflows/tgzterminal-build.yml) is CI only

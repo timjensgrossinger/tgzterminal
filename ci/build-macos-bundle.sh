@@ -22,9 +22,13 @@
 #   --help        Print this help and exit.
 #
 # Environment:
-#   MACOS_SIGN_IDENTITY   Codesign identity to use. Defaults to "-" (ad-hoc
-#                         signing). Set to a real Developer ID identity to
-#                         produce a signed, distributable bundle.
+#   MACOS_SIGN_IDENTITY   Codesign identity to use. Defaults to whatever
+#                         ci/macos-signing-cert.sh reports (a Developer ID if
+#                         present, else the local self-signed certificate),
+#                         falling back to "-" (ad-hoc) when there is none.
+#                         Ad-hoc bundles make macOS re-prompt for folder access
+#                         after every rebuild -- run
+#                         `ci/macos-signing-cert.sh create` once to stop that.
 #   CARGO_TARGET_DIR      Honored if set; otherwise defaults to "target" at
 #                         the repo root.
 #
@@ -81,7 +85,13 @@ REPO_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
 cd "$REPO_ROOT"
 
 TARGET_DIR=${CARGO_TARGET_DIR:-target}
-MACOS_SIGN_IDENTITY=${MACOS_SIGN_IDENTITY:--}
+# Resolve the signing identity. A stable identity matters beyond distribution:
+# macOS pins privacy (TCC) grants for ad-hoc bundles to the binary's code
+# directory hash, which changes on every rebuild, so folder-access prompts come
+# back on the next launch. See ci/macos-signing-cert.sh.
+if [[ -z "${MACOS_SIGN_IDENTITY:-}" ]]; then
+  MACOS_SIGN_IDENTITY=$("$SCRIPT_DIR/macos-signing-cert.sh" identity 2>/dev/null || echo -)
+fi
 
 APP_TEMPLATE="assets/macos/WezTerm.app"
 DIST_DIR="dist"
@@ -192,6 +202,49 @@ PLIST="$APP_PATH/Contents/Info.plist"
 # CFBundleExecutable stays wezterm-gui; CFBundleIconFile stays terminal.icns
 # (the icon file itself may be overridden below via BRAND_ICON).
 
+# The template's privacy usage strings all say "An application launched via
+# WezTerm ...". macOS shows these verbatim in the consent dialog, so rebrand
+# them; a prompt naming a different app than the one asking reads like malware.
+# Every inherited key gets the generic phrasing (the request really does come
+# from whatever the user ran in a pane), except the folder keys, where the fork
+# itself is the one reading -- the sidebar probes a pane's cwd for git state.
+plist_set_or_add() {
+  local key=$1 value=$2
+  /usr/libexec/PlistBuddy -c "Set :$key $value" "$PLIST" 2>/dev/null ||
+    /usr/libexec/PlistBuddy -c "Add :$key string $value" "$PLIST"
+}
+
+log "Rebranding privacy usage strings"
+while IFS='|' read -r key phrase; do
+  [[ -n "$key" ]] || continue
+  plist_set_or_add "$key" "An application launched via $BRAND_APP_NAME $phrase"
+done <<EOF
+NSAppleEventsUsageDescription|would like to access AppleScript.
+NSCalendarsUsageDescription|would like to access calendar data.
+NSCameraUsageDescription|would like to access the camera.
+NSContactsUsageDescription|wants to access your contacts.
+NSLocationAlwaysUsageDescription|would like to access your location information, even in the background.
+NSLocationUsageDescription|would like to access your location information.
+NSLocationWhenInUseUsageDescription|would like to access your location information while active.
+NSMicrophoneUsageDescription|would like to access your microphone.
+NSRemindersUsageDescription|would like to access your reminders.
+NSSystemAdministrationUsageDescription|requires elevated permission.
+NSLocalNetworkUsageDescription|would like to access the local network.
+EOF
+
+# Folder access is requested up front on first launch by
+# wezterm-gui/src/macos_permissions.rs, so these strings explain what the app
+# does with it. NSDesktopFolderUsageDescription is absent upstream; add it.
+while IFS='|' read -r key folder; do
+  [[ -n "$key" ]] || continue
+  plist_set_or_add "$key" \
+    "$BRAND_APP_NAME shows files and git status for terminal panes opened in your $folder folder."
+done <<EOF
+NSDocumentsFolderUsageDescription|Documents
+NSDesktopFolderUsageDescription|Desktop
+NSDownloadsFolderUsageDescription|Downloads
+EOF
+
 mkdir -p "$APP_PATH/Contents/MacOS"
 mkdir -p "$APP_PATH/Contents/Resources"
 
@@ -269,7 +322,32 @@ fi
 # ---------------------------------------------------------------------------
 
 log "Codesigning with identity: $MACOS_SIGN_IDENTITY"
-codesign --force --deep --sign "$MACOS_SIGN_IDENTITY" "$APP_PATH"
+if [[ "$MACOS_SIGN_IDENTITY" == "-" ]]; then
+  echo "warning: signing ad-hoc; macOS will forget folder-access permissions" >&2
+  echo "warning: on every rebuild. Run ci/macos-signing-cert.sh create once." >&2
+fi
+
+# Sign inside-out. `--deep` is discouraged by Apple and does not always reseal
+# nested code correctly, which leaves the bundle's signature (and therefore its
+# TCC identity) unstable.
+sign_one() {
+  codesign --force --sign "$MACOS_SIGN_IDENTITY" "$1"
+}
+
+shopt -s nullglob
+for nested in "$APP_PATH/Contents/MacOS"/*; do
+  # Symlinks (Contents/MacOS/wezterm) are sealed by the bundle signature.
+  [[ -L "$nested" ]] && continue
+  [[ -f "$nested" ]] || continue
+  if file -b "$nested" | grep -q "Mach-O"; then
+    log "  signing $(basename "$nested")"
+    sign_one "$nested"
+  fi
+done
+shopt -u nullglob
+
+log "  signing bundle"
+sign_one "$APP_PATH"
 
 log "Verifying signature"
 codesign --verify --deep --strict --verbose=2 "$APP_PATH"

@@ -558,14 +558,38 @@ fn push_history(history: &RefCell<Vec<String>>, limit: usize, text: &str) {
 }
 
 /// The active pane's working directory as a plain decoded path, if available.
-fn active_pane_cwd(term_window: &TermWindow) -> Option<String> {
+///
+/// Shared with the sidebar agent launcher, which needs the same OSC 7 value
+/// that a new tab would inherit.
+pub fn active_pane_cwd(term_window: &TermWindow) -> Option<String> {
     let pane = term_window.get_active_pane_or_overlay()?;
     let url = pane.get_current_working_dir(CachePolicy::AllowStale)?;
-    percent_decode_str(url.path())
+    let path = percent_decode_str(url.path())
         .decode_utf8()
         .ok()
         .map(|p| p.into_owned())
-        .filter(|p| !p.is_empty())
+        .filter(|p| !p.is_empty())?;
+    Some(normalize_cwd_path(path))
+}
+
+/// Make an already-decoded working-directory path usable as a spawn cwd.
+///
+/// Shared with `TermWindow::newest_local_pane_cwd`, which decodes the same
+/// OSC 7 URLs and must apply the identical Windows fixup.
+pub fn normalize_cwd_path(path: String) -> String {
+    strip_windows_drive_slash(path)
+}
+
+/// `file:///C:/foo` decodes to `/C:/foo`; strip the leading slash so the path
+/// is usable as a Windows working directory. Mirrors the same fixup in
+/// `Mux::resolve_cwd`. No-op on unix paths.
+fn strip_windows_drive_slash(path: String) -> String {
+    let bytes = path.as_bytes();
+    if bytes.len() >= 3 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b':' {
+        path[1..].to_string()
+    } else {
+        path
+    }
 }
 
 /// Send `text` to the active pane as a bracketed paste followed by a single

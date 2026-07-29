@@ -42,6 +42,8 @@ mod download;
 mod frontend;
 mod glyphcache;
 mod inputmap;
+#[cfg(target_os = "macos")]
+mod macos_permissions;
 mod overlay;
 mod quad;
 mod renderstate;
@@ -198,8 +200,7 @@ fn run_ssh(opts: SshCommand) -> anyhow::Result<()> {
     })
     .detach();
 
-    maybe_show_configuration_error_window();
-    gui.run_forever()
+    run_gui_forever(gui)
 }
 
 async fn async_run_serial(opts: SerialCommand) -> anyhow::Result<()> {
@@ -249,8 +250,7 @@ fn run_serial(config: config::ConfigHandle, opts: SerialCommand) -> anyhow::Resu
     })
     .detach();
 
-    maybe_show_configuration_error_window();
-    gui.run_forever()
+    run_gui_forever(gui)
 }
 
 fn have_panes_in_domain_and_ws(domain: &Arc<dyn Domain>, workspace: &Option<String>) -> bool {
@@ -787,8 +787,7 @@ fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> 
     })
     .detach();
 
-    maybe_show_configuration_error_window();
-    gui.run_forever()
+    run_gui_forever(gui)
 }
 
 fn fatal_toast_notification(title: &str, message: &str) {
@@ -839,6 +838,19 @@ fn main() {
     }
     Mux::shutdown();
     frontend::shutdown();
+}
+
+/// Shared tail of every GUI entry point (terminal, ssh, serial): show config
+/// problems, ask for the OS permissions we need, then run the event loop.
+fn run_gui_forever(gui: std::rc::Rc<crate::frontend::GuiFrontEnd>) -> anyhow::Result<()> {
+    maybe_show_configuration_error_window();
+
+    // Ask for folder access up front on the very first launch, rather than
+    // ambushing the user later when the sidebar first probes a pane's cwd.
+    #[cfg(target_os = "macos")]
+    crate::macos_permissions::prime_first_run();
+
+    gui.run_forever()
 }
 
 fn maybe_show_configuration_error_window() {

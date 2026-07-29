@@ -286,6 +286,14 @@ impl crate::TermWindow {
             self.paint_tab_bar(&mut layers).context("paint_tab_bar")?;
         }
 
+        // After the sidebar: the launch menu floats above it, and hit testing
+        // walks ui_items in reverse, so its rows must be pushed last to win
+        // clicks over the sidebar rows underneath.
+        self.paint_agent_launch_menu(&mut layers)
+            .context("paint_agent_launch_menu")?;
+        self.paint_new_tab_menu(&mut layers)
+            .context("paint_new_tab_menu")?;
+
         self.paint_window_borders(&mut layers)
             .context("paint_window_borders")?;
         drop(layers);

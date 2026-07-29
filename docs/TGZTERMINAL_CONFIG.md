@@ -29,6 +29,29 @@ overlay when the collapsed strip is hovered. The tab list scrolls with the
 mouse wheel when there are more tabs than visible rows. `sidebar_scroll_bar`
 shows a slim sidebar tab-list scrollbar when the list overflows.
 
+### Pane rows
+
+A tab with more than one pane gets a chevron on its row. Clicking the chevron
+shows the tab's panes as indented child rows; clicking it again hides them.
+Tabs with a single pane have no chevron and are unchanged — their one pane is
+what the tab row already describes.
+
+- Clicking a pane row focuses that pane, switching tabs if needed.
+- Hovering a pane row reveals a `×` that closes just that pane. A pane whose
+  foreground process would normally prompt on close still gets the standard
+  confirmation overlay, so an agent mid-task is never killed by a stray click.
+  Closing a tab's last pane goes through the tab-close path instead of leaving
+  an empty tab behind.
+- A pane on another host is labelled `(remote)`, so a local agent split off an
+  SSH shell is visibly distinct from the shell beside it.
+
+The Worktree browser gets a pane row too, so it can be closed by hand if it
+ever outlives its picker process.
+
+Which tabs are expanded is remembered across restarts in `tgz-ui-state.json`.
+Tab index is the only identity the row list has, so reordering or closing tabs
+between sessions can shift which tab comes back expanded.
+
 ## Scrollbar
 
 ```lua
@@ -122,6 +145,25 @@ config.agent_ui = {
     cursor = { enabled = true },
     amp = { enabled = true },
   },
+  launcher = {
+    enabled = true,
+    default_adapter = "claude",
+    cwd = "ActivePane",
+    open_in = "SplitPane",
+    split_direction = "Horizontal",
+    split_size_percent = 50,
+    remote_behavior = "ForceLocal",
+    project_markers = { ".git", ".hg", ".svn", ".jj" },
+    domain = nil,
+    prefer_wsl = true, -- Windows default; false elsewhere
+  },
+}
+
+config.new_tab_menu = {
+  enabled = true,
+  show_domains = true,
+  show_shells = true,
+  show_launch_menu = true,
 }
 
 config.agent_telemetry = {
@@ -147,7 +189,8 @@ vendor-neutral agent.
 Each adapter accepts `enabled`, `label`, `short_label`, `color`,
 `process_names`, `title_patterns`, `visible_patterns`, `strip_patterns`, and
 `model_patterns`. It may also accept action templates: `resume_command`,
-`resume_latest_command`, `attach_command`, and `detail_paths`. Pattern entries
+`resume_latest_command`, `attach_command`, `detail_paths`,
+`launch_command`, and `launch_domain`. Pattern entries
 are literal case-insensitive fragments by default. Entries prefixed with `re:`
 are treated as regexes, but long or invalid regexes are ignored to keep passive
 detection bounded. Built-in detection defaults cover Claude, Codex, Gemini,
@@ -176,6 +219,165 @@ paths are shown as `Details` in the toolbelt.
 
 `waiting_notification` enables a throttled local toast when an agent appears to
 be waiting for input.
+
+### Agent launcher
+
+`agent_ui.launcher` adds a sidebar button that starts a fresh agent session. It
+shares a row with the Worktree button (Worktree on the left, the agent on the
+right) and, when the sidebar is collapsed, takes the icon rail slot directly
+above `+`.
+
+- Left-click launches the default agent.
+- Alt-click launches it into the *other* target — see `open_in` below.
+- Right-click opens a dropdown listing every installed agent, plus a sticky
+  `Project root` toggle.
+
+Which agents appear is discovered, not configured: an adapter is offered only if
+it is `enabled` and the first element of its `launch_command` resolves to an
+executable. Lookup uses `PATH` first and then a fixed list of user install
+directories — `~/.local/bin`, `~/bin`, `~/.claude/local`, `~/.bun/bin`,
+`~/.cargo/bin`, `~/.volta/bin`, `~/.npm-global/bin`, `~/.yarn/bin`,
+`/opt/homebrew/bin`, `/usr/local/bin` — because an app bundle launched from
+Finder or the Dock inherits launchd's minimal `PATH`, not the login shell's, and
+would otherwise miss `~/.local/bin/claude`. The resolved absolute path is what
+gets spawned, for the same reason. Nothing installed means no button at all, and
+the Worktree button keeps its original full width. `launch_command` is a plain
+argv with no `{...}` substitutions — the working directory is supplied by the
+launcher, not baked into the command. Built-in launch commands are `claude`,
+`codex`, `gemini`, `opencode`, `copilot`, `cursor-agent`, and `amp`.
+
+`default_adapter` names the adapter used by a plain click and defaults to
+`"claude"` (Claude Code). When it is set to `nil`/`""` or names an agent that is
+not installed, the first installed adapter wins, which is Claude in the built-in
+ordering.
+
+`cwd` is the *initial* working-directory rule:
+
+- `"ActivePane"` (default) — the active pane's current directory, the same OSC 7
+  value a new tab would inherit.
+- `"ProjectRoot"` — walk up from that directory to the nearest one containing an
+  entry from `project_markers`, falling back to the pane directory when the pane
+  is not inside a project.
+
+The `Project root` row in the dropdown toggles the same setting at runtime and
+persists it to `tgz-ui-state.json` in the data directory. Once you have used the
+toggle, the persisted value takes precedence over the `cwd` config key — the
+same behavior as the sidebar auto-hide toggle. `project_markers` entries must be
+plain directory names; path-shaped entries such as `../.git` are ignored.
+
+#### Where the agent opens
+
+`open_in` decides the launch target:
+
+- `"SplitPane"` (default) — split the active pane and put the agent in the new
+  half, so the agent sits beside the shell it was started from. The shell keeps
+  its position; the agent takes the second half.
+- `"NewTab"` — open the agent in its own tab, the pre-`open_in` behavior.
+
+Holding **Alt** while clicking uses the other target for that launch only, so
+switching between the two never needs a config edit.
+
+`split_direction` is `"Horizontal"` (side by side, default) or `"Vertical"`
+(stacked), and `split_size_percent` is the share given to the agent pane,
+clamped to `5..=95`. Both are ignored when `open_in = "NewTab"`.
+
+#### Launching from an SSH pane
+
+`remote_behavior` decides what happens when the active pane is a session on
+another machine:
+
+- `"ForceLocal"` (default) — run the agent on **this** machine regardless. The
+  remote pane's working directory names a path over there and means nothing
+  here, so the agent starts in the most recently active *local* pane's
+  directory instead, falling back to your home directory when the window has no
+  local pane. With `open_in = "SplitPane"` the local agent still splits in
+  beside the SSH pane, the same way the Worktree browser does.
+- `"FollowPane"` — launch into the active pane's domain, starting the agent on
+  the remote host. Use this when the agent CLI is genuinely installed there.
+
+`ForceLocal` is the default because the agent CLI and its credentials normally
+live on the workstation; following an SSH pane usually finds no binary at all.
+It is checked last, so an explicitly configured `domain` (or `prefer_wsl` on
+Windows) still wins — both of those already name a local target.
+
+A pane is treated as remote when any of these hold: an `ssh://` working-
+directory URL, an `ssh`/`mosh` foreground process, an ssh-shaped argv, a pane
+belonging to a WezTerm SSH domain, or an OSC 7 `file://` URL whose host is not
+this machine.
+
+Unlike Resume, Attach, and Details, the launcher is **not** governed by
+`enable_control_actions`. That gate exists so that evidence derived from
+*detection* can never authorize acting on a session. Launching is a different
+category: the argv comes only from config, never from pane titles or visible
+text, and it always follows an explicit click.
+
+#### Launching into another domain (WSL)
+
+On Windows, agent CLIs are usually installed inside a WSL distro rather than on
+the host, so `prefer_wsl` defaults to `true` there and to `false` everywhere
+else. The domain for a launch is resolved in this order:
+
+1. the adapter's own `launch_domain`,
+2. `agent_ui.launcher.domain`,
+3. `prefer_wsl`, if the active pane is not already inside a distro,
+4. the active pane's domain.
+
+A configured domain name that is not registered logs a warning and falls
+through to the next rule instead of failing the click. `prefer_wsl` picks the
+**first registered** WSL domain — WSL reports distributions in its own order and
+the "default distro" flag is not carried into the domain list, so pin a specific
+one with `domain = "WSL:Ubuntu"` if you have several.
+
+```lua
+agent_ui = {
+  launcher = { domain = 'WSL:Ubuntu' },
+  adapters = {
+    -- keep one agent on the Windows side
+    codex = { launch_domain = 'local' },
+  },
+}
+```
+
+The working directory follows you across the domain change:
+
+- **Windows → WSL** needs no translation. The spawn becomes
+  `wsl.exe --distribution <distro> --cd <path> --exec <argv>`, and `wsl.exe --cd`
+  accepts a Windows path and translates it, so `C:\Users\tim\proj` lands at
+  `/mnt/c/Users/tim/proj`.
+- **WSL → Windows** is translated here: `/mnt/c/foo` becomes `C:\foo`, and a
+  path inside the distro becomes its UNC form,
+  `\\wsl.localhost\Ubuntu\home\tim\proj`.
+- **One distro → a different distro**, or between two unrelated non-WSL domains
+  (local → SSH), drops the directory and lets the target domain use its own
+  default, because the path has no meaning there.
+
+Project-root mode works from a WSL pane too: because Windows cannot stat a Linux
+path directly, the marker walk runs against the `\\wsl.localhost` view of the
+distro and the result is mapped back before launching.
+
+### New-tab dropdown
+
+`new_tab_menu` controls the chevron beside the sidebar's `+ New Tab` button,
+which opens a small picker of the shells and domains available on this machine.
+Clicking the `+` label itself still opens a tab as before, and right-clicking it
+still opens WezTerm's full launcher overlay.
+
+The list is grouped, with a divider between groups:
+
+- **Shells** (`show_shells`) — discovered, not configured. On Windows:
+  PowerShell, PowerShell 7, Command Prompt, and Git Bash, each shown only if
+  present. On macOS and Linux: the entries in `/etc/shells` that exist and are
+  executable.
+- **Domains** (`show_domains`) — every registered spawnable domain, including
+  each WSL distro and any SSH or mux domain. A `WSL:Ubuntu` domain is listed as
+  `Ubuntu`.
+- **`launch_menu`** (`show_launch_menu`) — your own entries. Entries with no
+  `args` are skipped, since the plain `+` button already covers the default
+  shell.
+
+Picking a row carries the current directory into the new tab using the same
+translation rules as the agent launcher above. The chevron is hidden entirely
+when the list would be empty.
 
 Telemetry field names are vendor-neutral. Provider names may be supplied by user
 configuration or pane metadata, but the public UI contract is based on generic

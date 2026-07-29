@@ -56,7 +56,7 @@ use percent_encoding::percent_decode_str;
 use smol::channel::Sender;
 use smol::Timer;
 use std::cell::{RefCell, RefMut};
-use std::collections::{HashMap, LinkedList};
+use std::collections::{HashMap, HashSet, LinkedList};
 use std::ops::Add;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -75,6 +75,36 @@ struct RemoteFileBrowserContext {
     destination: String,
     port: Option<u16>,
     path: String,
+}
+
+/// One pass of "is this pane on another machine?" evidence.
+///
+/// See `TermWindow::pane_remote_signals`, which is the only constructor. The
+/// individual flags are kept alongside the verdict because
+/// `file_browser_remote_context` needs them to decide *which* remote it is,
+/// and re-deriving them would repeat an expensive process-info fetch.
+struct PaneRemoteSignals {
+    working_dir_url: Option<url::Url>,
+    working_dir_path: Option<String>,
+    /// Foreground process argv, when it could be read. Only the argv is kept:
+    /// it is the sole part of the process info any caller needs, and holding it
+    /// avoids taking a `procinfo` dependency here.
+    fg_argv: Option<Vec<String>>,
+    name_is_ssh: bool,
+    argv_is_ssh: bool,
+    ssh_scheme: bool,
+    remote_ssh_domain: bool,
+    osc7_remote_host: bool,
+}
+
+impl PaneRemoteSignals {
+    fn looks_remote(&self) -> bool {
+        self.ssh_scheme
+            || self.name_is_ssh
+            || self.argv_is_ssh
+            || self.remote_ssh_domain
+            || self.osc7_remote_host
+    }
 }
 use wezterm_term::{Alert, Progress, StableRowIndex, TerminalConfiguration, TerminalSize};
 
@@ -95,6 +125,7 @@ mod selection;
 pub mod spawn;
 pub mod tgz_ui_state;
 pub mod webgpu;
+pub mod wsl_paths;
 use crate::spawn::SpawnWhere;
 use prevcursor::PrevCursorPos;
 
@@ -191,6 +222,18 @@ pub enum UIItemType {
         tab_idx: usize,
         active: bool,
     },
+    /// Chevron on a split tab's row that shows or hides its pane children.
+    SidebarTabExpand {
+        tab_idx: usize,
+    },
+    /// An indented pane row beneath an expanded tab.
+    SidebarPaneRow {
+        pane_id: PaneId,
+    },
+    /// Close button on a pane row.
+    SidebarPaneClose {
+        pane_id: PaneId,
+    },
     SidebarTabList,
     SidebarScrollTrack,
     SidebarScrollThumb,
@@ -200,6 +243,20 @@ pub enum UIItemType {
     SidebarSearch,
     SidebarAutoHideToggle,
     SidebarWorktreeButton,
+    /// Sidebar button that starts a fresh agent session.
+    SidebarAgentLaunchButton,
+    /// A single agent row in the launch dropdown.
+    SidebarAgentMenuItem {
+        adapter_id: String,
+    },
+    /// The sticky project-root toggle row in the launch dropdown.
+    SidebarAgentMenuProjectRootToggle,
+    /// Chevron beside the sidebar new-tab button.
+    SidebarNewTabMenuButton,
+    /// A shell/domain row in the new-tab dropdown.
+    SidebarNewTabMenuItem {
+        index: usize,
+    },
     AgentToolbeltButton {
         pane_id: PaneId,
         action: AgentToolbeltAction,
@@ -242,6 +299,48 @@ pub struct AgentCopyMenuState {
     pub pane_id: PaneId,
     pub x: usize,
     pub y: usize,
+}
+
+/// Anchor for the sidebar agent launch dropdown. Unlike the copy menu this is
+/// not tied to a pane: it lists installed agents, not a detected session.
+#[derive(Clone, Debug)]
+pub struct AgentLaunchMenuState {
+    pub x: usize,
+    pub y: usize,
+}
+
+/// What a new-tab dropdown row spawns.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NewTabTarget {
+    /// A registered domain, spawned with its own default program.
+    Domain(String),
+    /// An explicit program discovered on this machine, or a `launch_menu`
+    /// entry, spawned in the active pane's domain.
+    Program(Vec<String>),
+}
+
+/// One row offered by the sidebar new-tab dropdown.
+#[derive(Clone, Debug)]
+pub struct NewTabMenuEntry {
+    pub label: String,
+    pub target: NewTabTarget,
+    /// Rows are grouped shells / domains / launch_menu, with a divider
+    /// between groups.
+    pub group: u8,
+}
+
+/// One installed agent offered by the sidebar launcher.
+#[derive(Clone, Debug)]
+pub struct AgentLauncherEntry {
+    pub adapter_id: String,
+    pub label: String,
+    pub short_label: String,
+    pub color: ::window::color::LinearRgba,
+    /// Adapter-level domain override; see `agent_ui.launcher.domain`.
+    pub launch_domain: Option<String>,
+    /// Fully resolved argv. Contains no `{...}` placeholders: the launcher
+    /// passes the working directory out of band via `SpawnCommand::cwd`.
+    pub argv: Vec<String>,
 }
 
 #[derive(Clone, Default)]
@@ -463,10 +562,28 @@ pub struct TermWindow {
     sidebar_auto_hide_close_after: Option<Instant>,
     sidebar_search: Option<SidebarSearchState>,
     agent_copy_menu: Option<AgentCopyMenuState>,
+    agent_launch_menu: Option<AgentLaunchMenuState>,
+    new_tab_menu: Option<AgentLaunchMenuState>,
+    /// Shells/domains offered by the new-tab dropdown. Probing for shells
+    /// touches the filesystem, so this is rebuilt only when the config
+    /// generation changes.
+    new_tab_menu_cache: RefCell<Option<(usize, Arc<Vec<NewTabMenuEntry>>)>>,
+    /// Sticky "launch agents at the project root" toggle. Seeded from
+    /// `agent_ui.launcher.cwd` and then owned by the user's dropdown toggle,
+    /// persisted via `tgz_ui_state`.
+    agent_launcher_project_root: bool,
     agent_detection_cache: RefCell<HashMap<PaneId, AgentDetectionCacheEntry>>,
     adapter_cache: RefCell<Option<(usize, Arc<Vec<(String, AgentAdapterConfig)>>)>>,
+    /// Installed-agent launcher entries, rebuilt only when the config
+    /// generation changes. Building probes `$PATH`, so this must never be
+    /// recomputed per frame.
+    launcher_cache: RefCell<Option<(usize, Arc<Vec<AgentLauncherEntry>>)>>,
     sidebar_scroll_offset: usize,
     sidebar_drop_flash: Option<(usize, Instant)>,
+    /// Tabs whose pane children are shown in the sidebar. Persisted via
+    /// `tgz_ui_state`; entries for tabs that no longer exist are harmless and
+    /// simply never match.
+    sidebar_expanded_tabs: HashSet<usize>,
     fancy_tab_bar: Option<box_model::ComputedElement>,
     pub right_status: String,
     pub left_status: String,
@@ -821,12 +938,19 @@ impl TermWindow {
             sidebar_auto_hide_close_after: None,
             sidebar_search: None,
             agent_copy_menu: None,
+            agent_launch_menu: None,
+            new_tab_menu: None,
+            new_tab_menu_cache: RefCell::new(None),
+            agent_launcher_project_root: tgz_ui_state::load_agent_launcher_project_root()
+                .unwrap_or(config.agent_ui.launcher.cwd == config::AgentLauncherCwd::ProjectRoot),
             agent_detection_cache: RefCell::new(HashMap::new()),
             adapter_cache: RefCell::new(None),
+            launcher_cache: RefCell::new(None),
             composer_history: RefCell::new(Vec::new()),
             docked_input: crate::termwindow::composer::DockedInput::new(),
             sidebar_scroll_offset: 0,
             sidebar_drop_flash: None,
+            sidebar_expanded_tabs: tgz_ui_state::load_sidebar_expanded_tabs().unwrap_or_default(),
             fancy_tab_bar: None,
             right_status: String::new(),
             left_status: String::new(),
@@ -2847,10 +2971,15 @@ impl TermWindow {
         }
     }
 
-    fn file_browser_remote_context(
-        &self,
-        pane: &Arc<dyn Pane>,
-    ) -> (Option<RemoteFileBrowserContext>, bool) {
+    /// Every signal that says "this pane is not running on this machine",
+    /// gathered in one pass.
+    ///
+    /// Collecting them together matters: `get_foreground_process_info` is
+    /// fetched with `FetchImmediate` and is the expensive part, so callers that
+    /// need both the verdict and the individual signals must not pay for it
+    /// twice. `file_browser_remote_context` and the agent launcher both go
+    /// through here so there is exactly one definition of "remote".
+    fn pane_remote_signals(&self, pane: &Arc<dyn Pane>) -> PaneRemoteSignals {
         let working_dir_url = pane.get_current_working_dir(CachePolicy::AllowStale);
         let working_dir_path = working_dir_url.as_ref().and_then(|url| {
             percent_decode_str(url.path())
@@ -2863,22 +2992,23 @@ impl TermWindow {
         // A single fresh fetch of the foreground process info; AllowStale can
         // return an empty argv on macOS (KERN_PROCARGS2 failures), which used
         // to cause the ssh-argv signal below to silently disappear.
-        let fg_info = pane.get_foreground_process_info(CachePolicy::FetchImmediate);
+        let fg_argv = pane
+            .get_foreground_process_info(CachePolicy::FetchImmediate)
+            .map(|info| info.argv);
 
         let name_is_ssh = matches!(
             self.pane_command_basename(pane).as_deref(),
             Some("ssh" | "mosh")
         );
-        let argv_is_ssh = fg_info
+        let argv_is_ssh = fg_argv
             .as_ref()
-            .is_some_and(|info| Self::is_ssh_client_argv(&info.argv));
+            .is_some_and(|argv| Self::is_ssh_client_argv(argv));
 
         let ssh_scheme = working_dir_url
             .as_ref()
             .is_some_and(|url| url.scheme() == "ssh");
 
-        let mux = Mux::get();
-        let remote_ssh_domain = mux
+        let remote_ssh_domain = Mux::get()
             .get_domain(pane.domain_id())
             .is_some_and(|domain| domain.downcast_ref::<mux::ssh::RemoteSshDomain>().is_some());
 
@@ -2891,8 +3021,82 @@ impl TermWindow {
                     .is_some_and(|host| Self::host_looks_remote(host, local_label.as_deref()))
         });
 
-        let pane_looks_remote =
-            ssh_scheme || name_is_ssh || argv_is_ssh || remote_ssh_domain || osc7_remote_host;
+        PaneRemoteSignals {
+            working_dir_url,
+            working_dir_path,
+            fg_argv,
+            name_is_ssh,
+            argv_is_ssh,
+            ssh_scheme,
+            remote_ssh_domain,
+            osc7_remote_host,
+        }
+    }
+
+    /// True when the pane appears to be a session on another machine.
+    pub fn pane_looks_remote(&self, pane: &Arc<dyn Pane>) -> bool {
+        self.pane_remote_signals(pane).looks_remote()
+    }
+
+    /// Working directory of the most recently active pane that is running on
+    /// this machine, searched across every tab in this window.
+    ///
+    /// Used when the launcher is forced local from a remote pane: the remote
+    /// pane's cwd is meaningless here, so fall back to wherever the user last
+    /// was locally. `None` means there is no local pane to borrow from and the
+    /// caller should pick its own fallback.
+    pub fn newest_local_pane_cwd(&self) -> Option<PathBuf> {
+        let mux = Mux::get();
+        let window = mux.get_window(self.mux_window_id)?;
+
+        // Active tab first, then the rest, so the answer tracks where the user
+        // most plausibly just was.
+        let active_idx = window.get_active_idx();
+        let tabs: Vec<_> = window.iter().cloned().collect();
+        let ordered = std::iter::once(active_idx)
+            .chain((0..tabs.len()).filter(|idx| *idx != active_idx))
+            .filter_map(|idx| tabs.get(idx));
+
+        for tab in ordered {
+            let panes = tab.iter_panes_ignoring_zoom();
+            let active_pane_idx = panes.iter().position(|pos| pos.is_active).unwrap_or(0);
+            let pane_order = std::iter::once(active_pane_idx)
+                .chain((0..panes.len()).filter(|idx| *idx != active_pane_idx))
+                .filter_map(|idx| panes.get(idx));
+
+            for pos in pane_order {
+                let signals = self.pane_remote_signals(&pos.pane);
+                if signals.looks_remote() {
+                    continue;
+                }
+                if let Some(path) = signals.working_dir_path.as_ref() {
+                    return Some(PathBuf::from(
+                        crate::termwindow::composer::normalize_cwd_path(path.clone()),
+                    ));
+                }
+            }
+        }
+
+        None
+    }
+
+    fn file_browser_remote_context(
+        &self,
+        pane: &Arc<dyn Pane>,
+    ) -> (Option<RemoteFileBrowserContext>, bool) {
+        let signals = self.pane_remote_signals(pane);
+        let pane_looks_remote = signals.looks_remote();
+        let PaneRemoteSignals {
+            working_dir_url,
+            working_dir_path,
+            fg_argv,
+            name_is_ssh,
+            argv_is_ssh,
+            ssh_scheme,
+            remote_ssh_domain: _,
+            osc7_remote_host,
+        } = signals;
+        let mux = Mux::get();
 
         // 1. ssh:// working-directory URL (e.g. reported via OSC 7 by a remote shell).
         if let Some(url) = working_dir_url.as_ref() {
@@ -2917,9 +3121,8 @@ impl TermWindow {
 
         // 2. `ssh`/`mosh` invocation visible in the foreground process argv.
         if argv_is_ssh {
-            if let Some(info) = fg_info.as_ref() {
-                if let Some((destination, port)) = Self::parse_ssh_destination_from_argv(&info.argv)
-                {
+            if let Some(argv) = fg_argv.as_ref() {
+                if let Some((destination, port)) = Self::parse_ssh_destination_from_argv(argv) {
                     return (
                         Some(RemoteFileBrowserContext {
                             destination,
@@ -4425,6 +4628,91 @@ done
             .detach();
         }
     }
+    /// Show or hide a tab's pane rows in the sidebar, and remember the choice.
+    pub fn toggle_sidebar_tab_expanded(&mut self, tab_idx: usize) {
+        if !self.sidebar_expanded_tabs.remove(&tab_idx) {
+            self.sidebar_expanded_tabs.insert(tab_idx);
+        }
+        tgz_ui_state::save_sidebar_expanded_tabs(&self.sidebar_expanded_tabs);
+    }
+
+    /// Focus the pane a sidebar pane row refers to, switching tabs if needed.
+    pub fn activate_sidebar_pane(&mut self, pane_id: PaneId) {
+        let mux = Mux::get();
+        let Some(window) = mux.get_window(self.mux_window_id) else {
+            return;
+        };
+        let Some((tab_idx, tab, pane)) = window.iter().enumerate().find_map(|(idx, tab)| {
+            tab.iter_panes_ignoring_zoom()
+                .iter()
+                .find(|pos| pos.pane.pane_id() == pane_id)
+                .map(|pos| (idx, tab.clone(), pos.pane.clone()))
+        }) else {
+            return;
+        };
+        // Drop the borrow before activate_tab, which reaches back into the mux.
+        drop(window);
+
+        tab.set_active_pane(&pane);
+        // An error here just means the tab is already active; the pane change
+        // above still stands, so there is nothing to recover from.
+        let _ = self.activate_tab(tab_idx as isize);
+        self.update_title();
+    }
+
+    /// Close one specific pane, chosen from the sidebar rather than by focus.
+    ///
+    /// Mirrors `close_current_pane`: a pane that says it cannot close silently
+    /// gets the standard confirmation overlay, so a running agent is never
+    /// killed by a stray click on a small target.
+    pub fn close_sidebar_pane(&mut self, pane_id: PaneId) {
+        let mux = Mux::get();
+        let Some((_domain_id, _window_id, tab_id)) = mux.resolve_pane_id(pane_id) else {
+            return;
+        };
+        let Some(tab) = mux.get_tab(tab_id) else {
+            return;
+        };
+        let panes = tab.iter_panes_ignoring_zoom();
+        let Some(pane) = panes
+            .iter()
+            .find(|pos| pos.pane.pane_id() == pane_id)
+            .map(|pos| pos.pane.clone())
+        else {
+            return;
+        };
+
+        // The last pane in a tab is the tab: closing it through the pane path
+        // would leave an empty tab behind, so hand it to the tab-close flow.
+        if panes.len() <= 1 {
+            let tab_idx = mux.get_window(self.mux_window_id).and_then(|window| {
+                window
+                    .iter()
+                    .position(|candidate| candidate.tab_id() == tab_id)
+            });
+            if let Some(tab_idx) = tab_idx {
+                self.close_specific_tab(tab_idx, true);
+            }
+            return;
+        }
+
+        if pane.can_close_without_prompting(CloseReason::Pane) {
+            mux.remove_pane(pane_id);
+            return;
+        }
+
+        let mux_window_id = self.mux_window_id;
+        let window = match self.window.clone() {
+            Some(window) => window,
+            None => return,
+        };
+        let (overlay, future) = start_overlay_pane(self, &pane, move |pane_id, term| {
+            confirm_close_pane(pane_id, term, mux_window_id, window)
+        });
+        self.assign_overlay_for_pane(pane_id, overlay);
+        promise::spawn::spawn(future).detach();
+    }
+
     fn close_current_pane(&mut self, confirm: bool) {
         let mux_window_id = self.mux_window_id;
         let mux = Mux::get();
