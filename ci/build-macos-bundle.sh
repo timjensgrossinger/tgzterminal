@@ -334,11 +334,19 @@ sign_one() {
   codesign --force --sign "$MACOS_SIGN_IDENTITY" "$1"
 }
 
+# codesign resolves a path to the bundle's CFBundleExecutable as the *bundle*,
+# not the file, so signing it early would try to seal still-unsigned siblings
+# ("code object is not signed at all / In subcomponent: wezterm-mux-server").
+# Skip it here; the bundle signature below covers it.
+BUNDLE_MAIN_EXE=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" \
+  "$APP_PATH/Contents/Info.plist" 2>/dev/null || true)
+
 shopt -s nullglob
 for nested in "$APP_PATH/Contents/MacOS"/*; do
   # Symlinks (Contents/MacOS/wezterm) are sealed by the bundle signature.
   [[ -L "$nested" ]] && continue
   [[ -f "$nested" ]] || continue
+  [[ -n "$BUNDLE_MAIN_EXE" && "$(basename "$nested")" == "$BUNDLE_MAIN_EXE" ]] && continue
   if file -b "$nested" | grep -q "Mach-O"; then
     log "  signing $(basename "$nested")"
     sign_one "$nested"
