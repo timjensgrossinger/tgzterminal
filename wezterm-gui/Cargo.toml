@@ -71,6 +71,7 @@ ordered-float.workspace = true
 parking_lot.workspace = true
 percent-encoding.workspace = true
 portable-pty = { workspace=true, features = ["serde_support"]}
+procinfo.workspace = true
 promise.workspace = true
 rangeset.workspace = true
 ratelim.workspace = true

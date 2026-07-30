@@ -36,27 +36,14 @@ pub fn spawn_command_impl(
     .detach();
 }
 
-pub async fn spawn_command_internal(
-    spawn: SpawnCommand,
-    spawn_where: SpawnWhere,
-    size: TerminalSize,
-    src_window_id: Option<MuxWindowId>,
-    term_config: Arc<TermConfig>,
-) -> anyhow::Result<()> {
-    let mux = Mux::get();
-    let activity = Activity::new();
-
-    let current_pane_id = match src_window_id {
-        Some(window_id) => {
-            if let Some(tab) = mux.get_active_tab_for_window(window_id) {
-                tab.get_active_pane().map(|p| p.pane_id())
-            } else {
-                None
-            }
-        }
-        None => None,
-    };
-
+/// Turn a `SpawnCommand` into the `(CommandBuilder, cwd)` pair that
+/// `Domain::spawn`/`Domain::split_pane` expect. Shared by
+/// `spawn_command_internal` and `termwindow::agent_launch`, which drives the
+/// mux directly for multi-pane launches instead of going through
+/// `spawn_command_impl`.
+pub fn command_builder_for(
+    spawn: &SpawnCommand,
+) -> anyhow::Result<(Option<CommandBuilder>, Option<String>)> {
     let cwd = if let Some(cwd) = spawn.cwd.as_ref() {
         Some(cwd.to_str().map(|s| s.to_owned()).ok_or_else(|| {
             anyhow!(
@@ -89,6 +76,32 @@ pub async fn spawn_command_internal(
             Some(builder)
         }
     };
+
+    Ok((cmd_builder, cwd))
+}
+
+pub async fn spawn_command_internal(
+    spawn: SpawnCommand,
+    spawn_where: SpawnWhere,
+    size: TerminalSize,
+    src_window_id: Option<MuxWindowId>,
+    term_config: Arc<TermConfig>,
+) -> anyhow::Result<()> {
+    let mux = Mux::get();
+    let activity = Activity::new();
+
+    let current_pane_id = match src_window_id {
+        Some(window_id) => {
+            if let Some(tab) = mux.get_active_tab_for_window(window_id) {
+                tab.get_active_pane().map(|p| p.pane_id())
+            } else {
+                None
+            }
+        }
+        None => None,
+    };
+
+    let (cmd_builder, cwd) = command_builder_for(&spawn)?;
 
     let workspace = mux.active_workspace().clone();
 

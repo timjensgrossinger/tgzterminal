@@ -54,9 +54,9 @@ config since 2019, it still works exactly the same. We just added furniture to t
 
 | | Feature | What it does | Why an admin would care |
 |---|---|---|---|
-| 🗂️ | **Vertical sidebar** | Docked, resizable replacement for the top tab bar — configurable density, title source, auto-hide, and search. | Twenty panes stop looking like twenty identical rectangles. |
+| 🗂️ | **Vertical sidebar** | Docked, resizable replacement for the top tab bar — configurable width, position, density, title source and auto-hide, plus type-to-filter search. Labels step down to shorter forms when a column gets tight instead of clipping mid-word. | Twenty panes stop looking like twenty identical rectangles. |
 | 🌲 | **Pane rows** | Split tabs get a chevron that expands into indented pane rows: click to focus, hover for a per-pane `×`, `(remote)` on anything running on another host. Which tabs are expanded survives a restart. | The tab list finally admits that a "tab" is three panes, one of which is the one you actually wanted. |
-| 🤖 | **Agent awareness** | Vendor-neutral detection of running coding agents (Claude, Codex, Gemini, OpenCode, Copilot, Cursor, Amp, …) from process, title, or explicit OSC user variables. Surfaces status, model, and token/cost metadata. Detection is cached per pane and sticks to a session even when the agent rewrites its own pane title. | You stop `Cmd+Tab`-ing between six windows to find out which agent is stuck waiting on you. |
+| 🤖 | **Agent awareness** | Vendor-neutral detection of running coding agents (Claude, Codex, Gemini, OpenCode, Copilot, Cursor, Amp, …). Every signal is ranked by strength — user vars, then process, then title, then the agent's own on-screen chrome — so a brand word in ordinary output can't badge a plain shell, and an established badge doesn't flip when the agent retitles itself. Surfaces status, model and token/cost metadata, with a status dot that pulses while the agent works. | You stop `Cmd+Tab`-ing between six windows to find out which agent is stuck waiting on you — and the badge tells the truth. |
 | 🚀 | **Agent launcher** | Sidebar button that starts a fresh agent. The menu is *discovered*, not configured — an agent shows up only if its CLI actually resolves on `PATH` or in the usual install dirs (`~/.local/bin`, `~/.claude/local`, `~/.bun/bin`, Homebrew, …). Left-click launches the default, Alt-click flips split↔new-tab, right-click lists everything installed plus a sticky **Project root** toggle. | One click to put an agent beside the shell you were already in, in the directory you were already in — including from an SSH pane, where it runs *locally* by default because that's where the CLI and its credentials live. |
 | 🧰 | **Agent toolbelt** | Per-pane strip with a live status dot plus context actions — Copy conversation · Stop · Attach · Resume · open logs · compose input. | The nuclear-launch-codes buttons (Stop/Resume/Attach) are locked behind a config flag and real evidence, not vibes — see below. |
 | ➕ | **New-tab dropdown** | Chevron beside `+ New Tab` opens a grouped picker of what this machine actually has: discovered shells (`/etc/shells`, or PowerShell / PowerShell 7 / cmd / Git Bash on Windows), every registered domain including each WSL distro, and your own `launch_menu` entries. | Opening a tab in a specific distro or on a specific host stops being a `wezterm cli` invocation you have to remember. |
@@ -69,7 +69,9 @@ config since 2019, it still works exactly the same. We just added furniture to t
 > variable) — never visible terminal text alone. A pane printing the word "claude" in a
 > `cat`'d log file does not get to press your buttons. Copy actions are always
 > user-initiated and need no trust gate — copying is not a privileged operation, it's
-> just Tuesday. The launcher is deliberately outside that gate for the same reason:
+> just Tuesday. Both halves of the gate are required: trusted evidence on its own does
+> not unlock anything, and neither does flipping the flag on a pane nobody can identify.
+> The launcher is deliberately outside that gate for the same reason:
 > its argv comes from config only, never from pane titles or visible text, and it
 > only ever runs on a click. Starting a new process is not the same category of act
 > as reaching into a session you merely *think* you detected.
@@ -197,12 +199,17 @@ config.sidebar_enabled = true
 config.sidebar_position = 'Left'
 config.sidebar_tab_metadata = { 'GitBranch', 'WorkingDirectory' }
 
+-- Vertical sidebar instead of the top tab bar (width is 2x-calibrated and
+-- scales on 1x displays; a drag-resize is per-session, not persisted)
+config.sidebar_width_px = 400
+
 -- Agent awareness + toolbelt
 config.agent_ui = {
   enabled = true,
   show_sidebar_badges = true,
   show_pane_toolbelt = true,
   enable_control_actions = false, -- flip this on only once you trust the blast radius
+  trust_visible_evidence = true,  -- let an agent's own on-screen chrome identify it
 
   -- Sidebar button that starts a fresh agent session
   launcher = {
@@ -231,7 +238,9 @@ box and can be overridden or extended per-adapter — nobody's forcing you to ru
 the agent roster we picked. See
 **[`docs/TGZTERMINAL_CONFIG.md`](docs/TGZTERMINAL_CONFIG.md)** for the full reference of
 every fork-specific key, written for the version of you that's debugging this at 2am and
-does not want prose, just the field name and the default.
+does not want prose, just the field name and the default. It ends with a
+*What is not configurable* section listing the chrome that has no key at all — read that
+before going looking for one.
 
 ## Build, test & format
 

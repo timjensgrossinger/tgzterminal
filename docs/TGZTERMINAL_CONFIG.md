@@ -7,8 +7,8 @@ WezTerm compatibility unless noted.
 
 ```lua
 config.sidebar_enabled = true
-config.sidebar_width_px = 280
-config.sidebar_collapsed_width_px = 36
+config.sidebar_width_px = 400
+config.sidebar_collapsed_width_px = 48
 config.sidebar_auto_hide = true
 config.sidebar_position = "Left"
 config.sidebar_tab_density = "Comfortable"
@@ -18,16 +18,47 @@ config.sidebar_tab_hover_details = false
 config.sidebar_scroll_bar = true
 ```
 
-`sidebar_enabled` replaces the top tab strip with a vertical sidebar. The
-sidebar reserves horizontal space for the terminal grid. `sidebar_width_px` and
-`sidebar_collapsed_width_px` are calibrated for a 2x (Retina) display and scale
-down on lower-density displays so the sidebar keeps a consistent physical size
-across monitors; a manual drag-resize overrides `sidebar_width_px` and is kept
-verbatim. `sidebar_auto_hide`
-uses the collapsed width as the reserved size and expands the sidebar as an
-overlay when the collapsed strip is hovered. The tab list scrolls with the
-mouse wheel when there are more tabs than visible rows. `sidebar_scroll_bar`
-shows a slim sidebar tab-list scrollbar when the list overflows.
+| Key | Type | Default | Accepted values / notes |
+|---|---|---|---|
+| `sidebar_enabled` | bool | `true` | Replaces the top tab strip with a vertical sidebar, which reserves horizontal space for the terminal grid. |
+| `sidebar_width_px` | int px | `400` | Calibrated for 2x; scaled by display density (see below). Floored at `sidebar_collapsed_width_px`. |
+| `sidebar_collapsed_width_px` | int px | `48` | Also the reserved width under `sidebar_auto_hide`, where it is forced to at least 48. |
+| `sidebar_auto_hide` | bool | `true` | Reserves only the collapsed width and expands the sidebar as an overlay on hover. The in-app toggle persists to `tgz-ui-state.json` and then takes precedence over this key. |
+| `sidebar_position` | enum | `"Left"` | `"Left"`, `"Right"` |
+| `sidebar_tab_density` | enum | `"Comfortable"` | `"Comfortable"`, `"Compact"`. `Compact` also suppresses the metadata sub-line entirely. |
+| `sidebar_tab_title_source` | enum | `"Title"` | `"Title"`, `"Command"`, `"WorkingDirectory"`, `"GitBranch"` |
+| `sidebar_tab_metadata` | list of enum | `{ "GitBranch", "WorkingDirectory" }` | Elements: `"GitBranch"`, `"WorkingDirectory"` |
+| `sidebar_tab_hover_details` | bool | `false` | Shows the metadata sub-line on the active/hovered row — **and makes every row two text lines tall** whether or not you hover, so fewer tabs fit on screen. |
+| `sidebar_scroll_bar` | bool | `true` | Slim tab-list scrollbar when the list overflows. Reserves a 30px gutter, which narrows every row's text budget. |
+
+The tab list scrolls with the mouse wheel when there are more tabs than visible
+rows.
+
+### Width, density and the resize grip
+
+The two width keys are calibrated for a 2x (Retina) display and scaled by
+display density, so the sidebar keeps a consistent physical size across
+monitors. macOS reports DPI on a 72 base (2x ≈ 144, 1x ≈ 72); other platforms
+use 96 (2x ≈ 192). The factor is `(dpi / base) / 2` clamped to `0.5..=1.25`, so a
+2x display uses the configured values verbatim and a 1x display halves them.
+
+Dragging the sidebar's inner edge resizes it between `max(collapsed_width, 140)`
+and half the window width. A dragged width is kept verbatim (it is an explicit
+physical-pixel choice) and is **not** persisted — restart returns to
+`sidebar_width_px`.
+
+Two thresholds change the *layout* rather than just the text:
+
+- at 96px and below the search row and the auto-hide toggle are dropped;
+- at 180px and below the Worktree / agent-launcher row is dropped, and the tab
+  list reclaims the space.
+
+Everything else adapts by measuring: each label picks the widest variant that
+fits its box — `Worktree → Tree → Wt`, an adapter's `label → short_label`,
+`+ New Tab → + Tab → +` — and falls back to its icon or dot alone rather than
+rendering a clipped word. The default of 400 is the width at which both
+`Worktree` and a full adapter label fit their halves of the shared bottom row at
+a typical 14px cell, with headroom for wider monospace faces.
 
 ### Pane rows
 
@@ -73,6 +104,13 @@ config.file_browser = {
 }
 ```
 
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `editor_command` | list of string | unset | Receives the selected file path as its final argument. |
+| `list_command` | list of string | `{ "find", ".", "-maxdepth", "3", "-type", "f" }` | Accepted by the schema but **not currently read by any code**. |
+| `split_size_percent` | int | `30` | Clamped to `5..=95`. |
+| `reuse_editor_pane` | bool | `true` | Accepted by the schema but **not currently read by any code**. |
+
 The file browser configuration is public schema for the browser pane behavior.
 The editor command receives the selected file path as its final argument.
 Use `wezterm.action.OpenFileBrowser` from a key binding or the command palette
@@ -92,7 +130,11 @@ config.agent_ui = {
   detect_processes = true,
   copy_scrollback_lines = 500,
   waiting_notification = true,
-  toolbelt_position = "Top",
+  toolbelt_position = "Top", -- or "Bottom"
+  visible_identity_signals = 2,
+  trust_visible_evidence = true,
+  pulse_working_dot = true,
+  pulse_period_ms = 1600,
   adapters = {
     claude = {
       enabled = true,
@@ -101,7 +143,9 @@ config.agent_ui = {
       color = "#db7a52",
       process_names = { "claude", "claude-code", "claude_code" },
       title_patterns = { "claude code", "claude" },
-      visible_patterns = { "claude code", "claude team" },
+      visible_patterns = { "claude code", "claude team", "welcome to claude" },
+      running_patterns = { "esc to interrupt" },
+      chrome_patterns = { "? for shortcuts", "auto mode on (shift+tab" },
       strip_patterns = { "auto mode", "token usage" },
       model_patterns = { "sonnet", "opus", "haiku" },
       resume_command = { "claude", "--resume", "{session_id}" },
@@ -115,7 +159,9 @@ config.agent_ui = {
       color = "#3da37a",
       process_names = { "codex" },
       title_patterns = { "codex" },
-      visible_patterns = { "codex", "openai" },
+      visible_patterns = { "openai codex", "codex cli" },
+      running_patterns = { "esc to interrupt" },
+      chrome_patterns = { "send q or ctrl+c to exit" },
       strip_patterns = { "tokens", "context", "approval", "sandbox" },
       model_patterns = { "gpt-5", "gpt-4" },
       resume_command = { "codex", "resume", "{session_id}" },
@@ -152,6 +198,8 @@ config.agent_ui = {
     open_in = "SplitPane",
     split_direction = "Horizontal",
     split_size_percent = 50,
+    tile = "SplitLargest",
+    max_panes_per_tab = 4,
     remote_behavior = "ForceLocal",
     project_markers = { ".git", ".hg", ".svn", ".jj" },
     domain = nil,
@@ -175,19 +223,38 @@ config.agent_telemetry = {
     "InputTokens",
     "OutputTokens",
     "EstimatedCost",
+    -- "TotalTokens" is also accepted, but not on by default
   },
 }
 ```
 
-`agent_ui` enables passive detection for known agent CLIs. Detection checks pane
-user variables first, then the cached foreground process name and pane title,
-then visible text only when earlier trusted signals are insufficient.
+`agent_telemetry` is off by default. Its `fields` list accepts `"Kind"`,
+`"Model"`, `"Status"`, `"InputTokens"`, `"OutputTokens"`, `"TotalTokens"` and
+`"EstimatedCost"`; every one except `"TotalTokens"` is on by default.
+
+`agent_ui` enables passive detection for known agent CLIs.
 If a pane publishes generic agent metadata such as `agent.model` or
 `agent.status` without `agent.kind`, tgzterminal treats it as an unknown
 vendor-neutral agent.
 
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `enabled` | bool | `true` | Master switch for detection and every agent surface. |
+| `show_sidebar_badges` | bool | `true` | |
+| `show_pane_toolbelt` | bool | `true` | |
+| `enable_control_actions` | bool | `false` | Opt-in half of the control-action gate; see below. |
+| `detect_processes` | bool | `true` | When off, only user vars identify an agent — no process, title or visible-text detection, and therefore no inferred status. |
+| `copy_scrollback_lines` | int | `500` | |
+| `waiting_notification` | bool | `true` | |
+| `toolbelt_position` | enum | `"Top"` | `"Top"`, `"Bottom"` |
+| `visible_identity_signals` | int | `2` | Distinct adapter-exclusive patterns that must agree before visible text names an agent. Clamped by how many the adapter declares. |
+| `trust_visible_evidence` | bool | `true` | Whether multi-signal visible-text evidence counts as trusted for control actions. |
+| `pulse_working_dot` | bool | `true` | Pulse the status dot while an agent is Running/Streaming. |
+| `pulse_period_ms` | int | `1600` | One pulse cycle. Clamped to `400..=6000`. |
+
 Each adapter accepts `enabled`, `label`, `short_label`, `color`,
-`process_names`, `title_patterns`, `visible_patterns`, `strip_patterns`, and
+`process_names`, `title_patterns`, `visible_patterns`, `running_patterns`,
+`chrome_patterns`, `strip_patterns`, and
 `model_patterns`. It may also accept action templates: `resume_command`,
 `resume_latest_command`, `attach_command`, `detail_paths`,
 `launch_command`, and `launch_domain`. Pattern entries
@@ -210,15 +277,74 @@ active pane can show a slim toolbelt. `Stop` and copy actions stay user
 initiated. Copy actions read at most `copy_scrollback_lines` recent scrollback
 lines and may include terminal output or secrets printed in that range.
 
-`enable_control_actions` is `false` by default. Resume and log-opening controls
-require trusted process/title/user-variable evidence or an explicit opt-in via
-`agent_ui.enable_control_actions = true` or pane user variable
-`agent.enable_control_actions=true`. Claude log directories are canonicalized
-and must resolve under `~/.claude/projects`. Non-Claude local session or state
-paths are shown as `Details` in the toolbelt.
+`enable_control_actions` is `false` by default. Resume, Attach and log-opening
+controls require **both** an explicit opt-in — `agent_ui.enable_control_actions
+= true` or the pane user variable `agent.enable_control_actions=true` — **and**
+trusted identity evidence. Neither half is sufficient alone. Claude log
+directories are canonicalized and must resolve under `~/.claude/projects`.
+Non-Claude local session or state paths are shown as `Details` in the toolbelt.
 
 `waiting_notification` enables a throttled local toast when an agent appears to
 be waiting for input.
+
+### How an agent is identified
+
+Every signal produces a candidate tagged with the strength of its evidence, and
+the strongest class wins. Within a class, the candidate with the most agreeing
+patterns wins. Adapter table order never decides identity: a genuine tie between
+two adapters yields no agent for the weak classes, and an unnamed generic agent
+for the strong ones.
+
+| Evidence | Source | Trusted for control actions |
+|---|---|---|
+| `UserVar` | `agent.kind` / `agent.adapter` pane user variables | yes |
+| `Process` | foreground process basename matched `process_names` | yes |
+| `TitlePhrase` | a multi-word (or `re:`) `title_patterns` entry matched the pane title | yes |
+| `VisibleChrome` | the adapter's own on-screen chrome, with enough agreeing signals | only if `trust_visible_evidence` |
+| `TitleToken` | a single bare brand word matched the pane title | yes |
+| `Metadata` | generic `agent.*` telemetry with no identity of its own | no |
+
+`TitleToken` deliberately ranks *below* `VisibleChrome`: a pane title is prose
+the user or the agent typed ("fix the amp meter bug"), while an agent's TUI
+furniture is not. This is also what lets a genuine Claude Code pane be
+recognized at all — it runs as `node` and titles its pane with the current task,
+so its own footer is the only durable signal it has.
+
+Pattern conventions, which the built-in defaults follow:
+
+- **`title_patterns`** may contain bare brand tokens. The haystack is one short
+  string, and matching is word-boundary — `amp` no longer fires on `example`,
+  `stamp`, `&amp;`, or `/opt/amp-tools`.
+- **`visible_patterns`** must be phrases or long distinctive compounds, never a
+  bare brand word: the haystack is a whole screen, where words like `cursor`,
+  `codex` and `openai` appear in ordinary output.
+- **`running_patterns`** are printed only while that adapter is working. They
+  drive the Running status and count as identity when no other enabled adapter
+  claims the same string.
+- **`chrome_patterns`** are the adapter's permanent TUI furniture (footer, hint
+  line). Identity only, never status.
+- **`strip_patterns`** are never identity. They are deliberately short and
+  generic (`tokens`, `ctx:`), which is exactly what must not badge a pane.
+
+Visible text only names an agent when at least one `running`/`chrome` pattern
+matched **and** at least `visible_identity_signals` distinct adapter-exclusive
+patterns matched. A pattern claimed by more than one enabled adapter (such as
+`esc to interrupt`) still drives status but carries no identity weight. This is
+why displaying a log, a diff — or this project's own adapter table — does not
+badge the pane.
+
+Once established, a badge only changes on stronger evidence or after two
+consecutive detections agree on a different adapter, so a pane that retitles
+itself every turn does not flicker between agents. An identity is reused when a
+frame finds no fresh evidence, scoped to what earned it: process and user-var
+identities last as long as that anchor is unchanged, title-derived identities die
+with the title they came from, and visible-text identities expire after 30
+seconds and must be re-earned.
+
+Status is inferred from the whole visible region — not a fixed tail — and a
+`Running` reading is held for a 3 second grace period, because agents repaint
+their spinner asynchronously and a frame caught between repaints shows neither a
+marker nor a prompt.
 
 ### Agent launcher
 
@@ -230,7 +356,12 @@ above `+`.
 - Left-click launches the default agent.
 - Alt-click launches it into the *other* target — see `open_in` below.
 - Right-click opens a dropdown listing every installed agent, plus a sticky
-  `Project root` toggle.
+  `Project root` toggle. Clicking an agent row expands it into a submenu of
+  **Split pane** / **Fullscreen** / **New tab**, launching that one agent at
+  the explicit target regardless of `open_in` or Alt.
+- Clicking the launcher button repeatedly tiles agents into the current tab
+  — see "Repeat launches" below — instead of splitting the same pane over
+  and over.
 
 Which agents appear is discovered, not configured: an adapter is offered only if
 it is `enabled` and the first element of its `launch_command` resolves to an
@@ -273,13 +404,48 @@ plain directory names; path-shaped entries such as `../.git` are ignored.
   half, so the agent sits beside the shell it was started from. The shell keeps
   its position; the agent takes the second half.
 - `"NewTab"` — open the agent in its own tab, the pre-`open_in` behavior.
+- `"Zoomed"` — split in like `"SplitPane"`, then zoom the new agent pane so it
+  fills the tab regardless of how many panes were already open. Un-zooming
+  (`Ctrl-Shift-Z`, or `SetPaneZoomState(false)`) restores every pane that was
+  there before, agents included — nothing is closed, only hidden.
 
-Holding **Alt** while clicking uses the other target for that launch only, so
-switching between the two never needs a config edit.
+Holding **Alt** while clicking inverts `"SplitPane"`/`"NewTab"` for that launch
+only, so switching between the two never needs a config edit. Alt-clicking a
+`"Zoomed"` launcher also falls back to `"NewTab"` — `"Zoomed"` has no
+independent "other target" to invert into. The dropdown's per-agent submenu
+(above) always launches at the target you click, ignoring both `open_in` and
+Alt.
 
 `split_direction` is `"Horizontal"` (side by side, default) or `"Vertical"`
 (stacked), and `split_size_percent` is the share given to the agent pane,
-clamped to `5..=95`. Both are ignored when `open_in = "NewTab"`.
+clamped to `5..=95`. Both apply only to the *first* agent launched into a tab;
+both are ignored when `open_in = "NewTab"`.
+
+#### Repeat launches: tiling into one tab
+
+Clicking the launcher (or a submenu's Split/Fullscreen row) a second time in
+the same tab does not re-split the agent you just launched. Instead it splits
+the **largest** eligible pane along its longer axis, so three clicks give an
+even-ish grid rather than three ever-thinner slivers stacked on top of the
+first agent. Eligible panes exclude the worktree/file-browser pane, which is
+never split into.
+
+- `tile` controls this: `"SplitLargest"` (default) picks the largest pane as
+  above; `"ActivePane"` restores the pre-tiling behavior of always splitting
+  whichever pane is currently focused.
+- `max_panes_per_tab` (default `4`, `0` = unlimited) caps how many eligible
+  panes one tab may hold. A launch that would exceed the cap opens a new tab
+  instead of adding another pane. A pane whose resulting half would be too
+  small to use (under roughly 40 columns or 12 rows) also falls back to a new
+  tab rather than producing a sliver.
+- `"Zoomed"` composes with tiling: the new agent is tiled in first, then
+  zoomed. Un-zooming reveals the full tiled grid, not just the pane that was
+  there before the most recent launch.
+
+This applies no new layout engine — it is the same `SplitPane` your other key
+bindings use, aimed at the largest pane instead of the active one. WezTerm's
+existing pane zoom, splits, and sidebar pane rows are what make the tiled
+agents navigable; nothing new is introduced to maintain them.
 
 #### Launching from an SSH pane
 
@@ -528,3 +694,24 @@ rebrand without patching source.
 `CFBundleExecutable` stays `wezterm-gui`, and the internal namespaces
 (`tgzterminal.worktree` user var, `TGZTERMINAL_BIN`, `.cache/tgzterminal`) are
 unaffected by branding.
+
+## What is not configurable
+
+Some sidebar and toolbelt chrome has no config key at all. It is listed here so
+you are not left hunting for one.
+
+| Chrome | What governs it |
+|---|---|
+| Search box | Appears when the sidebar is wider than 96px. The `Search tabs...` placeholder is hardcoded, and steps down to `Search...` / `Search` when the row is narrow. |
+| Auto-hide toggle button | Always drawn alongside the search row. Clicking it persists a value that then overrides `sidebar_auto_hide`. |
+| Worktree button | Appears when the sidebar is wider than 180px; its label ladder and its half of the shared row are computed, not configured. |
+| `+ New Tab` button and label | Always drawn. `new_tab_menu.enabled` controls only the chevron beside it, not the button. |
+| Collapsed icon-rail composition | Derived from the auto-hide state and whether an agent CLI was discovered. Two-character badges come from an adapter's `short_label`. |
+| Toolbelt button labels, sizes and drop order | Hardcoded. When the strip is too narrow buttons are dropped in a fixed order (Input/Compose, then Details, Attach, Resume), and Stop and Copy are the last two standing. |
+| Per-toolbelt-button visibility | **Derived, not configured — there is no `show_stop` / `show_resume`.** `Stop` appears while the agent looks Running/Streaming; `Copy` whenever an agent is detected; `Attach` / `Resume` / `Details` need their action templates *and* the control-action gate; `Input` / `Compose` follow `rich_input.enabled` and `rich_input.docked`. If a button is missing, it is a detection or a gate question — see *How an agent is identified*. |
+| Sidebar spacing, radii and row geometry | Compile-time constants. |
+| Sidebar colors | Derived from the active color scheme. |
+| Worktree picker behavior | No config surface. |
+
+Two keys are accepted by the schema but currently read by no code:
+`file_browser.list_command` and `file_browser.reuse_editor_pane`.

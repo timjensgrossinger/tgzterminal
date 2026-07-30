@@ -36,8 +36,9 @@ use config::keyassignment::{
 };
 use config::window::WindowLevel;
 use config::{
-    configuration, AgentAdapterConfig, AudibleBell, ConfigHandle, Dimension, DimensionContext,
-    FrontEndSelection, GeometryOrigin, GuiPosition, TermConfig, WindowCloseConfirmation,
+    configuration, AgentAdapterConfig, AgentLaunchTarget, AudibleBell, ConfigHandle, Dimension,
+    DimensionContext, FrontEndSelection, GeometryOrigin, GuiPosition, TermConfig,
+    WindowCloseConfirmation,
 };
 use lfucache::*;
 use mlua::{FromLua, LuaSerdeExt, UserData, UserDataFields};
@@ -108,6 +109,7 @@ impl PaneRemoteSignals {
 }
 use wezterm_term::{Alert, Progress, StableRowIndex, TerminalConfiguration, TerminalSize};
 
+mod agent_launch;
 pub mod background;
 pub mod box_model;
 pub mod charselect;
@@ -251,6 +253,15 @@ pub enum UIItemType {
     },
     /// The sticky project-root toggle row in the launch dropdown.
     SidebarAgentMenuProjectRootToggle,
+    /// The "Agent overview" row in the launch dropdown: opens the herd
+    /// overview in the active pane.
+    SidebarAgentMenuHerd,
+    /// An indented target row under an expanded agent in the launch
+    /// dropdown: split / fullscreen (zoomed) / new tab, for that one launch.
+    SidebarAgentMenuTarget {
+        adapter_id: String,
+        target: AgentLaunchTarget,
+    },
     /// Chevron beside the sidebar new-tab button.
     SidebarNewTabMenuButton,
     /// A shell/domain row in the new-tab dropdown.
@@ -307,6 +318,9 @@ pub struct AgentCopyMenuState {
 pub struct AgentLaunchMenuState {
     pub x: usize,
     pub y: usize,
+    /// Adapter id whose target submenu (split / fullscreen / new tab) is
+    /// currently expanded. Only one agent's submenu is open at a time.
+    pub expanded: Option<String>,
 }
 
 /// What a new-tab dropdown row spawns.
@@ -818,14 +832,13 @@ impl TermWindow {
         } else {
             0
         };
+        // Same DPI-scaled rule the paint path uses. Reading the raw config
+        // values here instead made the reserved width disagree with the drawn
+        // width by the whole density factor.
         let sidebar_width = if show_tab_bar && config.sidebar_enabled {
-            if config.sidebar_auto_hide {
-                config.sidebar_collapsed_width_px.max(48)
-            } else {
-                config
-                    .sidebar_width_px
-                    .max(config.sidebar_collapsed_width_px)
-            }
+            crate::termwindow::render::sidebar::sidebar_reserved_width_for_config(
+                &config, dpi as f64,
+            )
         } else {
             0
         };
@@ -4577,6 +4590,9 @@ done
             }
             ToggleDockedInput => {
                 self.toggle_docked_input();
+            }
+            ShowAgentHerd => {
+                self.open_agent_herd(&pane);
             }
             PromptInputLine(args) => self.show_prompt_input_line(args),
             InputSelector(args) => self.show_input_selector(args),

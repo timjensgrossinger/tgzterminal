@@ -57,6 +57,8 @@ impl super::TermWindow {
             | UIItemType::SidebarAgentLaunchButton
             | UIItemType::SidebarAgentMenuItem { .. }
             | UIItemType::SidebarAgentMenuProjectRootToggle
+            | UIItemType::SidebarAgentMenuHerd
+            | UIItemType::SidebarAgentMenuTarget { .. }
             | UIItemType::SidebarNewTabMenuButton
             | UIItemType::SidebarNewTabMenuItem { .. }
             | UIItemType::AgentToolbeltButton { .. }
@@ -86,6 +88,8 @@ impl super::TermWindow {
             | UIItemType::SidebarAgentLaunchButton
             | UIItemType::SidebarAgentMenuItem { .. }
             | UIItemType::SidebarAgentMenuProjectRootToggle
+            | UIItemType::SidebarAgentMenuHerd
+            | UIItemType::SidebarAgentMenuTarget { .. }
             | UIItemType::SidebarNewTabMenuButton
             | UIItemType::SidebarNewTabMenuItem { .. }
             | UIItemType::AgentToolbeltButton { .. }
@@ -336,6 +340,8 @@ impl super::TermWindow {
                         UIItemType::SidebarAgentLaunchButton
                             | UIItemType::SidebarAgentMenuItem { .. }
                             | UIItemType::SidebarAgentMenuProjectRootToggle
+                            | UIItemType::SidebarAgentMenuHerd
+                            | UIItemType::SidebarAgentMenuTarget { .. }
                     )
             );
             if !on_launch_menu {
@@ -588,6 +594,12 @@ impl super::TermWindow {
             UIItemType::SidebarAgentMenuProjectRootToggle => {
                 self.mouse_event_sidebar_agent_menu_project_root_toggle(event, context);
             }
+            UIItemType::SidebarAgentMenuHerd => {
+                self.mouse_event_sidebar_agent_menu_herd(event, context);
+            }
+            UIItemType::SidebarAgentMenuTarget { adapter_id, target } => {
+                self.mouse_event_sidebar_agent_menu_target(&adapter_id, target, event, context);
+            }
             UIItemType::SidebarNewTabMenuButton => {
                 self.mouse_event_sidebar_new_tab_menu_button(item, event, context);
             }
@@ -740,7 +752,7 @@ impl super::TermWindow {
                 if self.agent_launch_menu.take().is_none() {
                     if let Some(entry) = self.agent_launcher_default() {
                         let invert = event.modifiers.contains(KeyModifiers::ALT);
-                        self.launch_agent(&entry, invert);
+                        self.launch_agent(&entry, None, invert);
                     }
                 }
             }
@@ -750,6 +762,7 @@ impl super::TermWindow {
                     None => Some(AgentLaunchMenuState {
                         x: item.x,
                         y: item.y,
+                        expanded: None,
                     }),
                 };
             }
@@ -758,6 +771,10 @@ impl super::TermWindow {
         context.invalidate();
     }
 
+    /// Clicking an agent row expands (or collapses) its Split pane /
+    /// Fullscreen / New tab submenu rather than launching immediately — the
+    /// launcher button itself still launches on a plain click, so the fast
+    /// path is unaffected.
     fn mouse_event_sidebar_agent_menu_item(
         &mut self,
         adapter_id: &str,
@@ -765,10 +782,32 @@ impl super::TermWindow {
         context: &dyn WindowOps,
     ) {
         if event.kind == WMEK::Release(MousePress::Left) {
+            self.pressed_ui_item = None;
+            if let Some(menu) = self.agent_launch_menu.as_mut() {
+                menu.expanded = if menu.expanded.as_deref() == Some(adapter_id) {
+                    None
+                } else {
+                    Some(adapter_id.to_string())
+                };
+            }
+        }
+        context.invalidate();
+    }
+
+    /// A Split pane / Fullscreen / New tab row under an expanded agent:
+    /// launch that one agent at the explicit target, ignoring both the
+    /// configured `open_in` and the Alt-click inversion.
+    fn mouse_event_sidebar_agent_menu_target(
+        &mut self,
+        adapter_id: &str,
+        target: config::AgentLaunchTarget,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        if event.kind == WMEK::Release(MousePress::Left) {
             self.agent_launch_menu = None;
             self.pressed_ui_item = None;
-            let invert = event.modifiers.contains(KeyModifiers::ALT);
-            self.launch_agent_by_id(adapter_id, invert);
+            self.launch_agent_by_id(adapter_id, Some(target), false);
         }
         context.invalidate();
     }
@@ -788,6 +827,7 @@ impl super::TermWindow {
                 None => Some(AgentLaunchMenuState {
                     x: item.x,
                     y: item.y,
+                    expanded: None,
                 }),
             };
         }
@@ -818,6 +858,19 @@ impl super::TermWindow {
             // Deliberately leaves the menu open: the user can see the tick
             // change and then pick an agent in the same interaction.
             self.toggle_agent_launcher_project_root();
+        }
+        context.invalidate();
+    }
+
+    fn mouse_event_sidebar_agent_menu_herd(&mut self, event: MouseEvent, context: &dyn WindowOps) {
+        if event.kind == WMEK::Release(MousePress::Left) {
+            self.pressed_ui_item = None;
+            // Unlike the project-root tick, this navigates away, so the menu
+            // has no reason to stay open.
+            self.agent_launch_menu = None;
+            if let Some(pane) = self.get_active_pane_no_overlay() {
+                self.open_agent_herd(&pane);
+            }
         }
         context.invalidate();
     }

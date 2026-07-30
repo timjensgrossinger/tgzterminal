@@ -1,3 +1,4 @@
+use crate::agent_herd::{HerdStatus, PaneAgentRow};
 use crate::quad::TripleLayerQuadAllocator;
 use crate::spawn::SpawnWhere;
 use crate::tabbar::TabBarItem;
@@ -7,18 +8,19 @@ use crate::termwindow::render::corners::{
 };
 use crate::termwindow::render::RenderScreenLineParams;
 use crate::termwindow::{
-    wsl_paths, AgentCopyAction, AgentLauncherEntry, AgentToolbeltAction, NewTabMenuEntry,
-    NewTabTarget, UIItem, UIItemType,
+    agent_launch, wsl_paths, AgentCopyAction, AgentLauncherEntry, AgentToolbeltAction,
+    NewTabMenuEntry, NewTabTarget, UIItem, UIItemType,
 };
 use config::keyassignment::{SpawnCommand, SpawnTabDomain};
 use config::{
     default_agent_adapters, AgentAdapterConfig, AgentLaunchTarget, AgentRemoteBehavior,
-    AgentSplitDirection, AgentTelemetryField, AgentToolbeltPosition, SidebarPosition,
+    AgentSplitDirection, AgentTelemetryField, AgentToolbeltPosition, ConfigHandle, SidebarPosition,
     SidebarTabDensity, SidebarTabMetadata, SidebarTabTitleSource, TabBarColors,
 };
+use finl_unicode::grapheme_clusters::Graphemes;
 use mux::pane::{CachePolicy, Pane, PaneId};
 use mux::renderable::RenderableDimensions;
-use mux::tab::{PositionedPane, SplitDirection, SplitRequest, SplitSize as MuxSplitSize};
+use mux::tab::{PositionedPane, SplitDirection};
 use mux::Mux;
 use regex::RegexBuilder;
 use std::collections::{HashMap, HashSet};
@@ -28,7 +30,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use std::{env, fs};
-use termwiz::cell::{CellAttributes, Intensity};
+use termwiz::cell::{grapheme_column_width, unicode_column_width, CellAttributes, Intensity};
 use termwiz::color::ColorAttribute;
 use termwiz::surface::{Line, SEQ_ZERO};
 use url::Url;
@@ -48,11 +50,9 @@ const ACTION_ICON_W: f32 = 16.;
 const ACTION_ICON_GAP: f32 = 8.;
 const RADIUS: f32 = 7.;
 const CLOSE_ZONE_W: f32 = 34.;
-// Horizontal space the tab row reserves for the close button when laying out
-// the title text. Smaller than CLOSE_ZONE_W (the hit/hover target) because the
-// × is right-aligned within the zone, so the title can run closer to it before
-// truncating — giving short-sidebar titles more room.
-const CLOSE_TEXT_RESERVE: f32 = 22.;
+/// Gap between the close `×` glyph and the right edge of its zone. The text
+/// reserve is derived from it in `sidebar_close_text_reserve`.
+const CLOSE_GLYPH_INSET: f32 = 6.;
 const SIDEBAR_SCROLLBAR_GUTTER_W: f32 = 30.;
 const SIDEBAR_SCROLLBAR_W: f32 = 10.;
 const SIDEBAR_SCROLLBAR_INSET_Y: f32 = 12.;
@@ -155,6 +155,50 @@ fn lerp_rgba(a: LinearRgba, b: LinearRgba, t: f32) -> LinearRgba {
     )
 }
 
+/// Repaint cadence while a status dot is pulsing. ~30fps is ample for a 1.6s
+/// breath and half the cost of the 16ms drop-flash interval.
+const AGENT_PULSE_FRAME_INTERVAL: Duration = Duration::from_millis(33);
+
+/// Slow pulse in `0.0..=1.0`, smoothstep-eased.
+///
+/// Derived from wall clock so every dot in the window breathes in phase with no
+/// per-dot state. Smoothstep over a triangle wave is continuous in value and
+/// first derivative at the turnaround, so the dot breathes instead of ticking.
+fn agent_pulse_phase(elapsed: Duration, period: Duration) -> f32 {
+    let period_ms = period.as_millis() as f32;
+    if period_ms <= 1. {
+        return 0.;
+    }
+    let t = (elapsed.as_millis() as f32 % period_ms) / period_ms;
+    let triangle = 1. - (2. * t - 1.).abs();
+    triangle * triangle * (3. - 2. * triangle)
+}
+
+/// Accent for an agent status dot.
+///
+/// `pulse` is `None` when nothing should animate. A phase modulates brightness
+/// only, never geometry, so a pulse can never trigger a relayout. Phase 1.0 is
+/// exactly the static colour, so enabling the pulse never makes a dot brighter
+/// than it was before.
+fn agent_status_dot_accent(
+    status: &AgentStatus,
+    base: LinearRgba,
+    surface: LinearRgba,
+    pulse: Option<f32>,
+) -> LinearRgba {
+    let color = if *status == AgentStatus::WaitingForInput {
+        LinearRgba(0.94, 0.72, 0.26, 1.0)
+    } else {
+        base
+    };
+    match pulse {
+        // Breathe between 55% and 100% of the accent against the surface behind
+        // it: enough to read as motion, never dim enough to look disabled.
+        Some(phase) => lerp_rgba(surface, color, 0.55 + 0.45 * phase.clamp(0., 1.)),
+        None => color,
+    }
+}
+
 fn opaque(color: LinearRgba) -> LinearRgba {
     LinearRgba(color.0, color.1, color.2, 1.0)
 }
@@ -240,6 +284,41 @@ fn contains_case_insensitive(haystack: &str, needle: &str) -> bool {
 /// title/visible-text detection paths, where plain substring matching produced
 /// false positives on normal shell / ssh output. `haystack_lower` is assumed
 /// already ASCII-lowercased; `needle` is lowercased here.
+/// Bytes that *glue* a token to a neighbour rather than ending a word: path
+/// separators, hyphenated compounds, HTML entities, dotted identifiers.
+///
+/// Treating them as plain boundaries is why `&amp;`, `/opt/amp-tools` and
+/// `amp-hour` all matched the pattern "amp". They still count as boundaries when
+/// they behave like punctuation — nothing alphanumeric on their far side — so
+/// `starting codex.` keeps matching.
+const WORD_GLUE_BYTES: &[u8] = b"-_/\\.:&;@+#~";
+
+fn word_boundary_before(bytes: &[u8], idx: usize) -> bool {
+    if idx == 0 {
+        return true;
+    }
+    let previous = bytes[idx - 1];
+    !previous.is_ascii_alphanumeric() && !WORD_GLUE_BYTES.contains(&previous)
+}
+
+fn word_boundary_after(bytes: &[u8], end: usize) -> bool {
+    if end >= bytes.len() {
+        return true;
+    }
+    let next = bytes[end];
+    if next.is_ascii_alphanumeric() {
+        return false;
+    }
+    if WORD_GLUE_BYTES.contains(&next) {
+        // Glue only ends a word when nothing follows it, i.e. it is trailing
+        // punctuation rather than joining the token to something else.
+        return bytes
+            .get(end + 1)
+            .is_none_or(|following| !following.is_ascii_alphanumeric());
+    }
+    true
+}
+
 fn contains_word_lower(haystack_lower: &str, needle: &str) -> bool {
     let needle = needle.trim().to_ascii_lowercase();
     if needle.is_empty() {
@@ -249,10 +328,8 @@ fn contains_word_lower(haystack_lower: &str, needle: &str) -> bool {
     let mut start = 0;
     while let Some(pos) = haystack_lower[start..].find(needle.as_str()) {
         let idx = start + pos;
-        let before_ok = idx == 0 || !bytes[idx - 1].is_ascii_alphanumeric();
         let after = idx + needle.len();
-        let after_ok = after >= bytes.len() || !bytes[after].is_ascii_alphanumeric();
-        if before_ok && after_ok {
+        if word_boundary_before(bytes, idx) && word_boundary_after(bytes, after) {
             return true;
         }
         start = idx + 1;
@@ -558,6 +635,316 @@ fn agent_toolbelt_button_area(buttons: &[(&str, AgentToolbeltAction, f32)]) -> f
     let widths = buttons.iter().map(|(_, _, width)| *width).sum::<f32>();
     widths + buttons.len().saturating_sub(1) as f32 * AGENT_TOOLBELT_GAP
 }
+
+/// Order buttons are dropped in when the strip is too narrow, first dropped
+/// first. Stop and Copy are absent on purpose: Stop is the only mouse path to
+/// halt a runaway agent, and Copy is the one action that never needs trust.
+const AGENT_TOOLBELT_TRIM_ORDER: &[AgentToolbeltAction] = &[
+    AgentToolbeltAction::DockInput,
+    AgentToolbeltAction::Compose,
+    AgentToolbeltAction::OpenLogs,
+    AgentToolbeltAction::Attach,
+    AgentToolbeltAction::Resume,
+];
+
+fn trim_agent_toolbelt_buttons(buttons: &mut Vec<(&str, AgentToolbeltAction, f32)>, max_area: f32) {
+    while !buttons.is_empty() && agent_toolbelt_button_area(buttons) > max_area {
+        let remove_idx = AGENT_TOOLBELT_TRIM_ORDER
+            .iter()
+            .find_map(|action| {
+                buttons
+                    .iter()
+                    .position(|(_, candidate, _)| candidate == action)
+            })
+            // Everything droppable is gone: fall back to the rightmost
+            // non-Copy button, then to the last one standing.
+            .or_else(|| {
+                buttons
+                    .iter()
+                    .rposition(|(_, action, _)| action != &AgentToolbeltAction::CopyMenu)
+            })
+            .unwrap_or(buttons.len() - 1);
+        buttons.remove(remove_idx);
+    }
+}
+
+/// Whole glyph cells that fit *entirely* inside `pixel_width`.
+///
+/// `render_screen_line` does not clip glyphs: it stops only once a glyph's left
+/// edge has passed `pixel_width`, so the glyph straddling the boundary is
+/// painted at full size and overhangs the region. Every sidebar caller must
+/// therefore derive its cell count from the same pixel width it passes down.
+/// Returns 0 — draw nothing — for a region narrower than one cell, rather than
+/// forcing a cell that cannot fit.
+fn sidebar_text_cols(pixel_width: f32, cell_width: usize) -> usize {
+    if cell_width == 0 || !pixel_width.is_finite() || pixel_width < cell_width as f32 {
+        return 0;
+    }
+    (pixel_width / cell_width as f32) as usize
+}
+
+/// Longest prefix of `text` occupying at most `cols` terminal columns.
+///
+/// Column-aware rather than char-aware: `Line::resize` truncates the *cell*
+/// vector, so cutting a double-width grapheme leaves the wide cell as the last
+/// cell and it paints a full cell past the region.
+fn truncate_to_cols(text: &str, cols: usize) -> &str {
+    if cols == 0 {
+        return "";
+    }
+    let mut end = 0;
+    let mut width = 0;
+    for grapheme in Graphemes::new(text) {
+        let grapheme_width = grapheme_column_width(grapheme, None);
+        if width + grapheme_width > cols {
+            break;
+        }
+        width += grapheme_width;
+        end += grapheme.len();
+    }
+    &text[..end]
+}
+
+/// Like [`truncate_to_cols`] but keeps the *tail*.
+///
+/// The sidebar search field renders as `"{query}|"`; head-truncating it would
+/// hide the caret the user is typing at.
+fn truncate_to_cols_from_end(text: &str, cols: usize) -> &str {
+    if cols == 0 {
+        return "";
+    }
+    let graphemes: Vec<&str> = Graphemes::new(text).collect();
+    let mut start = text.len();
+    let mut width = 0;
+    for grapheme in graphemes.into_iter().rev() {
+        let grapheme_width = grapheme_column_width(grapheme, None);
+        if width + grapheme_width > cols {
+            break;
+        }
+        width += grapheme_width;
+        start -= grapheme.len();
+    }
+    &text[start..]
+}
+
+/// Widest label variant that fits `cols`, candidates ordered widest first.
+///
+/// The render region hard-truncates to whole cells with no ellipsis, so instead
+/// of letting "Worktree" clip to "Workt" we pick the widest whole variant that
+/// fits. `None` means not even the narrowest rung fits, which callers answer by
+/// drawing their icon or dot alone.
+fn fit_label<'a>(candidates: &[&'a str], cols: usize) -> Option<&'a str> {
+    if cols == 0 {
+        return None;
+    }
+    candidates
+        .iter()
+        .copied()
+        .find(|candidate| unicode_column_width(candidate, None) <= cols)
+}
+
+/// Diameter of an agent status dot. Single source of truth: the sidebar tab
+/// badge and the launcher button used to disagree (a fixed 7px vs a cell-derived
+/// clamp), so the same status read differently in two places.
+fn sidebar_status_dot_size(cell_height: f32) -> f32 {
+    (cell_height * 0.42).clamp(5., 10.)
+}
+
+/// Horizontal space a row reserves for the status dot, dot plus its trailing gap.
+fn sidebar_agent_badge_w(cell_height: f32) -> f32 {
+    sidebar_status_dot_size(cell_height) + GAP
+}
+
+/// Horizontal space a row reserves for the close `×` when laying out text.
+///
+/// Smaller than `CLOSE_ZONE_W` (the hit target) because the glyph is
+/// right-aligned inside that zone, so text may run closer before truncating.
+/// Derived from `cell_width` because the glyph's left edge moves with DPI — the
+/// previous fixed 22px was calibrated for one cell size and under-reserved on
+/// hidpi while wasting room at 1x.
+fn sidebar_close_text_reserve(cell_width: f32) -> f32 {
+    (cell_width + CLOSE_GLYPH_INSET + GAP).min(CLOSE_ZONE_W)
+}
+
+/// Horizontal composition of a sidebar row's leading decorations.
+///
+/// The chevron and the agent status dot are painted *before* the title, so the
+/// title's origin **and** its width must both step past them. Getting only the
+/// width right is what painted the leading "N: " tab index on top of the
+/// chevron and the status dot.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct SidebarRowColumns {
+    /// Only meaningful when `chevron_w > 0`.
+    pub chevron_x: f32,
+    /// Glyph cell plus its trailing gap; the gap itself is not painted.
+    pub chevron_w: f32,
+    /// Only meaningful when `badge_w > 0`.
+    pub badge_x: f32,
+    pub badge_w: f32,
+    /// Shared by the title line and the metadata sub-line.
+    pub text_x: f32,
+    pub text_w: f32,
+}
+
+fn sidebar_row_columns(
+    label_x: f32,
+    label_w: f32,
+    cell_width: f32,
+    cell_height: f32,
+    has_chevron: bool,
+    has_agent_badge: bool,
+) -> SidebarRowColumns {
+    let chevron_w = if has_chevron {
+        cell_width + CHEVRON_GAP
+    } else {
+        0.
+    };
+    let badge_w = if has_agent_badge {
+        sidebar_agent_badge_w(cell_height)
+    } else {
+        0.
+    };
+    let text_x = label_x + chevron_w + badge_w;
+    SidebarRowColumns {
+        chevron_x: label_x,
+        chevron_w,
+        badge_x: label_x + chevron_w,
+        badge_w,
+        text_x,
+        // Clamped at zero rather than at one cell: a region narrower than a
+        // glyph must render nothing, not overhang.
+        text_w: (label_w - chevron_w - badge_w).max(0.),
+    }
+}
+
+/// Vertical composition of a row: y offsets from the row top for the title line
+/// and, when shown, the metadata sub-line.
+fn sidebar_row_text_offsets(
+    row_height: f32,
+    cell_height: f32,
+    show_metadata: bool,
+) -> (f32, Option<f32>) {
+    if show_metadata {
+        // Clamped at the row top: a row too short for two lines (a Compact row
+        // that somehow shows metadata) must start inside itself rather than
+        // drawing the title above the row.
+        let primary = ((row_height - cell_height * 2.) * 0.5).max(0.);
+        (primary, Some(primary + cell_height))
+    } else {
+        (((row_height - cell_height) * 0.5).max(0.), None)
+    }
+}
+
+/// Horizontal composition of the shared Worktree / agent-launcher row.
+///
+/// Both halves derive from one split point so they can never overlap, whichever
+/// side the scrollbar gutter is on (the content column is narrower than the row
+/// and is not centered in it). The two *fills* still reach the row's outer
+/// edges; only the text budgets are confined to the content column.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct SidebarBottomRowLayout {
+    pub worktree_fill_x: f32,
+    pub worktree_fill_w: f32,
+    pub worktree_icon_x: f32,
+    pub worktree_text_x: f32,
+    pub worktree_text_w: f32,
+    pub agent_fill_x: f32,
+    pub agent_fill_w: f32,
+    pub agent_dot_x: f32,
+    pub agent_text_x: f32,
+    pub agent_text_w: f32,
+}
+
+fn sidebar_bottom_row_layout(
+    item_x: f32,
+    item_w: f32,
+    content_x: f32,
+    content_w: f32,
+    dot_size: f32,
+    has_agent: bool,
+) -> SidebarBottomRowLayout {
+    let worktree_icon_x = content_x + PAD_X;
+    if !has_agent {
+        return SidebarBottomRowLayout {
+            worktree_fill_x: item_x,
+            worktree_fill_w: item_w.max(1.),
+            worktree_icon_x,
+            worktree_text_x: worktree_icon_x + ACTION_ICON_W + ACTION_ICON_GAP,
+            worktree_text_w: (content_w - PAD_X * 2. - ACTION_ICON_W - ACTION_ICON_GAP).max(0.),
+            agent_fill_x: 0.,
+            agent_fill_w: 0.,
+            agent_dot_x: 0.,
+            agent_text_x: 0.,
+            agent_text_w: 0.,
+        };
+    }
+
+    let content_half = ((content_w - GAP) * 0.5).max(0.);
+    let agent_x = content_x + content_half + GAP;
+    let agent_w = (content_w - content_half - GAP).max(0.);
+    let agent_dot_x = agent_x + PAD_X;
+    let agent_text_x = agent_dot_x + dot_size + ACTION_ICON_GAP;
+    SidebarBottomRowLayout {
+        worktree_fill_x: item_x,
+        worktree_fill_w: (agent_x - GAP - item_x).max(1.),
+        worktree_icon_x,
+        worktree_text_x: worktree_icon_x + ACTION_ICON_W + ACTION_ICON_GAP,
+        worktree_text_w: (content_half - PAD_X * 2. - ACTION_ICON_W - ACTION_ICON_GAP).max(0.),
+        agent_fill_x: agent_x,
+        // The pill reaches the row's right edge even though the text budget is
+        // confined to the content column.
+        agent_fill_w: (item_x + item_w - agent_x).max(1.),
+        agent_dot_x,
+        agent_text_x,
+        agent_text_w: (agent_x + agent_w - PAD_X - agent_text_x).max(0.),
+    }
+}
+
+/// Density factor applied to the configured sidebar widths.
+///
+/// The config values are calibrated for a 2x display, so a 2x display uses them
+/// verbatim and a 1x display halves them. Free-standing rather than a method so
+/// window creation, which has no `TermWindow` yet, resolves the same width the
+/// paint path will.
+pub(crate) fn sidebar_width_scale_for_dpi(dpi: f64) -> f32 {
+    #[cfg(target_os = "macos")]
+    let base_dpi = 72.0_f32;
+    #[cfg(not(target_os = "macos"))]
+    let base_dpi = 96.0_f32;
+    let backing_scale = (dpi as f32 / base_dpi).max(0.1);
+    (backing_scale / 2.0).clamp(0.5, 1.25)
+}
+
+pub(crate) fn sidebar_collapsed_width_for_config(config: &ConfigHandle, dpi: f64) -> usize {
+    let scaled = (config.sidebar_collapsed_width_px as f32 * sidebar_width_scale_for_dpi(dpi))
+        .round() as usize;
+    if config.sidebar_auto_hide {
+        scaled.max(MIN_AUTO_HIDE_RAIL_W)
+    } else {
+        scaled
+    }
+}
+
+pub(crate) fn sidebar_expanded_width_for_config(config: &ConfigHandle, dpi: f64) -> usize {
+    let scaled =
+        (config.sidebar_width_px as f32 * sidebar_width_scale_for_dpi(dpi)).round() as usize;
+    scaled.max(sidebar_collapsed_width_for_config(config, dpi))
+}
+
+/// Width the window reserves for the sidebar at creation, before any
+/// `TermWindow` exists. Mirrors `sidebar_reserved_width` for the initial frame.
+pub(crate) fn sidebar_reserved_width_for_config(config: &ConfigHandle, dpi: f64) -> usize {
+    if config.sidebar_auto_hide {
+        sidebar_collapsed_width_for_config(config, dpi)
+    } else {
+        sidebar_expanded_width_for_config(config, dpi)
+    }
+}
+
+/// Label ladders for the sidebar's fixed-width buttons, widest first.
+const WORKTREE_LABELS: [&str; 3] = ["Worktree", "Tree", "Wt"];
+const NEW_TAB_LABELS: [&str; 3] = ["+ New Tab", "+ Tab", "+"];
+const SEARCH_PLACEHOLDER_LABELS: [&str; 3] = ["Search tabs...", "Search...", "Search"];
 
 fn compact_label(value: &str, fallback: &str) -> String {
     let label: String = value
@@ -926,36 +1313,6 @@ fn agent_launch_forced_local(behavior: AgentRemoteBehavior, pane_looks_remote: b
     matches!(behavior, AgentRemoteBehavior::ForceLocal) && pane_looks_remote
 }
 
-/// Turn the configured launch target into a spawn target, applying the
-/// Alt-click inversion.
-fn agent_spawn_where(
-    open_in: AgentLaunchTarget,
-    direction: AgentSplitDirection,
-    size_percent: u8,
-    invert_target: bool,
-) -> SpawnWhere {
-    let split = match open_in {
-        AgentLaunchTarget::SplitPane => !invert_target,
-        AgentLaunchTarget::NewTab => invert_target,
-    };
-    if !split {
-        return SpawnWhere::NewTab;
-    }
-    SpawnWhere::SplitPane(SplitRequest {
-        direction: match direction {
-            AgentSplitDirection::Horizontal => SplitDirection::Horizontal,
-            AgentSplitDirection::Vertical => SplitDirection::Vertical,
-        },
-        // The agent goes in the new half, so the shell the user was already
-        // typing in keeps its position.
-        target_is_second: true,
-        // A 0% or 100% split would make one half unusable; the config is free
-        // text so clamp rather than trust it.
-        size: MuxSplitSize::Percent(size_percent.clamp(5, 95)),
-        top_level: false,
-    })
-}
-
 fn is_worktree_pane(pane: &Arc<dyn Pane>) -> bool {
     pane.copy_user_vars().contains_key("tgzterminal.worktree")
         || pane.get_title().trim() == "Worktree"
@@ -1025,6 +1382,53 @@ fn resolve_claude_logs_path_under(home: &Path, cwd: &Path) -> Result<PathBuf, Cl
     Ok(path)
 }
 
+/// Flatten a color to an 8-bit-per-channel sRGB triple.
+///
+/// The overview renders into terminal cells, which take sRGB components, and
+/// `parse_adapter_color` already stores config hex values componentwise, so this
+/// is a plain scale rather than a gamma conversion.
+fn srgb8(color: LinearRgba) -> (u8, u8, u8) {
+    let to_u8 = |v: f32| (v.clamp(0., 1.) * 255.).round() as u8;
+    (to_u8(color.0), to_u8(color.1), to_u8(color.2))
+}
+
+/// Translate pane-detection status into the herd overview's vocabulary.
+///
+/// `Exited` becomes `Done`: from the overview's point of view a finished agent
+/// is a result you haven't collected yet, not an error.
+fn herd_status_from_agent(status: AgentStatus) -> HerdStatus {
+    match status {
+        AgentStatus::Running | AgentStatus::Streaming => HerdStatus::Working,
+        AgentStatus::WaitingForInput => HerdStatus::Blocked,
+        AgentStatus::Idle => HerdStatus::Idle,
+        AgentStatus::Exited => HerdStatus::Done,
+        AgentStatus::Unknown => HerdStatus::Unknown,
+    }
+}
+
+/// Every pid in this pane's foreground process tree.
+///
+/// This is what lets an agent discovered on disk be matched to the pane that
+/// owns it: the agent's own pid is somewhere in this set, usually below a shell
+/// or a `node` wrapper rather than being the process-group leader itself.
+///
+/// `AllowStale` is deliberate — a fresh process walk must never happen on a
+/// per-frame path.
+fn foreground_process_pids(pane: &Arc<dyn Pane>) -> HashSet<u32> {
+    fn flatten(info: &procinfo::LocalProcessInfo, pids: &mut HashSet<u32>) {
+        pids.insert(info.pid);
+        for child in info.children.values() {
+            flatten(child, pids);
+        }
+    }
+
+    let mut pids = HashSet::new();
+    if let Some(info) = pane.get_foreground_process_info(CachePolicy::AllowStale) {
+        flatten(&info, &mut pids);
+    }
+    pids
+}
+
 fn find_git_branch(mut dir: &Path) -> Option<String> {
     loop {
         let git = dir.join(".git");
@@ -1080,12 +1484,21 @@ fn truthy_agent_var(vars: &HashMap<String, String>, key: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Control actions (Resume / Attach / Details) require **both** an explicit
+/// opt-in **and** trusted evidence.
+///
+/// This was previously an OR, which meant trusted evidence alone unlocked
+/// process-spawning actions even with `enable_control_actions = false` — the
+/// opposite of the documented model, and strictly looser than the default the
+/// config comment promises. The per-pane `agent.enable_control_actions` var acts
+/// as the opt-in for a single pane, not as a bypass of the evidence check.
 fn agent_control_actions_allowed(
     config_enabled: bool,
     trusted_controls: bool,
     vars: &HashMap<String, String>,
 ) -> bool {
-    trusted_controls || config_enabled || truthy_agent_var(vars, "agent.enable_control_actions")
+    let opted_in = config_enabled || truthy_agent_var(vars, "agent.enable_control_actions");
+    opted_in && trusted_controls
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1511,6 +1924,16 @@ fn merge_agent_adapter_config(
         } else {
             configured.visible_patterns.clone()
         },
+        running_patterns: if configured.running_patterns.is_empty() {
+            base.running_patterns.clone()
+        } else {
+            configured.running_patterns.clone()
+        },
+        chrome_patterns: if configured.chrome_patterns.is_empty() {
+            base.chrome_patterns.clone()
+        } else {
+            configured.chrome_patterns.clone()
+        },
         strip_patterns: if configured.strip_patterns.is_empty() {
             base.strip_patterns.clone()
         } else {
@@ -1620,6 +2043,12 @@ struct SidebarDropdownRow {
     checkbox: Option<bool>,
     /// Draw a separator band above this row.
     divider_above: bool,
+    /// Indent this row under the item above it, e.g. a launch-target row
+    /// nested under its agent.
+    indent: bool,
+    /// Draw a trailing `>` chevron, marking a row that expands into a
+    /// submenu rather than acting immediately.
+    trailing_chevron: bool,
     item_type: UIItemType,
 }
 
@@ -1705,6 +2134,9 @@ struct AgentActions {
 pub(crate) struct AgentPaneState {
     adapter_id: Option<String>,
     kind: AgentKind,
+    /// What identified this agent. Carried on the state so the cache can decide
+    /// whether the identity may be reused, and whether its trust bit still holds.
+    evidence: AgentEvidence,
     trusted_controls: bool,
     status: AgentStatus,
     model: Option<String>,
@@ -1780,6 +2212,11 @@ pub(crate) struct AgentDetectionCacheEntry {
     state: Option<AgentPaneState>,
     last_wait_notification: Option<Instant>,
     detected_at: Instant,
+    /// When the current status was last observed fresh, for the running grace.
+    status_at: Instant,
+    /// Consecutive detections agreeing on an adapter that is not the
+    /// established one, for the identity switch hysteresis.
+    pending_switch: Option<(String, u32)>,
 }
 
 /// Agent identity carried over from this pane's previous detection.
@@ -1787,17 +2224,8 @@ pub(crate) struct AgentDetectionCacheEntry {
 struct StickyAgentIdentity {
     adapter_id: Option<String>,
     kind: AgentKind,
+    evidence: AgentEvidence,
     trusted_controls: bool,
-}
-
-/// Interactive shells, which never *are* the agent: an agent CLI running in a
-/// shell is the tty's foreground process, so seeing a shell there means no
-/// agent is running in the foreground of that pane.
-fn is_shell_process(name: &str) -> bool {
-    matches!(
-        basename(name).to_ascii_lowercase().as_str(),
-        "bash" | "fish" | "nu" | "powershell" | "pwsh" | "sh" | "zsh" | "csh" | "tcsh" | "ksh"
-    )
 }
 
 /// Identity to reuse when the current frame found no fresh evidence.
@@ -1805,13 +2233,20 @@ fn is_shell_process(name: &str) -> bool {
 /// Title and visible-text evidence are both transient: agents rewrite the pane
 /// title as their task changes, and the identifying startup banner scrolls out
 /// of the visible region. Neither means the agent went away, so the badge must
-/// not flicker off. An unchanged, non-shell foreground process (plus unchanged
-/// agent user vars) is enough to say it is still the same agent, whatever the
-/// title now says. With no such process to anchor on — unknown process, or a
-/// shell-wrapped agent — the stricter "title unchanged" guard is kept.
+/// not flicker off. What it *must not* do is outlive its evidence indefinitely,
+/// which is how one bad frame pinned a wrong badge for the whole life of a
+/// `node` process. So reuse is scoped to the class that earned it:
+///
+/// - process / user-var identities last as long as that anchor is unchanged;
+/// - title-derived identities die with the title they came from, whatever the
+///   process is;
+/// - visible-text and metadata identities expire after a TTL and must be
+///   re-earned.
 fn sticky_agent_identity(
     previous: Option<&AgentDetectionCacheEntry>,
     key: &AgentDetectionCacheKey,
+    now: Instant,
+    trust_visible: bool,
 ) -> Option<StickyAgentIdentity> {
     let entry = previous?;
     let state = entry.state.as_ref()?;
@@ -1821,17 +2256,24 @@ fn sticky_agent_identity(
     {
         return None;
     }
-    let process_anchored = key
-        .foreground_process
-        .as_deref()
-        .is_some_and(|process| !is_shell_process(process));
-    if !process_anchored && previous_key.pane_title != key.pane_title {
+    if !state.evidence.survives_title_change() && previous_key.pane_title != key.pane_title {
         return None;
+    }
+    match state.evidence {
+        AgentEvidence::VisibleChrome | AgentEvidence::Metadata => {
+            if now.duration_since(entry.detected_at) >= AGENT_STICKY_VISIBLE_TTL {
+                return None;
+            }
+        }
+        _ => {}
     }
     Some(StickyAgentIdentity {
         adapter_id: state.adapter_id.clone(),
         kind: state.kind.clone(),
-        trusted_controls: state.trusted_controls,
+        evidence: state.evidence,
+        // Trust never outlives the class that granted it: a bit computed while
+        // `trust_visible_evidence` was on must not survive turning it off.
+        trusted_controls: state.trusted_controls && state.evidence.is_trusted(trust_visible),
     })
 }
 
@@ -1877,17 +2319,252 @@ fn adapter_kind_from_id(id: &str, adapter: &AgentAdapterConfig) -> AgentKind {
     AgentKind::from_adapter_id(id).unwrap_or_else(|| AgentKind::Unknown(adapter_label(adapter, id)))
 }
 
-fn title_agent_hint(title: &str) -> Option<(String, AgentKind)> {
-    let lower = title.to_ascii_lowercase();
-    for (id, adapter) in built_in_agent_adapters() {
-        if adapter.title_patterns.iter().any(|pattern| {
-            let pattern = pattern.trim();
-            !pattern.is_empty() && agent_word_pattern_matches_pre_lowered(&lower, pattern)
-        }) {
-            return Some((id.clone(), adapter_kind_from_id(&id, &adapter)));
+/// Strength of the evidence that identified an agent, strongest first.
+///
+/// `Ord` *is* the precedence policy. Nothing else may reorder candidates — in
+/// particular adapter map order must never decide identity, which is how an
+/// alphabetically-first adapter ("amp") won ties against a correct process-name
+/// match.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum AgentEvidence {
+    /// `agent.kind` / `agent.adapter` user vars.
+    UserVar,
+    /// Foreground process basename matched `process_names`.
+    Process,
+    /// A multi-word `title_patterns` entry matched the pane title.
+    TitlePhrase,
+    /// The adapter's own TUI chrome is on screen, with enough exclusive signals
+    /// agreeing. Cannot be produced by merely echoing a brand name.
+    VisibleChrome,
+    /// A single bare brand token matched the title. A pane title is prose the
+    /// user or the agent typed ("fix the amp meter bug"), so it ranks below the
+    /// running agent's own chrome.
+    TitleToken,
+    /// Generic `agent.*` telemetry with no identity of its own.
+    Metadata,
+}
+
+impl AgentEvidence {
+    /// Evidence classes allowed to unlock Resume/Attach/Details.
+    fn is_trusted(self, trust_visible: bool) -> bool {
+        match self {
+            Self::UserVar | Self::Process | Self::TitlePhrase | Self::TitleToken => true,
+            Self::VisibleChrome => trust_visible,
+            Self::Metadata => false,
         }
     }
-    None
+
+    /// Whether an identity from this class survives a pane retitling itself.
+    ///
+    /// Title-derived identities must not: they were only ever as good as the
+    /// title they came from, and Claude rewrites its title every turn.
+    fn survives_title_change(self) -> bool {
+        !matches!(self, Self::TitlePhrase | Self::TitleToken)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct AgentIdentityCandidate {
+    adapter_id: Option<String>,
+    kind: AgentKind,
+    evidence: AgentEvidence,
+    /// Distinct adapter-exclusive patterns that agreed. Breaks ties *within* one
+    /// evidence class only.
+    signals: u32,
+}
+
+/// Strongest class wins; within a class, most agreeing signals wins.
+///
+/// A genuine tie between two *different* adapters is never broken by ordering:
+/// for the weak classes that shape is precisely the false positive, so it
+/// yields `None`; for strong classes something is certainly there and it yields
+/// an unnamed agent instead of guessing which one.
+fn resolve_agent_identity(
+    mut candidates: Vec<AgentIdentityCandidate>,
+) -> Option<AgentIdentityCandidate> {
+    candidates.sort_by(|a, b| a.evidence.cmp(&b.evidence).then(b.signals.cmp(&a.signals)));
+    let best = candidates.first()?.clone();
+    let tied_other_adapter = candidates
+        .iter()
+        .skip(1)
+        .filter(|candidate| {
+            candidate.evidence == best.evidence && candidate.signals == best.signals
+        })
+        .any(|candidate| candidate.adapter_id != best.adapter_id);
+    if !tied_other_adapter {
+        return Some(best);
+    }
+    match best.evidence {
+        AgentEvidence::UserVar | AgentEvidence::Process | AgentEvidence::TitlePhrase => {
+            Some(AgentIdentityCandidate {
+                adapter_id: None,
+                kind: AgentKind::Unknown("Agent".to_string()),
+                ..best
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Every adapter whose `title_patterns` match, in deterministic order.
+///
+/// A multi-word pattern is a phrase and outranks visible text; a bare token is
+/// weak evidence. Matching is word-boundary in both cases — the plain substring
+/// matcher this path used before made "amp" fire on "example" and "&amp;".
+fn title_agent_candidates(
+    title: &str,
+    adapters: impl Iterator<Item = (String, AgentAdapterConfig)>,
+) -> Vec<AgentIdentityCandidate> {
+    let lower = title.to_ascii_lowercase();
+    let mut candidates = Vec::new();
+    for (id, adapter) in adapters {
+        if !adapter.enabled {
+            continue;
+        }
+        let mut phrase_hits = 0;
+        let mut token_hits = 0;
+        for pattern in &adapter.title_patterns {
+            let pattern = pattern.trim();
+            if pattern.is_empty() || !agent_word_pattern_matches_pre_lowered(&lower, pattern) {
+                continue;
+            }
+            if pattern.starts_with("re:") || pattern.contains(char::is_whitespace) {
+                phrase_hits += 1;
+            } else {
+                token_hits += 1;
+            }
+        }
+        let (evidence, signals) = if phrase_hits > 0 {
+            (AgentEvidence::TitlePhrase, phrase_hits)
+        } else if token_hits > 0 {
+            (AgentEvidence::TitleToken, token_hits)
+        } else {
+            continue;
+        };
+        candidates.push(AgentIdentityCandidate {
+            kind: adapter_kind_from_id(&id, &adapter),
+            adapter_id: Some(id),
+            evidence,
+            signals,
+        });
+    }
+    candidates
+}
+
+/// Lowercased patterns claimed by more than one enabled adapter.
+///
+/// They still drive status but carry zero identity weight: "esc to interrupt" is
+/// printed by Claude, Codex and Copilot alike and cannot say which one it is.
+fn ambiguous_agent_patterns(adapters: &[(String, AgentAdapterConfig)]) -> HashSet<String> {
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    for (_, adapter) in adapters {
+        if !adapter.enabled {
+            continue;
+        }
+        let mut adapter_patterns: HashSet<String> = HashSet::new();
+        for pattern in adapter
+            .visible_patterns
+            .iter()
+            .chain(&adapter.running_patterns)
+            .chain(&adapter.chrome_patterns)
+        {
+            let pattern = pattern.trim().to_ascii_lowercase();
+            if !pattern.is_empty() {
+                adapter_patterns.insert(pattern);
+            }
+        }
+        for pattern in adapter_patterns {
+            *seen.entry(pattern).or_insert(0) += 1;
+        }
+    }
+    seen.into_iter()
+        .filter(|(_, count)| *count > 1)
+        .map(|(pattern, _)| pattern)
+        .collect()
+}
+
+/// Distinct adapter-exclusive visible patterns matching `text_lower`, as
+/// `(identity_total, chrome_or_running_hits)`.
+fn visible_identity_signals(
+    text_lower: &str,
+    adapter: &AgentAdapterConfig,
+    ambiguous: &HashSet<String>,
+) -> (u32, u32) {
+    let mut identity = 0;
+    let mut chrome = 0;
+    let mut matched: HashSet<String> = HashSet::new();
+    let chrome_and_running: HashSet<&String> = adapter
+        .running_patterns
+        .iter()
+        .chain(&adapter.chrome_patterns)
+        .collect();
+    for pattern in adapter
+        .visible_patterns
+        .iter()
+        .chain(&adapter.running_patterns)
+        .chain(&adapter.chrome_patterns)
+    {
+        let trimmed = pattern.trim();
+        let lowered = trimmed.to_ascii_lowercase();
+        if trimmed.is_empty() || ambiguous.contains(&lowered) || !matched.insert(lowered) {
+            continue;
+        }
+        if !agent_word_pattern_matches_pre_lowered(text_lower, trimmed) {
+            continue;
+        }
+        identity += 1;
+        if chrome_and_running.contains(pattern) {
+            chrome += 1;
+        }
+    }
+    (identity, chrome)
+}
+
+/// Adapters whose visible evidence clears the bar, as `VisibleChrome` candidates.
+///
+/// The bar is: at least one chrome/running hit — waived for adapters that
+/// declare none, so user-configured adapters behave as before — plus enough
+/// exclusive hits overall. The chrome requirement is load-bearing: this project's
+/// own config source contains the literals "claude code" and "claude team" on
+/// adjacent lines, so brand phrases alone would badge any pane merely reading it.
+fn visible_agent_candidates(
+    text: &str,
+    adapters: &[(String, AgentAdapterConfig)],
+    ambiguous: &HashSet<String>,
+    min_signals: u32,
+) -> Vec<AgentIdentityCandidate> {
+    let lower = text.to_ascii_lowercase();
+    let mut candidates = Vec::new();
+    for (id, adapter) in adapters {
+        if !adapter.enabled {
+            continue;
+        }
+        let declares_chrome =
+            !adapter.chrome_patterns.is_empty() || !adapter.running_patterns.is_empty();
+        let (identity, chrome) = visible_identity_signals(&lower, adapter, ambiguous);
+        if identity == 0 || (declares_chrome && chrome == 0) {
+            continue;
+        }
+        let exclusive_total = adapter
+            .visible_patterns
+            .iter()
+            .chain(&adapter.running_patterns)
+            .chain(&adapter.chrome_patterns)
+            .filter(|pattern| !ambiguous.contains(&pattern.trim().to_ascii_lowercase()))
+            .count() as u32;
+        // Clamped by what the adapter actually declares, so a custom adapter
+        // with one distinctive string still matches at the default threshold.
+        if identity < min_signals.min(exclusive_total.max(1)) {
+            continue;
+        }
+        candidates.push(AgentIdentityCandidate {
+            kind: adapter_kind_from_id(id, adapter),
+            adapter_id: Some(id.clone()),
+            evidence: AgentEvidence::VisibleChrome,
+            signals: identity,
+        });
+    }
+    candidates
 }
 
 fn visible_agent_kind_hint(text: &str, adapter: Option<&AgentAdapterConfig>) -> Option<String> {
@@ -1918,56 +2595,152 @@ fn visible_model_hint(text: &str, adapter: Option<&AgentAdapterConfig>) -> Optio
         .find(|pattern| agent_pattern_matches_pre_lowered(&lower, pattern))
 }
 
-fn infer_agent_status_from_visible_text(text: &str) -> AgentStatus {
-    let recent: Vec<&str> = text.lines().rev().take(20).collect();
-    // The "esc to interrupt" hint is printed only while the agent is actively
-    // working. It is the authoritative running signal: the input prompt box is
-    // drawn below the spinner, so a bottom-up scan would otherwise read the
-    // prompt and report WaitingForInput mid-run.
-    for line in &recent {
-        let lower = line.to_ascii_lowercase();
-        if lower.contains("esc to interrupt") {
-            return AgentStatus::Running;
-        }
+/// Running markers common to agent CLIs, used when the adapter is unknown or
+/// declares none of its own. Private rather than configurable: these are facts
+/// about how agent TUIs behave, not preferences.
+const GENERIC_AGENT_RUNNING_MARKERS: &[&str] = &[
+    "esc to interrupt",
+    "press esc to stop",
+    "esc to cancel",
+    "ctrl+c to interrupt",
+    "(interrupt)",
+];
+
+/// Spinner glyphs agents lead their working line with.
+const AGENT_SPINNER_GLYPHS: &[char] = &['✻', '✽', '✶', '✷', '✳', '✢', '∗'];
+
+/// How long a `Running` status is held after its marker disappears.
+const AGENT_RUNNING_GRACE: Duration = Duration::from_secs(3);
+
+/// How long a visible-text or metadata identity may be reused without fresh
+/// evidence before it has to be re-earned.
+const AGENT_STICKY_VISIBLE_TTL: Duration = Duration::from_secs(30);
+
+/// Infer status from the pane's visible region.
+///
+/// The previous implementation looked only at the last 20 lines of an up-to-120
+/// *logical* line blob. Wrapped agent output collapses dozens of screen rows into
+/// one logical line and the docked input strip adds trailing lines, so the
+/// running marker routinely fell outside that tail, status went Unknown, and the
+/// Stop button disappeared mid-run. The whole visible region is scanned instead:
+/// it is the live screen, never scrollback, so a marker found there is current by
+/// construction and the input is already bounded.
+fn infer_agent_status_from_visible_text(
+    text: &str,
+    adapter: Option<&AgentAdapterConfig>,
+) -> AgentStatus {
+    let lower = text.to_ascii_lowercase();
+    let adapter_markers = adapter
+        .map(|adapter| adapter.running_patterns.clone())
+        .unwrap_or_default();
+    if adapter_markers
+        .iter()
+        .any(|pattern| agent_pattern_matches_pre_lowered(&lower, pattern))
+    {
+        return AgentStatus::Running;
     }
-    // Spinner glyph on a recent line also indicates active work.
-    for line in &recent {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if matches!(
-            trimmed.chars().next(),
-            Some('✻' | '✽' | '✶' | '✷' | '✳' | '✢' | '∗')
-        ) {
-            return AgentStatus::Running;
-        }
-        break;
+    if GENERIC_AGENT_RUNNING_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
+    {
+        return AgentStatus::Running;
+    }
+    // A spinner anywhere in the last few non-blank lines counts: agents redraw
+    // the spinner and the prompt box independently, so the spinner is not
+    // reliably the very last line.
+    let tail: Vec<&str> = text
+        .lines()
+        .rev()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .take(5)
+        .collect();
+    if tail.iter().any(|line| {
+        line.chars()
+            .next()
+            .is_some_and(|c| AGENT_SPINNER_GLYPHS.contains(&c))
+    }) {
+        return AgentStatus::Running;
     }
     // Otherwise, a bare prompt at the bottom means it is waiting for input.
-    for line in &recent {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if matches!(trimmed, "❯" | ">" | "›")
-            || trimmed.starts_with("❯ ")
-            || trimmed.starts_with("> ")
-            || trimmed.starts_with("› ")
+    if let Some(last) = tail.first() {
+        if matches!(*last, "❯" | ">" | "›")
+            || last.starts_with("❯ ")
+            || last.starts_with("> ")
+            || last.starts_with("› ")
         {
             return AgentStatus::WaitingForInput;
         }
-        break;
     }
     AgentStatus::Unknown
 }
 
+/// Hold `Running` for a short grace period after its marker vanishes.
+///
+/// Agent TUIs repaint the spinner asynchronously, so a frame captured between
+/// redraws shows neither a running marker nor a prompt. Dropping to `Unknown`
+/// there is what made the Stop button flicker. A prompt line or an explicit
+/// `agent.status` ends the grace immediately.
+fn stabilize_agent_status(
+    fresh: AgentStatus,
+    previous: Option<AgentStatus>,
+    previous_at: Option<Instant>,
+    now: Instant,
+    grace: Duration,
+) -> AgentStatus {
+    if fresh != AgentStatus::Unknown {
+        return fresh;
+    }
+    let was_running = matches!(
+        previous,
+        Some(AgentStatus::Running) | Some(AgentStatus::Streaming)
+    );
+    let within_grace = previous_at.is_some_and(|at| now.duration_since(at) < grace);
+    if was_running && within_grace {
+        return previous.unwrap_or(AgentStatus::Unknown);
+    }
+    fresh
+}
+
+/// Whether an established identity may be replaced by a fresh candidate.
+///
+/// Stronger evidence switches immediately; equal-or-weaker evidence must agree
+/// twice in a row. Without this, a pane whose title changes every turn re-rolls
+/// its identity from whatever brand token the new title happens to contain,
+/// which is what made a Claude pane flip to Codex and back.
+fn agent_identity_switch_allowed(
+    established: Option<(&str, AgentEvidence)>,
+    candidate_id: Option<&str>,
+    candidate_evidence: AgentEvidence,
+    agreements: u32,
+) -> bool {
+    let Some((established_id, established_evidence)) = established else {
+        return true;
+    };
+    if candidate_id == Some(established_id) {
+        return true;
+    }
+    candidate_evidence < established_evidence || agreements >= 2
+}
+
 fn should_load_visible_agent_text(
-    matched_without_visible: bool,
+    strongest: Option<AgentEvidence>,
     detect_processes: bool,
     explicit_status: Option<&str>,
 ) -> bool {
-    detect_processes && (!matched_without_visible || explicit_status.is_none())
+    if !detect_processes {
+        return false;
+    }
+    // Loaded for status whenever the pane does not publish one, and for identity
+    // *arbitration* whenever the best evidence so far is weak — a bare title
+    // token must not outvote the running agent's own chrome.
+    explicit_status.is_none()
+        || matches!(
+            strongest,
+            None | Some(AgentEvidence::TitleToken)
+                | Some(AgentEvidence::TitlePhrase)
+                | Some(AgentEvidence::Metadata)
+        )
 }
 
 fn waiting_notification_update(
@@ -2016,42 +2789,17 @@ impl crate::TermWindow {
         }
     }
 
-    /// The configured sidebar widths (`sidebar_width_px` /
-    /// `sidebar_collapsed_width_px`) are calibrated for a 2x (Retina) display.
-    /// On lower-density displays we scale the pixel widths down so the sidebar
-    /// keeps a consistent *physical* size (and a consistent ratio to the
-    /// DPI-scaled font) instead of eating the screen. macOS reports DPI on a
-    /// 72 base (Retina ~144, 1x ~72); other platforms use 96 (Retina ~192).
-    /// The result is clamped so extreme/zero DPIs stay sane.
-    fn sidebar_width_scale(&self) -> f32 {
-        #[cfg(target_os = "macos")]
-        let base_dpi = 72.0_f32;
-        #[cfg(not(target_os = "macos"))]
-        let base_dpi = 96.0_f32;
-        let backing_scale = (self.dimensions.dpi as f32 / base_dpi).max(0.1);
-        (backing_scale / 2.0).clamp(0.5, 1.25)
-    }
-
     fn sidebar_expanded_width(&self) -> usize {
         // A manual drag-resize is an explicit physical-pixel choice by the
         // user, so it is kept verbatim; only the configured default scales.
-        let base = match self.sidebar_drag_width {
-            Some(w) => w,
-            None => {
-                (self.config.sidebar_width_px as f32 * self.sidebar_width_scale()).round() as usize
-            }
-        };
-        base.max(self.sidebar_collapsed_width())
+        match self.sidebar_drag_width {
+            Some(w) => w.max(self.sidebar_collapsed_width()),
+            None => sidebar_expanded_width_for_config(&self.config, self.dimensions.dpi as f64),
+        }
     }
 
     pub fn sidebar_collapsed_width(&self) -> usize {
-        let scaled = (self.config.sidebar_collapsed_width_px as f32 * self.sidebar_width_scale())
-            .round() as usize;
-        if self.config.sidebar_auto_hide {
-            scaled.max(MIN_AUTO_HIDE_RAIL_W)
-        } else {
-            scaled
-        }
+        sidebar_collapsed_width_for_config(&self.config, self.dimensions.dpi as f64)
     }
 
     pub fn sidebar_reserved_width(&self) -> usize {
@@ -2630,13 +3378,28 @@ impl crate::TermWindow {
         self.translate_cwd_for_domain(cwd, target)
     }
 
-    /// Start a fresh agent session in a new tab.
+    /// Start a fresh agent session, placed per `agent_ui.launcher` config
+    /// (a new tab, a split, or a split that gets zoomed), the Alt-click
+    /// inversion, and — for the second and later agent in a tab — the tile
+    /// policy that spreads repeat launches across an even-ish grid instead
+    /// of nondeterministically halving whatever pane a previous launch made
+    /// active.
+    ///
+    /// `override_target` is the explicit target chosen from the launcher's
+    /// submenu (Split pane / Fullscreen / New tab); it wins over both the
+    /// configured `open_in` and the Alt-click inversion. Pass `None` for the
+    /// plain-click/Alt-click path.
     ///
     /// The argv comes only from config (built-in defaults or user Lua), never
     /// from pane text, and the action is always user-initiated — so unlike
     /// Resume/Attach this is deliberately not gated by
     /// `agent_ui.enable_control_actions`.
-    pub fn launch_agent(&mut self, entry: &AgentLauncherEntry, invert_target: bool) {
+    pub fn launch_agent(
+        &mut self,
+        entry: &AgentLauncherEntry,
+        override_target: Option<AgentLaunchTarget>,
+        invert_target: bool,
+    ) {
         if entry.argv.is_empty() {
             return;
         }
@@ -2646,44 +3409,88 @@ impl crate::TermWindow {
         // drop the cwd entirely whenever the target domain differs.
         let domain = self.agent_launch_domain(entry, forced_local);
         let cwd = self.agent_launch_cwd(&domain, forced_local);
-        let spawn_where = self.agent_spawn_where(invert_target);
-        self.spawn_command(
-            &SpawnCommand {
+        let placement = self.agent_launch_placement(invert_target, override_target);
+        self.spawn_agent(
+            SpawnCommand {
                 label: Some(format!("{} agent", entry.label)),
                 args: Some(entry.argv.clone()),
                 cwd,
                 domain,
                 ..Default::default()
             },
-            spawn_where,
+            placement,
         );
     }
 
-    /// Resolve `agent_ui.launcher.open_in` into a spawn target.
-    ///
-    /// `invert_target` is the Alt-click escape hatch: whichever target is
-    /// configured, holding Alt gets the other one for that launch only, so
-    /// switching between "beside this shell" and "its own tab" never requires
-    /// a config edit.
-    fn agent_spawn_where(&self, invert_target: bool) -> SpawnWhere {
+    /// Resolve `agent_ui.launcher.open_in` (plus the Alt-click inversion or
+    /// an explicit submenu override) into a concrete `AgentPlacement`,
+    /// using the active tab's current panes for tiling geometry.
+    fn agent_launch_placement(
+        &self,
+        invert_target: bool,
+        override_target: Option<AgentLaunchTarget>,
+    ) -> agent_launch::AgentPlacement {
         let launcher = &self.config.agent_ui.launcher;
-        agent_spawn_where(
-            launcher.open_in,
-            launcher.split_direction,
+        let target =
+            agent_launch::resolve_launch_target(launcher.open_in, invert_target, override_target);
+
+        let mux = Mux::get();
+        let Some(tab) = mux.get_active_tab_for_window(self.mux_window_id) else {
+            return agent_launch::AgentPlacement::NewTab;
+        };
+        let Some(active_pane) = tab.get_active_pane() else {
+            return agent_launch::AgentPlacement::NewTab;
+        };
+
+        // A pane half narrower than this or shorter than this is not worth
+        // tiling into; the launch falls back to a new tab instead.
+        const MIN_TILE_COLUMNS: usize = 40;
+        const MIN_TILE_ROWS: usize = 12;
+        let cell_width = self.render_metrics.cell_size.width as usize;
+        let cell_height = self.render_metrics.cell_size.height as usize;
+
+        let eligible_panes: Vec<agent_launch::PaneGeom> = tab
+            .iter_panes_ignoring_zoom()
+            .into_iter()
+            .filter(|pos| !is_worktree_pane(&pos.pane))
+            .map(|pos| agent_launch::PaneGeom {
+                pane_id: pos.pane.pane_id(),
+                index: pos.index,
+                pixel_width: pos.pixel_width,
+                pixel_height: pos.pixel_height,
+            })
+            .collect();
+
+        agent_launch::agent_placement(
+            target,
+            launcher.tile,
+            match launcher.split_direction {
+                AgentSplitDirection::Horizontal => SplitDirection::Horizontal,
+                AgentSplitDirection::Vertical => SplitDirection::Vertical,
+            },
             launcher.split_size_percent,
-            invert_target,
+            launcher.max_panes_per_tab,
+            active_pane.pane_id(),
+            &eligible_panes,
+            cell_width * MIN_TILE_COLUMNS,
+            cell_height * MIN_TILE_ROWS,
         )
     }
 
     /// Launch the agent with the given adapter id, if it is still installed.
-    pub fn launch_agent_by_id(&mut self, adapter_id: &str, invert_target: bool) {
+    pub fn launch_agent_by_id(
+        &mut self,
+        adapter_id: &str,
+        target: Option<AgentLaunchTarget>,
+        invert_target: bool,
+    ) {
         let entry = self
             .agent_launcher_entries()
             .iter()
             .find(|entry| entry.adapter_id == adapter_id)
             .cloned();
         if let Some(entry) = entry {
-            self.launch_agent(&entry, invert_target);
+            self.launch_agent(&entry, target, invert_target);
         }
     }
 
@@ -2699,36 +3506,34 @@ impl crate::TermWindow {
         self.agent_launcher_project_root
     }
 
-    fn configured_agent_match(
-        &self,
-        process: Option<&str>,
-        title: &str,
-    ) -> Option<(String, AgentKind)> {
-        let process = process.map(|process| basename(process).to_ascii_lowercase());
-        let title = title.to_ascii_lowercase();
-
+    /// Adapters whose `process_names` match the pane's foreground process.
+    ///
+    /// Separated from the title path, which it previously shared: bundling both
+    /// into one Option let a weak title hit on an earlier adapter mask a correct
+    /// process match on a later one.
+    fn process_agent_candidate(&self, process: Option<&str>) -> Vec<AgentIdentityCandidate> {
+        let Some(process) = process.map(|process| basename(process).to_ascii_lowercase()) else {
+            return Vec::new();
+        };
+        let mut candidates = Vec::new();
         for (id, adapter) in self.merged_agent_adapters().iter().cloned() {
             if !adapter.enabled {
                 continue;
             }
-            if let Some(process) = &process {
-                if adapter
-                    .process_names
-                    .iter()
-                    .any(|name| basename(name).eq_ignore_ascii_case(process))
-                {
-                    return Some((id.clone(), adapter_kind_from_id(&id, &adapter)));
-                }
-            }
-            if adapter.title_patterns.iter().any(|pattern| {
-                let pattern = pattern.trim();
-                !pattern.is_empty() && agent_pattern_matches(&title, pattern)
-            }) {
-                return Some((id.clone(), adapter_kind_from_id(&id, &adapter)));
+            if adapter
+                .process_names
+                .iter()
+                .any(|name| basename(name).eq_ignore_ascii_case(&process))
+            {
+                candidates.push(AgentIdentityCandidate {
+                    kind: adapter_kind_from_id(&id, &adapter),
+                    adapter_id: Some(id),
+                    evidence: AgentEvidence::Process,
+                    signals: 1,
+                });
             }
         }
-
-        None
+        candidates
     }
 
     fn agent_supported_actions(
@@ -2793,6 +3598,113 @@ impl crate::TermWindow {
         self.detect_agent_pane(pane).is_some()
     }
 
+    /// Open the agent herd overview as an overlay over `pane`.
+    ///
+    /// Everything the overview needs from the GUI thread — colors, the first
+    /// pane snapshot, the project to scope to — is gathered here, before the
+    /// overlay thread starts. After that the overlay pulls fresh pane data
+    /// through `TermWindowNotif::Apply`.
+    pub(crate) fn open_agent_herd(&mut self, pane: &Arc<dyn Pane>) {
+        let Some(window) = self.window.clone() else {
+            return;
+        };
+
+        let cwd = pane_working_dir(pane);
+        let current_project = cwd.as_deref().and_then(crate::agent_herd::project_root_for);
+        let args = crate::overlay::agent_herd::HerdArgs {
+            theme: self.agent_herd_theme(),
+            view: crate::agent_herd::HerdView::CurrentProject,
+            // With no repo root we would filter against nothing and show an
+            // empty list, so fall back to the plain cwd.
+            current_project: current_project.or(cwd),
+            refresh: Duration::from_millis(500),
+            include_subagents: true,
+            read_claude_sessions: true,
+            initial_panes: self.agent_herd_pane_rows(),
+        };
+
+        let (overlay, future) =
+            crate::overlay::start_overlay_pane(self, pane, move |_pane_id, term| {
+                crate::overlay::agent_herd::agent_herd_overview(window, term, args)
+            });
+        self.assign_overlay_for_pane(pane.pane_id(), overlay);
+        promise::spawn::spawn(future).detach();
+    }
+
+    /// Colors for the herd overview, resolved here so the overview's own thread
+    /// never reads config or the palette.
+    pub(crate) fn agent_herd_theme(&self) -> crate::overlay::agent_herd::HerdTheme {
+        let mut adapter_colors = HashMap::new();
+        for (id, adapter) in self.merged_agent_adapters().iter() {
+            let kind = AgentKind::from_adapter_id(id)
+                .unwrap_or_else(|| AgentKind::Unknown(id.to_string()));
+            adapter_colors.insert(id.to_string(), srgb8(adapter_color(Some(adapter), &kind)));
+        }
+
+        let colors = self
+            .config
+            .resolved_palette
+            .tab_bar
+            .clone()
+            .unwrap_or_else(TabBarColors::default);
+        crate::overlay::agent_herd::HerdTheme {
+            adapter_colors,
+            attention: crate::agent_herd::ATTENTION_RGB,
+            dim: srgb8(colors.inactive_tab().fg_color.to_linear()),
+            accent: srgb8(colors.active_tab().fg_color.to_linear()),
+        }
+    }
+
+    /// Snapshot every detected agent pane in this window's workspace for the
+    /// herd overview.
+    ///
+    /// Lives here rather than in `agent_herd` because `AgentPaneState`'s fields
+    /// are private to this module. Must run on the GUI thread — it touches the
+    /// mux and the detection cache, so the overview thread reaches it through
+    /// `TermWindowNotif::Apply`.
+    ///
+    /// Cost is bounded by `detect_agent_pane`'s 500 ms cache, so polling this a
+    /// couple of times a second does no filesystem work per call.
+    pub(crate) fn agent_herd_pane_rows(&self) -> Vec<PaneAgentRow> {
+        let mux = Mux::get();
+        let workspace = mux.active_workspace();
+        let mut rows = Vec::new();
+
+        for window_id in mux.iter_windows_in_workspace(&workspace) {
+            // Clone the tabs out before doing any work: `get_window` holds a
+            // read guard over the mux.
+            let tabs: Vec<Arc<mux::tab::Tab>> = match mux.get_window(window_id) {
+                Some(window) => window.iter().cloned().collect(),
+                None => continue,
+            };
+            for tab in tabs {
+                for pos in tab.iter_panes_ignoring_zoom() {
+                    let Some(agent) = self.detect_agent_pane(&pos.pane) else {
+                        continue;
+                    };
+                    let cwd = agent.cwd.clone().or_else(|| pane_working_dir(&pos.pane));
+                    rows.push(PaneAgentRow {
+                        pane_id: pos.pane.pane_id(),
+                        provider: agent
+                            .adapter_id
+                            .clone()
+                            .or_else(|| Some(agent.kind.label().to_ascii_lowercase())),
+                        title: pos.pane.get_title(),
+                        status: herd_status_from_agent(agent.status),
+                        model: agent.model.clone(),
+                        session_id: agent.session_id.clone(),
+                        project_root: cwd.as_deref().and_then(crate::agent_herd::project_root_for),
+                        git_branch: cwd.as_deref().and_then(find_git_branch),
+                        cwd,
+                        pids: foreground_process_pids(&pos.pane),
+                    });
+                }
+            }
+        }
+
+        rows
+    }
+
     fn detect_agent_pane(&self, pane: &Arc<dyn Pane>) -> Option<AgentPaneState> {
         if !self.config.agent_ui.enabled {
             return None;
@@ -2837,54 +3749,53 @@ impl crate::TermWindow {
         }
 
         let explicit_adapter_id = user_var(&vars, "agent.adapter").map(str::to_ascii_lowercase);
-        let explicit_kind = user_var(&vars, "agent.kind").map(|kind| {
-            let merged = self.merged_agent_adapters();
-            let resolved = AgentKind::from_hint_with_adapters(kind, &merged)
+        let merged_adapters = self.merged_agent_adapters();
+        let mut candidates: Vec<AgentIdentityCandidate> = Vec::new();
+        if let Some(kind) = user_var(&vars, "agent.kind") {
+            let resolved = AgentKind::from_hint_with_adapters(kind, &merged_adapters)
                 .unwrap_or_else(|| AgentKind::from_user_var(kind));
             let adapter_id = explicit_adapter_id
                 .clone()
                 .or_else(|| resolved.config_key().map(ToString::to_string));
-            (adapter_id, resolved)
-        });
-        let configured_kind = if self.config.agent_ui.detect_processes {
-            self.configured_agent_match(foreground_process.as_deref(), &pane_title)
-                .map(|(id, kind)| (Some(id), kind))
-        } else {
-            None
-        };
-        let title_kind = if self.config.agent_ui.detect_processes {
-            title_agent_hint(&pane_title).map(|(id, kind)| (Some(id), kind))
-        } else {
-            None
-        };
-        let metadata_kind = if has_agent_metadata_evidence(&vars) {
-            Some((None, AgentKind::Unknown("Agent".to_string())))
-        } else {
-            None
-        };
+            candidates.push(AgentIdentityCandidate {
+                signals: if explicit_adapter_id.is_some() { 2 } else { 1 },
+                adapter_id,
+                kind: resolved,
+                evidence: AgentEvidence::UserVar,
+            });
+        }
+        if self.config.agent_ui.detect_processes {
+            candidates.extend(self.process_agent_candidate(foreground_process.as_deref()));
+            candidates.extend(title_agent_candidates(
+                &pane_title,
+                merged_adapters.iter().cloned(),
+            ));
+        }
+        if has_agent_metadata_evidence(&vars) {
+            candidates.push(AgentIdentityCandidate {
+                adapter_id: None,
+                kind: AgentKind::Unknown("Agent".to_string()),
+                evidence: AgentEvidence::Metadata,
+                signals: 1,
+            });
+        }
         let explicit_status = user_var(&vars, "agent.status");
-        let matched_without_visible = explicit_kind
-            .as_ref()
-            .or(title_kind.as_ref())
-            .or(configured_kind.as_ref())
-            .or(metadata_kind.as_ref())
-            .is_some();
-        let visible_kind = if should_load_visible_agent_text(
-            matched_without_visible,
+        let strongest = candidates.iter().map(|c| c.evidence).min();
+        if should_load_visible_agent_text(
+            strongest,
             self.config.agent_ui.detect_processes,
             explicit_status,
         ) {
             visible_text = self.visible_agent_text(pane);
             visible_text_loaded = true;
-            if !matched_without_visible {
-                self.visible_agent_match(&visible_text)
-                    .map(|(id, kind)| (Some(id), kind))
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+            let ambiguous = ambiguous_agent_patterns(&merged_adapters);
+            candidates.extend(visible_agent_candidates(
+                &visible_text,
+                &merged_adapters,
+                &ambiguous,
+                self.config.agent_ui.visible_identity_signals as u32,
+            ));
+        }
         let visible_fingerprint = if visible_text_loaded {
             visible_text_fingerprint(&visible_text)
         } else {
@@ -2899,25 +3810,83 @@ impl crate::TermWindow {
                 return entry.state.clone();
             }
         }
-        let evidence_trusted = explicit_kind.is_some()
-            || title_kind.is_some()
-            || configured_kind.is_some()
-            || truthy_agent_var(&vars, "agent.enable_control_actions");
-        let fresh_identity = explicit_kind
-            .or(title_kind)
-            .or(configured_kind)
-            .or(visible_kind)
-            .or(metadata_kind);
+        let trust_visible = self.config.agent_ui.trust_visible_evidence;
+        let mut fresh_identity = resolve_agent_identity(candidates);
         // Sticky detection: a pane previously detected as an agent should not
         // vanish because the identifying banner scrolled out of the visible
         // region, nor because the agent rewrote the pane title to name its
         // current task. Reusing only the *identity* (not the whole cached
         // state) keeps status, model and telemetry live.
-        let sticky_identity = if fresh_identity.is_none() {
-            sticky_agent_identity(previous_entry.as_ref(), &cache_key)
-        } else {
-            None
-        };
+        let sticky_identity = sticky_agent_identity(
+            previous_entry.as_ref(),
+            &cache_key,
+            Instant::now(),
+            trust_visible,
+        );
+
+        // Identity hysteresis: an established badge only changes on stronger
+        // evidence, or on two consecutive detections agreeing. Otherwise a pane
+        // that retitles itself every turn re-rolls its identity from whatever
+        // brand token the new title happens to contain.
+        let established = previous_entry
+            .as_ref()
+            .and_then(|entry| entry.state.as_ref())
+            .and_then(|state| state.adapter_id.as_deref().map(|id| (id, state.evidence)));
+        let mut pending_switch = previous_entry
+            .as_ref()
+            .and_then(|entry| entry.pending_switch.clone());
+        if let Some(candidate) = fresh_identity.clone() {
+            let candidate_id = candidate.adapter_id.as_deref();
+            let disagrees = established
+                .map(|(id, _)| Some(id) != candidate_id)
+                .unwrap_or(false);
+            let agreements = match (&mut pending_switch, candidate_id) {
+                (Some((pending_id, count)), Some(id)) if pending_id == id => {
+                    *count += 1;
+                    *count
+                }
+                (_, Some(id)) if disagrees => {
+                    pending_switch = Some((id.to_string(), 1));
+                    1
+                }
+                _ => {
+                    pending_switch = None;
+                    1
+                }
+            };
+            if !agent_identity_switch_allowed(
+                established,
+                candidate_id,
+                candidate.evidence,
+                agreements,
+            ) {
+                // Hold the established identity for this frame; the counter
+                // above decides whether the next one flips it. Substituted
+                // explicitly rather than left to the sticky path, which would
+                // return nothing for a title-derived identity whose title just
+                // changed — blinking the badge off is worse than flipping it.
+                fresh_identity = previous_entry
+                    .as_ref()
+                    .and_then(|entry| entry.state.as_ref())
+                    .map(|state| AgentIdentityCandidate {
+                        adapter_id: state.adapter_id.clone(),
+                        kind: state.kind.clone(),
+                        evidence: state.evidence,
+                        signals: 1,
+                    });
+            } else if !disagrees {
+                pending_switch = None;
+            }
+        }
+
+        let evidence = fresh_identity
+            .as_ref()
+            .map(|candidate| candidate.evidence)
+            .or(sticky_identity.as_ref().map(|sticky| sticky.evidence));
+        // `agent.enable_control_actions` is the per-pane *opt-in*, checked in
+        // `agent_control_actions_allowed`; it is deliberately not evidence, so a
+        // pane cannot vouch for its own identity by asking for permission.
+        let evidence_trusted = evidence.is_some_and(|evidence| evidence.is_trusted(trust_visible));
         let trusted_controls = evidence_trusted
             || sticky_identity
                 .as_ref()
@@ -2927,8 +3896,10 @@ impl crate::TermWindow {
             trusted_controls,
             &vars,
         );
+        let evidence = evidence.unwrap_or(AgentEvidence::Metadata);
 
         let Some((adapter_id, kind)) = fresh_identity
+            .map(|candidate| (candidate.adapter_id, candidate.kind))
             .or_else(|| sticky_identity.map(|sticky| (sticky.adapter_id, sticky.kind)))
         else {
             self.agent_detection_cache.borrow_mut().insert(
@@ -2938,6 +3909,8 @@ impl crate::TermWindow {
                     state: None,
                     last_wait_notification: previous_wait_notification,
                     detected_at: Instant::now(),
+                    status_at: Instant::now(),
+                    pending_switch: None,
                 },
             );
             return None;
@@ -2956,6 +3929,8 @@ impl crate::TermWindow {
                     state: None,
                     last_wait_notification: previous_wait_notification,
                     detected_at: Instant::now(),
+                    status_at: Instant::now(),
+                    pending_switch: None,
                 },
             );
             return None;
@@ -2968,18 +3943,41 @@ impl crate::TermWindow {
                     state: None,
                     last_wait_notification: previous_wait_notification,
                     detected_at: Instant::now(),
+                    status_at: Instant::now(),
+                    pending_switch: None,
                 },
             );
             return None;
         }
 
         let cwd = pane_working_dir(pane);
-        let status = if explicit_status.is_some() {
+        let previous_state = previous_entry
+            .as_ref()
+            .and_then(|entry| entry.state.as_ref());
+        let fresh_status = if explicit_status.is_some() {
             AgentStatus::from_hint(explicit_status)
         } else if visible_text_loaded {
-            infer_agent_status_from_visible_text(&visible_text)
+            infer_agent_status_from_visible_text(&visible_text, adapter.as_ref())
         } else {
             AgentStatus::Unknown
+        };
+        let now = Instant::now();
+        let status = stabilize_agent_status(
+            fresh_status.clone(),
+            previous_state.map(|state| state.status.clone()),
+            previous_entry.as_ref().map(|entry| entry.status_at),
+            now,
+            AGENT_RUNNING_GRACE,
+        );
+        // Only a *fresh* observation refreshes the grace window; carrying the
+        // old timestamp forward is what makes the grace expire.
+        let status_at = if fresh_status == AgentStatus::Unknown {
+            previous_entry
+                .as_ref()
+                .map(|entry| entry.status_at)
+                .unwrap_or(now)
+        } else {
+            now
         };
         let actions = self.agent_supported_actions(
             adapter_id.as_deref(),
@@ -2997,6 +3995,7 @@ impl crate::TermWindow {
         let state = Some(AgentPaneState {
             adapter_id: adapter_id.clone(),
             kind,
+            evidence,
             trusted_controls: control_actions_allowed,
             status,
             model,
@@ -3044,6 +4043,8 @@ impl crate::TermWindow {
                 state: state.clone(),
                 last_wait_notification,
                 detected_at: Instant::now(),
+                status_at,
+                pending_switch,
             },
         );
         state
@@ -3750,6 +4751,27 @@ impl crate::TermWindow {
         self.detect_agent_pane(&pane)
     }
 
+    /// Phase to draw this agent's status dot at, or `None` when it must not
+    /// animate.
+    ///
+    /// Registering a next-frame deadline is what keeps the pulse going, so the
+    /// early returns are also the cost control: with nothing working, nothing is
+    /// scheduled and the window falls back to event-driven repaints. Unfocused
+    /// windows return `None` rather than freezing at whatever brightness the
+    /// last frame happened to catch (the frame scheduler ignores unfocused
+    /// windows anyway).
+    fn agent_dot_pulse(&self, agent: &AgentPaneState) -> Option<f32> {
+        if !self.config.agent_ui.pulse_working_dot || self.focused.is_none() {
+            return None;
+        }
+        if !matches!(agent.status, AgentStatus::Running | AgentStatus::Streaming) {
+            return None;
+        }
+        let period = Duration::from_millis(self.config.agent_ui.pulse_period_ms.clamp(400, 6000));
+        self.update_next_frame_time(Some(Instant::now() + AGENT_PULSE_FRAME_INTERVAL));
+        Some(agent_pulse_phase(self.created.elapsed(), period))
+    }
+
     fn sidebar_primary_pane_for_tab_idx(&self, tab_idx: usize) -> Option<Arc<dyn Pane>> {
         let tab = Mux::get()
             .get_window(self.mux_window_id)
@@ -3954,15 +4976,7 @@ impl crate::TermWindow {
                 (label, action, width)
             })
             .collect::<Vec<_>>();
-        while !visible_buttons.is_empty()
-            && agent_toolbelt_button_area(&visible_buttons) > max_button_area
-        {
-            let remove_idx = visible_buttons
-                .iter()
-                .rposition(|(_, action, _)| action != &AgentToolbeltAction::CopyMenu)
-                .unwrap_or(visible_buttons.len() - 1);
-            visible_buttons.remove(remove_idx);
-        }
+        trim_agent_toolbelt_buttons(&mut visible_buttons, max_button_area);
         if visible_buttons.is_empty() {
             return Ok(());
         }
@@ -3993,11 +5007,16 @@ impl crate::TermWindow {
         let bg = opaque(inactive_tab.bg_color.to_linear());
         let hover_bg = lerp_rgba(bg, fg, 0.18);
         let pressed_bg = lerp_rgba(bg, fg, 0.28);
-        let accent = if agent.status == AgentStatus::WaitingForInput {
-            LinearRgba(0.94, 0.72, 0.26, 1.0)
-        } else {
-            adapter_color(adapter.as_ref(), &agent.kind)
-        };
+        let accent = agent_status_dot_accent(
+            &agent.status,
+            adapter_color(adapter.as_ref(), &agent.kind),
+            bg,
+            None,
+        );
+        // The dot breathes while the agent works; the rest of the strip keeps
+        // the steady accent so button text and borders do not shimmer.
+        let dot_accent =
+            agent_status_dot_accent(&agent.status, accent, bg, self.agent_dot_pulse(&agent));
 
         self.sidebar_rounded_fill(
             layers,
@@ -4016,7 +5035,7 @@ impl crate::TermWindow {
                 dot_size,
             ),
             dot_size * 0.5,
-            accent,
+            dot_accent,
         )?;
 
         let palette = self.palette().clone();
@@ -4033,14 +5052,18 @@ impl crate::TermWindow {
                            default_bg: LinearRgba,
                            bold: bool|
          -> anyhow::Result<()> {
-            let cols = (pixel_width / cell_width as f32).max(1.) as usize;
+            let cols = sidebar_text_cols(pixel_width, cell_width);
+            if cols == 0 {
+                return Ok(());
+            }
+            let text = truncate_to_cols(text, cols);
             let mut attrs = CellAttributes::default();
             attrs.set_foreground(ColorAttribute::TrueColorWithDefaultFallback(fg.to_srgb()));
             if bold {
                 attrs.set_intensity(Intensity::Bold);
             }
             let mut line = Line::from_text(text, &attrs, 1, None);
-            line.resize(cols.max(1), SEQ_ZERO);
+            line.resize(cols, SEQ_ZERO);
             this.render_screen_line(
                 RenderScreenLineParams {
                     top_pixel_y: y,
@@ -4252,11 +5275,15 @@ impl crate::TermWindow {
                            fg: LinearRgba,
                            default_bg: LinearRgba|
          -> anyhow::Result<()> {
-            let cols = (pixel_width / cell_width as f32).max(1.) as usize;
+            let cols = sidebar_text_cols(pixel_width, cell_width as usize);
+            if cols == 0 {
+                return Ok(());
+            }
+            let text = truncate_to_cols(text, cols);
             let mut attrs = CellAttributes::default();
             attrs.set_foreground(ColorAttribute::TrueColorWithDefaultFallback(fg.to_srgb()));
             let mut line = Line::from_text(text, &attrs, 1, None);
-            line.resize(cols.max(1), SEQ_ZERO);
+            line.resize(cols, SEQ_ZERO);
             this.render_screen_line(
                 RenderScreenLineParams {
                     top_pixel_y: y,
@@ -4357,7 +5384,9 @@ impl crate::TermWindow {
     }
 
     /// Dropdown opened from the sidebar agent launch button: one row per
-    /// installed agent, plus the sticky project-root toggle.
+    /// installed agent (each expandable into a Split pane / Fullscreen / New
+    /// tab submenu for that one launch), plus the sticky project-root
+    /// toggle.
     pub fn paint_agent_launch_menu(
         &mut self,
         layers: &mut TripleLayerQuadAllocator,
@@ -4373,24 +5402,61 @@ impl crate::TermWindow {
             return Ok(());
         }
 
-        let mut rows: Vec<SidebarDropdownRow> = entries
-            .iter()
-            .map(|entry| SidebarDropdownRow {
+        const TARGET_ROWS: [(&str, AgentLaunchTarget); 3] = [
+            ("Split pane", AgentLaunchTarget::SplitPane),
+            ("Fullscreen", AgentLaunchTarget::Zoomed),
+            ("New tab", AgentLaunchTarget::NewTab),
+        ];
+
+        let mut rows: Vec<SidebarDropdownRow> = Vec::new();
+        for entry in entries.iter() {
+            let expanded = menu.expanded.as_deref() == Some(entry.adapter_id.as_str());
+            rows.push(SidebarDropdownRow {
                 label: entry.label.clone(),
                 dot_color: Some(entry.color),
                 checkbox: None,
                 divider_above: false,
+                indent: false,
+                trailing_chevron: true,
                 item_type: UIItemType::SidebarAgentMenuItem {
                     adapter_id: entry.adapter_id.clone(),
                 },
-            })
-            .collect();
+            });
+            if expanded {
+                for (label, target) in TARGET_ROWS {
+                    rows.push(SidebarDropdownRow {
+                        label: label.to_string(),
+                        dot_color: None,
+                        checkbox: None,
+                        divider_above: false,
+                        indent: true,
+                        trailing_chevron: false,
+                        item_type: UIItemType::SidebarAgentMenuTarget {
+                            adapter_id: entry.adapter_id.clone(),
+                            target,
+                        },
+                    });
+                }
+            }
+        }
         rows.push(SidebarDropdownRow {
             label: "Project root".to_string(),
             dot_color: None,
             checkbox: Some(self.agent_launcher_project_root),
             divider_above: true,
+            indent: false,
+            trailing_chevron: false,
             item_type: UIItemType::SidebarAgentMenuProjectRootToggle,
+        });
+        // Below the launch actions: this one inspects rather than launches.
+        rows.push(SidebarDropdownRow {
+            label: "Agent overview".to_string(),
+            dot_color: None,
+            checkbox: None,
+            divider_above: false,
+            indent: false,
+            trailing_chevron: false,
+            item_type: UIItemType::SidebarAgentMenuHerd,
         });
 
         self.paint_sidebar_dropdown(layers, menu.x as f32, menu.y as f32, &rows)
@@ -4423,6 +5489,8 @@ impl crate::TermWindow {
                     dot_color: None,
                     checkbox: None,
                     divider_above,
+                    indent: false,
+                    trailing_chevron: false,
                     item_type: UIItemType::SidebarNewTabMenuItem { index },
                 }
             })
@@ -4542,11 +5610,15 @@ impl crate::TermWindow {
                            fg: LinearRgba,
                            default_bg: LinearRgba|
          -> anyhow::Result<()> {
-            let cols = (pixel_width / cell_width as f32).max(1.) as usize;
+            let cols = sidebar_text_cols(pixel_width, cell_width as usize);
+            if cols == 0 {
+                return Ok(());
+            }
+            let text = truncate_to_cols(text, cols);
             let mut attrs = CellAttributes::default();
             attrs.set_foreground(ColorAttribute::TrueColorWithDefaultFallback(fg.to_srgb()));
             let mut line = Line::from_text(text, &attrs, 1, None);
-            line.resize(cols.max(1), SEQ_ZERO);
+            line.resize(cols, SEQ_ZERO);
             this.render_screen_line(
                 RenderScreenLineParams {
                     top_pixel_y: y,
@@ -4644,6 +5716,9 @@ impl crate::TermWindow {
 
             // Leading marker: an adapter-colored dot, a checkbox, or nothing.
             let mut text_x = menu_x + row_text_inset;
+            if row.indent {
+                text_x += cell_width as f32;
+            }
             if let Some(color) = row.dot_color {
                 self.sidebar_rounded_fill(
                     layers,
@@ -4684,16 +5759,33 @@ impl crate::TermWindow {
                 text_x += box_size + ACTION_ICON_GAP;
             }
 
+            let chevron_w = if row.trailing_chevron {
+                cell_width as f32 + CHEVRON_GAP
+            } else {
+                0.
+            };
             render_text(
                 self,
                 layers,
                 &row.label,
                 text_x,
                 row_y + (row_h - cell_h_f) * 0.5,
-                (menu_x + menu_w - row_text_inset - text_x).max(1.),
+                (menu_x + menu_w - row_text_inset - chevron_w - text_x).max(1.),
                 contrast_label_color(row_bg),
                 row_bg,
             )?;
+            if row.trailing_chevron {
+                render_text(
+                    self,
+                    layers,
+                    "›",
+                    menu_x + menu_w - row_text_inset - cell_width as f32,
+                    row_y + (row_h - cell_h_f) * 0.5,
+                    cell_width as f32,
+                    contrast_label_color(row_bg),
+                    row_bg,
+                )?;
+            }
             self.ui_items.push(UIItem {
                 x: (menu_x + row_inset) as usize,
                 y: row_y as usize,
@@ -4838,28 +5930,37 @@ impl crate::TermWindow {
         let text_x = content_x + PAD_X + ACTIVE_TEXT_GAP;
         // Title width runs from the label column to the (reduced) close reserve
         // on the right.
-        let text_w =
-            (content_w - PAD_X * 2. - ACTIVE_TEXT_GAP - CLOSE_TEXT_RESERVE).max(cell_width as f32);
-        let text_cols = (text_w / cell_width as f32).max(1.) as usize;
-        let content_cols =
-            ((content_w - PAD_X * 2.).max(cell_width as f32) / cell_width as f32).max(1.) as usize;
+        let text_w = (content_w
+            - PAD_X * 2.
+            - ACTIVE_TEXT_GAP
+            - sidebar_close_text_reserve(cell_width as f32))
+        .max(0.);
         let palette = self.palette().clone();
         let gl_state = self.render_state.as_ref().unwrap();
         let white_space = gl_state.util_sprites.white_space.texture_coords();
         let filled_box = gl_state.util_sprites.filled_box.texture_coords();
 
+        // Takes the text and its pixel budget, and derives the cell count from
+        // that budget itself. Callers cannot pass a mismatched `cols` because
+        // there is no `cols` parameter: handing `render_screen_line` more cells
+        // than its pixel width holds is what made labels overhang, since it
+        // does not clip a glyph that starts inside the region.
         let render_text = |this: &mut Self,
                            layers: &mut TripleLayerQuadAllocator,
-                           line: &Line,
+                           text: &str,
+                           attrs: &CellAttributes,
                            x: f32,
                            y: f32,
-                           cols: usize,
                            pixel_width: f32,
                            fg: LinearRgba,
                            default_bg: LinearRgba|
          -> anyhow::Result<()> {
-            let mut line = line.clone();
-            line.resize(cols.max(1), SEQ_ZERO);
+            let cols = sidebar_text_cols(pixel_width, cell_width);
+            if cols == 0 {
+                return Ok(());
+            }
+            let mut line = Line::from_text(truncate_to_cols(text, cols), attrs, 1, None);
+            line.resize(cols, SEQ_ZERO);
             this.render_screen_line(
                 RenderScreenLineParams {
                     top_pixel_y: y,
@@ -5086,14 +6187,13 @@ impl crate::TermWindow {
                         label_fg.to_srgb(),
                     ))
                     .set_intensity(Intensity::Bold);
-                let symbol_line = Line::from_text(&symbol, &symbol_attrs, symbol_cols, None);
                 render_text(
                     self,
                     layers,
-                    &symbol_line,
+                    &symbol,
+                    &symbol_attrs,
                     rail_x + (rail_side - symbol_pixel_width) * 0.5,
                     rail_y + tab_offset + (rail_side - cell_height as f32) * 0.5,
-                    symbol_cols,
                     symbol_pixel_width,
                     label_fg,
                     tab_bg,
@@ -5139,14 +6239,13 @@ impl crate::TermWindow {
                 } else {
                     symbol_w
                 };
-                let symbol_line = Line::from_text(&symbol, &CellAttributes::default(), 1, None);
                 render_text(
                     self,
                     layers,
-                    &symbol_line,
+                    &symbol,
+                    &CellAttributes::default(),
                     rail_x + (rail_side - symbol_w) * 0.5,
                     launch_y + launch_offset + (rail_side - cell_height as f32) * 0.5,
-                    symbol.chars().count().max(1),
                     symbol_w,
                     if launch_hovered {
                         entry.color
@@ -5182,14 +6281,13 @@ impl crate::TermWindow {
                 rail_radius,
                 new_tab_bg,
             )?;
-            let plus_line = Line::from_text("+", &CellAttributes::default(), 1, None);
             render_text(
                 self,
                 layers,
-                &plus_line,
+                "+",
+                &CellAttributes::default(),
                 rail_x + (rail_side - cell_width as f32) * 0.5,
                 new_tab_y + new_tab_offset + (rail_side - cell_height as f32) * 0.5,
-                1,
                 cell_width as f32,
                 if new_tab_hovered {
                     hover_fg
@@ -5288,8 +6386,11 @@ impl crate::TermWindow {
             // at the scrollbar gutter / resize grip.
             let search_w = (item_x + item_w - search_x).max(1.);
             let search_text_x = search_x + PAD_X + ACTIVE_TEXT_GAP;
-            let search_cols = ((search_w - PAD_X * 2.).max(cell_width as f32) / cell_width as f32)
-                .max(1.) as usize;
+            // Measured from the text origin to the pill's inner right edge. The
+            // old budget was `search_w - PAD_X * 2` while the origin was inset
+            // by `PAD_X + ACTIVE_TEXT_GAP`, so the text's right bound landed
+            // 3px from the pill edge instead of the intended inset.
+            let search_text_w = (search_x + search_w - PAD_X - search_text_x).max(0.);
 
             let focused = self.sidebar_search.is_some();
             let search_hovered = hovered_item.as_ref() == Some(&UIItemType::SidebarSearch);
@@ -5327,28 +6428,36 @@ impl crate::TermWindow {
             }
             self.sidebar_rounded_fill(layers, 1, search_rect, search_radius, search_bg)?;
 
+            let search_cols = sidebar_text_cols(search_text_w, cell_width);
+            // A typed query keeps its *tail*, so the caret you are typing at
+            // stays visible. The placeholder steps down through shorter forms
+            // and is dropped entirely rather than shown as a truncated stub.
             let search_text = match &self.sidebar_search {
-                Some(state) if state.query.is_empty() => "|".to_string(),
-                Some(state) => format!("{}|", state.query),
-                None => "Search tabs...".to_string(),
+                Some(state) if state.query.is_empty() => Some("|".to_string()),
+                Some(state) => {
+                    let full = format!("{}|", state.query);
+                    Some(truncate_to_cols_from_end(&full, search_cols).to_string())
+                }
+                None => fit_label(&SEARCH_PLACEHOLDER_LABELS, search_cols).map(str::to_string),
             };
             let search_fg = if focused || search_hovered {
                 hover_fg
             } else {
                 inactive_fg.mul_alpha(0.62)
             };
-            let search_line = Line::from_text(&search_text, &CellAttributes::default(), 1, None);
-            render_text(
-                self,
-                layers,
-                &search_line,
-                search_text_x,
-                y + search_offset + (row_height as f32 - cell_height as f32) * 0.5,
-                search_cols,
-                search_w - PAD_X * 2.,
-                search_fg,
-                search_bg,
-            )?;
+            if let Some(search_text) = &search_text {
+                render_text(
+                    self,
+                    layers,
+                    search_text,
+                    &CellAttributes::default(),
+                    search_text_x,
+                    y + search_offset + (row_height as f32 - cell_height as f32) * 0.5,
+                    search_text_w,
+                    search_fg,
+                    search_bg,
+                )?;
+            }
             self.ui_items.push(UIItem {
                 x: search_x as usize,
                 y: y as usize,
@@ -5491,18 +6600,20 @@ impl crate::TermWindow {
                     } else {
                         label
                     };
-                    let label_line = Line::from_text(&label, &CellAttributes::default(), 1, None);
                     let label_x = content_x + indent + PAD_X + ACTIVE_TEXT_GAP;
-                    let label_w =
-                        (content_w - indent - PAD_X * 2. - ACTIVE_TEXT_GAP - CLOSE_TEXT_RESERVE)
-                            .max(cell_width as f32);
+                    let label_w = (content_w
+                        - indent
+                        - PAD_X * 2.
+                        - ACTIVE_TEXT_GAP
+                        - sidebar_close_text_reserve(cell_width as f32))
+                    .max(0.);
                     render_text(
                         self,
                         layers,
-                        &label_line,
+                        &label,
+                        &CellAttributes::default(),
                         label_x,
                         y + row_offset + (row_height as f32 - cell_height as f32) * 0.5,
-                        (label_w / cell_width as f32).max(1.) as usize,
                         label_w,
                         if active || row_hovered || close_hovered {
                             inactive_fg
@@ -5523,16 +6634,15 @@ impl crate::TermWindow {
                     // Only drawn on hover: a persistent × on every pane row
                     // would crowd an already indented line.
                     if row_hovered || close_hovered {
-                        let close_line = Line::from_text("×", &CellAttributes::default(), 1, None);
                         render_text(
                             self,
                             layers,
-                            &close_line,
-                            close_x + CLOSE_ZONE_W - cell_width as f32 - 6.,
+                            "×",
+                            &CellAttributes::default(),
+                            close_x + CLOSE_ZONE_W - cell_width as f32 - CLOSE_GLYPH_INSET,
                             y + row_offset
                                 + (row_height as f32 - cell_height as f32) * 0.5
                                 + if close_pressed { 1. } else { 0. },
-                            1,
                             cell_width as f32,
                             if close_hovered {
                                 hover_fg
@@ -5633,25 +6743,27 @@ impl crate::TermWindow {
             // nothing to expand, so nothing is drawn and nothing shifts.
             let expand_type = UIItemType::SidebarTabExpand { tab_idx };
             let expand_hovered = hovered_item.as_ref() == Some(&expand_type);
-            let chevron_w = if pane_count > 1 {
-                cell_width as f32 + CHEVRON_GAP
-            } else {
-                0.
-            };
+            let agent = self.sidebar_agent_for_tab_idx(tab_idx);
+            // One composition for the whole row: the title's origin *and* its
+            // width both step past the chevron and the status dot. Deriving
+            // only the width from them is what painted the leading "N: " index
+            // on top of the chevron and the dot.
+            let cols = sidebar_row_columns(
+                text_x,
+                text_w,
+                cell_width as f32,
+                cell_height as f32,
+                pane_count > 1,
+                agent.is_some(),
+            );
             if pane_count > 1 {
-                let chevron_line = Line::from_text(
-                    if expanded { "⌄" } else { "›" },
-                    &CellAttributes::default(),
-                    1,
-                    None,
-                );
                 render_text(
                     self,
                     layers,
-                    &chevron_line,
-                    text_x,
+                    if expanded { "⌄" } else { "›" },
+                    &CellAttributes::default(),
+                    cols.chevron_x,
                     y + row_offset + (row_height as f32 - cell_height as f32) * 0.5,
-                    1,
                     cell_width as f32,
                     if expand_hovered {
                         hover_fg
@@ -5662,23 +6774,24 @@ impl crate::TermWindow {
                 )?;
             }
 
-            let agent = self.sidebar_agent_for_tab_idx(tab_idx);
-            let agent_badge_w = if agent.is_some() { 12. } else { 0. };
             if let Some(agent) = &agent {
-                let badge_size = 7.;
-                let badge_x = text_x + chevron_w;
+                let badge_size = sidebar_status_dot_size(cell_height as f32);
                 let badge_y = y + row_offset + (row_height as f32 - badge_size) * 0.5;
-                let badge_color = if agent.status == AgentStatus::WaitingForInput {
-                    LinearRgba(0.94, 0.72, 0.26, 1.0)
-                } else if active {
+                let badge_base = if active {
                     accent
                 } else {
                     inactive_fg.mul_alpha(0.58)
                 };
+                let badge_color = agent_status_dot_accent(
+                    &agent.status,
+                    badge_base,
+                    row_bg,
+                    self.agent_dot_pulse(agent),
+                );
                 self.sidebar_pill_fill(
                     layers,
                     2,
-                    euclid::rect(badge_x, badge_y, badge_size, badge_size),
+                    euclid::rect(cols.badge_x, badge_y, badge_size, badge_size),
                     badge_size * 0.5,
                     badge_color,
                 )?;
@@ -5689,25 +6802,22 @@ impl crate::TermWindow {
             } else {
                 format!("{}: {}", tab_idx + 1, title)
             };
-            let primary_line = Line::from_text(&display_title, &CellAttributes::default(), 1, None);
             let metadata_text = metadata.join(" · ");
             let show_metadata = !metadata_text.is_empty()
                 && self.sidebar_metadata_rows_enabled()
                 && (active || tab_hovered || close_hovered);
-            let primary_y = if show_metadata {
-                y + row_offset + (row_height as f32 - cell_height as f32 * 2.) * 0.5
-            } else {
-                y + row_offset + (row_height as f32 - cell_height as f32) * 0.5
-            };
+            let (primary_offset, metadata_offset) =
+                sidebar_row_text_offsets(row_height as f32, cell_height as f32, show_metadata);
+            let primary_y = y + row_offset + primary_offset;
 
             render_text(
                 self,
                 layers,
-                &primary_line,
-                text_x + agent_badge_w,
+                &display_title,
+                &CellAttributes::default(),
+                cols.text_x,
                 primary_y,
-                text_cols,
-                (text_w - chevron_w - agent_badge_w).max(cell_width as f32),
+                cols.text_w,
                 if active || tab_hovered || close_hovered {
                     inactive_fg
                 } else {
@@ -5715,17 +6825,15 @@ impl crate::TermWindow {
                 },
                 row_bg,
             )?;
-            if show_metadata {
-                let metadata_line =
-                    Line::from_text(&metadata_text, &CellAttributes::default(), 1, None);
+            if let Some(metadata_offset) = metadata_offset {
                 render_text(
                     self,
                     layers,
-                    &metadata_line,
-                    text_x + chevron_w + agent_badge_w,
-                    primary_y + cell_height as f32,
-                    text_cols,
-                    (text_w - chevron_w - agent_badge_w).max(cell_width as f32),
+                    &metadata_text,
+                    &CellAttributes::default(),
+                    cols.text_x,
+                    y + row_offset + metadata_offset,
+                    cols.text_w,
                     if active || tab_hovered || close_hovered {
                         inactive_fg.mul_alpha(0.60)
                     } else {
@@ -5746,9 +6854,9 @@ impl crate::TermWindow {
             // not to the tab underneath it.
             if pane_count > 1 {
                 self.ui_items.push(UIItem {
-                    x: text_x as usize,
+                    x: cols.chevron_x as usize,
                     y: y as usize,
-                    width: chevron_w as usize,
+                    width: cols.chevron_w as usize,
                     height: row_height,
                     item_type: expand_type,
                 });
@@ -5783,18 +6891,17 @@ impl crate::TermWindow {
                     close_bg,
                 )?;
             }
-            let close_line = Line::from_text("×", &CellAttributes::default(), 1, None);
-            let close_glyph_x = close_x + CLOSE_ZONE_W - cell_width as f32 - 6.;
+            let close_glyph_x = close_x + CLOSE_ZONE_W - cell_width as f32 - CLOSE_GLYPH_INSET;
             let close_glyph_offset = if close_pressed { 1. } else { 0. };
             render_text(
                 self,
                 layers,
-                &close_line,
+                "×",
+                &CellAttributes::default(),
                 close_glyph_x,
                 y + row_offset
                     + (row_height as f32 - cell_height as f32) * 0.5
                     + close_glyph_offset,
-                1,
                 cell_width as f32,
                 if close_hovered {
                     hover_fg
@@ -5862,26 +6969,15 @@ impl crate::TermWindow {
             // the right. With no agent installed the worktree button keeps the
             // full width it had before the launcher existed.
             let launcher_entry = self.agent_launcher_default();
-            // Below this width two full words do not fit side by side, so both
-            // halves fall back to their two-letter forms.
-            let compact_labels = width <= 260;
-            // Both fills are derived from the single split point so they can
-            // never overlap, whichever side the scrollbar gutter is on (the
-            // content column is narrower than the row, and not centered in it).
-            let (worktree_fill_w, worktree_content_w, agent_x, agent_w) = match launcher_entry {
-                Some(_) => {
-                    let content_half = (content_w - GAP) * 0.5;
-                    let agent_x = content_x + content_half + GAP;
-                    (
-                        (agent_x - GAP - item_x).max(1.),
-                        content_half,
-                        agent_x,
-                        content_w - content_half - GAP,
-                    )
-                }
-                None => (item_w, content_w, 0., 0.),
-            };
-            let cols_for = |pixel_width: f32| (pixel_width / cell_width as f32).max(1.) as usize;
+            let dot_size = sidebar_status_dot_size(cell_height as f32);
+            let bottom_row = sidebar_bottom_row_layout(
+                item_x,
+                item_w,
+                content_x,
+                content_w,
+                dot_size,
+                launcher_entry.is_some(),
+            );
 
             let worktree_type = UIItemType::SidebarWorktreeButton;
             let worktree_hovered = hovered_item.as_ref() == Some(&worktree_type);
@@ -5900,12 +6996,12 @@ impl crate::TermWindow {
                 layers,
                 1,
                 euclid::rect(
-                    item_x,
+                    bottom_row.worktree_fill_x,
                     worktree_y + worktree_offset,
-                    worktree_fill_w,
+                    bottom_row.worktree_fill_w,
                     row_height as f32,
                 ),
-                RADIUS,
+                RADIUS * dpi_scale,
                 worktree_bg,
             )?;
             let folder_color = if worktree_hovered {
@@ -5913,7 +7009,7 @@ impl crate::TermWindow {
             } else {
                 inactive_fg.mul_alpha(0.70)
             };
-            let icon_x = content_x + PAD_X;
+            let icon_x = bottom_row.worktree_icon_x;
             let icon_y = worktree_y
                 + worktree_offset
                 + (row_height as f32 - cell_height as f32) * 0.5
@@ -5932,31 +7028,33 @@ impl crate::TermWindow {
                 3.,
                 folder_color,
             )?;
-            let worktree_label = if compact_labels { "Wt" } else { "Worktree" };
-            let worktree_line =
-                Line::from_text(worktree_label, &CellAttributes::default(), 1, None);
-            let worktree_text_x = icon_x + ACTION_ICON_W + ACTION_ICON_GAP;
-            let worktree_text_w =
-                (worktree_content_w - PAD_X * 2. - ACTION_ICON_W - ACTION_ICON_GAP).max(1.);
-            render_text(
-                self,
-                layers,
-                &worktree_line,
-                worktree_text_x,
-                worktree_y + worktree_offset + (row_height as f32 - cell_height as f32) * 0.5,
-                cols_for(worktree_text_w).min(content_cols),
-                worktree_text_w,
-                if worktree_hovered {
-                    hover_fg
-                } else {
-                    inactive_fg.mul_alpha(0.86)
-                },
-                worktree_bg,
-            )?;
+            // Widest label that actually fits its half, measured — not chosen by
+            // a width threshold, which cannot know the cell width, the adapter's
+            // configured label length or whether the scrollbar gutter is present.
+            // Nothing fits at all -> the folder icon speaks for itself.
+            let worktree_cols = sidebar_text_cols(bottom_row.worktree_text_w, cell_width);
+            if let Some(worktree_label) = fit_label(&WORKTREE_LABELS, worktree_cols) {
+                render_text(
+                    self,
+                    layers,
+                    worktree_label,
+                    &CellAttributes::default(),
+                    bottom_row.worktree_text_x,
+                    worktree_y + worktree_offset + (row_height as f32 - cell_height as f32) * 0.5,
+                    bottom_row.worktree_text_w,
+                    if worktree_hovered {
+                        hover_fg
+                    } else {
+                        inactive_fg.mul_alpha(0.86)
+                    },
+                    worktree_bg,
+                )?;
+            }
             self.ui_items.push(UIItem {
                 x: content_x as usize,
                 y: worktree_y as usize,
-                width: worktree_content_w as usize,
+                width: (bottom_row.worktree_fill_x + bottom_row.worktree_fill_w - content_x).max(1.)
+                    as usize,
                 height: row_height,
                 item_type: worktree_type,
             });
@@ -5975,30 +7073,25 @@ impl crate::TermWindow {
                     search_fill
                 };
                 let agent_offset = if agent_pressed { 1. } else { 0. };
-                // The fill starts at the content column but must still reach
-                // the row's right edge, which is item_x + item_w.
-                let agent_fill_w = (item_x + item_w - agent_x).max(1.);
                 self.sidebar_rounded_fill(
                     layers,
                     1,
                     euclid::rect(
-                        agent_x,
+                        bottom_row.agent_fill_x,
                         worktree_y + agent_offset,
-                        agent_fill_w,
+                        bottom_row.agent_fill_w,
                         row_height as f32,
                     ),
-                    RADIUS,
+                    RADIUS * dpi_scale,
                     agent_bg,
                 )?;
 
                 // Adapter-colored dot, vertically centered on the text row.
-                let dot_size = (cell_height as f32 * 0.42).clamp(5., 10.);
-                let dot_x = agent_x + PAD_X;
                 let dot_y = worktree_y + agent_offset + (row_height as f32 - dot_size) * 0.5;
                 self.sidebar_rounded_fill(
                     layers,
                     2,
-                    euclid::rect(dot_x, dot_y, dot_size, dot_size),
+                    euclid::rect(bottom_row.agent_dot_x, dot_y, dot_size, dot_size),
                     dot_size * 0.5,
                     if agent_hovered {
                         entry.color
@@ -6007,35 +7100,33 @@ impl crate::TermWindow {
                     },
                 )?;
 
-                let agent_label = if compact_labels {
-                    entry.short_label.as_str()
-                } else {
-                    entry.label.as_str()
-                };
-                let agent_line = Line::from_text(agent_label, &CellAttributes::default(), 1, None);
-                let agent_text_x = dot_x + dot_size + ACTION_ICON_GAP;
-                let agent_text_w = (agent_x + agent_w - PAD_X - agent_text_x).max(1.);
-                render_text(
-                    self,
-                    layers,
-                    &agent_line,
-                    agent_text_x,
-                    worktree_y + agent_offset + (row_height as f32 - cell_height as f32) * 0.5,
-                    cols_for(agent_text_w).min(content_cols),
-                    agent_text_w,
-                    if agent_hovered {
-                        hover_fg
-                    } else {
-                        inactive_fg.mul_alpha(0.86)
-                    },
-                    agent_bg,
-                )?;
+                // Ladder from the adapter's own labels, so a configured
+                // `label = "Claude Code"` is fitted rather than guessed at.
+                let agent_label_rungs = [entry.label.as_str(), entry.short_label.as_str()];
+                let agent_cols = sidebar_text_cols(bottom_row.agent_text_w, cell_width);
+                if let Some(agent_label) = fit_label(&agent_label_rungs, agent_cols) {
+                    render_text(
+                        self,
+                        layers,
+                        agent_label,
+                        &CellAttributes::default(),
+                        bottom_row.agent_text_x,
+                        worktree_y + agent_offset + (row_height as f32 - cell_height as f32) * 0.5,
+                        bottom_row.agent_text_w,
+                        if agent_hovered {
+                            hover_fg
+                        } else {
+                            inactive_fg.mul_alpha(0.86)
+                        },
+                        agent_bg,
+                    )?;
+                }
                 // Hit region matches the drawn pill (which reaches the row's
                 // right edge), not the narrower content column.
                 self.ui_items.push(UIItem {
-                    x: agent_x as usize,
+                    x: bottom_row.agent_fill_x as usize,
                     y: worktree_y as usize,
-                    width: agent_fill_w as usize,
+                    width: bottom_row.agent_fill_w as usize,
                     height: row_height,
                     item_type: agent_type,
                 });
@@ -6083,23 +7174,27 @@ impl crate::TermWindow {
             RADIUS,
             new_tab_bg,
         )?;
-        let new_tab_line = Line::from_text("+ New Tab", &CellAttributes::default(), 1, None);
-        let new_tab_text_w = (new_tab_hit_w - PAD_X * 2. - ACTIVE_TEXT_GAP).max(1.);
-        render_text(
-            self,
-            layers,
-            &new_tab_line,
-            text_x,
-            new_tab_y + new_tab_offset + (row_height as f32 - cell_height as f32) * 0.5,
-            content_cols,
-            new_tab_text_w,
-            if new_tab_hovered {
-                hover_fg
-            } else {
-                inactive_fg
-            },
-            new_tab_bg,
-        )?;
+        let new_tab_text_w = (new_tab_hit_w - PAD_X * 2. - ACTIVE_TEXT_GAP).max(0.);
+        if let Some(new_tab_label) = fit_label(
+            &NEW_TAB_LABELS,
+            sidebar_text_cols(new_tab_text_w, cell_width),
+        ) {
+            render_text(
+                self,
+                layers,
+                new_tab_label,
+                &CellAttributes::default(),
+                text_x,
+                new_tab_y + new_tab_offset + (row_height as f32 - cell_height as f32) * 0.5,
+                new_tab_text_w,
+                if new_tab_hovered {
+                    hover_fg
+                } else {
+                    inactive_fg
+                },
+                new_tab_bg,
+            )?;
+        }
         self.ui_items.push(UIItem {
             x: content_x as usize,
             y: new_tab_y as usize,
@@ -6480,93 +7575,34 @@ mod tests {
         assert_eq!(rows.len(), 2);
     }
 
-    fn split_percent(spawn: SpawnWhere) -> Option<u8> {
-        match spawn {
-            SpawnWhere::SplitPane(SplitRequest {
-                size: MuxSplitSize::Percent(pct),
-                ..
-            }) => Some(pct),
-            _ => None,
-        }
-    }
+    // Placement policy itself (target resolution, tiling, clamping, the Alt
+    // inversion) moved to `agent_launch` and is tested there — see
+    // `termwindow::agent_launch::tests`. What's left here is that
+    // `agent_launch_placement` wires the config fields through correctly.
 
     #[test]
-    fn agent_spawn_where_follows_the_configured_target() {
+    fn agent_launch_target_gained_a_zoomed_variant() {
+        // Guards the sidebar's config-to-mux-enum mapping in
+        // `agent_launch_placement`: `AgentSplitDirection` still only maps to
+        // `SplitDirection::{Horizontal,Vertical}`, independent of the launch
+        // target itself.
         assert_eq!(
-            agent_spawn_where(
-                AgentLaunchTarget::NewTab,
-                AgentSplitDirection::Horizontal,
-                50,
-                false
-            ),
-            SpawnWhere::NewTab
+            match AgentSplitDirection::Horizontal {
+                AgentSplitDirection::Horizontal => SplitDirection::Horizontal,
+                AgentSplitDirection::Vertical => SplitDirection::Vertical,
+            },
+            SplitDirection::Horizontal
         );
-        assert!(matches!(
-            agent_spawn_where(
-                AgentLaunchTarget::SplitPane,
-                AgentSplitDirection::Horizontal,
-                50,
-                false
-            ),
-            SpawnWhere::SplitPane(_)
-        ));
-    }
-
-    #[test]
-    fn agent_spawn_where_inverts_for_alt_click() {
-        // Alt is the escape hatch in both directions, so neither configured
-        // value can strand the user without the other target.
-        assert!(matches!(
-            agent_spawn_where(
-                AgentLaunchTarget::NewTab,
-                AgentSplitDirection::Horizontal,
-                50,
-                true
-            ),
-            SpawnWhere::SplitPane(_)
-        ));
         assert_eq!(
-            agent_spawn_where(
-                AgentLaunchTarget::SplitPane,
-                AgentSplitDirection::Horizontal,
-                50,
-                true
-            ),
-            SpawnWhere::NewTab
+            match AgentSplitDirection::Vertical {
+                AgentSplitDirection::Horizontal => SplitDirection::Horizontal,
+                AgentSplitDirection::Vertical => SplitDirection::Vertical,
+            },
+            SplitDirection::Vertical
         );
-    }
-
-    #[test]
-    fn agent_split_puts_the_agent_in_the_new_half() {
-        // target_is_second keeps the shell the user was typing in where it was.
-        match agent_spawn_where(
-            AgentLaunchTarget::SplitPane,
-            AgentSplitDirection::Vertical,
-            30,
-            false,
-        ) {
-            SpawnWhere::SplitPane(request) => {
-                assert!(request.target_is_second);
-                assert_eq!(request.direction, SplitDirection::Vertical);
-                assert!(!request.top_level);
-            }
-            other => panic!("expected a split, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn agent_split_size_is_clamped_to_a_usable_range() {
-        let split = |pct| {
-            split_percent(agent_spawn_where(
-                AgentLaunchTarget::SplitPane,
-                AgentSplitDirection::Horizontal,
-                pct,
-                false,
-            ))
-        };
-        assert_eq!(split(0), Some(5));
-        assert_eq!(split(100), Some(95));
-        assert_eq!(split(30), Some(30));
+        // AgentLaunchTarget::Zoomed exists and is distinct from the other two.
+        assert_ne!(AgentLaunchTarget::Zoomed, AgentLaunchTarget::SplitPane);
+        assert_ne!(AgentLaunchTarget::Zoomed, AgentLaunchTarget::NewTab);
     }
 
     #[test]
@@ -6757,6 +7793,311 @@ mod tests {
     }
 
     #[test]
+    fn text_cols_never_admits_a_partly_visible_glyph() {
+        // render_screen_line does not clip: a glyph starting inside the region
+        // is painted whole and overhangs, so only fully-fitting cells count.
+        assert_eq!(sidebar_text_cols(27., 14), 1);
+        assert_eq!(sidebar_text_cols(28., 14), 2);
+        assert_eq!(sidebar_text_cols(13., 14), 0);
+        assert_eq!(sidebar_text_cols(0., 14), 0);
+        assert_eq!(sidebar_text_cols(-5., 14), 0);
+        assert_eq!(sidebar_text_cols(f32::NAN, 14), 0);
+        // A zero cell width must not divide by zero.
+        assert_eq!(sidebar_text_cols(100., 0), 0);
+    }
+
+    #[test]
+    fn truncate_to_cols_never_splits_a_wide_grapheme() {
+        assert_eq!(truncate_to_cols("日本語", 3), "日");
+        assert_eq!(truncate_to_cols("日本語", 4), "日本");
+        assert_eq!(truncate_to_cols("日本語", 1), "");
+        assert_eq!(truncate_to_cols("Worktree", 4), "Work");
+        assert_eq!(truncate_to_cols("Worktree", 0), "");
+        // A combining mark stays with the base character it modifies.
+        assert_eq!(truncate_to_cols("e\u{301}x", 1), "e\u{301}");
+    }
+
+    #[test]
+    fn truncate_from_end_keeps_the_caret_visible() {
+        // The search field renders "{query}|"; head-truncating it would hide the
+        // caret the user is typing at.
+        assert_eq!(truncate_to_cols_from_end("a long query|", 6), "query|");
+        assert_eq!(truncate_to_cols_from_end("abc", 0), "");
+    }
+
+    #[test]
+    fn fit_label_picks_the_widest_variant_that_fits() {
+        assert_eq!(fit_label(&WORKTREE_LABELS, 9), Some("Worktree"));
+        assert_eq!(fit_label(&WORKTREE_LABELS, 8), Some("Worktree"));
+        assert_eq!(fit_label(&WORKTREE_LABELS, 7), Some("Tree"));
+        assert_eq!(fit_label(&WORKTREE_LABELS, 3), Some("Wt"));
+        assert_eq!(fit_label(&WORKTREE_LABELS, 1), None);
+        assert_eq!(fit_label(&WORKTREE_LABELS, 0), None);
+    }
+
+    /// Content geometry for a Left sidebar of `width` with the scrollbar gutter
+    /// shown, mirroring `paint_sidebar`.
+    fn bottom_row_for_width(width: f32, cell_height: f32) -> SidebarBottomRowLayout {
+        let item_x = INSET;
+        let item_w = width - INSET * 2.;
+        let content_w = item_w - RESIZE_GRIP_W as f32 - SIDEBAR_SCROLLBAR_GUTTER_W;
+        sidebar_bottom_row_layout(
+            item_x,
+            item_w,
+            item_x,
+            content_w,
+            sidebar_status_dot_size(cell_height),
+            true,
+        )
+    }
+
+    #[test]
+    fn worktree_and_agent_labels_fit_at_the_default_width() {
+        // Pins the arithmetic behind the default `sidebar_width_px`: at a 14px
+        // cell on a 2x display both full words must fit their halves. If this
+        // fails, the default width and the label ladder have drifted apart.
+        let cell_width = 14usize;
+        let layout = bottom_row_for_width(
+            config::Config::default_config().sidebar_width_px as f32,
+            32.,
+        );
+        assert_eq!(
+            fit_label(
+                &WORKTREE_LABELS,
+                sidebar_text_cols(layout.worktree_text_w, cell_width)
+            ),
+            Some("Worktree")
+        );
+        let claude = default_agent_adapters().remove("claude").unwrap();
+        let label = claude.label.clone().unwrap();
+        let rungs = [label.as_str(), "Cl"];
+        assert_eq!(
+            fit_label(&rungs, sidebar_text_cols(layout.agent_text_w, cell_width)),
+            Some("Claude")
+        );
+    }
+
+    #[test]
+    fn bottom_row_labels_step_down_on_a_one_x_display() {
+        // 1x halves the effective width, and the fixed paddings do not scale, so
+        // the halves are genuinely tight — the ladder is what keeps them legible
+        // instead of clipping mid-word.
+        let layout = bottom_row_for_width(200., 16.);
+        let cell_width = 7usize;
+        assert!(fit_label(
+            &WORKTREE_LABELS,
+            sidebar_text_cols(layout.worktree_text_w, cell_width)
+        )
+        .is_some());
+        assert!(fit_label(
+            &["Claude", "Cl"],
+            sidebar_text_cols(layout.agent_text_w, cell_width)
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn bottom_row_halves_never_overlap() {
+        let mut width = 180.;
+        while width <= 800. {
+            for content_offset in [0., 36.] {
+                let item_x = INSET;
+                let item_w = width - INSET * 2.;
+                let content_x = item_x + content_offset;
+                let content_w = item_w - content_offset - RESIZE_GRIP_W as f32;
+                let layout =
+                    sidebar_bottom_row_layout(item_x, item_w, content_x, content_w, 10., true);
+                assert!(
+                    layout.worktree_fill_x + layout.worktree_fill_w <= layout.agent_fill_x + 0.001,
+                    "fills overlap at width {width}"
+                );
+                assert!(
+                    layout.worktree_text_x + layout.worktree_text_w <= layout.agent_fill_x + 0.001,
+                    "worktree text runs into the agent half at width {width}"
+                );
+                assert!(
+                    layout.agent_text_x + layout.agent_text_w <= item_x + item_w + 0.001,
+                    "agent text runs past the row at width {width}"
+                );
+                assert!(layout.agent_dot_x >= layout.agent_fill_x);
+            }
+            width += 4.;
+        }
+    }
+
+    #[test]
+    fn bottom_row_gives_worktree_everything_without_an_agent() {
+        let layout = sidebar_bottom_row_layout(8., 264., 8., 228., 10., false);
+        assert_eq!(layout.worktree_fill_x, 8.);
+        assert_eq!(layout.worktree_fill_w, 264.);
+        assert_eq!(layout.agent_fill_w, 0.);
+        assert!(layout.worktree_text_w > 0.);
+    }
+
+    #[test]
+    fn bottom_row_fills_reach_the_row_edges() {
+        let layout = sidebar_bottom_row_layout(8., 384., 8., 348., 10., true);
+        assert_eq!(layout.worktree_fill_x, 8.);
+        assert_eq!(layout.agent_fill_x + layout.agent_fill_w, 8. + 384.);
+    }
+
+    #[test]
+    fn tab_row_title_starts_after_the_chevron_and_the_agent_badge() {
+        // The reported collision: the title (which carries the leading "N: "
+        // index) was drawn at the chevron's own x, so the number landed on top
+        // of the chevron and the status dot.
+        let cols = sidebar_row_columns(100., 200., 14., 32., true, true);
+        assert_eq!(cols.chevron_x, 100.);
+        assert_eq!(cols.text_x, 100. + cols.chevron_w + cols.badge_w);
+        assert!(cols.text_x > cols.badge_x + cols.badge_w - 0.001);
+    }
+
+    #[test]
+    fn tab_row_decorations_never_overlap() {
+        for (chevron, badge) in [(false, false), (true, false), (false, true), (true, true)] {
+            for cell_height in [15., 24., 32., 48.] {
+                let cols = sidebar_row_columns(40., 180., 14., cell_height, chevron, badge);
+                if chevron {
+                    assert!(cols.chevron_x + cols.chevron_w <= cols.badge_x + 0.001);
+                }
+                if badge {
+                    assert!(cols.badge_x + cols.badge_w <= cols.text_x + 0.001);
+                }
+                // Origin and width always agree: the text ends where the row's
+                // label region ends, whatever precedes it.
+                assert!((cols.text_x + cols.text_w - (40. + 180.)).abs() < 0.001);
+            }
+        }
+    }
+
+    #[test]
+    fn tab_row_text_width_clamps_to_zero_instead_of_negative() {
+        let cols = sidebar_row_columns(0., 4., 14., 32., true, true);
+        assert_eq!(cols.text_w, 0.);
+        assert_eq!(sidebar_text_cols(cols.text_w, 14), 0);
+    }
+
+    #[test]
+    fn close_text_reserve_clears_the_close_glyph() {
+        for cell_width in [7., 14., 20.] {
+            let reserve = sidebar_close_text_reserve(cell_width);
+            assert!(
+                reserve >= (cell_width + CLOSE_GLYPH_INSET).min(CLOSE_ZONE_W),
+                "reserve {reserve} must clear the glyph at cell width {cell_width}"
+            );
+            assert!(reserve <= CLOSE_ZONE_W);
+        }
+    }
+
+    #[test]
+    fn agent_badge_is_wider_than_its_dot() {
+        for cell_height in [15., 24., 32., 48.] {
+            assert!(sidebar_agent_badge_w(cell_height) > sidebar_status_dot_size(cell_height));
+        }
+        // The dot is clamped so it stays a dot at any font size.
+        assert_eq!(sidebar_status_dot_size(4.), 5.);
+        assert_eq!(sidebar_status_dot_size(200.), 10.);
+    }
+
+    #[test]
+    fn row_text_offsets_keep_both_lines_inside_the_row() {
+        // Heights as `sidebar_row_height` computes them, since that is what the
+        // offsets have to fit inside. Metadata rows are only reachable under
+        // Comfortable density, whose height always has room for two lines; the
+        // single-line densities are checked with metadata off, which is the only
+        // way they occur.
+        for cell_height in [15f32, 24., 32.] {
+            let comfortable_two_line = (cell_height * 2. + 8.).max(44.);
+            let comfortable = (cell_height + 10.).max(34.);
+            let compact = (cell_height + 6.).max(28.);
+
+            let (primary, metadata) =
+                sidebar_row_text_offsets(comfortable_two_line, cell_height, true);
+            assert!(primary >= -0.001, "primary line above the row");
+            assert!(
+                metadata.unwrap() + cell_height <= comfortable_two_line + 0.001,
+                "metadata line overflows a {comfortable_two_line}px row at cell {cell_height}"
+            );
+
+            for row_height in [comfortable_two_line, comfortable, compact] {
+                let (primary, metadata) = sidebar_row_text_offsets(row_height, cell_height, false);
+                assert!(primary >= -0.001);
+                assert!(
+                    primary + cell_height <= row_height + 0.001,
+                    "title overflows a {row_height}px row at cell {cell_height}"
+                );
+                assert!(metadata.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn sidebar_width_scale_is_one_at_retina_and_half_at_one_x() {
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(sidebar_width_scale_for_dpi(144.), 1.0);
+            assert_eq!(sidebar_width_scale_for_dpi(72.), 0.5);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert_eq!(sidebar_width_scale_for_dpi(192.), 1.0);
+            assert_eq!(sidebar_width_scale_for_dpi(96.), 0.5);
+        }
+        // Degenerate DPIs stay inside the clamp.
+        assert_eq!(sidebar_width_scale_for_dpi(0.), 0.5);
+        assert_eq!(sidebar_width_scale_for_dpi(100_000.), 1.25);
+    }
+
+    #[test]
+    fn pulse_phase_is_a_smooth_closed_loop() {
+        let period = Duration::from_millis(1600);
+        assert!(agent_pulse_phase(Duration::ZERO, period) < 0.001);
+        assert!((agent_pulse_phase(Duration::from_millis(800), period) - 1.0).abs() < 0.001);
+        assert!(agent_pulse_phase(period, period) < 0.001);
+        let mut previous = -1.0;
+        for step in 0..=8 {
+            let phase = agent_pulse_phase(Duration::from_millis(step * 100), period);
+            assert!((0.0..=1.0).contains(&phase), "phase {phase} out of range");
+            assert!(phase >= previous - 0.001, "not monotonic on the way up");
+            previous = phase;
+        }
+        // A degenerate period must not divide by zero.
+        assert_eq!(
+            agent_pulse_phase(Duration::from_millis(5), Duration::ZERO),
+            0.
+        );
+    }
+
+    #[test]
+    fn pulse_only_dims_never_brightens() {
+        let base = LinearRgba(0.8, 0.5, 0.3, 1.0);
+        let surface = LinearRgba(0.1, 0.1, 0.1, 1.0);
+        assert_eq!(
+            agent_status_dot_accent(&AgentStatus::Idle, base, surface, None),
+            base
+        );
+        // Full phase is exactly the static colour, so turning the pulse on never
+        // makes a dot brighter than it was.
+        let full = agent_status_dot_accent(&AgentStatus::Running, base, surface, Some(1.0));
+        assert!((full.0 - base.0).abs() < 0.001);
+        let dim = agent_status_dot_accent(&AgentStatus::Running, base, surface, Some(0.0));
+        assert!(dim.0 < base.0);
+        assert!(dim.0 > surface.0);
+    }
+
+    #[test]
+    fn waiting_dot_keeps_its_attention_color_while_pulsing() {
+        let base = LinearRgba(0.2, 0.4, 0.9, 1.0);
+        let surface = LinearRgba(0.1, 0.1, 0.1, 1.0);
+        let pulsed =
+            agent_status_dot_accent(&AgentStatus::WaitingForInput, base, surface, Some(1.0));
+        assert!(
+            pulsed.0 > pulsed.2,
+            "waiting must stay in the orange family, not revert to the adapter accent"
+        );
+    }
+
+    #[test]
     fn rail_icon_side_fits_normal_cell_height() {
         // Rail width and font size both modest enough that neither the
         // ceiling nor the cell_height floor kicks in: just the usual
@@ -6897,26 +8238,45 @@ mod tests {
     }
 
     #[test]
-    fn passive_visible_detection_does_not_enable_control_actions() {
-        let text = "Claude Code v2.1.198\n❯ continue\n";
-        assert!(
-            visible_agent_match_from_adapters(text, default_agent_adapters().into_iter()).is_some()
-        );
+    fn control_actions_require_both_opt_in_and_trusted_evidence() {
+        // The gate is an AND. It was an OR, so trusted evidence alone unlocked
+        // process-spawning actions with `enable_control_actions = false` —
+        // looser than the documented model and than the config comment promises.
         let vars = HashMap::new();
 
         assert!(!agent_control_actions_allowed(false, false, &vars));
-        assert!(agent_control_actions_allowed(false, true, &vars));
+        assert!(
+            !agent_control_actions_allowed(false, true, &vars),
+            "trusted evidence alone must not unlock control actions"
+        );
+        assert!(
+            !agent_control_actions_allowed(true, false, &vars),
+            "opting in must not unlock control actions on untrusted evidence"
+        );
+        assert!(agent_control_actions_allowed(true, true, &vars));
     }
 
     #[test]
-    fn explicit_user_var_enables_control_actions() {
+    fn explicit_user_var_opts_a_single_pane_in() {
         let mut vars = HashMap::new();
         vars.insert(
             "agent.enable_control_actions".to_string(),
             "true".to_string(),
         );
 
-        assert!(agent_control_actions_allowed(false, false, &vars));
+        // The var is the per-pane opt-in, standing in for the config key. It is
+        // not evidence, so it cannot satisfy both halves of the gate by itself.
+        assert!(!agent_control_actions_allowed(false, false, &vars));
+        assert!(agent_control_actions_allowed(false, true, &vars));
+    }
+
+    #[test]
+    fn visible_chrome_trust_follows_the_config_switch() {
+        assert!(AgentEvidence::Process.is_trusted(false));
+        assert!(AgentEvidence::UserVar.is_trusted(false));
+        assert!(!AgentEvidence::Metadata.is_trusted(true));
+        assert!(!AgentEvidence::VisibleChrome.is_trusted(false));
+        assert!(AgentEvidence::VisibleChrome.is_trusted(true));
     }
 
     #[test]
@@ -7019,6 +8379,7 @@ mod tests {
         let agent = AgentPaneState {
             adapter_id: Some("codex".to_string()),
             kind: AgentKind::Codex,
+            evidence: AgentEvidence::Process,
             trusted_controls: true,
             status: AgentStatus::Running,
             model: None,
@@ -7229,25 +8590,61 @@ mod tests {
     #[test]
     fn status_inference_detects_running_and_waiting() {
         assert_eq!(
-            infer_agent_status_from_visible_text("Thinking\n✻ Brewing"),
+            infer_agent_status_from_visible_text("Thinking\n✻ Brewing", None),
             AgentStatus::Running
         );
         assert_eq!(
-            infer_agent_status_from_visible_text("Done\n\n❯"),
+            infer_agent_status_from_visible_text("Done\n\n❯", None),
             AgentStatus::WaitingForInput
         );
         assert_eq!(
-            infer_agent_status_from_visible_text("Here is the answer."),
+            infer_agent_status_from_visible_text("Here is the answer.", None),
             AgentStatus::Unknown
         );
     }
 
     #[test]
     fn process_detected_agent_loads_visible_text_for_status() {
-        assert!(should_load_visible_agent_text(true, true, None));
-        assert!(!should_load_visible_agent_text(true, true, Some("running")));
-        assert!(should_load_visible_agent_text(false, true, None));
-        assert!(!should_load_visible_agent_text(true, false, None));
+        // Strong evidence still loads the text when the pane publishes no
+        // status, because status inference needs it.
+        assert!(should_load_visible_agent_text(
+            Some(AgentEvidence::Process),
+            true,
+            None
+        ));
+        assert!(!should_load_visible_agent_text(
+            Some(AgentEvidence::Process),
+            true,
+            Some("running")
+        ));
+        assert!(should_load_visible_agent_text(None, true, None));
+        assert!(!should_load_visible_agent_text(
+            Some(AgentEvidence::Process),
+            false,
+            None
+        ));
+    }
+
+    #[test]
+    fn weak_title_evidence_still_loads_visible_text_for_arbitration() {
+        // A bare title token must not settle identity on its own: the visible
+        // text is loaded so the running agent's chrome can outvote it, even
+        // though the pane already published a status.
+        assert!(should_load_visible_agent_text(
+            Some(AgentEvidence::TitleToken),
+            true,
+            Some("running")
+        ));
+        assert!(should_load_visible_agent_text(
+            Some(AgentEvidence::TitlePhrase),
+            true,
+            Some("running")
+        ));
+        assert!(!should_load_visible_agent_text(
+            Some(AgentEvidence::UserVar),
+            true,
+            Some("running")
+        ));
     }
 
     fn detection_key(process: Option<&str>, title: &str) -> AgentDetectionCacheKey {
@@ -7270,13 +8667,36 @@ mod tests {
             state,
             last_wait_notification: None,
             detected_at: Instant::now(),
+            status_at: Instant::now(),
+            pending_switch: None,
+        }
+    }
+
+    fn aged_detection_entry(
+        key: AgentDetectionCacheKey,
+        state: Option<AgentPaneState>,
+        age: Duration,
+    ) -> AgentDetectionCacheEntry {
+        let detected_at = Instant::now() - age;
+        AgentDetectionCacheEntry {
+            key,
+            state,
+            last_wait_notification: None,
+            detected_at,
+            status_at: detected_at,
+            pending_switch: None,
         }
     }
 
     fn claude_state() -> AgentPaneState {
+        claude_state_with_evidence(AgentEvidence::Process)
+    }
+
+    fn claude_state_with_evidence(evidence: AgentEvidence) -> AgentPaneState {
         AgentPaneState {
             adapter_id: Some("claude".to_string()),
             kind: AgentKind::Claude,
+            evidence,
             trusted_controls: true,
             status: AgentStatus::Running,
             model: None,
@@ -7299,6 +8719,8 @@ mod tests {
         let sticky = sticky_agent_identity(
             Some(&previous),
             &detection_key(Some("claude"), "✳ fixing the sidebar badge"),
+            Instant::now(),
+            true,
         )
         .expect("identity should stick across a title rewrite");
         assert_eq!(sticky.adapter_id.as_deref(), Some("claude"));
@@ -7312,36 +8734,111 @@ mod tests {
             detection_key(Some("claude"), "claude"),
             Some(claude_state()),
         );
-        assert!(
-            sticky_agent_identity(Some(&previous), &detection_key(Some("zsh"), "claude")).is_none()
-        );
+        assert!(sticky_agent_identity(
+            Some(&previous),
+            &detection_key(Some("zsh"), "claude"),
+            Instant::now(),
+            true
+        )
+        .is_none());
     }
 
     #[test]
-    fn sticky_identity_without_a_process_anchor_still_requires_the_same_title() {
-        // Shell-wrapped and unknown-process panes have nothing to anchor on, so
-        // they keep the stricter pre-existing guard.
-        for process in [None, Some("zsh")] {
-            let previous = detection_entry(detection_key(process, "claude"), Some(claude_state()));
-            assert!(
-                sticky_agent_identity(Some(&previous), &detection_key(process, "claude")).is_some()
+    fn sticky_title_identity_expires_when_the_title_changes() {
+        // A title-derived identity is only ever as good as the title it came
+        // from, whatever the process is — including a non-shell one like `node`,
+        // which previously bypassed this guard entirely and let one bad frame
+        // pin a wrong badge for the life of the process.
+        for process in [None, Some("zsh"), Some("node")] {
+            let previous = detection_entry(
+                detection_key(process, "claude"),
+                Some(claude_state_with_evidence(AgentEvidence::TitleToken)),
             );
             assert!(sticky_agent_identity(
                 Some(&previous),
-                &detection_key(process, "~/Documents/tgzterminal")
+                &detection_key(process, "claude"),
+                Instant::now(),
+                true
+            )
+            .is_some());
+            assert!(sticky_agent_identity(
+                Some(&previous),
+                &detection_key(process, "~/Documents/tgzterminal"),
+                Instant::now(),
+                true
             )
             .is_none());
         }
     }
 
     #[test]
+    fn sticky_chrome_identity_survives_a_title_rewrite() {
+        // The flapping report: Claude retitles itself every turn, and an
+        // identity earned from its on-screen chrome must not be dropped by that.
+        let previous = detection_entry(
+            detection_key(Some("node"), "Update readme"),
+            Some(claude_state_with_evidence(AgentEvidence::VisibleChrome)),
+        );
+        let sticky = sticky_agent_identity(
+            Some(&previous),
+            &detection_key(Some("node"), "fix codex import"),
+            Instant::now(),
+            true,
+        )
+        .expect("chrome-derived identity should survive a retitle");
+        assert_eq!(sticky.adapter_id.as_deref(), Some("claude"));
+    }
+
+    #[test]
+    fn sticky_visible_identity_expires_after_its_ttl() {
+        let key = detection_key(Some("node"), "Update readme");
+        let fresh = aged_detection_entry(
+            key.clone(),
+            Some(claude_state_with_evidence(AgentEvidence::VisibleChrome)),
+            Duration::from_secs(5),
+        );
+        assert!(sticky_agent_identity(Some(&fresh), &key, Instant::now(), true).is_some());
+
+        let stale = aged_detection_entry(
+            key.clone(),
+            Some(claude_state_with_evidence(AgentEvidence::VisibleChrome)),
+            AGENT_STICKY_VISIBLE_TTL + Duration::from_secs(1),
+        );
+        assert!(sticky_agent_identity(Some(&stale), &key, Instant::now(), true).is_none());
+    }
+
+    #[test]
+    fn sticky_never_carries_trust_from_untrusted_evidence() {
+        let key = detection_key(Some("node"), "Update readme");
+        let previous = detection_entry(
+            key.clone(),
+            Some(claude_state_with_evidence(AgentEvidence::VisibleChrome)),
+        );
+        let sticky = sticky_agent_identity(Some(&previous), &key, Instant::now(), false)
+            .expect("identity still sticks");
+        assert!(
+            !sticky.trusted_controls,
+            "trust must not outlive the class that granted it"
+        );
+    }
+
+    #[test]
     fn sticky_identity_needs_a_previously_detected_agent() {
         let previous = detection_entry(detection_key(Some("claude"), "claude"), None);
-        assert!(
-            sticky_agent_identity(Some(&previous), &detection_key(Some("claude"), "other"))
-                .is_none()
-        );
-        assert!(sticky_agent_identity(None, &detection_key(Some("claude"), "claude")).is_none());
+        assert!(sticky_agent_identity(
+            Some(&previous),
+            &detection_key(Some("claude"), "other"),
+            Instant::now(),
+            true
+        )
+        .is_none());
+        assert!(sticky_agent_identity(
+            None,
+            &detection_key(Some("claude"), "claude"),
+            Instant::now(),
+            true
+        )
+        .is_none());
     }
 
     #[test]
@@ -7352,7 +8849,7 @@ mod tests {
         );
         let mut key = detection_key(Some("claude"), "claude");
         key.relevant_user_vars = vec![("agent.kind".to_string(), "codex".to_string())];
-        assert!(sticky_agent_identity(Some(&previous), &key).is_none());
+        assert!(sticky_agent_identity(Some(&previous), &key, Instant::now(), true).is_none());
     }
 
     #[test]
@@ -7398,13 +8895,7 @@ mod tests {
             ("Logs", AgentToolbeltAction::OpenLogs, 88.),
         ];
         let mut visible = buttons.clone();
-        while !visible.is_empty() && agent_toolbelt_button_area(&visible) > 190. {
-            let remove_idx = visible
-                .iter()
-                .rposition(|(_, action, _)| action != &AgentToolbeltAction::CopyMenu)
-                .unwrap_or(visible.len() - 1);
-            visible.remove(remove_idx);
-        }
+        trim_agent_toolbelt_buttons(&mut visible, 190.);
 
         assert!(visible
             .iter()
@@ -7524,6 +9015,382 @@ mod tests {
             "claude sonnet 5",
             "re:sonnet\\s+\\d+"
         ));
+    }
+
+    #[test]
+    fn glue_bytes_block_short_tokens_in_paths_and_entities() {
+        // Path separators, hyphens and entity punctuation glue a token to a
+        // neighbour; treating them as plain word boundaries is why "amp" fired
+        // on "&amp;" and "/opt/amp-tools".
+        for haystack in [
+            "echo &amp;amp; done",
+            "ls /opt/amp-tools",
+            "rated at 20 amp-hour capacity",
+            "postage stamp",
+        ] {
+            assert!(
+                !agent_word_pattern_matches_pre_lowered(haystack, "amp"),
+                "{haystack:?} must not match \"amp\""
+            );
+        }
+        // Trailing punctuation is still a boundary.
+        for haystack in ["amp", "starting amp.", "(amp)", "amp:"] {
+            assert!(
+                agent_word_pattern_matches_pre_lowered(haystack, "amp"),
+                "{haystack:?} must match \"amp\""
+            );
+        }
+    }
+
+    fn adapter_list() -> Vec<(String, AgentAdapterConfig)> {
+        default_agent_adapters().into_iter().collect()
+    }
+
+    #[test]
+    fn bare_brand_tokens_do_not_identify_an_agent_from_visible_text() {
+        // An ordinary shell pane whose output happens to contain agent brand
+        // words. Every one of these used to badge the pane.
+        let text = "\
+move the cursor to column 3\n\
+see the openai docs for codex-style completions\n\
+run the example script and read the sample output\n\
+gemini is a constellation\n";
+        let adapters = adapter_list();
+        let ambiguous = ambiguous_agent_patterns(&adapters);
+        assert!(
+            visible_agent_candidates(text, &adapters, &ambiguous, 2).is_empty(),
+            "brand words in ordinary output must not identify an agent"
+        );
+    }
+
+    #[test]
+    fn reading_this_repos_own_source_is_not_an_agent_pane() {
+        // Literal fragments of this project's adapter table. Brand phrases alone
+        // must not be enough, or `cat`/`grep` on config.rs badges the pane.
+        let text = "\
+        &[\"claude\", \"claude-code\", \"claude_code\"],\n\
+        &[\"claude code\", \"claude\"],\n\
+        &[\"claude code\", \"claude team\", \"welcome to claude\"],\n\
+            \"auto mode\",\n\
+            \"shift+tab\",\n\
+            \"ctx:\",\n\
+        &[\"codex\", \"openai-codex\", \"openai_codex\"],\n";
+        let adapters = adapter_list();
+        let ambiguous = ambiguous_agent_patterns(&adapters);
+        assert!(
+            visible_agent_candidates(text, &adapters, &ambiguous, 2).is_empty(),
+            "reading the adapter table must not detect an agent"
+        );
+    }
+
+    #[test]
+    fn running_claude_chrome_identifies_claude() {
+        // A running Claude frame with no banner left on screen: process is
+        // `node`, title is the current task. Only its own chrome can name it.
+        let text = "\
+✳ Updating the sidebar renderer… (esc to interrupt)\n\
+\n\
+  ? for shortcuts                          ctx: 42%\n\
+> \n";
+        let adapters = adapter_list();
+        let ambiguous = ambiguous_agent_patterns(&adapters);
+        let candidates = visible_agent_candidates(text, &adapters, &ambiguous, 2);
+        let resolved = resolve_agent_identity(candidates).expect("claude should be identified");
+        assert_eq!(resolved.adapter_id.as_deref(), Some("claude"));
+        assert_eq!(resolved.evidence, AgentEvidence::VisibleChrome);
+    }
+
+    #[test]
+    fn visible_identity_requires_chrome_not_just_brand_phrases() {
+        let adapters = adapter_list();
+        let ambiguous = ambiguous_agent_patterns(&adapters);
+        let text = "welcome to claude code\nclaude team plan\n";
+        assert!(visible_agent_candidates(text, &adapters, &ambiguous, 2).is_empty());
+    }
+
+    #[test]
+    fn generic_running_markers_name_no_adapter_but_do_set_running() {
+        // "esc to interrupt" is printed by several agents, so it cannot say
+        // which one — but it still means something is working.
+        let text = "thinking… (esc to interrupt)\n";
+        let adapters = adapter_list();
+        let ambiguous = ambiguous_agent_patterns(&adapters);
+        assert!(
+            ambiguous.contains("esc to interrupt"),
+            "a marker claimed by several adapters must be ambiguous"
+        );
+        assert!(visible_agent_candidates(text, &adapters, &ambiguous, 2).is_empty());
+        assert_eq!(
+            infer_agent_status_from_visible_text(text, None),
+            AgentStatus::Running
+        );
+    }
+
+    fn candidate(id: &str, evidence: AgentEvidence, signals: u32) -> AgentIdentityCandidate {
+        AgentIdentityCandidate {
+            adapter_id: Some(id.to_string()),
+            kind: AgentKind::from_adapter_id(id)
+                .unwrap_or_else(|| AgentKind::Unknown(id.to_string())),
+            evidence,
+            signals,
+        }
+    }
+
+    #[test]
+    fn stronger_evidence_outranks_weaker_regardless_of_order() {
+        let resolved = resolve_agent_identity(vec![
+            candidate("amp", AgentEvidence::TitleToken, 1),
+            candidate("claude", AgentEvidence::Process, 1),
+        ])
+        .unwrap();
+        assert_eq!(resolved.adapter_id.as_deref(), Some("claude"));
+
+        let resolved = resolve_agent_identity(vec![
+            candidate("claude", AgentEvidence::UserVar, 1),
+            candidate("codex", AgentEvidence::Process, 1),
+        ])
+        .unwrap();
+        assert_eq!(resolved.adapter_id.as_deref(), Some("claude"));
+    }
+
+    #[test]
+    fn title_token_loses_to_multi_signal_visible_chrome() {
+        // The pane title is prose the user typed ("run the amp job"); the chrome
+        // belongs to the agent actually running there.
+        let resolved = resolve_agent_identity(vec![
+            candidate("amp", AgentEvidence::TitleToken, 1),
+            candidate("claude", AgentEvidence::VisibleChrome, 3),
+        ])
+        .unwrap();
+        assert_eq!(resolved.adapter_id.as_deref(), Some("claude"));
+    }
+
+    #[test]
+    fn title_phrase_still_outranks_visible_chrome() {
+        let resolved = resolve_agent_identity(vec![
+            candidate("claude", AgentEvidence::TitlePhrase, 1),
+            candidate("codex", AgentEvidence::VisibleChrome, 3),
+        ])
+        .unwrap();
+        assert_eq!(resolved.adapter_id.as_deref(), Some("claude"));
+    }
+
+    #[test]
+    fn ambiguous_weak_evidence_is_not_resolved_alphabetically() {
+        // Two equally weak candidates is exactly the false-positive shape, and
+        // must not fall back to whichever adapter sorts first.
+        let resolved = resolve_agent_identity(vec![
+            candidate("amp", AgentEvidence::VisibleChrome, 1),
+            candidate("codex", AgentEvidence::VisibleChrome, 1),
+        ]);
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn ambiguous_strong_evidence_yields_an_unnamed_agent() {
+        let resolved = resolve_agent_identity(vec![
+            candidate("claude", AgentEvidence::Process, 1),
+            candidate("codex", AgentEvidence::Process, 1),
+        ])
+        .expect("something is certainly there");
+        assert_eq!(resolved.adapter_id, None);
+    }
+
+    #[test]
+    fn more_agreeing_signals_win_inside_one_class() {
+        let resolved = resolve_agent_identity(vec![
+            candidate("codex", AgentEvidence::VisibleChrome, 2),
+            candidate("claude", AgentEvidence::VisibleChrome, 4),
+        ])
+        .unwrap();
+        assert_eq!(resolved.adapter_id.as_deref(), Some("claude"));
+    }
+
+    #[test]
+    fn title_candidates_separate_phrases_from_bare_tokens() {
+        let adapters = adapter_list();
+        let phrase = title_agent_candidates("welcome to claude code", adapters.iter().cloned());
+        assert!(phrase
+            .iter()
+            .any(|c| c.adapter_id.as_deref() == Some("claude")
+                && c.evidence == AgentEvidence::TitlePhrase));
+
+        let token = title_agent_candidates("amp", adapters.iter().cloned());
+        assert!(token
+            .iter()
+            .any(|c| c.adapter_id.as_deref() == Some("amp")
+                && c.evidence == AgentEvidence::TitleToken));
+
+        // The substring match this path used before fired here.
+        assert!(
+            title_agent_candidates("run the example script", adapters.iter().cloned()).is_empty()
+        );
+    }
+
+    #[test]
+    fn identity_does_not_flip_on_a_single_disagreeing_frame() {
+        // The flapping report: one frame claiming a different agent must not
+        // change the badge.
+        assert!(!agent_identity_switch_allowed(
+            Some(("claude", AgentEvidence::VisibleChrome)),
+            Some("codex"),
+            AgentEvidence::VisibleChrome,
+            1
+        ));
+    }
+
+    #[test]
+    fn identity_switches_after_two_agreeing_frames() {
+        assert!(agent_identity_switch_allowed(
+            Some(("claude", AgentEvidence::VisibleChrome)),
+            Some("codex"),
+            AgentEvidence::VisibleChrome,
+            2
+        ));
+    }
+
+    #[test]
+    fn stronger_evidence_switches_identity_immediately() {
+        assert!(agent_identity_switch_allowed(
+            Some(("amp", AgentEvidence::TitleToken)),
+            Some("claude"),
+            AgentEvidence::Process,
+            1
+        ));
+        // ...and a weaker class cannot, however many times it repeats within one
+        // frame's worth of agreement.
+        assert!(!agent_identity_switch_allowed(
+            Some(("claude", AgentEvidence::Process)),
+            Some("amp"),
+            AgentEvidence::TitleToken,
+            1
+        ));
+    }
+
+    #[test]
+    fn identity_switch_is_free_when_nothing_is_established() {
+        assert!(agent_identity_switch_allowed(
+            None,
+            Some("claude"),
+            AgentEvidence::VisibleChrome,
+            1
+        ));
+        assert!(agent_identity_switch_allowed(
+            Some(("claude", AgentEvidence::Process)),
+            Some("claude"),
+            AgentEvidence::VisibleChrome,
+            1
+        ));
+    }
+
+    #[test]
+    fn status_running_marker_is_found_outside_the_last_twenty_lines() {
+        // The exact Stop-button regression: the marker sits far from the end,
+        // with the docked input strip and prompt box trailing it.
+        let mut lines = vec!["✳ Working on the sidebar… (esc to interrupt)".to_string()];
+        for idx in 0..60 {
+            lines.push(format!("  edited file_{idx}.rs"));
+        }
+        lines.push("╭──────────────╮".to_string());
+        lines.push("│ >            │".to_string());
+        lines.push("╰──────────────╯".to_string());
+        let text = lines.join("\n");
+        assert_eq!(
+            infer_agent_status_from_visible_text(&text, None),
+            AgentStatus::Running
+        );
+    }
+
+    #[test]
+    fn status_uses_adapter_running_patterns() {
+        let adapter = AgentAdapterConfig {
+            running_patterns: vec!["crunching numbers".to_string()],
+            ..Default::default()
+        };
+        let text = "crunching numbers\nplease hold\n";
+        assert_eq!(
+            infer_agent_status_from_visible_text(text, Some(&adapter)),
+            AgentStatus::Running
+        );
+        assert_eq!(
+            infer_agent_status_from_visible_text(text, None),
+            AgentStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn status_spinner_counts_above_the_prompt_box() {
+        // Agents redraw the spinner and the prompt independently, so the spinner
+        // is not reliably the final line.
+        let text = "✻ Thinking\n\n> \n";
+        assert_eq!(
+            infer_agent_status_from_visible_text(text, None),
+            AgentStatus::Running
+        );
+    }
+
+    #[test]
+    fn running_status_is_sticky_for_the_grace_period() {
+        let now = Instant::now();
+        let grace = Duration::from_secs(3);
+        // A frame caught between spinner redraws reads Unknown; the badge and
+        // the Stop button must not blink out.
+        assert_eq!(
+            stabilize_agent_status(
+                AgentStatus::Unknown,
+                Some(AgentStatus::Running),
+                Some(now - Duration::from_millis(500)),
+                now,
+                grace
+            ),
+            AgentStatus::Running
+        );
+        // Past the grace window it is allowed to go quiet.
+        assert_eq!(
+            stabilize_agent_status(
+                AgentStatus::Unknown,
+                Some(AgentStatus::Running),
+                Some(now - Duration::from_secs(4)),
+                now,
+                grace
+            ),
+            AgentStatus::Unknown
+        );
+        // A fresh reading always wins over the grace.
+        assert_eq!(
+            stabilize_agent_status(
+                AgentStatus::WaitingForInput,
+                Some(AgentStatus::Running),
+                Some(now),
+                now,
+                grace
+            ),
+            AgentStatus::WaitingForInput
+        );
+    }
+
+    #[test]
+    fn toolbelt_trim_drops_input_before_stop_and_copy() {
+        let mut visible = vec![
+            ("Stop", AgentToolbeltAction::Interrupt, 88.),
+            ("Copy", AgentToolbeltAction::CopyMenu, 88.),
+            ("Resume", AgentToolbeltAction::Resume, 112.),
+            ("Logs", AgentToolbeltAction::OpenLogs, 88.),
+            ("Input", AgentToolbeltAction::DockInput, 88.),
+        ];
+        trim_agent_toolbelt_buttons(&mut visible, 190.);
+        let actions: Vec<_> = visible
+            .iter()
+            .map(|(_, action, _)| action.clone())
+            .collect();
+        assert_eq!(
+            actions,
+            vec![
+                AgentToolbeltAction::Interrupt,
+                AgentToolbeltAction::CopyMenu
+            ],
+            "Stop and Copy are the last two standing"
+        );
     }
 
     #[test]

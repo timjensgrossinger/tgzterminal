@@ -239,10 +239,30 @@ pub struct AgentAdapterConfig {
     pub title_patterns: Vec<String>,
 
     /// Visible text fragments that identify this adapter.
+    ///
+    /// Use phrases, not bare brand words: a single token like `amp` or `cursor`
+    /// appears in ordinary output (man pages, source, package names) and made
+    /// plain shells detect as agents. Brand tokens belong in `title_patterns`,
+    /// where the haystack is one short string rather than a whole screen.
     #[dynamic(default)]
     pub visible_patterns: Vec<String>,
 
+    /// Visible text fragments printed only while this adapter is actively
+    /// working. Drive the Running status, and count as identity evidence when no
+    /// other enabled adapter claims the same fragment.
+    #[dynamic(default)]
+    pub running_patterns: Vec<String>,
+
+    /// Visible text fragments belonging to this adapter's own TUI furniture —
+    /// its footer, hint line or status bar. Identity evidence only, never
+    /// status: they are on screen whether or not the agent is busy.
+    #[dynamic(default)]
+    pub chrome_patterns: Vec<String>,
+
     /// Transcript chrome fragments removed from copy actions.
+    ///
+    /// Never used for identity: these are deliberately short and generic
+    /// (`tokens`, `ctx:`), which is exactly what must not badge a pane.
     #[dynamic(default)]
     pub strip_patterns: Vec<String>,
 
@@ -289,6 +309,8 @@ impl Default for AgentAdapterConfig {
             process_names: Vec::new(),
             title_patterns: Vec::new(),
             visible_patterns: Vec::new(),
+            running_patterns: Vec::new(),
+            chrome_patterns: Vec::new(),
             strip_patterns: Vec::new(),
             model_patterns: Vec::new(),
             resume_command: None,
@@ -326,6 +348,8 @@ impl AgentAdapterConfig {
                 .iter()
                 .map(|pattern| pattern.to_string())
                 .collect(),
+            running_patterns: Vec::new(),
+            chrome_patterns: Vec::new(),
             strip_patterns: strip_patterns
                 .iter()
                 .map(|pattern| pattern.to_string())
@@ -349,6 +373,14 @@ impl AgentAdapterConfig {
         self.launch_command = Some(vec![command.to_string()]);
         self
     }
+
+    /// Set the visible-text markers this adapter is recognized by: `running`
+    /// prints only while it works, `chrome` is its permanent TUI furniture.
+    fn with_markers(mut self, running: &[&str], chrome: &[&str]) -> Self {
+        self.running_patterns = running.iter().map(|p| p.to_string()).collect();
+        self.chrome_patterns = chrome.iter().map(|p| p.to_string()).collect();
+        self
+    }
 }
 
 pub type AgentAdaptersConfig = BTreeMap<String, AgentAdapterConfig>;
@@ -361,7 +393,7 @@ pub fn default_agent_adapters() -> AgentAdaptersConfig {
         "#db7a52",
         &["claude", "claude-code", "claude_code"],
         &["claude code", "claude"],
-        &["claude code", "claude team"],
+        &["claude code", "claude team", "welcome to claude"],
         &[
             "sessionstart:startup",
             "auto mode",
@@ -400,6 +432,25 @@ pub fn default_agent_adapters() -> AgentAdaptersConfig {
         "{home}/.claude/projects/{claude_project_path}".to_string()
     ]);
     claude.launch_command = Some(vec!["claude".to_string()]);
+    // Claude Code usually runs as `node` and titles its pane with the current
+    // task, so its own footer is the only durable identity signal once the
+    // startup banner scrolls away.
+    claude.running_patterns = vec!["esc to interrupt".to_string()];
+    claude.chrome_patterns = [
+        "? for shortcuts",
+        "/help for help",
+        "auto mode on (shift+tab",
+        "shift+tab to cycle",
+        "bypass permissions on",
+        "plan mode on",
+        "accept edits on",
+        "context left until auto-compact",
+        r"re:\bctx:\s*\d+%",
+        r"re:\d+%\s+context\s+left",
+    ]
+    .iter()
+    .map(|p| p.to_string())
+    .collect();
     adapters.insert("claude".to_string(), claude);
 
     let mut codex = AgentAdapterConfig::with_defaults(
@@ -408,7 +459,7 @@ pub fn default_agent_adapters() -> AgentAdaptersConfig {
         "#3da37a",
         &["codex", "openai-codex", "openai_codex"],
         &["codex"],
-        &["codex", "openai"],
+        &["openai codex", "codex cli", "welcome to codex"],
         &["tokens", "context", "approval", "sandbox"],
         &["gpt-5", "gpt-4"],
     );
@@ -427,6 +478,15 @@ pub fn default_agent_adapters() -> AgentAdaptersConfig {
         "{home}/.codex/log".to_string(),
     ]);
     codex.launch_command = Some(vec!["codex".to_string()]);
+    codex.running_patterns = vec!["esc to interrupt".to_string()];
+    codex.chrome_patterns = [
+        "send q or ctrl+c to exit",
+        "/approvals",
+        "/status for session",
+    ]
+    .iter()
+    .map(|p| p.to_string())
+    .collect();
     adapters.insert("codex".to_string(), codex);
     adapters.insert(
         "gemini".to_string(),
@@ -436,11 +496,12 @@ pub fn default_agent_adapters() -> AgentAdaptersConfig {
             "#4785eb",
             &["gemini", "gemini-cli", "gemini_cli"],
             &["gemini"],
-            &["gemini"],
+            &["gemini cli", "google gemini", "welcome to gemini"],
             &["tokens", "context"],
             &["gemini"],
         )
-        .with_launch("gemini"),
+        .with_launch("gemini")
+        .with_markers(&["esc to cancel"], &["type your message", "/help for more"]),
     );
     let mut opencode = AgentAdapterConfig::with_defaults(
         "OpenCode",
@@ -468,6 +529,8 @@ pub fn default_agent_adapters() -> AgentAdaptersConfig {
         "{home}/.local/share/opencode/storage".to_string(),
     ]);
     opencode.launch_command = Some(vec!["opencode".to_string()]);
+    opencode.running_patterns = vec!["esc to interrupt".to_string()];
+    opencode.chrome_patterns = vec!["opencode v".to_string()];
     adapters.insert("opencode".to_string(), opencode);
 
     let mut copilot = AgentAdapterConfig::with_defaults(
@@ -476,7 +539,7 @@ pub fn default_agent_adapters() -> AgentAdaptersConfig {
         "#57a85f",
         &["copilot", "gh-copilot", "github-copilot"],
         &["copilot"],
-        &["copilot"],
+        &["github copilot", "copilot cli", "gh copilot"],
         &["tokens", "context"],
         &["gpt", "claude"],
     );
@@ -490,6 +553,7 @@ pub fn default_agent_adapters() -> AgentAdaptersConfig {
         "{home}/.copilot/session-state".to_string(),
     ]);
     copilot.launch_command = Some(vec!["copilot".to_string()]);
+    copilot.running_patterns = vec!["esc to interrupt".to_string()];
     adapters.insert("copilot".to_string(), copilot);
     adapters.insert(
         "cursor".to_string(),
@@ -499,13 +563,14 @@ pub fn default_agent_adapters() -> AgentAdaptersConfig {
             "#706bd1",
             &["cursor"],
             &["cursor"],
-            &["cursor"],
+            &["cursor agent", "cursor-agent", "cursor cli"],
             &["tokens", "context"],
             &["gpt", "claude"],
         )
         // The Cursor terminal agent ships as `cursor-agent`; plain `cursor`
         // is the GUI editor launcher and would not start an agent session.
-        .with_launch("cursor-agent"),
+        .with_launch("cursor-agent")
+        .with_markers(&["esc to interrupt"], &[]),
     );
     adapters.insert(
         "amp".to_string(),
@@ -515,11 +580,12 @@ pub fn default_agent_adapters() -> AgentAdaptersConfig {
             "#bd5cad",
             &["amp"],
             &["amp"],
-            &["amp"],
+            &["amp cli", "sourcegraph amp", "amp v"],
             &["tokens", "context"],
             &["sonnet", "opus"],
         )
-        .with_launch("amp"),
+        .with_launch("amp")
+        .with_markers(&["esc to interrupt"], &[]),
     );
     adapters
 }
@@ -546,11 +612,34 @@ pub enum AgentLaunchTarget {
     NewTab,
     /// Split the active pane and put the agent beside it.
     SplitPane,
+    /// Split in, then zoom the agent pane so it fills the tab. Un-zooming
+    /// (`SetPaneZoomState(false)`) restores the panes that were there before.
+    Zoomed,
 }
 
 impl Default for AgentLaunchTarget {
     fn default() -> Self {
         Self::SplitPane
+    }
+}
+
+/// How the launcher picks a split target for the second and later agent
+/// launched into the same tab. Only consulted when the resolved launch
+/// target is `SplitPane` or `Zoomed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromDynamic, ToDynamic)]
+pub enum AgentTilePolicy {
+    /// Split the largest eligible pane along its longer axis, so repeated
+    /// launches tile into an even-ish grid instead of repeatedly halving
+    /// whichever pane happens to be active.
+    SplitLargest,
+    /// Always split whatever pane is currently active, the original
+    /// behavior from before repeat-click tiling existed.
+    ActivePane,
+}
+
+impl Default for AgentTilePolicy {
+    fn default() -> Self {
+        Self::SplitLargest
     }
 }
 
@@ -590,6 +679,10 @@ impl Default for AgentSplitDirection {
 
 pub fn default_agent_split_size_percent() -> u8 {
     50
+}
+
+pub fn default_max_panes_per_tab() -> u8 {
+    4
 }
 
 pub fn default_project_markers() -> Vec<String> {
@@ -633,6 +726,17 @@ pub struct AgentLauncherConfig {
     #[dynamic(default = "default_agent_split_size_percent")]
     pub split_size_percent: u8,
 
+    /// How the second and later agent launched into the same tab picks its
+    /// split target.
+    #[dynamic(default)]
+    pub tile: AgentTilePolicy,
+
+    /// Maximum number of eligible panes tiled into one tab before a launch
+    /// that would otherwise split falls back to a new tab instead. `0` means
+    /// unlimited.
+    #[dynamic(default = "default_max_panes_per_tab")]
+    pub max_panes_per_tab: u8,
+
     /// What to do when the active pane is a remote/SSH session. Defaults to
     /// running the agent locally regardless.
     #[dynamic(default)]
@@ -675,6 +779,8 @@ impl Default for AgentLauncherConfig {
             open_in: AgentLaunchTarget::default(),
             split_direction: AgentSplitDirection::default(),
             split_size_percent: default_agent_split_size_percent(),
+            tile: AgentTilePolicy::default(),
+            max_panes_per_tab: default_max_panes_per_tab(),
             remote_behavior: AgentRemoteBehavior::default(),
             project_markers: default_project_markers(),
             domain: None,
@@ -756,6 +862,34 @@ pub struct AgentUiConfig {
     /// Sidebar button that starts a fresh agent session.
     #[dynamic(default)]
     pub launcher: AgentLauncherConfig,
+
+    /// Distinct adapter-exclusive patterns that must agree before visible pane
+    /// text is accepted as an agent's identity.
+    ///
+    /// One brand phrase is not evidence: a pane merely displaying a log, a diff
+    /// or this project's own adapter table would otherwise be badged. Clamped in
+    /// practice by how many patterns an adapter actually declares, so a custom
+    /// adapter with a single distinctive string still matches.
+    #[dynamic(default = "default_agent_visible_identity_signals")]
+    pub visible_identity_signals: u8,
+
+    /// Whether multi-signal visible-text evidence may unlock control actions.
+    ///
+    /// Agents whose process is a generic interpreter (Claude Code runs as
+    /// `node`) and whose title is task prose can only be recognized from their
+    /// on-screen chrome, so without this their Resume/Details actions can never
+    /// appear. Control actions still additionally require
+    /// `enable_control_actions`.
+    #[dynamic(default = "default_true")]
+    pub trust_visible_evidence: bool,
+
+    /// Pulse the agent status dot while the agent is working.
+    #[dynamic(default = "default_true")]
+    pub pulse_working_dot: bool,
+
+    /// Duration of one pulse cycle, in milliseconds. Clamped to 400..=6000.
+    #[dynamic(default = "default_agent_pulse_period_ms")]
+    pub pulse_period_ms: u64,
 }
 
 impl Default for AgentUiConfig {
@@ -771,8 +905,20 @@ impl Default for AgentUiConfig {
             toolbelt_position: AgentToolbeltPosition::Top,
             adapters: default_agent_adapters(),
             launcher: AgentLauncherConfig::default(),
+            visible_identity_signals: default_agent_visible_identity_signals(),
+            trust_visible_evidence: true,
+            pulse_working_dot: true,
+            pulse_period_ms: default_agent_pulse_period_ms(),
         }
     }
+}
+
+fn default_agent_visible_identity_signals() -> u8 {
+    2
+}
+
+fn default_agent_pulse_period_ms() -> u64 {
+    1600
 }
 
 #[derive(Debug, Clone, FromDynamic, ToDynamic, ConfigMeta)]
@@ -2688,8 +2834,14 @@ fn default_tab_max_width() -> usize {
     16
 }
 
+/// Calibrated for a 2x display, where it is used verbatim; halved on 1x.
+///
+/// The floor is set by the shared bottom row: at a 14px cell, "Worktree" needs
+/// `144 + 16 * cell_width = 368px` before its half of the row can hold the full
+/// word. 400 leaves headroom for wider monospace faces (the label still fits at
+/// a 16px cell) instead of dropping straight to the "Wt" rung.
 fn default_sidebar_width_px() -> usize {
-    280
+    400
 }
 
 fn default_sidebar_collapsed_width_px() -> usize {
@@ -2825,14 +2977,31 @@ mod agent_ui_tests {
         assert_eq!(launcher.remote_behavior, AgentRemoteBehavior::ForceLocal);
         assert_eq!(launcher.split_direction, AgentSplitDirection::Horizontal);
         assert_eq!(launcher.split_size_percent, 50);
+        assert_eq!(launcher.tile, AgentTilePolicy::SplitLargest);
+        assert_eq!(launcher.max_panes_per_tab, 4);
     }
 
     #[test]
     fn agent_launch_target_round_trips_through_dynamic() {
-        for value in [AgentLaunchTarget::NewTab, AgentLaunchTarget::SplitPane] {
+        for value in [
+            AgentLaunchTarget::NewTab,
+            AgentLaunchTarget::SplitPane,
+            AgentLaunchTarget::Zoomed,
+        ] {
             let dynamic = value.to_dynamic();
             assert_eq!(
                 AgentLaunchTarget::from_dynamic(&dynamic, Default::default()).unwrap(),
+                value
+            );
+        }
+    }
+
+    #[test]
+    fn agent_tile_policy_round_trips_through_dynamic() {
+        for value in [AgentTilePolicy::SplitLargest, AgentTilePolicy::ActivePane] {
+            let dynamic = value.to_dynamic();
+            assert_eq!(
+                AgentTilePolicy::from_dynamic(&dynamic, Default::default()).unwrap(),
                 value
             );
         }
@@ -2891,6 +3060,128 @@ mod agent_ui_tests {
             adapters["cursor"].launch_command,
             Some(strings(&["cursor-agent"]))
         );
+    }
+
+    #[test]
+    fn agent_ui_defaults_include_detection_and_pulse_keys() {
+        let agent_ui = Config::default_config().agent_ui;
+
+        assert_eq!(agent_ui.visible_identity_signals, 2);
+        assert!(agent_ui.trust_visible_evidence);
+        assert!(agent_ui.pulse_working_dot);
+        assert_eq!(agent_ui.pulse_period_ms, 1600);
+    }
+
+    #[test]
+    fn sidebar_width_defaults_clear_every_layout_threshold() {
+        let config = Config::default_config();
+
+        // 400 is the arithmetic floor for a full "Worktree" at a 14px cell plus
+        // headroom for wider faces; the thresholds below gate whole rows.
+        assert_eq!(config.sidebar_width_px, 400);
+        assert_eq!(config.sidebar_collapsed_width_px, 48);
+        assert!(
+            config.sidebar_width_px > 180,
+            "the Worktree/agent row is not drawn at or below 180px"
+        );
+        assert!(
+            config.sidebar_width_px > 96,
+            "the search row is not drawn at or below 96px"
+        );
+        // Must also survive being halved on a 1x display and still keep the row.
+        assert!(config.sidebar_width_px / 2 > 180);
+    }
+
+    #[test]
+    fn visible_patterns_never_contain_a_bare_brand_token() {
+        // A single short brand word matches ordinary output (man pages, source,
+        // package names), which is what badged plain shells as agents. Brand
+        // tokens belong in `title_patterns`; visible patterns must be phrases.
+        for (id, adapter) in default_agent_adapters() {
+            for pattern in &adapter.visible_patterns {
+                if pattern.starts_with("re:") {
+                    continue;
+                }
+                assert!(
+                    pattern.contains(char::is_whitespace)
+                        || pattern.contains('-')
+                        || pattern.chars().count() >= 7,
+                    "{id}: visible pattern {pattern:?} is a bare brand token"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn claude_is_identifiable_by_its_own_chrome() {
+        let claude = &default_agent_adapters()["claude"];
+
+        // Claude Code runs as `node` and titles its pane with the current task,
+        // so its footer is the only durable identity signal it has.
+        assert!(claude
+            .running_patterns
+            .iter()
+            .any(|pattern| pattern == "esc to interrupt"));
+        assert!(claude
+            .chrome_patterns
+            .iter()
+            .any(|pattern| pattern == "? for shortcuts"));
+        assert!(claude
+            .chrome_patterns
+            .iter()
+            .any(|pattern| pattern.starts_with("re:")));
+    }
+
+    #[test]
+    fn chrome_patterns_are_never_short_generic_fragments() {
+        // Guards the exact mistake of promoting `strip_patterns` entries such as
+        // "ctx:" or "tokens" into identity evidence.
+        for (id, adapter) in default_agent_adapters() {
+            for pattern in &adapter.chrome_patterns {
+                if pattern.starts_with("re:") {
+                    continue;
+                }
+                assert!(
+                    pattern.chars().count() >= 8,
+                    "{id}: chrome pattern {pattern:?} is too generic to identify an adapter"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn strip_patterns_survive_the_identity_split() {
+        // Transcript-chrome removal keeps every entry it had; the identity work
+        // was added alongside it, not carved out of it.
+        let claude = &default_agent_adapters()["claude"];
+        for expected in [
+            "auto mode",
+            "shift+tab",
+            "ctx:",
+            "% left",
+            "tokens used",
+            "model:",
+            "cwd:",
+            "welcome to claude",
+        ] {
+            assert!(
+                claude.strip_patterns.iter().any(|p| p == expected),
+                "claude strip_patterns lost {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn partial_adapter_config_leaves_the_new_pattern_lists_empty() {
+        // The merge in the GUI layer substitutes built-ins for empty lists, the
+        // same way it does for the resume/attach templates.
+        let user = AgentAdapterConfig {
+            enabled: true,
+            ..AgentAdapterConfig::default()
+        };
+
+        assert!(user.running_patterns.is_empty());
+        assert!(user.chrome_patterns.is_empty());
     }
 
     #[test]
