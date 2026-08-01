@@ -17,20 +17,8 @@
 //! All of this runs on the overlay thread. Nothing here may touch the mux.
 
 use super::{status_from_claude, subagent_status, ClaudeSession, HerdSubagent};
-use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
-
-/// How much of a transcript's tail to read on the first attempt when inferring
-/// subagent status. These files reach hundreds of KB, so they are never read
-/// whole up front.
-const TAIL_WINDOW: u64 = 64 * 1024;
-
-/// Hard ceiling on tail reading. A final assistant message routinely exceeds
-/// the initial window — a subagent that returns a long report writes one very
-/// long JSONL line — so the window grows until it contains a line break. This
-/// caps that growth so a pathological transcript can never be slurped whole.
-const MAX_TAIL_WINDOW: u64 = 4 * 1024 * 1024;
 
 /// Why a project's log directory could not be used.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -286,57 +274,25 @@ fn parse_tail_line(line: &str) -> (Option<String>, Option<String>) {
 
 /// Read the last line of a possibly-huge JSONL file.
 ///
-/// Reads the final [`TAIL_WINDOW`] bytes and, when that window starts mid-file,
-/// discards its leading partial line. If no line break survives that trim the
-/// window is grown and retried, up to [`MAX_TAIL_WINDOW`] — real transcripts
-/// end in a single line far larger than the initial window, and returning
-/// `None` there would misreport a finished subagent as unknown.
-///
-/// Returns `None` only when the file is empty, unreadable, or one line longer
-/// than the ceiling. A trailing line with no terminating newline is returned as
-/// is; callers parse it and degrade gracefully if the writer was mid-append.
+/// Thin wrapper over [`super::transcript::tail_lines`], which owns the bounded
+/// tail-reading machinery this and the activity reader both need.
 pub fn last_complete_line(path: &Path) -> Option<String> {
-    let mut file = std::fs::File::open(path).ok()?;
-    let len = file.metadata().ok()?.len();
-    if len == 0 {
-        return None;
-    }
+    super::transcript::tail_lines(path, 1).pop()
+}
 
-    let mut window = TAIL_WINDOW;
-    loop {
-        let start = len.saturating_sub(window);
-        file.seek(SeekFrom::Start(start)).ok()?;
-        let mut buf = Vec::with_capacity((len - start) as usize);
-        file.read_to_end(&mut buf).ok()?;
-        let text = String::from_utf8_lossy(&buf);
-
-        // Past the leading partial line, if we started mid-file.
-        let usable: Option<&str> = if start > 0 {
-            text.find('\n').map(|idx| &text[idx + 1..])
-        } else {
-            Some(&text[..])
-        };
-
-        if let Some(line) = usable.and_then(|usable| {
-            usable
-                .lines()
-                .rev()
-                .find(|line| !line.trim().is_empty())
-                .map(str::to_string)
-        }) {
-            return Some(line);
-        }
-
-        // Whole file read, or ceiling reached: nothing more to try.
-        if start == 0 || window >= MAX_TAIL_WINDOW {
-            return None;
-        }
-        window = window.saturating_mul(8).min(MAX_TAIL_WINDOW);
-    }
+/// Path to a session's own transcript.
+///
+/// It sits beside the `<sessionId>/` directory that holds the subagent
+/// transcripts, not inside it.
+pub fn session_transcript_path(home: &Path, cwd: &Path, session_id: &str) -> Option<PathBuf> {
+    let project_dir = resolve_project_dir(home, cwd).ok()?;
+    let path = project_dir.join(format!("{session_id}.jsonl"));
+    path.is_file().then_some(path)
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::transcript::{MAX_TAIL_WINDOW, TAIL_WINDOW};
     use super::super::HerdStatus;
     use super::*;
     use std::time::Duration;

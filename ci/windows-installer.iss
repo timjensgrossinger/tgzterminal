@@ -2,13 +2,33 @@
 ; SEE THE DOCUMENTATION FOR DETAILS ON CREATING INNO SETUP SCRIPT FILES!
 ; vim:ts=2:sw=2:et:
 
-#define MyAppName "WezTerm"
+; Branding. Each of these may be supplied on the iscc command line
+; (//DMyAppName=... etc); the #ifndef guards mean the values below are
+; defaults only. A bare `#define` would silently overwrite a command-line
+; define, which is why they are not used here.
+#ifndef MyAppName
+  #define MyAppName "TGZTerminal"
+#endif
 ;#define MyAppVersion "1.5"
-#define MyAppPublisher "Wez Furlong"
-#define MyAppURL "http://wezterm.org"
+#ifndef MyAppPublisher
+  #define MyAppPublisher "Tim Grossinger"
+#endif
+#ifndef MyAppURL
+  #define MyAppURL "https://github.com/timjensgrossinger/tgzterminal"
+#endif
 #define MyAppExeName "wezterm-gui.exe"
 
+; The GUI calls SetCurrentProcessExplicitAppUserModelID with this exact string
+; (wezterm-gui/src/main.rs) and the toast backend registers under it
+; (wezterm-toast-notification/src/windows.rs). Windows only delivers toasts for
+; an AUMID that matches a Start Menu shortcut, so this must not be rebranded
+; independently of that code.
+#define MyAppUserModelID "org.wezfurlong.wezterm"
+
 [Setup]
+; Stable across releases so that installing a newer build upgrades the
+; existing install in place (same directory, no duplicate entry in
+; Apps & Features) rather than sitting alongside it.
 AppId={{BCF6F0DA-5B9A-408D-8562-F680AE6E1EAF}
 ArchitecturesAllowed=x64 arm64
 ArchitecturesInstallIn64BitMode=x64 arm64
@@ -26,7 +46,10 @@ DisableProgramGroupPage=yes
 ;PrivilegesRequired=lowest
 ;PrivilegesRequiredOverridesAllowed=dialog
 OutputDir=..
-OutputBaseFilename=WezTerm-Setup
+#ifndef MyOutputBaseFilename
+  #define MyOutputBaseFilename MyAppName + "-Setup"
+#endif
+OutputBaseFilename={#MyOutputBaseFilename}
 SetupIconFile=..\assets\windows\terminal.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
 Compression=lzma
@@ -35,6 +58,11 @@ WizardStyle=modern
 ; Build 1809 is required for pty support
 MinVersion=10.0.17763
 ChangesEnvironment=true
+; Upgrading over a running install otherwise fails on locked binaries. Restart
+; Manager asks the running GUI and mux server to close, then brings them back
+; afterwards.
+CloseApplications=yes
+RestartApplications=yes
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -56,22 +84,22 @@ Source: "..\target\release\fzf.exe"; DestDir: "{app}"; Flags: ignoreversion
 ; NOTE: Don't use "Flags: ignoreversion" on any shared system files
 
 [Icons]
-Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; AppUserModelID: "org.wezfurlong.wezterm"
-Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon; AppUserModelID: "org.wezfurlong.wezterm"
+Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; AppUserModelID: "{#MyAppUserModelID}"
+Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon; AppUserModelID: "{#MyAppUserModelID}"
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
 
 [Registry]
-Root: HKA; Subkey: "Software\Classes\Drive\shell\Open WezTerm here"; Flags: uninsdeletekey
-Root: HKA; Subkey: "Software\Classes\Drive\shell\Open WezTerm here"; ValueName: "icon"; ValueType: string; ValueData: "{app}\{#MyAppExeName}"; Flags: uninsdeletekey;
-Root: HKA; Subkey: "Software\Classes\Drive\shell\Open WezTerm here\command"; ValueType: string; ValueData: """{app}\{#MyAppExeName}"" start --no-auto-connect --cwd ""%V\"""; Flags: uninsdeletekey;
-Root: HKA; Subkey: "Software\Classes\Directory\Background\shell\Open WezTerm here"; Flags: uninsdeletekey
-Root: HKA; Subkey: "Software\Classes\Directory\Background\shell\Open WezTerm here"; ValueName: "icon"; ValueType: string; ValueData: "{app}\{#MyAppExeName}"; Flags: uninsdeletekey;
-Root: HKA; Subkey: "Software\Classes\Directory\Background\shell\Open WezTerm here\command"; ValueType: string; ValueData: """{app}\{#MyAppExeName}"" start --no-auto-connect --cwd ""%V"; Flags: uninsdeletekey;
-Root: HKA; Subkey: "Software\Classes\Directory\shell\Open WezTerm here"; Flags: uninsdeletekey
-Root: HKA; Subkey: "Software\Classes\Directory\shell\Open WezTerm here"; ValueName: "icon"; ValueType: string; ValueData: "{app}\{#MyAppExeName}"; Flags: uninsdeletekey;
-Root: HKA; Subkey: "Software\Classes\Directory\shell\Open WezTerm here\command"; ValueType: string; ValueData: """{app}\{#MyAppExeName}"" start --no-auto-connect --cwd ""%V\\"""; Flags: uninsdeletekey;
+Root: HKA; Subkey: "Software\Classes\Drive\shell\Open {#MyAppName} here"; Flags: uninsdeletekey
+Root: HKA; Subkey: "Software\Classes\Drive\shell\Open {#MyAppName} here"; ValueName: "icon"; ValueType: string; ValueData: "{app}\{#MyAppExeName}"; Flags: uninsdeletekey;
+Root: HKA; Subkey: "Software\Classes\Drive\shell\Open {#MyAppName} here\command"; ValueType: string; ValueData: """{app}\{#MyAppExeName}"" start --no-auto-connect --cwd ""%V\"""; Flags: uninsdeletekey;
+Root: HKA; Subkey: "Software\Classes\Directory\Background\shell\Open {#MyAppName} here"; Flags: uninsdeletekey
+Root: HKA; Subkey: "Software\Classes\Directory\Background\shell\Open {#MyAppName} here"; ValueName: "icon"; ValueType: string; ValueData: "{app}\{#MyAppExeName}"; Flags: uninsdeletekey;
+Root: HKA; Subkey: "Software\Classes\Directory\Background\shell\Open {#MyAppName} here\command"; ValueType: string; ValueData: """{app}\{#MyAppExeName}"" start --no-auto-connect --cwd ""%V"; Flags: uninsdeletekey;
+Root: HKA; Subkey: "Software\Classes\Directory\shell\Open {#MyAppName} here"; Flags: uninsdeletekey
+Root: HKA; Subkey: "Software\Classes\Directory\shell\Open {#MyAppName} here"; ValueName: "icon"; ValueType: string; ValueData: "{app}\{#MyAppExeName}"; Flags: uninsdeletekey;
+Root: HKA; Subkey: "Software\Classes\Directory\shell\Open {#MyAppName} here\command"; ValueType: string; ValueData: """{app}\{#MyAppExeName}"" start --no-auto-connect --cwd ""%V\\"""; Flags: uninsdeletekey;
 
 [Code]
 { https://stackoverflow.com/a/46609047/149111 }
@@ -188,10 +216,38 @@ begin
   else Log(Format('Error while removing the [%s] from PATH: [%s]', [instlPath, Paths]));
 end;
 
+{ Earlier builds registered the shell verbs under the upstream "Open WezTerm
+  here" name. The [Registry] entries above now use {#MyAppName}, so upgrading
+  such an install would leave the old keys behind as orphans pointing at the
+  same executable -- two identical context menu entries. Remove them.
+  HKA resolves to HKLM in an administrative install and HKCU otherwise, so
+  both hives are cleaned; a missing key is not an error. }
+procedure RemoveLegacyShellVerbs();
+var
+  Keys: array[0..2] of String;
+  I: Integer;
+begin
+  if CompareText('{#MyAppName}', 'WezTerm') = 0 then
+    exit;
+
+  Keys[0] := 'Software\Classes\Drive\shell\Open WezTerm here';
+  Keys[1] := 'Software\Classes\Directory\Background\shell\Open WezTerm here';
+  Keys[2] := 'Software\Classes\Directory\shell\Open WezTerm here';
+
+  for I := 0 to 2 do
+  begin
+    RegDeleteKeyIncludingSubkeys(HKEY_LOCAL_MACHINE, Keys[I]);
+    RegDeleteKeyIncludingSubkeys(HKEY_CURRENT_USER, Keys[I]);
+  end;
+end;
+
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssPostInstall then
+  begin
     EnvAddPath(ExpandConstant('{app}'));
+    RemoveLegacyShellVerbs();
+  end;
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);

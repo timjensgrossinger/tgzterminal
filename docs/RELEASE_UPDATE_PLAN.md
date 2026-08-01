@@ -16,6 +16,34 @@ parallel with them.
 - No silent background installs; updates always require user confirmation.
 - No telemetry/phone-home beyond the update check itself.
 
+## Status: partially superseded
+
+The Sparkle route below is still the intended end state, but it is not what
+ships today. An interim "notify, user installs" updater is implemented instead:
+`wezterm-gui/src/update.rs` polls the GitHub release API, and the notification's
+click target is the release artifact for the running platform
+(`pick_asset_for`). `check_for_updates` is on by default, a `CheckForUpdates`
+key assignment / palette entry runs the check on demand, and the Windows
+installer upgrades in place (`CloseApplications=yes`). Nothing is downloaded or
+installed by the app itself.
+
+**The blocker for anything more automatic is notarization.** Nothing in
+`ci/build-macos-bundle.sh` or the release workflows runs `notarytool` or
+staples a ticket, so a downloaded dmg is quarantined and Gatekeeper refuses the
+app until the user clears the xattr. Self-replacing an unnotarized bundle would
+turn that one-time friction into a per-update failure. Notarize first, then
+revisit Sparkle.
+
+Two consequences of shipping unnotarized, both handled but worth keeping
+visible:
+
+- macOS pins TCC grants of an ad-hoc signed bundle to the binary's code
+  directory hash, so replacing the bundle silently revokes folder access. The
+  priming marker (`wezterm-gui/src/macos_permissions.rs`) therefore records the
+  build that primed and re-primes after an upgrade.
+- The release notes need to keep carrying the
+  `xattr -dr com.apple.quarantine /Applications/TGZTerminal.app` escape hatch.
+
 ## Current Starting Point
 
 - Private preview branch; update story intentionally manual.

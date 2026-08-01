@@ -1,6 +1,7 @@
 #![allow(clippy::range_plus_one)]
 use super::renderstate::*;
 use super::utilsprites::RenderMetrics;
+use crate::agent_herd::sessions::AgentSession;
 use crate::colorease::ColorEase;
 use crate::frontend::{front_end, try_front_end};
 use crate::inputmap::InputMap;
@@ -109,6 +110,7 @@ impl PaneRemoteSignals {
 }
 use wezterm_term::{Alert, Progress, StableRowIndex, TerminalConfiguration, TerminalSize};
 
+pub mod agent_insight;
 mod agent_launch;
 pub mod background;
 pub mod box_model;
@@ -262,6 +264,15 @@ pub enum UIItemType {
         adapter_id: String,
         target: AgentLaunchTarget,
     },
+    /// The "Resume session" row in the launch dropdown: expands into the
+    /// recently-used sessions found on disk.
+    SidebarAgentMenuResume,
+    /// One past session under an expanded "Resume session" row. Carries an
+    /// index into the scanned session list rather than the session itself, so
+    /// hit-test items stay small.
+    SidebarAgentMenuResumeSession {
+        index: usize,
+    },
     /// Chevron beside the sidebar new-tab button.
     SidebarNewTabMenuButton,
     /// A shell/domain row in the new-tab dropdown.
@@ -312,15 +323,28 @@ pub struct AgentCopyMenuState {
     pub y: usize,
 }
 
+/// Which row of the agent launch dropdown has its submenu open.
+///
+/// Only ever one at a time: the dropdown grows upward from a button near the
+/// bottom of the sidebar, so several expansions at once would quickly run out of
+/// screen.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExpandedMenuRow {
+    /// An installed agent, showing its split / fullscreen / new tab targets.
+    Agent(String),
+    /// The "Resume session" row, showing past sessions found on disk.
+    ResumeSessions,
+}
+
 /// Anchor for the sidebar agent launch dropdown. Unlike the copy menu this is
 /// not tied to a pane: it lists installed agents, not a detected session.
 #[derive(Clone, Debug)]
 pub struct AgentLaunchMenuState {
     pub x: usize,
     pub y: usize,
-    /// Adapter id whose target submenu (split / fullscreen / new tab) is
-    /// currently expanded. Only one agent's submenu is open at a time.
-    pub expanded: Option<String>,
+    /// Row whose submenu is currently expanded, if any. The new-tab dropdown
+    /// reuses this struct and always leaves it `None`.
+    pub expanded: Option<ExpandedMenuRow>,
 }
 
 /// What a new-tab dropdown row spawns.
@@ -587,11 +611,26 @@ pub struct TermWindow {
     /// persisted via `tgz_ui_state`.
     agent_launcher_project_root: bool,
     agent_detection_cache: RefCell<HashMap<PaneId, AgentDetectionCacheEntry>>,
+    /// Panes that are agent insight views. Membership is the identity check —
+    /// these panes must never be badged as agents, split into, or picked as a
+    /// target by anything that wants a shell.
+    agent_insight_panes: RefCell<HashSet<PaneId>>,
     adapter_cache: RefCell<Option<(usize, Arc<Vec<(String, AgentAdapterConfig)>>)>>,
     /// Installed-agent launcher entries, rebuilt only when the config
     /// generation changes. Building probes `$PATH`, so this must never be
     /// recomputed per frame.
     launcher_cache: RefCell<Option<(usize, Arc<Vec<AgentLauncherEntry>>)>>,
+    /// Past sessions offered by the launcher's "Resume session" submenu, with
+    /// the instant they were scanned.
+    ///
+    /// Finding these means statting every transcript on disk and reading the
+    /// head of the newest few, so the scan runs on a worker thread and lands
+    /// here; the render path only ever reads this. Owned rather than a `RefCell`
+    /// because it is written from the notification handler, not from paint.
+    agent_session_cache: Option<(Instant, Arc<Vec<AgentSession>>)>,
+    /// A scan is in flight. Keeps a held-open submenu from queueing a new scan
+    /// per frame, and tells the renderer to show progress instead of "none".
+    agent_session_scan_pending: bool,
     sidebar_scroll_offset: usize,
     sidebar_drop_flash: Option<(usize, Instant)>,
     /// Tabs whose pane children are shown in the sidebar. Persisted via
@@ -957,8 +996,11 @@ impl TermWindow {
             agent_launcher_project_root: tgz_ui_state::load_agent_launcher_project_root()
                 .unwrap_or(config.agent_ui.launcher.cwd == config::AgentLauncherCwd::ProjectRoot),
             agent_detection_cache: RefCell::new(HashMap::new()),
+            agent_insight_panes: RefCell::new(HashSet::new()),
             adapter_cache: RefCell::new(None),
             launcher_cache: RefCell::new(None),
+            agent_session_cache: None,
+            agent_session_scan_pending: false,
             composer_history: RefCell::new(Vec::new()),
             docked_input: crate::termwindow::composer::DockedInput::new(),
             sidebar_scroll_offset: 0,
@@ -3877,9 +3919,15 @@ done
             return shell;
         }
 
+        // Last resort: any pane that is not one of the utility views. The
+        // insight pane has no process, so the ssh/shell probes above never pick
+        // it, but this fallback would.
         tab.iter_panes_ignoring_zoom()
             .iter()
-            .find(|pos| !self.is_worktree_pane_for_file_browser(&pos.pane))
+            .find(|pos| {
+                !self.is_worktree_pane_for_file_browser(&pos.pane)
+                    && !self.is_agent_insight_pane(&pos.pane)
+            })
             .map(|pos| pos.pane.clone())
             .unwrap_or_else(|| Arc::clone(requested))
     }
@@ -4198,6 +4246,7 @@ done
             ScrollToBottom => self.scroll_to_bottom(pane),
             ShowTabNavigator => self.show_tab_navigator(),
             ShowDebugOverlay => self.show_debug_overlay(),
+            CheckForUpdates => crate::update::check_for_updates_now(),
             ShowLauncher => self.show_launcher(),
             ShowLauncherArgs(args) => {
                 let title = args.title.clone().unwrap_or("Launcher".to_string());
@@ -4592,7 +4641,7 @@ done
                 self.toggle_docked_input();
             }
             ShowAgentHerd => {
-                self.open_agent_herd(&pane);
+                self.toggle_agent_insight_pane(&pane);
             }
             PromptInputLine(args) => self.show_prompt_input_line(args),
             InputSelector(args) => self.show_input_selector(args),

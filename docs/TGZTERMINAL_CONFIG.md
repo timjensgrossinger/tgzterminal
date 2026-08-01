@@ -204,6 +204,7 @@ config.agent_ui = {
     project_markers = { ".git", ".hg", ".svn", ".jj" },
     domain = nil,
     prefer_wsl = true, -- Windows default; false elsewhere
+    resume_menu_sessions = 10,
   },
 }
 
@@ -477,6 +478,38 @@ Unlike Resume, Attach, and Details, the launcher is **not** governed by
 category: the argv comes only from config, never from pane titles or visible
 text, and it always follows an explicit click.
 
+#### Resuming a past session
+
+The launcher dropdown's **Resume session** row expands into the most recently
+used agent sessions found on disk, newest first, mixing every vendor into one
+list. Clicking one starts that agent with its resume command
+(`claude --resume <id>`, `codex resume <id>`, …) **in the directory the session
+originally ran in** — the project-root toggle deliberately does not apply, since
+a resumed session whose relative paths have moved is not much use. Placement
+otherwise follows `open_in`, `tile`, and the rest of the launcher config, exactly
+like a fresh launch.
+
+Each row reads `project · description`, prefixed with `[branch]` when the session
+was not on `main`/`master`. The description is Claude Code's own generated
+session title where one exists, and otherwise the first thing the user actually
+asked, trimmed to ten words.
+
+- `resume_menu_sessions` (default `10`, max `25`, `0` hides the row) caps how
+  many sessions are offered.
+
+Only Claude Code and Codex are listed. The other adapters declare resume
+commands, but none of them documents a session store this terminal could
+enumerate; when one does, it slots into the same list. The scan runs on a worker
+thread and is cached for ten seconds, so opening the submenu never blocks
+rendering — a first open may show `Scanning…` briefly.
+
+Session ids come from the filesystem rather than from pane output, and are
+charset-checked (and refused if they begin with `-`) before reaching argv, so a
+file dropped into an agent's state directory cannot turn into a command-line
+flag. Because the argv still comes only from config and the row must be clicked,
+this action is not gated by `enable_control_actions` either — unlike the
+toolbelt's Resume button, whose session id *does* come from pane text.
+
 #### Launching into another domain (WSL)
 
 On Windows, agent CLIs are usually installed inside a WSL distro rather than on
@@ -520,6 +553,77 @@ The working directory follows you across the domain change:
 Project-root mode works from a WSL pane too: because Windows cannot stat a Linux
 path directly, the marker walk runs against the `\\wsl.localhost` view of the
 distro and the result is mapped back before launching.
+
+### Agent insight pane
+
+The agent launcher's dropdown has an **Agent insight** entry, and the command
+palette and *Shell* menubar carry the same action as **Toggle Agent Insight
+Pane** (`ShowAgentHerd`, unbound by default — bind it if you want a key).
+
+It opens a **real split pane**, not an overlay: it sits beside your work like
+the worktree pane, survives focus changes, and closes when you press the same
+control again, press `q` inside it, or close the pane normally. It has no child
+process — the view is drawn by TGZTerminal itself.
+
+The pane lists every agent this terminal can see, grouped by project:
+
+- status glyph, name, and `status · provider · model` per agent,
+- what it is **doing right now**, when its transcript can be read —
+  `▸ now: Bash cargo check`. The label is `last:` instead of `now:` when the
+  agent is not working, or when its newest event is too old to still be in
+  flight, so a finished agent never looks busy,
+- an expandable log of its recent tool calls and messages,
+- its subagents, with type, description and status,
+- the block reason and how long it has been waiting, for anything blocked.
+
+Keys inside the pane:
+
+| Key | Action |
+|---|---|
+| `↑` `↓` / `k` `j` | move the selection |
+| `⏎` / `→` / `←` | expand or collapse the selected agent's activity log |
+| `f` | focus that agent's pane (the insight pane stays open) |
+| `s` | stop it — a synthetic Ctrl-C to the owning pane, never a signal to a pid |
+| `tab` | switch between this project and all projects |
+| `r` | refresh now |
+| `q` / `Esc` | close the pane |
+
+Clicking works too: a click selects a row, a click on the activity line expands
+it, and a click on `Stop` stops that agent.
+
+```lua
+agent_ui = {
+  insight = {
+    side = 'Left',              -- 'Left' | 'Right' | 'Top' | 'Bottom'
+    split_size_percent = 30,    -- clamped to 5..=95
+    refresh_ms = 500,           -- clamped to 100..=10000
+    default_view = 'CurrentProject',  -- or 'AllProjects'
+    show_activity = true,
+    activity_history = 30,
+  },
+}
+```
+
+| Key | Default | Meaning |
+|---|---|---|
+| `side` | `"Left"` | Which edge of the tab the pane splits off. |
+| `split_size_percent` | `30` | Share of the split given to the pane. |
+| `refresh_ms` | `500` | How often agent state is re-read. |
+| `default_view` | `"CurrentProject"` | Scope the pane opens with. |
+| `show_activity` | `true` | Read transcripts for the activity line and log. |
+| `activity_history` | `30` | Events kept per agent. |
+
+Activity comes from the agent's own on-disk transcript, which is an
+**undocumented internal** of the agent CLI (currently only Claude Code writes
+one this can read). Every field is optional and every parse failure drops a
+single event, so the worst case is no activity line rather than a broken pane;
+agents from other vendors simply have none. Reads are bounded — a transcript is
+only re-read when it actually changed, only its tail is parsed, and all of it
+happens on the pane's own thread, never the render path. Set
+`show_activity = false` to skip these reads entirely.
+
+The insight pane is never treated as an agent, never used as a launch target by
+the agent launcher, and never stands in for its tab in the sidebar.
 
 ### New-tab dropdown
 
@@ -667,6 +771,37 @@ Note: because bound key assignments are handled before the strip, a bound
 clipboard-paste shortcut still pastes into the pane rather than the strip while
 the strip is focused; use the overlay composer if you need paste-into-buffer.
 
+## Update Checking
+
+These are upstream WezTerm keys whose fork behavior differs; they are documented
+in full in `docs/config/lua/config/check_for_updates.md`.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `check_for_updates` | `true` | Periodically ask GitHub whether a newer release of this fork exists. Upstream WezTerm also defaults this to true; earlier TGZTerminal builds defaulted it to `false`. |
+| `check_for_updates_interval_seconds` | `86400` | Seconds between checks. |
+| `show_update_window` | `false` | Deprecated no-op, kept for config compatibility. |
+
+When a newer release is found, the notification's click target is the release
+artifact for the running platform — `TGZTerminal.dmg`, `TGZTerminal-Setup.exe`,
+or the portable `TGZTerminal-windows-portable-<tag>.zip` — falling back to the
+release page when the release publishes nothing for this platform. The mux
+banner always links the release page. Nothing is downloaded or installed
+without the user acting on the notification.
+
+The `CheckForUpdates` key assignment runs the same check on demand and always
+reports a result, including "up to date". It is registered in the command
+palette and the Help menu.
+
+```lua
+config.keys = {
+  { key = 'U', mods = 'CTRL|SHIFT', action = wezterm.action.CheckForUpdates },
+}
+```
+
+Asset names are derived from `BRAND_PRODUCT_NAME` (see below), so a rebranded
+overlay fork resolves its own artifacts without patching the updater.
+
 ## Branding (build-time)
 
 These are compile/package-time environment variables, not Lua config keys. Each
@@ -689,7 +824,7 @@ rebrand without patching source.
 | Env var | Default | Controls |
 |---|---|---|
 | `BRAND_GITHUB_REPO` | `timjensgrossinger/tgzterminal` | `owner/repo` used for update/release queries |
-| `BRAND_PRODUCT_NAME` | `TGZTerminal` | Product name in the update User-Agent and "… Update Available" notifications |
+| `BRAND_PRODUCT_NAME` | `TGZTerminal` | Product name in the update User-Agent and update notifications, and the prefix used to match release assets (`<name>.dmg`, `<name>-Setup*.exe`, `<name>-windows-portable-*.zip`) |
 
 `CFBundleExecutable` stays `wezterm-gui`, and the internal namespaces
 (`tgzterminal.worktree` user var, `TGZTERMINAL_BIN`, `.cache/tgzterminal`) are

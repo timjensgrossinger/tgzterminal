@@ -1,7 +1,8 @@
 use crate::tabbar::TabBarItem;
 use crate::termwindow::{
-    AgentCopyAction, AgentCopyMenuState, AgentLaunchMenuState, AgentToolbeltAction, GuiWin,
-    MouseCapture, PositionedSplit, ScrollHit, TermWindowNotif, UIItem, UIItemType, TMB,
+    AgentCopyAction, AgentCopyMenuState, AgentLaunchMenuState, AgentToolbeltAction,
+    ExpandedMenuRow, GuiWin, MouseCapture, PositionedSplit, ScrollHit, TermWindowNotif, UIItem,
+    UIItemType, TMB,
 };
 use ::window::{
     MouseButtons as WMB, MouseCursor, MouseEvent, MouseEventKind as WMEK, MousePress,
@@ -59,6 +60,8 @@ impl super::TermWindow {
             | UIItemType::SidebarAgentMenuProjectRootToggle
             | UIItemType::SidebarAgentMenuHerd
             | UIItemType::SidebarAgentMenuTarget { .. }
+            | UIItemType::SidebarAgentMenuResume
+            | UIItemType::SidebarAgentMenuResumeSession { .. }
             | UIItemType::SidebarNewTabMenuButton
             | UIItemType::SidebarNewTabMenuItem { .. }
             | UIItemType::AgentToolbeltButton { .. }
@@ -90,6 +93,8 @@ impl super::TermWindow {
             | UIItemType::SidebarAgentMenuProjectRootToggle
             | UIItemType::SidebarAgentMenuHerd
             | UIItemType::SidebarAgentMenuTarget { .. }
+            | UIItemType::SidebarAgentMenuResume
+            | UIItemType::SidebarAgentMenuResumeSession { .. }
             | UIItemType::SidebarNewTabMenuButton
             | UIItemType::SidebarNewTabMenuItem { .. }
             | UIItemType::AgentToolbeltButton { .. }
@@ -342,6 +347,8 @@ impl super::TermWindow {
                             | UIItemType::SidebarAgentMenuProjectRootToggle
                             | UIItemType::SidebarAgentMenuHerd
                             | UIItemType::SidebarAgentMenuTarget { .. }
+                            | UIItemType::SidebarAgentMenuResume
+                            | UIItemType::SidebarAgentMenuResumeSession { .. }
                     )
             );
             if !on_launch_menu {
@@ -600,6 +607,12 @@ impl super::TermWindow {
             UIItemType::SidebarAgentMenuTarget { adapter_id, target } => {
                 self.mouse_event_sidebar_agent_menu_target(&adapter_id, target, event, context);
             }
+            UIItemType::SidebarAgentMenuResume => {
+                self.mouse_event_sidebar_agent_menu_resume(event, context);
+            }
+            UIItemType::SidebarAgentMenuResumeSession { index } => {
+                self.mouse_event_sidebar_agent_menu_resume_session(index, event, context);
+            }
             UIItemType::SidebarNewTabMenuButton => {
                 self.mouse_event_sidebar_new_tab_menu_button(item, event, context);
             }
@@ -784,10 +797,11 @@ impl super::TermWindow {
         if event.kind == WMEK::Release(MousePress::Left) {
             self.pressed_ui_item = None;
             if let Some(menu) = self.agent_launch_menu.as_mut() {
-                menu.expanded = if menu.expanded.as_deref() == Some(adapter_id) {
+                let row = ExpandedMenuRow::Agent(adapter_id.to_string());
+                menu.expanded = if menu.expanded.as_ref() == Some(&row) {
                     None
                 } else {
-                    Some(adapter_id.to_string())
+                    Some(row)
                 };
             }
         }
@@ -862,14 +876,59 @@ impl super::TermWindow {
         context.invalidate();
     }
 
+    /// The "Resume session" row: expands the list of past sessions, and starts
+    /// the scan that fills it.
+    ///
+    /// Like the project-root tick this leaves the menu open — expanding it is
+    /// the whole point of the click. The scan is kicked here rather than in
+    /// paint because paint must not touch the filesystem; it self-throttles, so
+    /// toggling the row repeatedly costs nothing.
+    fn mouse_event_sidebar_agent_menu_resume(
+        &mut self,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        if event.kind == WMEK::Release(MousePress::Left) {
+            self.pressed_ui_item = None;
+            let expand = match self.agent_launch_menu.as_mut() {
+                Some(menu) => {
+                    let already = menu.expanded.as_ref() == Some(&ExpandedMenuRow::ResumeSessions);
+                    menu.expanded = (!already).then_some(ExpandedMenuRow::ResumeSessions);
+                    !already
+                }
+                None => false,
+            };
+            if expand {
+                self.kick_agent_session_scan();
+            }
+        }
+        context.invalidate();
+    }
+
+    /// One past session: resume it, honoring the configured launch placement the
+    /// same way a fresh launch does.
+    fn mouse_event_sidebar_agent_menu_resume_session(
+        &mut self,
+        index: usize,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        if event.kind == WMEK::Release(MousePress::Left) {
+            self.agent_launch_menu = None;
+            self.pressed_ui_item = None;
+            self.resume_agent_session(index, None);
+        }
+        context.invalidate();
+    }
+
     fn mouse_event_sidebar_agent_menu_herd(&mut self, event: MouseEvent, context: &dyn WindowOps) {
         if event.kind == WMEK::Release(MousePress::Left) {
             self.pressed_ui_item = None;
-            // Unlike the project-root tick, this navigates away, so the menu
-            // has no reason to stay open.
+            // Unlike the project-root tick, this acts on the tab layout, so
+            // the menu has no reason to stay open.
             self.agent_launch_menu = None;
             if let Some(pane) = self.get_active_pane_no_overlay() {
-                self.open_agent_herd(&pane);
+                self.toggle_agent_insight_pane(&pane);
             }
         }
         context.invalidate();

@@ -757,10 +757,20 @@ pub struct AgentLauncherConfig {
     /// CLIs are typically installed inside a distro rather than on the host.
     #[dynamic(default = "default_prefer_wsl")]
     pub prefer_wsl: bool,
+
+    /// How many past sessions the launcher's "Resume session" submenu offers.
+    /// `0` hides the row entirely. Clamped to 0..=25 — the dropdown is a menu,
+    /// not a session browser, and every row costs a transcript read.
+    #[dynamic(default = "default_resume_menu_sessions")]
+    pub resume_menu_sessions: u8,
 }
 
 pub fn default_prefer_wsl() -> bool {
     cfg!(windows)
+}
+
+pub fn default_resume_menu_sessions() -> u8 {
+    10
 }
 
 /// Claude Code leads the launcher out of the box; an uninstalled default still
@@ -785,6 +795,97 @@ impl Default for AgentLauncherConfig {
             project_markers: default_project_markers(),
             domain: None,
             prefer_wsl: default_prefer_wsl(),
+            resume_menu_sessions: default_resume_menu_sessions(),
+        }
+    }
+}
+
+/// Which edge of the tab the agent insight pane splits off.
+///
+/// Expressed as a side rather than a `SplitDirection` plus a flag because that
+/// is what the choice actually is; the mux-level orientation is derived at the
+/// call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromDynamic, ToDynamic)]
+pub enum AgentInsightSide {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+impl Default for AgentInsightSide {
+    fn default() -> Self {
+        Self::Left
+    }
+}
+
+/// Which agents the insight pane lists when it opens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromDynamic, ToDynamic)]
+pub enum AgentInsightView {
+    /// Only agents in the launching pane's project.
+    CurrentProject,
+    /// Every agent, grouped by project.
+    AllProjects,
+}
+
+impl Default for AgentInsightView {
+    fn default() -> Self {
+        Self::CurrentProject
+    }
+}
+
+pub fn default_agent_insight_split_size_percent() -> u8 {
+    30
+}
+
+pub fn default_agent_insight_refresh_ms() -> u64 {
+    500
+}
+
+pub fn default_agent_insight_activity_history() -> u16 {
+    30
+}
+
+/// The agent insight pane: a real split pane listing every detected agent, its
+/// subagents, and what each is currently doing.
+#[derive(Debug, Clone, FromDynamic, ToDynamic)]
+pub struct AgentInsightConfig {
+    /// Which side of the tab the pane occupies.
+    #[dynamic(default)]
+    pub side: AgentInsightSide,
+
+    /// Percentage of the split assigned to the insight pane. Clamped to 5..=95.
+    #[dynamic(default = "default_agent_insight_split_size_percent")]
+    pub split_size_percent: u8,
+
+    /// How often the pane re-reads agent state, in milliseconds. Clamped to
+    /// 100..=10000; the lower bound keeps a stray `0` from spinning the thread.
+    #[dynamic(default = "default_agent_insight_refresh_ms")]
+    pub refresh_ms: u64,
+
+    /// Scope the pane opens with.
+    #[dynamic(default)]
+    pub default_view: AgentInsightView,
+
+    /// Show what each agent is currently doing, read from the agent's own
+    /// on-disk transcript. Turning this off skips those reads entirely.
+    #[dynamic(default = "default_true")]
+    pub show_activity: bool,
+
+    /// How many recent events the per-agent activity log keeps.
+    #[dynamic(default = "default_agent_insight_activity_history")]
+    pub activity_history: u16,
+}
+
+impl Default for AgentInsightConfig {
+    fn default() -> Self {
+        Self {
+            side: AgentInsightSide::default(),
+            split_size_percent: default_agent_insight_split_size_percent(),
+            refresh_ms: default_agent_insight_refresh_ms(),
+            default_view: AgentInsightView::default(),
+            show_activity: true,
+            activity_history: default_agent_insight_activity_history(),
         }
     }
 }
@@ -863,6 +964,10 @@ pub struct AgentUiConfig {
     #[dynamic(default)]
     pub launcher: AgentLauncherConfig,
 
+    /// The agent insight split pane.
+    #[dynamic(default)]
+    pub insight: AgentInsightConfig,
+
     /// Distinct adapter-exclusive patterns that must agree before visible pane
     /// text is accepted as an agent's identity.
     ///
@@ -905,6 +1010,7 @@ impl Default for AgentUiConfig {
             toolbelt_position: AgentToolbeltPosition::Top,
             adapters: default_agent_adapters(),
             launcher: AgentLauncherConfig::default(),
+            insight: AgentInsightConfig::default(),
             visible_identity_signals: default_agent_visible_identity_signals(),
             trust_visible_evidence: true,
             pulse_working_dot: true,
@@ -1681,6 +1787,10 @@ pub struct Config {
     #[dynamic(default = "default_true")]
     pub automatically_reload_config: bool,
 
+    /// Periodically ask the GitHub API whether a newer release exists and,
+    /// if so, show a notification linking this platform's release artifact.
+    /// Nothing is ever downloaded or installed without the user acting on
+    /// that notification.
     #[dynamic(default = "default_check_for_updates")]
     pub check_for_updates: bool,
     #[dynamic(
@@ -2570,8 +2680,12 @@ impl Config {
     }
 }
 
+/// On by default so that users are told about releases without having to
+/// discover the setting first. The check only fetches release metadata from
+/// the GitHub API; nothing is downloaded or installed automatically. See
+/// `PRIVACY.md`.
 fn default_check_for_updates() -> bool {
-    false
+    true
 }
 
 fn default_pane_select_fg_color() -> RgbaColor {
@@ -2903,6 +3017,18 @@ mod agent_ui_tests {
 
     fn strings(items: &[&str]) -> Vec<String> {
         items.iter().map(|item| item.to_string()).collect()
+    }
+
+    #[test]
+    fn agent_insight_defaults_match_the_documented_pane() {
+        let insight = Config::default_config().agent_ui.insight;
+
+        assert_eq!(insight.side, AgentInsightSide::Left);
+        assert_eq!(insight.split_size_percent, 30);
+        assert_eq!(insight.refresh_ms, 500);
+        assert_eq!(insight.default_view, AgentInsightView::CurrentProject);
+        assert!(insight.show_activity);
+        assert_eq!(insight.activity_history, 30);
     }
 
     #[test]

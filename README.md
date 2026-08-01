@@ -58,6 +58,7 @@ config since 2019, it still works exactly the same. We just added furniture to t
 | 🌲 | **Pane rows** | Split tabs get a chevron that expands into indented pane rows: click to focus, hover for a per-pane `×`, `(remote)` on anything running on another host. Which tabs are expanded survives a restart. | The tab list finally admits that a "tab" is three panes, one of which is the one you actually wanted. |
 | 🤖 | **Agent awareness** | Vendor-neutral detection of running coding agents (Claude, Codex, Gemini, OpenCode, Copilot, Cursor, Amp, …). Every signal is ranked by strength — user vars, then process, then title, then the agent's own on-screen chrome — so a brand word in ordinary output can't badge a plain shell, and an established badge doesn't flip when the agent retitles itself. Surfaces status, model and token/cost metadata, with a status dot that pulses while the agent works. | You stop `Cmd+Tab`-ing between six windows to find out which agent is stuck waiting on you — and the badge tells the truth. |
 | 🚀 | **Agent launcher** | Sidebar button that starts a fresh agent. The menu is *discovered*, not configured — an agent shows up only if its CLI actually resolves on `PATH` or in the usual install dirs (`~/.local/bin`, `~/.claude/local`, `~/.bun/bin`, Homebrew, …). Left-click launches the default, Alt-click flips split↔new-tab, right-click lists everything installed plus a sticky **Project root** toggle. | One click to put an agent beside the shell you were already in, in the directory you were already in — including from an SSH pane, where it runs *locally* by default because that's where the CLI and its credentials live. |
+| 🔭 | **Agent insight pane** | A real split pane — not an overlay — listing every agent this terminal can see, grouped by project, with what each one is *doing right now* (`now: Bash cargo check`), an expandable log of its recent tool calls, and its subagents. `f` focuses an agent, `s` stops it, and the pane stays open while you do. | "Is it still working, or is it waiting on me?" answered without switching to the pane and squinting at the last twenty lines — and the `now:` label downgrades itself to `last:` rather than lie about a stale transcript. |
 | 🧰 | **Agent toolbelt** | Per-pane strip with a live status dot plus context actions — Copy conversation · Stop · Attach · Resume · open logs · compose input. | The nuclear-launch-codes buttons (Stop/Resume/Attach) are locked behind a config flag and real evidence, not vibes — see below. |
 | ➕ | **New-tab dropdown** | Chevron beside `+ New Tab` opens a grouped picker of what this machine actually has: discovered shells (`/etc/shells`, or PowerShell / PowerShell 7 / cmd / Git Bash on Windows), every registered domain including each WSL distro, and your own `launch_menu` entries. | Opening a tab in a specific distro or on a specific host stops being a `wezterm cli` invocation you have to remember. |
 | 📁 | **File-browser pane** | Lightweight worktree browser that also works inside SSH sessions. | You can look at a file tree on a box three hops away without giving up your terminal identity. |
@@ -123,22 +124,36 @@ you once because the build is unsigned — **More info → Run anyway**.
 ## Staying up to date
 
 TGZTerminal reuses WezTerm's built-in update check, pointed at this repo instead. When a
-newer release ships, the app shows an **"update available"** banner linking to the
-release page. Download the new `.dmg` / `.zip`, replace your copy (drag over the old app
-on macOS, extract over the old folder on Windows), then **fully quit and relaunch** — a
-new window will not magically pick up a new binary, no matter how hard you believe in it.
+newer release ships you get a notification naming the version; **clicking it downloads
+the artifact for your platform** — `TGZTerminal.dmg` on macOS, `TGZTerminal-Setup.exe`
+(or the portable `.zip`, when a release didn't produce an installer) on Windows. The
+banner in the first pane links the release page, for when you want the notes first.
 
-It's **off by default**, because nobody who lives in a terminal wants a surprise popup
-mid-incident. Turn it on in `wezterm.lua` if you want it:
+Install it the same way you installed the last one:
+
+- **macOS** — open the dmg, drag onto **Applications**, replace the old copy.
+- **Windows** — run `TGZTerminal-Setup.exe`; it upgrades in place and closes a running
+  instance for you. On the portable zip, extract over the old folder.
+
+Then **fully quit and relaunch** — an already-running window will not pick up a new
+binary, no matter how hard you believe in it.
+
+**Your settings survive.** Nothing user-owned lives inside the app bundle or the install
+directory: `wezterm.lua`, the sidebar/UI state and everything else sit in your home
+directory and are untouched by an upgrade.
+
+Checking is **on by default**, once a day. It reads public GitHub release metadata over
+HTTPS and nothing else — no telemetry, no phone-home, no automatic install. It asks "is
+there a newer tag" and that's the entire conversation. Turn it off, or change the
+cadence, in `wezterm.lua`:
 
 ```lua
-config.check_for_updates = true
+config.check_for_updates = false
 config.check_for_updates_interval_seconds = 86400 -- once a day, not once a heartbeat
 ```
 
-The check only ever reads public GitHub release metadata over HTTPS — no telemetry, no
-phone-home, no automatic install. It asks "is there a newer tag" and that's the entire
-conversation.
+Impatient? **Check for updates** in the command palette (or the Help menu) asks right
+now, and — unlike the background check — tells you when you're already current.
 
 ## Build from source
 
@@ -221,6 +236,14 @@ config.agent_ui = {
     split_size_percent = 50,
     remote_behavior = 'ForceLocal', -- SSH pane? run the agent here anyway
     -- domain = 'WSL:Ubuntu',    -- pin a distro if you have several
+  },
+
+  -- The agent insight pane (dropdown entry, or bind ShowAgentHerd)
+  insight = {
+    side = 'Left',               -- 'Left' | 'Right' | 'Top' | 'Bottom'
+    split_size_percent = 30,
+    show_activity = true,        -- read transcripts for "what is it doing now"
+    activity_history = 30,
   },
 }
 

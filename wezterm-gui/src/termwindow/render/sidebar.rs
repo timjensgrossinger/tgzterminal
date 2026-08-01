@@ -1,3 +1,4 @@
+use crate::agent_herd::claude::{self, ProjectDirError as ClaudeLogsPathError};
 use crate::agent_herd::{HerdStatus, PaneAgentRow};
 use crate::quad::TripleLayerQuadAllocator;
 use crate::spawn::SpawnWhere;
@@ -9,7 +10,7 @@ use crate::termwindow::render::corners::{
 use crate::termwindow::render::RenderScreenLineParams;
 use crate::termwindow::{
     agent_launch, wsl_paths, AgentCopyAction, AgentLauncherEntry, AgentToolbeltAction,
-    NewTabMenuEntry, NewTabTarget, UIItem, UIItemType,
+    ExpandedMenuRow, NewTabMenuEntry, NewTabTarget, TermWindowNotif, UIItem, UIItemType,
 };
 use config::keyassignment::{SpawnCommand, SpawnTabDomain};
 use config::{
@@ -35,7 +36,7 @@ use termwiz::color::ColorAttribute;
 use termwiz::surface::{Line, SEQ_ZERO};
 use url::Url;
 use window::color::LinearRgba;
-use window::{MousePress, RectF};
+use window::{MousePress, RectF, WindowOps};
 
 const INSET: f32 = 8.;
 const GAP: f32 = 4.;
@@ -73,6 +74,13 @@ const AGENT_TOOLBELT_RIGHT_INSET: f32 = 44.;
 const AGENT_COPY_MENU_W: f32 = 360.;
 /// Narrower than the copy menu: rows are short agent names, not sentences.
 const AGENT_LAUNCH_MENU_W: f32 = 200.;
+/// Width of the launch dropdown while the resume submenu is open. Session rows
+/// carry a project name, an optional branch and a sentence of description, none
+/// of which fits the width a list of agent names needs.
+const AGENT_RESUME_MENU_W: f32 = 420.;
+/// Ceiling on `agent_ui.launcher.resume_menu_sessions`. Each row costs a
+/// transcript read, and a dropdown taller than this stops being a menu.
+const MAX_RESUME_MENU_SESSIONS: u8 = 25;
 const AGENT_COPY_MENU_ROW_H: f32 = 28.;
 const MAX_AGENT_PATTERN_LEN: usize = 256;
 const AGENT_PATTERN_REGEX_CACHE_LIMIT: usize = 128;
@@ -1342,44 +1350,24 @@ fn clean_live_title(title: &str, fallback: &str, command: Option<&str>) -> Optio
     }
 }
 
-fn pane_working_dir(pane: &Arc<dyn Pane>) -> Option<PathBuf> {
+pub(crate) fn pane_working_dir(pane: &Arc<dyn Pane>) -> Option<PathBuf> {
     pane.get_current_working_dir(CachePolicy::AllowStale)
         .and_then(|url| url.to_file_path().ok())
 }
 
+/// Encode a working directory the way Claude Code names its project folders.
+///
+/// This used to be a second, subtly wrong copy of the same mapping: it dashed
+/// separators and colons but not **dots**, so a home directory like
+/// `/Users/first.last` encoded to `-Users-first.last-…` and matched nothing,
+/// silently disabling the Claude `Logs` action for every user with a dot in
+/// their path. There is now one implementation, in [`claude`].
 fn encode_claude_project_path(cwd: &Path) -> String {
-    cwd.to_string_lossy()
-        .chars()
-        .map(|ch| match ch {
-            '/' | '\\' | ':' => '-',
-            _ => ch,
-        })
-        .collect()
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum ClaudeLogsPathError {
-    Missing,
-    OutsideProjects,
-    NotDirectory,
+    claude::encode_project_path(cwd)
 }
 
 fn resolve_claude_logs_path_under(home: &Path, cwd: &Path) -> Result<PathBuf, ClaudeLogsPathError> {
-    let projects_root = home.join(".claude").join("projects");
-    let project_dir = projects_root.join(encode_claude_project_path(cwd));
-    let root = projects_root
-        .canonicalize()
-        .map_err(|_| ClaudeLogsPathError::Missing)?;
-    let path = project_dir
-        .canonicalize()
-        .map_err(|_| ClaudeLogsPathError::Missing)?;
-    if !path.starts_with(&root) {
-        return Err(ClaudeLogsPathError::OutsideProjects);
-    }
-    if !path.is_dir() {
-        return Err(ClaudeLogsPathError::NotDirectory);
-    }
-    Ok(path)
+    claude::resolve_project_dir(home, cwd)
 }
 
 /// Flatten a color to an 8-bit-per-channel sRGB triple.
@@ -3452,7 +3440,10 @@ impl crate::TermWindow {
         let eligible_panes: Vec<agent_launch::PaneGeom> = tab
             .iter_panes_ignoring_zoom()
             .into_iter()
-            .filter(|pos| !is_worktree_pane(&pos.pane))
+            // Neither utility pane is a place to put an agent: the worktree
+            // picker is already a narrow column, and splitting the insight pane
+            // would hide half of the very list you launched from.
+            .filter(|pos| !is_worktree_pane(&pos.pane) && !self.is_agent_insight_pane(&pos.pane))
             .map(|pos| agent_launch::PaneGeom {
                 pane_id: pos.pane.pane_id(),
                 index: pos.index,
@@ -3475,6 +3466,128 @@ impl crate::TermWindow {
             cell_width * MIN_TILE_COLUMNS,
             cell_height * MIN_TILE_ROWS,
         )
+    }
+
+    /// How long a session scan stays fresh.
+    ///
+    /// Long enough that reopening the submenu to pick a different row is free,
+    /// short enough that a session finished in another window shows up without
+    /// restarting the terminal.
+    const SESSION_SCAN_TTL: Duration = Duration::from_secs(10);
+
+    /// Start a background scan for resumable sessions unless one is already in
+    /// flight or the cached answer is still fresh.
+    ///
+    /// Statting every transcript and head-reading the newest few is filesystem
+    /// work, so it happens on a worker thread and is applied back on the GUI
+    /// thread — the same shape `open_agent_insight_pane` uses. Called from the
+    /// click that opens the submenu, never from paint.
+    pub fn kick_agent_session_scan(&mut self) {
+        if self.agent_session_scan_pending {
+            return;
+        }
+        let fresh = self
+            .agent_session_cache
+            .as_ref()
+            .is_some_and(|(scanned_at, _)| scanned_at.elapsed() < Self::SESSION_SCAN_TTL);
+        if fresh {
+            return;
+        }
+        let limit = self.agent_resume_menu_limit();
+        if limit == 0 {
+            return;
+        }
+        let Some(home) = dirs_next::home_dir() else {
+            return;
+        };
+        let Some(window) = self.window.clone() else {
+            return;
+        };
+
+        self.agent_session_scan_pending = true;
+        let future = promise::spawn::spawn_into_new_thread(move || {
+            let sessions = crate::agent_herd::sessions::collect_recent_sessions(&home, limit);
+            // The scan thread must not touch the mux or any GUI state, so the
+            // result is applied back on the GUI thread.
+            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                term_window.agent_session_scan_pending = false;
+                term_window.agent_session_cache = Some((Instant::now(), Arc::new(sessions)));
+            })));
+            Ok::<(), anyhow::Error>(())
+        });
+        promise::spawn::spawn(async move {
+            if let Err(err) = future.await {
+                log::error!("agent session scan failed: {err:#}");
+            }
+        })
+        .detach();
+    }
+
+    /// Resume the session at `index` of the last scan.
+    ///
+    /// The session's own directory is used rather than the active pane's, and
+    /// the project-root toggle deliberately does not apply: a resumed session
+    /// has to come back up where it left off or its relative paths break.
+    ///
+    /// Like `launch_agent` and unlike the toolbelt's Resume button, this is not
+    /// gated by `agent_ui.enable_control_actions`. That gate exists because the
+    /// toolbelt takes its session id from pane text, which an agent's own output
+    /// can forge. Here the argv comes from config, the id comes from a
+    /// filesystem enumeration under the user's own agent state directories and
+    /// is charset-checked before it can reach argv, and the user picked the row.
+    pub fn resume_agent_session(&mut self, index: usize, target: Option<AgentLaunchTarget>) {
+        let Some(session) = self
+            .agent_session_cache
+            .as_ref()
+            .and_then(|(_, sessions)| sessions.get(index))
+            .cloned()
+        else {
+            // The scan was replaced between paint and click; nothing to do.
+            return;
+        };
+        let Some(adapter) = self.agent_adapter_config_by_id(Some(&session.adapter_id)) else {
+            return;
+        };
+        let label = adapter_label(&adapter, &session.adapter_id);
+        let values = AgentActionTemplateValues {
+            session_id: Some(session.session_id.clone()),
+            cwd: Some(session.cwd.clone()),
+            home: dirs_next::home_dir(),
+            attach_url: None,
+        };
+        let Some(argv) = resolve_agent_resume_command(&adapter, &values) else {
+            wezterm_toast_notification::show(wezterm_toast_notification::ToastNotification {
+                title: "Agent resume".to_string(),
+                message: format!("{label} has no resume command, or it is not on PATH"),
+                url: None,
+                timeout: Some(Duration::from_millis(2600)),
+            });
+            return;
+        };
+
+        let forced_local = self.agent_launch_forced_local();
+        let domain = match self
+            .agent_launcher_entries()
+            .iter()
+            .find(|entry| entry.adapter_id == session.adapter_id)
+        {
+            Some(entry) => self.agent_launch_domain(entry, forced_local),
+            // The agent is resumable but not installed as a launcher entry;
+            // fall back to the active pane's domain rather than refusing.
+            None => SpawnTabDomain::CurrentPaneDomain,
+        };
+        let cwd = self.translate_cwd_for_domain(session.cwd.clone(), &domain);
+        let placement = self.agent_launch_placement(false, target);
+        self.spawn_agent(
+            SpawnCommand {
+                label: Some(format!("{label} resume")),
+                args: Some(argv),
+                cwd,
+                domain,
+                ..Default::default()
+            },
+            placement,
+        );
     }
 
     /// Launch the agent with the given adapter id, if it is still installed.
@@ -3598,39 +3711,6 @@ impl crate::TermWindow {
         self.detect_agent_pane(pane).is_some()
     }
 
-    /// Open the agent herd overview as an overlay over `pane`.
-    ///
-    /// Everything the overview needs from the GUI thread — colors, the first
-    /// pane snapshot, the project to scope to — is gathered here, before the
-    /// overlay thread starts. After that the overlay pulls fresh pane data
-    /// through `TermWindowNotif::Apply`.
-    pub(crate) fn open_agent_herd(&mut self, pane: &Arc<dyn Pane>) {
-        let Some(window) = self.window.clone() else {
-            return;
-        };
-
-        let cwd = pane_working_dir(pane);
-        let current_project = cwd.as_deref().and_then(crate::agent_herd::project_root_for);
-        let args = crate::overlay::agent_herd::HerdArgs {
-            theme: self.agent_herd_theme(),
-            view: crate::agent_herd::HerdView::CurrentProject,
-            // With no repo root we would filter against nothing and show an
-            // empty list, so fall back to the plain cwd.
-            current_project: current_project.or(cwd),
-            refresh: Duration::from_millis(500),
-            include_subagents: true,
-            read_claude_sessions: true,
-            initial_panes: self.agent_herd_pane_rows(),
-        };
-
-        let (overlay, future) =
-            crate::overlay::start_overlay_pane(self, pane, move |_pane_id, term| {
-                crate::overlay::agent_herd::agent_herd_overview(window, term, args)
-            });
-        self.assign_overlay_for_pane(pane.pane_id(), overlay);
-        promise::spawn::spawn(future).detach();
-    }
-
     /// Colors for the herd overview, resolved here so the overview's own thread
     /// never reads config or the palette.
     pub(crate) fn agent_herd_theme(&self) -> crate::overlay::agent_herd::HerdTheme {
@@ -3707,6 +3787,12 @@ impl crate::TermWindow {
 
     fn detect_agent_pane(&self, pane: &Arc<dyn Pane>) -> Option<AgentPaneState> {
         if !self.config.agent_ui.enabled {
+            return None;
+        }
+        // The insight pane prints adapter names, status words and agent chrome
+        // by definition, so visible-evidence detection would badge it as an
+        // agent and then list it as one of the agents it is listing.
+        if self.is_agent_insight_pane(pane) {
             return None;
         }
 
@@ -4605,12 +4691,12 @@ impl crate::TermWindow {
         let panes = tab.iter_panes_ignoring_zoom();
         let pane = active_pane
             .as_ref()
-            .filter(|pane| !is_worktree_pane(pane))
+            .filter(|pane| !self.is_sidebar_utility_pane(pane))
             .cloned()
             .or_else(|| {
                 panes
                     .iter()
-                    .find(|pos| !is_worktree_pane(&pos.pane))
+                    .find(|pos| !self.is_sidebar_utility_pane(&pos.pane))
                     .map(|pos| pos.pane.clone())
             })
             .or(active_pane);
@@ -4705,11 +4791,22 @@ impl crate::TermWindow {
             .collect()
     }
 
+    /// A pane that describes the tab's *tooling* rather than its work.
+    ///
+    /// Neither one has a working directory, a branch or a command worth
+    /// showing, so neither may stand in for a tab in the sidebar.
+    fn is_sidebar_utility_pane(&self, pane: &Arc<dyn Pane>) -> bool {
+        is_worktree_pane(pane) || self.is_agent_insight_pane(pane)
+    }
+
     /// Short human label for a pane row: the agent name when one is detected,
     /// otherwise the foreground command, otherwise the pane title.
     fn sidebar_pane_label(&self, pane: &Arc<dyn Pane>) -> String {
         if is_worktree_pane(pane) {
             return "Worktree".to_string();
+        }
+        if self.is_agent_insight_pane(pane) {
+            return crate::termwindow::agent_insight::INSIGHT_PANE_TITLE.to_string();
         }
         if self.config.agent_ui.enabled {
             if let Some(agent) = self.detect_agent_pane(pane) {
@@ -4780,12 +4877,12 @@ impl crate::TermWindow {
         let panes = tab.iter_panes_ignoring_zoom();
         active_pane
             .as_ref()
-            .filter(|pane| !is_worktree_pane(pane))
+            .filter(|pane| !self.is_sidebar_utility_pane(pane))
             .cloned()
             .or_else(|| {
                 panes
                     .iter()
-                    .find(|pos| !is_worktree_pane(&pos.pane))
+                    .find(|pos| !self.is_sidebar_utility_pane(&pos.pane))
                     .map(|pos| pos.pane.clone())
             })
             .or(active_pane)
@@ -5410,7 +5507,8 @@ impl crate::TermWindow {
 
         let mut rows: Vec<SidebarDropdownRow> = Vec::new();
         for entry in entries.iter() {
-            let expanded = menu.expanded.as_deref() == Some(entry.adapter_id.as_str());
+            let expanded =
+                menu.expanded.as_ref() == Some(&ExpandedMenuRow::Agent(entry.adapter_id.clone()));
             rows.push(SidebarDropdownRow {
                 label: entry.label.clone(),
                 dot_color: Some(entry.color),
@@ -5450,7 +5548,11 @@ impl crate::TermWindow {
         });
         // Below the launch actions: this one inspects rather than launches.
         rows.push(SidebarDropdownRow {
-            label: "Agent overview".to_string(),
+            label: if self.find_agent_insight_pane().is_some() {
+                "Close agent insight".to_string()
+            } else {
+                "Agent insight".to_string()
+            },
             dot_color: None,
             checkbox: None,
             divider_above: false,
@@ -5459,7 +5561,92 @@ impl crate::TermWindow {
             item_type: UIItemType::SidebarAgentMenuHerd,
         });
 
-        self.paint_sidebar_dropdown(layers, menu.x as f32, menu.y as f32, &rows)
+        // Past sessions. Unlike the agent rows above, which launch something
+        // new, these continue something that already exists.
+        let resume_expanded = menu.expanded.as_ref() == Some(&ExpandedMenuRow::ResumeSessions);
+        if self.agent_resume_menu_limit() > 0 {
+            rows.push(SidebarDropdownRow {
+                label: "Resume session".to_string(),
+                dot_color: None,
+                checkbox: None,
+                divider_above: false,
+                indent: false,
+                trailing_chevron: true,
+                item_type: UIItemType::SidebarAgentMenuResume,
+            });
+            if resume_expanded {
+                rows.extend(self.agent_resume_session_rows());
+            }
+        }
+
+        // The session labels are prose, not one-word commands, so the submenu
+        // needs a wider panel than the launch rows do.
+        let menu_w = if resume_expanded {
+            AGENT_RESUME_MENU_W
+        } else {
+            AGENT_LAUNCH_MENU_W
+        };
+        self.paint_sidebar_dropdown(layers, menu.x as f32, menu.y as f32, menu_w, &rows)
+    }
+
+    /// How many past sessions the resume submenu may offer.
+    fn agent_resume_menu_limit(&self) -> usize {
+        self.config
+            .agent_ui
+            .launcher
+            .resume_menu_sessions
+            .min(MAX_RESUME_MENU_SESSIONS) as usize
+    }
+
+    /// Rows for the expanded resume submenu: the sessions, or why there are
+    /// none yet.
+    ///
+    /// Never scans here — painting must not touch the filesystem. The scan is
+    /// kicked off by the click that expands the row and lands in
+    /// `agent_session_cache`, so a first open shows progress for a frame or two.
+    fn agent_resume_session_rows(&self) -> Vec<SidebarDropdownRow> {
+        let placeholder = |label: &str| SidebarDropdownRow {
+            label: label.to_string(),
+            dot_color: None,
+            checkbox: None,
+            divider_above: false,
+            indent: true,
+            trailing_chevron: false,
+            // Deliberately not a resume row: there is nothing to click, and a
+            // hit-testable placeholder would resume an index that does not
+            // exist.
+            item_type: UIItemType::SidebarAgentMenuResume,
+        };
+
+        let Some((_, sessions)) = self.agent_session_cache.as_ref() else {
+            return vec![placeholder("Scanning…")];
+        };
+        if sessions.is_empty() {
+            return vec![placeholder(if self.agent_session_scan_pending {
+                "Scanning…"
+            } else {
+                "No past sessions"
+            })];
+        }
+
+        let adapters = self.merged_agent_adapters();
+        sessions
+            .iter()
+            .enumerate()
+            .map(|(index, session)| SidebarDropdownRow {
+                label: session.menu_label(),
+                dot_color: adapters
+                    .iter()
+                    .find(|(id, _)| id == &session.adapter_id)
+                    .and_then(|(_, adapter)| adapter.color.as_deref())
+                    .and_then(parse_adapter_color),
+                checkbox: None,
+                divider_above: false,
+                indent: true,
+                trailing_chevron: false,
+                item_type: UIItemType::SidebarAgentMenuResumeSession { index },
+            })
+            .collect()
     }
 
     /// Dropdown opened by the chevron beside the sidebar new-tab button: the
@@ -5496,7 +5683,13 @@ impl crate::TermWindow {
             })
             .collect();
 
-        self.paint_sidebar_dropdown(layers, menu.x as f32, menu.y as f32, &rows)
+        self.paint_sidebar_dropdown(
+            layers,
+            menu.x as f32,
+            menu.y as f32,
+            AGENT_LAUNCH_MENU_W,
+            &rows,
+        )
     }
 
     /// Downward chevron centered on `(cx, cy)`, drawn as stacked rounded bars
@@ -5543,6 +5736,7 @@ impl crate::TermWindow {
         layers: &mut TripleLayerQuadAllocator,
         anchor_x: f32,
         anchor_y: f32,
+        width: f32,
         rows: &[SidebarDropdownRow],
     ) -> anyhow::Result<()> {
         if rows.is_empty() {
@@ -5563,7 +5757,11 @@ impl crate::TermWindow {
         let divider_h = (1. * dpi_scale).max(1.);
         let divider_gap = 4. * dpi_scale;
         let divider_band = divider_gap * 2. + divider_h;
-        let menu_w = AGENT_LAUNCH_MENU_W * dpi_scale;
+        // Never wider than the window itself; a 420px submenu on a narrow
+        // window would otherwise be clamped to a negative x below.
+        let menu_w = (width * dpi_scale)
+            .min(self.dimensions.pixel_width as f32 - AGENT_TOOLBELT_GAP * 2.)
+            .max(AGENT_LAUNCH_MENU_W);
         let divider_count = rows.iter().filter(|row| row.divider_above).count();
         let menu_h = rows.len() as f32 * row_h + divider_count as f32 * divider_band + menu_pad;
 
@@ -9406,6 +9604,21 @@ gemini is a constellation\n";
             let _ = agent_pattern_matches("test", &pattern);
         }
         assert!(AGENT_PATTERN_REGEX_CACHE.lock().unwrap().len() <= AGENT_PATTERN_REGEX_CACHE_LIMIT);
+    }
+
+    /// Regression: this encoder used to keep dots, so every user whose home
+    /// directory contains one — `/Users/first.last` — got a project path that
+    /// matched nothing and a Claude `Logs` action that silently did nothing.
+    #[test]
+    fn claude_project_path_dashes_dots_as_well_as_separators() {
+        assert_eq!(
+            encode_claude_project_path(Path::new("/Users/first.last/Documents/repo")),
+            "-Users-first-last-Documents-repo"
+        );
+        assert_eq!(
+            encode_claude_project_path(Path::new("/Users/plain/repo")),
+            "-Users-plain-repo"
+        );
     }
 
     #[test]

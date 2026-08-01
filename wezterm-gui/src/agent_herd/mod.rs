@@ -16,6 +16,8 @@
 //! here is pure and unit tested.
 
 pub mod claude;
+pub mod sessions;
+pub mod transcript;
 
 use mux::pane::PaneId;
 use std::collections::HashSet;
@@ -24,6 +26,14 @@ use std::time::{Duration, SystemTime};
 
 /// How long after its last write a subagent transcript still counts as active.
 const SUBAGENT_ACTIVITY_WINDOW: Duration = Duration::from_secs(10);
+
+/// How recent the newest transcript event must be for the activity headline to
+/// claim the agent is doing it *now* rather than that it did it last.
+///
+/// Wider than [`SUBAGENT_ACTIVITY_WINDOW`] because a single tool call routinely
+/// runs longer than that — a build, a test run, a long web fetch — and the
+/// transcript stays silent for its whole duration.
+const ACTIVITY_FRESH_WINDOW: Duration = Duration::from_secs(120);
 
 /// sRGB color for "this agent is waiting on you".
 ///
@@ -139,6 +149,74 @@ pub struct HerdSubagent {
     pub last_activity: Option<SystemTime>,
 }
 
+/// What kind of thing an agent did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HerdEventKind {
+    /// A tool call: `Edit sidebar.rs`, `Bash cargo check`.
+    Tool,
+    /// Prose the agent wrote.
+    Assistant,
+    /// Anything the source told us about that is neither of the above.
+    Notice,
+}
+
+/// One thing an agent did, as read from its own transcript.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HerdEvent {
+    /// When it happened, when the source timestamps it.
+    pub at: Option<SystemTime>,
+    pub kind: HerdEventKind,
+    /// Already humanized and single-line; renderers only truncate.
+    pub text: String,
+}
+
+/// What an agent is doing, and what it did just before that.
+///
+/// `current` is deliberately separate from `recent.last()`: the headline needs
+/// the newest *tool* call, which is what "doing" means, while the log keeps
+/// prose too so the drill-down reads as a narrative.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct HerdActivity {
+    pub current: Option<HerdEvent>,
+    /// Oldest first, so the log renders top-down and appends at the bottom.
+    pub recent: Vec<HerdEvent>,
+}
+
+impl HerdActivity {
+    pub fn is_empty(&self) -> bool {
+        self.current.is_none() && self.recent.is_empty()
+    }
+
+    /// Newest activity timestamp we know of.
+    pub fn last_activity(&self) -> Option<SystemTime> {
+        self.current
+            .as_ref()
+            .and_then(|event| event.at)
+            .or_else(|| self.recent.last().and_then(|event| event.at))
+    }
+
+    /// Headline for the agent row.
+    ///
+    /// `now:` is only claimed when the agent is actually working *and* the
+    /// newest event is recent enough to still be in flight; otherwise the
+    /// honest label is `last:`. Guessing "now" from a stale transcript is how a
+    /// finished agent ends up looking busy.
+    pub fn headline(&self, status: HerdStatus, now: SystemTime) -> Option<(&'static str, &str)> {
+        let event = self.current.as_ref().or_else(|| self.recent.last())?;
+        let fresh = event
+            .at
+            .and_then(|at| now.duration_since(at).ok())
+            .map(|age| age <= ACTIVITY_FRESH_WINDOW)
+            .unwrap_or(false);
+        let label = if status == HerdStatus::Working && fresh {
+            "now"
+        } else {
+            "last"
+        };
+        Some((label, event.text.as_str()))
+    }
+}
+
 /// One agent in the herd.
 #[derive(Clone, Debug, PartialEq)]
 pub struct HerdAgent {
@@ -162,6 +240,8 @@ pub struct HerdAgent {
     pub started_at: Option<SystemTime>,
     pub status_changed_at: Option<SystemTime>,
     pub subagents: Vec<HerdSubagent>,
+    /// What this agent is doing, when a source could read its transcript.
+    pub activity: Option<HerdActivity>,
 }
 
 impl HerdAgent {
@@ -268,6 +348,9 @@ pub fn join_sessions_with_panes(
             started_at: session.started_at,
             status_changed_at: session.status_changed_at,
             subagents: session.subagents,
+            // Filled in afterwards by whoever owns the transcript cache; the
+            // join stays pure so it can be tested without a filesystem.
+            activity: None,
         });
     }
 
@@ -292,6 +375,7 @@ pub fn join_sessions_with_panes(
             started_at: None,
             status_changed_at: None,
             subagents: Vec::new(),
+            activity: None,
         });
     }
 
@@ -511,6 +595,7 @@ mod tests {
             started_at: None,
             status_changed_at: None,
             subagents: Vec::new(),
+            activity: None,
         }
     }
 

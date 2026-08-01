@@ -77,8 +77,13 @@ rangeset.workspace = true
 ratelim.workspace = true
 rayon.workspace = true
 regex.workspace = true
+# Read-only access to OpenCode's session database, which is the only place it
+# records past sessions. `bundled` so this works on Windows too, where there is
+# no system libsqlite3.
+rusqlite = {workspace=true, features = ["bundled"]}
 serde = {workspace=true, features = ["rc", "derive"]}
 serde_json.workspace = true
+serde_yaml.workspace = true
 shlex.workspace = true
 smol.workspace = true
 tabout.workspace = true

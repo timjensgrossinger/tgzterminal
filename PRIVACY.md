@@ -1,6 +1,8 @@
 # Privacy Policy for TGZTerminal
 
-No data about your device(s) or TGZTerminal usage leave your device by default.
+No data about your device(s) or TGZTerminal usage leave your device, with one
+exception: the update check described under _Update Checking_, which is enabled
+by default and can be turned off.
 
 ## Data Maintained by TGZTerminal
 
@@ -48,14 +50,29 @@ opened.
 
 ## Update Checking
 
-TGZTerminal disables automatic update checking by default. While this private
-preview is manually installed, updates are expected to come from rebuilding,
-signing, and reinstalling the local macOS bundle.
+TGZTerminal checks for new releases by default, so that you find out about
+security and bug fixes without having to watch the repository. Set
+`check_for_updates = false` in your configuration to switch it off.
 
-If you explicitly set `check_for_updates = true`, the compatibility update
-checker may make an HTTP request to GitHub's release API. The request uses a
-TGZTerminal User-Agent string and release notifications use TGZTerminal-branded
-text.
+**What is sent.** Periodically (once per day by default, configurable via
+`check_for_updates_interval_seconds`) TGZTerminal makes an HTTPS GET request to
+GitHub's public release API for this project's repository. The request carries a
+User-Agent of `TGZTerminal/<version>` and nothing else: no identifier, no
+configuration, no usage data. Like any HTTP request it necessarily discloses
+your IP address to GitHub.
+
+**What is stored.** The release metadata GitHub returns is cached in a
+`check_update` file in TGZTerminal's local data directory
+(`~/Library/Application Support/wezterm` on macOS). Its modification time is how
+TGZTerminal knows when it last checked. Delete the file at any time.
+
+**What is not done.** TGZTerminal never downloads or installs an update on its
+own. When a newer release exists it shows a notification; acting on that
+notification opens a normal browser download of the release artifact, which you
+then install yourself. Nothing is executed without you asking for it.
+
+A manual **Check for updates** command (command palette, Help menu, or the
+`CheckForUpdates` key assignment) performs the same single request on demand.
 
 ## EU / GDPR Notice (Regulation (EU) 2016/679)
 
@@ -82,20 +99,23 @@ _Data Maintained by TGZTerminal_) and under your sole control. You are the
 controller of that local content. Delete it at any time by clearing the relevant
 buffers or removing the app's data directory and configuration files.
 
-**Lawful basis and the only optional network egress.** The single case in which
-data leaves your device is the update checker, which is **disabled by default**
-and only runs if you explicitly set `check_for_updates = true`. When enabled, it
-makes an HTTPS request to GitHub's public release API. That request necessarily
-discloses your IP address and a TGZTerminal User-Agent string to **GitHub, Inc.
-(a US-based processor/controller)**. The lawful basis is your consent, given by
-opting in via that setting; withdraw it at any time by setting
-`check_for_updates = false`. GitHub's handling of that request is governed by the
+**Lawful basis and the only network egress.** The single case in which data
+leaves your device is the update checker, which is **enabled by default**. It
+makes a periodic HTTPS request to GitHub's public release API. That request
+necessarily discloses your IP address and a TGZTerminal User-Agent string to
+**GitHub, Inc. (a US-based processor/controller)**. The lawful basis is the
+legitimate interest (Art. 6(1)(f) GDPR) in informing users of security and
+correctness fixes to software they are running; the processing is limited to
+what a plain HTTP request to a public API entails, no profile is built, and no
+identifier is transmitted. You may object at any time, with immediate effect and
+no loss of functionality, by setting `check_for_updates = false`. GitHub's
+handling of that request is governed by the
 [GitHub Privacy Statement](https://docs.github.com/site-policy/privacy-policies/github-general-privacy-statement).
 
-**International transfers.** No transfer occurs unless you enable the update
-check. If you do, the request to GitHub may be processed in the United States;
-those transfers rely on GitHub's own transfer safeguards (Standard Contractual
-Clauses / Data Privacy Framework as applicable).
+**International transfers.** Unless you disable the update check, the request to
+GitHub may be processed in the United States; those transfers rely on GitHub's
+own transfer safeguards (Standard Contractual Clauses / Data Privacy Framework
+as applicable). Setting `check_for_updates = false` stops any transfer.
 
 **Retention.** The project retains no personal data about you. Local data is
 retained on your device until you delete it.
@@ -129,6 +149,6 @@ differently from the source version.
 
 ---
 
-_Effective date: 2026-07-24. This notice is provided for transparency about how
+_Effective date: 2026-07-31. This notice is provided for transparency about how
 the software behaves and is not legal advice. Parties who redistribute or deploy
 TGZTerminal commercially should have their own counsel confirm their obligations._

@@ -798,6 +798,16 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             menubar: &["Help"],
             icon: Some("cod_debug"),
         },
+        CheckForUpdates => CommandDef {
+            brief: "Check for updates".into(),
+            doc: "Asks GitHub for the latest release and offers a download link \
+                  if one is newer than this build"
+                .into(),
+            keys: vec![],
+            args: &[ArgType::ActiveWindow],
+            menubar: &["Help"],
+            icon: Some("md_update"),
+        },
         InputSelector(_) => CommandDef {
             brief: "Prompt the user to choose from a list".into(),
             doc: "Activates the selector overlay and wait for input".into(),
@@ -2038,9 +2048,10 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: None,
         },
         ShowAgentHerd => CommandDef {
-            brief: "Show Agent Overview".into(),
-            doc: "Lists every detected agent and its subagents, with status and \
-                  a Stop control, in the active pane"
+            brief: "Toggle Agent Insight Pane".into(),
+            doc: "Splits off a pane listing every detected agent, what it is \
+                  currently doing, and its subagents, with Stop and focus \
+                  controls. Press again to close it"
                 .into(),
             // No default binding: leaves the user's map untouched. Also
             // reachable from the sidebar agent button's dropdown.
@@ -2183,6 +2194,7 @@ fn compute_default_actions() -> Vec<KeyAssignment> {
         OpenUri("https://github.com/wezterm/wezterm/discussions/".to_string()),
         OpenUri("https://github.com/wezterm/wezterm/issues/".to_string()),
         ShowDebugOverlay,
+        CheckForUpdates,
         // ----------------- Misc
         OpenLinkAtMouseCursor,
     ];

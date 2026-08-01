@@ -19,11 +19,12 @@
 //! Everything here is best-effort: any failure is logged and swallowed, and a
 //! denied prompt is not retried on the next launch.
 
+use config::wezterm_version;
 use std::path::{Path, PathBuf};
 
 /// Bumping this re-primes once on the next launch, e.g. if a new directory is
 /// added to `PRIMED_DIRS`.
-const MARKER_VERSION: u32 = 1;
+const MARKER_VERSION: u32 = 2;
 
 /// Directories, relative to `$HOME`, that the fork reads on behalf of the user.
 const PRIMED_DIRS: &[&str] = &["Documents", "Desktop", "Downloads"];
@@ -32,14 +33,44 @@ fn marker_path() -> PathBuf {
     config::DATA_DIR.join("macos-permissions-primed")
 }
 
+/// The marker records `<MARKER_VERSION> <build version>`.
+///
+/// The build version matters because replacing the bundle can lose the grants
+/// this marker claims to have collected: for an ad-hoc signed bundle TCC keys
+/// consent to the binary's code directory hash, which changes with every
+/// build, and switching signing identities has the same effect. Recording the
+/// build that primed lets an updated install ask once more instead of
+/// silently running without folder access.
+///
+/// A version-only marker written by an older build parses as "primed by an
+/// unknown build", which is stale by definition. Any parse failure also means
+/// not primed: re-priming is idempotent and costs one directory read.
 fn already_primed(marker: &Path) -> bool {
-    match std::fs::read_to_string(marker) {
-        Ok(contents) => contents
-            .trim()
-            .parse::<u32>()
-            .map_or(false, |version| version >= MARKER_VERSION),
-        Err(_) => false,
+    let contents = match std::fs::read_to_string(marker) {
+        Ok(contents) => contents,
+        Err(_) => return false,
+    };
+
+    // Split once only: the build version is the rest of the line, and is not
+    // guaranteed to be a single whitespace-free token.
+    let (version_field, build) = match contents.trim().split_once(char::is_whitespace) {
+        Some((version, build)) => (version, build.trim()),
+        None => (contents.trim(), ""),
+    };
+
+    let version = match version_field.parse::<u32>() {
+        Ok(version) => version,
+        Err(_) => return false,
+    };
+    if version < MARKER_VERSION {
+        return false;
     }
+
+    build == wezterm_version()
+}
+
+fn marker_contents() -> String {
+    format!("{} {}\n", MARKER_VERSION, wezterm_version())
 }
 
 /// TCC attributes an access to the *responsible* application. When we run
@@ -92,7 +123,7 @@ pub fn prime_first_run() {
             // Written even when a prompt was denied: macOS will not ask again
             // either way, and re-running this on every launch would be pure
             // startup cost.
-            if let Err(err) = std::fs::write(&marker, format!("{}\n", MARKER_VERSION)) {
+            if let Err(err) = std::fs::write(&marker, marker_contents()) {
                 log::warn!(
                     "unable to record permission priming in {}: {:#}",
                     marker.display(),
@@ -103,5 +134,47 @@ pub fn prime_first_run() {
 
     if let Err(err) = spawned {
         log::warn!("unable to spawn permission priming thread: {:#}", err);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{already_primed, marker_contents, MARKER_VERSION};
+    use std::io::Write;
+
+    fn marker_with(contents: &str) -> tempfile::NamedTempFile {
+        let mut file = tempfile::NamedTempFile::new().expect("temp file");
+        file.write_all(contents.as_bytes()).expect("write marker");
+        file.flush().expect("flush marker");
+        file
+    }
+
+    #[test]
+    fn marker_written_by_this_build_counts_as_primed() {
+        let file = marker_with(&marker_contents());
+        assert!(already_primed(file.path()));
+    }
+
+    /// The bundle was replaced by an update; grants may not have survived.
+    #[test]
+    fn marker_from_another_build_is_stale() {
+        let file = marker_with(&format!("{} tgz-v1970.01.1\n", MARKER_VERSION));
+        assert!(!already_primed(file.path()));
+    }
+
+    /// Written by a build from before the marker recorded a version string.
+    #[test]
+    fn legacy_version_only_marker_is_stale() {
+        let file = marker_with("1\n");
+        assert!(!already_primed(file.path()));
+    }
+
+    #[test]
+    fn unreadable_or_malformed_marker_is_not_primed() {
+        let file = marker_with("not a version\n");
+        assert!(!already_primed(file.path()));
+
+        let missing = std::path::Path::new("/nonexistent/tgzterminal/marker");
+        assert!(!already_primed(missing));
     }
 }

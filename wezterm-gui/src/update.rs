@@ -55,6 +55,66 @@ fn get_github_release_info(uri: &str) -> anyhow::Result<Release> {
     Ok(latest)
 }
 
+/// The platforms the fork publishes release artifacts for.
+///
+/// Kept as an explicit parameter rather than a `cfg!` inside the selection
+/// logic so that the asset matching for every platform is testable from any
+/// host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Platform {
+    MacOS,
+    Windows,
+    Other,
+}
+
+impl Platform {
+    fn current() -> Self {
+        if cfg!(target_os = "macos") {
+            Self::MacOS
+        } else if cfg!(target_os = "windows") {
+            Self::Windows
+        } else {
+            Self::Other
+        }
+    }
+}
+
+/// The release artifact a user on `platform` should download.
+///
+/// Asset names are produced by the release workflows and are stable:
+/// `<Product>.dmg` on macOS, `<Product>-Setup.exe` on Windows with the
+/// portable `<Product>-windows-portable-<tag>.zip` as the fallback (the
+/// installer step is best-effort and can legitimately be missing from a
+/// release). Returns `None` on platforms we publish nothing for, in which
+/// case callers fall back to the release page.
+fn pick_asset_for(release: &Release, platform: Platform) -> Option<&Asset> {
+    let product = crate::brand::PRODUCT_NAME;
+    match platform {
+        Platform::MacOS => {
+            let dmg = format!("{}.dmg", product);
+            release.assets.iter().find(|asset| asset.name == dmg)
+        }
+        Platform::Windows => {
+            let setup = format!("{}-Setup", product);
+            let portable = format!("{}-windows-portable", product);
+            release
+                .assets
+                .iter()
+                .find(|asset| asset.name.starts_with(&setup) && asset.name.ends_with(".exe"))
+                .or_else(|| {
+                    release.assets.iter().find(|asset| {
+                        asset.name.starts_with(&portable) && asset.name.ends_with(".zip")
+                    })
+                })
+        }
+        Platform::Other => None,
+    }
+}
+
+fn pick_asset(release: &Release) -> Option<&Asset> {
+    pick_asset_for(release, Platform::current())
+}
+
 pub fn get_latest_release_info() -> anyhow::Result<Release> {
     let uri = format!(
         "https://api.github.com/repos/{}/releases/latest",
@@ -208,6 +268,111 @@ fn schedule_set_banner_from_release_info(latest: &Release) {
     .detach();
 }
 
+/// Persist the release metadata; the file's mtime doubles as the timestamp of
+/// the last successful check.
+fn cache_release(latest: &Release) {
+    let update_file_name = config::DATA_DIR.join("check_update");
+    config::create_user_owned_dirs(update_file_name.parent().unwrap()).ok();
+
+    if let Ok(f) = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&update_file_name)
+    {
+        serde_json::to_writer_pretty(f, latest).ok();
+    }
+}
+
+/// Show the "update available" toast. Clicking it downloads this platform's
+/// artifact directly; when the release has no artifact for us (Linux, or a
+/// release whose upload failed) it falls back to the release page.
+fn notify_update_available(latest: &Release) {
+    let asset = pick_asset(latest);
+    let url = asset
+        .map(|asset| asset.browser_download_url.as_str())
+        .unwrap_or(latest.html_url.as_str());
+    let message = match asset {
+        Some(asset) => format!("Click to download {}", asset.name),
+        None => "Click to see release details".to_string(),
+    };
+
+    persistent_toast_notification_with_click_to_open_url(
+        &format!(
+            "{} {} is available",
+            crate::brand::PRODUCT_NAME,
+            latest.tag_name
+        ),
+        &message,
+        url,
+    );
+}
+
+/// A build made from a release tag reports `tgz-vYYYY.MM.PATCH`; a local or CI
+/// build reports the git-derived `YYYYMMDD-HHMMSS-hash` form, which
+/// `release_tag_is_newer` cannot meaningfully compare against a release tag.
+fn is_release_build(current: &str) -> bool {
+    current.starts_with("tgz-")
+}
+
+fn toast(title: &str, message: &str) {
+    ToastNotification {
+        title: title.to_string(),
+        message: message.to_string(),
+        url: None,
+        timeout: Some(Duration::from_secs(10)),
+    }
+    .show();
+}
+
+/// One-shot update check, for the `CheckForUpdates` key assignment / command
+/// palette entry. Always answers the user, even when already up to date, and
+/// ignores both the `check_for_updates` setting and the multi-process
+/// consensus used by the background checker: this was explicitly asked for.
+pub fn check_for_updates_now() {
+    if let Err(err) = std::thread::Builder::new()
+        .name("update_check_now".into())
+        .spawn(|| {
+            let latest = match get_latest_release_info() {
+                Ok(latest) => latest,
+                Err(err) => {
+                    log::warn!("manual update check failed: {:#}", err);
+                    toast(
+                        &format!("{} update check failed", crate::brand::PRODUCT_NAME),
+                        &format!("{:#}", err),
+                    );
+                    return;
+                }
+            };
+
+            cache_release(&latest);
+            schedule_set_banner_from_release_info(&latest);
+
+            let current = wezterm_version();
+            if !is_release_build(current) {
+                // Comparing a `20260730-121314-abc12345` dev build against a
+                // `tgz-v2026.07.2` tag numerically is meaningless, so say so
+                // rather than claiming to be up to date.
+                notify_update_available(&latest);
+                log::info!(
+                    "development build {}; latest release is {}",
+                    current,
+                    latest.tag_name
+                );
+            } else if release_tag_is_newer(latest.tag_name.as_str(), current) {
+                notify_update_available(&latest);
+            } else {
+                toast(
+                    &format!("{} is up to date", crate::brand::PRODUCT_NAME),
+                    &format!("{} is the latest release", current),
+                );
+            }
+        })
+    {
+        log::warn!("unable to spawn update check thread: {:#}", err);
+    }
+}
+
 /// Returns true if the provided socket path is dead.
 fn update_checker() {
     // Compute how long we should sleep for;
@@ -254,28 +419,13 @@ fn update_checker() {
                         current
                     );
 
-                    let url = latest.html_url.clone();
-
                     if force_ui || socks.is_empty() || socks[0] == my_sock {
-                        persistent_toast_notification_with_click_to_open_url(
-                            &format!("{} Update Available", crate::brand::PRODUCT_NAME),
-                            "Click to see release details",
-                            &url,
-                        );
+                        notify_update_available(&latest);
                     }
                 }
 
-                config::create_user_owned_dirs(update_file_name.parent().unwrap()).ok();
-
                 // Record the time of this check
-                if let Ok(f) = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .open(&update_file_name)
-                {
-                    serde_json::to_writer_pretty(f, &latest).ok();
-                }
+                cache_release(&latest);
             }
         }
 
@@ -299,7 +449,96 @@ pub fn start_update_checker() {
 
 #[cfg(test)]
 mod tests {
-    use super::release_tag_is_newer;
+    use super::{is_release_build, pick_asset_for, release_tag_is_newer, Asset, Platform, Release};
+
+    fn release_with(asset_names: &[&str]) -> Release {
+        Release {
+            url: "https://api.github.com/repos/example/example/releases/1".to_string(),
+            body: String::new(),
+            html_url: "https://github.com/example/example/releases/tag/tgz-v2026.07.2".to_string(),
+            tag_name: "tgz-v2026.07.2".to_string(),
+            assets: asset_names
+                .iter()
+                .map(|name| Asset {
+                    name: name.to_string(),
+                    size: 1,
+                    url: format!("https://api.github.com/assets/{}", name),
+                    browser_download_url: format!("https://example.invalid/{}", name),
+                })
+                .collect(),
+        }
+    }
+
+    /// The default branding; tests assert against the shipped asset names.
+    const PRODUCT: &str = crate::brand::PRODUCT_NAME;
+
+    #[test]
+    fn macos_picks_the_dmg() {
+        let release = release_with(&[
+            &format!("{}-windows-portable-tgz-v2026.07.2.zip", PRODUCT),
+            &format!("{}.dmg", PRODUCT),
+        ]);
+        let asset = pick_asset_for(&release, Platform::MacOS).expect("dmg should be picked");
+        assert_eq!(asset.name, format!("{}.dmg", PRODUCT));
+    }
+
+    #[test]
+    fn windows_prefers_the_installer_over_the_portable_zip() {
+        let release = release_with(&[
+            &format!("{}-windows-portable-tgz-v2026.07.2.zip", PRODUCT),
+            &format!("{}-Setup.exe", PRODUCT),
+            &format!("{}.dmg", PRODUCT),
+        ]);
+        let asset =
+            pick_asset_for(&release, Platform::Windows).expect("installer should be picked");
+        assert_eq!(asset.name, format!("{}-Setup.exe", PRODUCT));
+    }
+
+    /// The Inno Setup step is `continue-on-error`, so a release can ship the
+    /// portable zip alone.
+    #[test]
+    fn windows_falls_back_to_the_portable_zip() {
+        let release = release_with(&[
+            &format!("{}.dmg", PRODUCT),
+            &format!("{}-windows-portable-tgz-v2026.07.2.zip", PRODUCT),
+        ]);
+        let asset = pick_asset_for(&release, Platform::Windows).expect("zip should be picked");
+        assert_eq!(
+            asset.name,
+            format!("{}-windows-portable-tgz-v2026.07.2.zip", PRODUCT)
+        );
+    }
+
+    #[test]
+    fn no_asset_for_unpublished_platforms() {
+        let release = release_with(&[&format!("{}.dmg", PRODUCT)]);
+        assert!(pick_asset_for(&release, Platform::Other).is_none());
+    }
+
+    #[test]
+    fn no_asset_when_the_release_has_none() {
+        let release = release_with(&[]);
+        assert!(pick_asset_for(&release, Platform::MacOS).is_none());
+        assert!(pick_asset_for(&release, Platform::Windows).is_none());
+    }
+
+    /// Guards against matching an unrelated asset that merely starts with the
+    /// product name.
+    #[test]
+    fn unrelated_assets_are_not_picked() {
+        let release = release_with(&[
+            &format!("{}-debug-symbols.zip", PRODUCT),
+            &format!("{}.dmg.sha256", PRODUCT),
+        ]);
+        assert!(pick_asset_for(&release, Platform::MacOS).is_none());
+        assert!(pick_asset_for(&release, Platform::Windows).is_none());
+    }
+
+    #[test]
+    fn release_builds_are_distinguished_from_dev_builds() {
+        assert!(is_release_build("tgz-v2026.07.2"));
+        assert!(!is_release_build("20260730-121314-abc12345"));
+    }
 
     #[test]
     fn tgz_patch_ordering() {

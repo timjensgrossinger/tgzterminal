@@ -1,22 +1,25 @@
-//! The agent herd overview: a full-pane list of every agent this terminal can
-//! see, its subagents, and a Stop control.
+//! The agent herd view: a list of every agent this terminal can see, what each
+//! one is doing, its subagents, and a Stop control.
 //!
-//! Runs as a `TermWizTerminal` overlay, which means it occupies a pane, gets all
-//! input, and — importantly — runs on its own thread. Filesystem polling for
-//! Claude sessions therefore never touches the render path.
+//! Drawn into a `TermWizTerminal`, which gets all of the pane's input and —
+//! importantly — runs on its own thread, so filesystem polling for Claude
+//! sessions and transcripts never touches the render path. It lives in a real
+//! split pane; see [`crate::termwindow::agent_insight`] for how that pane is
+//! made and torn down.
 //!
 //! The one hard constraint: **this thread must not touch the mux.** Pane data is
 //! requested from the GUI thread via [`TermWindowNotif::Apply`] and arrives over
 //! a channel; see [`request_pane_rows`].
 
 use crate::agent_herd::{
-    claude, group_by_project, join_sessions_with_panes, HerdAgent, HerdGroup, HerdStatus, HerdView,
-    PaneAgentRow,
+    claude, group_by_project, join_sessions_with_panes, transcript, HerdActivity, HerdAgent,
+    HerdEventKind, HerdGroup, HerdStatus, HerdView, PaneAgentRow,
 };
 use crate::termwindow::TermWindowNotif;
 use mux::termwiztermtab::TermWizTerminal;
 use mux::Mux;
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::{Duration, Instant, SystemTime};
@@ -78,6 +81,10 @@ pub struct HerdArgs {
     pub read_claude_sessions: bool,
     /// Pane rows for the first frame, so the overview opens populated.
     pub initial_panes: Vec<PaneAgentRow>,
+    /// Read each agent's transcript for what it is currently doing.
+    pub show_activity: bool,
+    /// How many recent events the per-agent log keeps.
+    pub activity_history: usize,
 }
 
 /// Entry point: run the overview until the user closes it.
@@ -87,6 +94,11 @@ pub fn agent_herd_overview(
     args: HerdArgs,
 ) -> anyhow::Result<()> {
     term.set_raw_mode()?;
+    // Names the pane in the sidebar and the tab title. Cosmetic only — nothing
+    // identifies this pane by its title.
+    term.render(&[Change::Title(
+        crate::termwindow::agent_insight::INSIGHT_PANE_TITLE.to_string(),
+    )])?;
     let mut state = HerdState::new(args);
     let (tx, rx) = channel();
 
@@ -141,9 +153,68 @@ enum Row {
     Agent(usize),
     /// Continuation line under an agent (block reason).
     Detail(usize),
+    /// The `now:` activity headline under an agent.
+    Activity(usize),
+    /// (agent index, event index) in the expanded activity log.
+    Event(usize, usize),
     /// (agent index, subagent index)
     Subagent(usize, usize),
     Blank,
+}
+
+/// A run of text at a fixed column, with the attributes it is drawn in.
+#[derive(Clone, Debug, PartialEq)]
+struct Segment {
+    x: usize,
+    text: String,
+    fg: ColorAttribute,
+    bold: bool,
+    reverse: bool,
+}
+
+impl Segment {
+    fn dim(x: usize, text: impl Into<String>, dim: (u8, u8, u8)) -> Self {
+        Self {
+            x,
+            text: text.into(),
+            fg: rgb(dim),
+            bold: false,
+            reverse: false,
+        }
+    }
+}
+
+/// One laid-out body line, before it is clipped to the visible window.
+#[derive(Clone, Debug, PartialEq)]
+struct BodyLine {
+    row: Row,
+    segments: Vec<Segment>,
+    /// Where the Stop control sits on this line, if it has one.
+    stop: Option<Range<usize>>,
+}
+
+/// Scroll offset that keeps the selected agent's row on screen.
+///
+/// Clamps in both directions, which is the whole point: the offset must grow
+/// when the selection moves below the fold, not only shrink when it moves above
+/// it.
+fn clamp_scroll(lines: &[BodyLine], selected: usize, scroll: usize, height: usize) -> usize {
+    if height == 0 || lines.is_empty() {
+        return 0;
+    }
+    let max_scroll = lines.len().saturating_sub(height);
+    let mut scroll = scroll.min(max_scroll);
+    if let Some(idx) = lines
+        .iter()
+        .position(|line| line.row == Row::Agent(selected))
+    {
+        if idx < scroll {
+            scroll = idx;
+        } else if idx >= scroll + height {
+            scroll = idx + 1 - height;
+        }
+    }
+    scroll
 }
 
 struct HerdState {
@@ -153,6 +224,8 @@ struct HerdState {
     refresh: Duration,
     include_subagents: bool,
     read_claude_sessions: bool,
+    show_activity: bool,
+    activity_history: usize,
 
     pane_rows: Vec<PaneAgentRow>,
     /// Display order, flattened across groups.
@@ -161,6 +234,12 @@ struct HerdState {
     selected: usize,
     scroll: usize,
     footer: Option<String>,
+
+    /// Agents whose activity log is expanded, keyed by [`HerdState::key`].
+    expanded: HashSet<String>,
+    /// Transcript activity per session, with the `(mtime, len)` it was read at
+    /// so an unchanged file is never re-read.
+    activity_cache: HashMap<String, (Option<(Option<SystemTime>, u64)>, HerdActivity)>,
 
     /// Previous status per agent, for deriving `Done`.
     prev_status: HashMap<String, HerdStatus>,
@@ -181,12 +260,16 @@ impl HerdState {
             refresh: args.refresh,
             include_subagents: args.include_subagents,
             read_claude_sessions: args.read_claude_sessions,
+            show_activity: args.show_activity,
+            activity_history: args.activity_history,
             pane_rows: args.initial_panes,
             agents: Vec::new(),
             groups: Vec::new(),
             selected: 0,
             scroll: 0,
             footer: None,
+            expanded: HashSet::new(),
+            activity_cache: HashMap::new(),
             prev_status: HashMap::new(),
             unseen_done: HashSet::new(),
             rows: Vec::new(),
@@ -228,6 +311,7 @@ impl HerdState {
         };
 
         let mut agents = join_sessions_with_panes(sessions, self.pane_rows.clone());
+        self.fill_activity(&mut agents);
         self.apply_done_derivation(&mut agents);
 
         self.groups = group_by_project(agents, self.view, self.current_project.as_deref());
@@ -239,6 +323,60 @@ impl HerdState {
         if self.selected >= self.agents.len() {
             self.selected = self.agents.len().saturating_sub(1);
         }
+    }
+
+    /// Attach "what is it doing" to every agent whose transcript we can find.
+    ///
+    /// The cache is what makes this affordable at the refresh rate: a transcript
+    /// is only re-read when its `(mtime, len)` moved, so a quiet agent costs one
+    /// `stat` per tick and a busy one costs a bounded tail read.
+    fn fill_activity(&mut self, agents: &mut [HerdAgent]) {
+        if !self.show_activity || self.activity_history == 0 {
+            return;
+        }
+        let Some(home) = dirs_next::home_dir() else {
+            return;
+        };
+
+        let mut live = HashSet::new();
+        for agent in agents.iter_mut() {
+            // Only Claude publishes a transcript we know how to read; other
+            // vendors simply have no activity line, which is the honest result.
+            let (Some(session_id), Some(cwd)) = (agent.session_id.as_deref(), agent.cwd.as_deref())
+            else {
+                continue;
+            };
+            if agent.provider != "claude" {
+                continue;
+            }
+            let Some(path) = claude::session_transcript_path(&home, cwd, session_id) else {
+                continue;
+            };
+            let stamp = std::fs::metadata(&path)
+                .ok()
+                .map(|meta| (meta.modified().ok(), meta.len()));
+
+            live.insert(session_id.to_string());
+            let cached = self.activity_cache.get(session_id);
+            let activity = match cached {
+                Some((cached_stamp, activity)) if *cached_stamp == stamp && stamp.is_some() => {
+                    activity.clone()
+                }
+                _ => {
+                    let activity = transcript::read_activity(&path, self.activity_history);
+                    self.activity_cache
+                        .insert(session_id.to_string(), (stamp, activity.clone()));
+                    activity
+                }
+            };
+            if !activity.is_empty() {
+                agent.activity = Some(activity);
+            }
+        }
+
+        // Sessions that ended must not keep their entry alive forever.
+        self.activity_cache
+            .retain(|session_id, _| live.contains(session_id));
     }
 
     /// `Done` is not reported by any source: it means "finished while you
@@ -316,14 +454,39 @@ impl HerdState {
                 self.footer = Some("refreshed".to_string());
             }
             (KeyCode::Char('s'), Modifiers::NONE) => self.stop_selected(window),
-            (KeyCode::Enter, _) => {
-                if self.focus_selected(window) {
-                    return true;
-                }
+            // The pane persists, so Enter is free for the thing you do most
+            // often here — look closer — and focusing moves to `f`.
+            (KeyCode::Enter, _)
+            | (KeyCode::RightArrow, _)
+            | (KeyCode::LeftArrow, _)
+            | (KeyCode::Char('l'), Modifiers::NONE)
+            | (KeyCode::Char('h'), Modifiers::NONE) => self.toggle_expand_selected(),
+            (KeyCode::Char('f'), Modifiers::NONE) => {
+                self.focus_selected(window);
             }
             _ => {}
         }
         false
+    }
+
+    /// Expand or collapse the selected agent's activity log.
+    fn toggle_expand_selected(&mut self) {
+        let Some(agent) = self.agents.get(self.selected) else {
+            return;
+        };
+        let key = Self::key(agent);
+        let has_log = agent
+            .activity
+            .as_ref()
+            .is_some_and(|activity| !activity.recent.is_empty());
+        if !self.expanded.remove(&key) {
+            if !has_log {
+                self.footer = Some(format!("no recorded activity for {}", agent.name));
+                return;
+            }
+            self.expanded.insert(key);
+        }
+        self.acknowledge_selected();
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent, window: &::window::Window) {
@@ -342,9 +505,21 @@ impl HerdState {
         }
 
         match self.rows.get(y).cloned() {
-            Some(Row::Agent(idx)) | Some(Row::Detail(idx)) | Some(Row::Subagent(idx, _)) => {
+            Some(Row::Agent(idx))
+            | Some(Row::Detail(idx))
+            | Some(Row::Event(idx, _))
+            | Some(Row::Subagent(idx, _)) => {
                 self.selected = idx;
                 self.acknowledge_selected();
+            }
+            // The activity line is the expander, so clicking it does what
+            // clicking a disclosure triangle does.
+            Some(Row::Activity(idx)) => {
+                self.selected = idx;
+                self.acknowledge_selected();
+                if left {
+                    self.toggle_expand_selected();
+                }
             }
             Some(Row::ViewToggle) if left => {
                 self.view = self.view.toggled();
@@ -388,16 +563,20 @@ impl HerdState {
         self.footer = Some(format!("sent Ctrl-C to {name}"));
     }
 
-    /// Focus the selected agent's pane. Returns true when the overlay should
-    /// close because focus moved away.
-    fn focus_selected(&mut self, window: &::window::Window) -> bool {
+    /// Focus the selected agent's pane.
+    ///
+    /// This view lives in a pane of its own, so focusing an agent moves the
+    /// cursor without tearing the list down — that is the point of it being a
+    /// pane rather than an overlay.
+    fn focus_selected(&mut self, window: &::window::Window) {
         let Some(agent) = self.agents.get(self.selected) else {
-            return false;
+            return;
         };
         let Some(pane_id) = agent.pane_id else {
             self.footer = Some("no pane owns this agent".to_string());
-            return false;
+            return;
         };
+        let name = agent.name.clone();
 
         window.notify(TermWindowNotif::Apply(Box::new(move |_term_window| {
             let mux = Mux::get();
@@ -420,7 +599,7 @@ impl HerdState {
                 window.save_and_then_set_active(idx);
             }
         })));
-        true
+        self.footer = Some(format!("focused {name}"));
     }
 
     fn render(&mut self, term: &mut TermWizTerminal) -> anyhow::Result<()> {
@@ -445,9 +624,8 @@ impl HerdState {
         if self.agents.is_empty() {
             self.render_empty(&mut changes, y);
         } else {
-            y = self.render_groups(&mut changes, cols, y, body_end);
+            self.paint_body(&mut changes, cols, y, body_end);
         }
-        let _ = y;
 
         self.render_footer(&mut changes, rows_avail.saturating_sub(1));
         term.render(&changes)?;
@@ -504,78 +682,40 @@ impl HerdState {
         changes.push(Change::Text(hint.to_string()));
     }
 
-    fn render_groups(
-        &mut self,
-        changes: &mut Vec<Change>,
-        cols: usize,
-        mut y: usize,
-        body_end: usize,
-    ) -> usize {
-        // Keep the selection on screen.
-        let selected_line = self.selected;
-        if selected_line < self.scroll {
-            self.scroll = selected_line;
-        }
-
+    /// Lay the whole body out as data, without clipping it.
+    ///
+    /// Layout is separated from painting so that scrolling has a real line
+    /// count to work against — the previous single-pass renderer could only
+    /// ever scroll *up*, because it never knew how much was below the fold —
+    /// and so the layout can be tested without a terminal.
+    fn body_lines(&self, cols: usize) -> Vec<BodyLine> {
+        let mut lines = Vec::new();
         let mut agent_idx = 0usize;
-        let mut skipped = 0usize;
-        let groups = std::mem::take(&mut self.groups);
 
-        for group in &groups {
-            if group.show_header && y < body_end {
-                if skipped >= self.scroll {
-                    move_to(changes, MARGIN, y);
-                    changes.push(Change::Attribute(AttributeChange::Foreground(rgb(self
-                        .theme
-                        .dim))));
-                    changes.push(Change::Text(group.label.clone()));
-                    self.rows[y] = Row::GroupHeader;
-                    y += 1;
-                }
+        for group in &self.groups {
+            if group.show_header {
+                lines.push(BodyLine {
+                    row: Row::GroupHeader,
+                    segments: vec![Segment::dim(MARGIN, group.label.clone(), self.theme.dim)],
+                    stop: None,
+                });
             }
             for agent in &group.agents {
-                if skipped < self.scroll {
-                    skipped += 1;
-                    agent_idx += 1;
-                    continue;
-                }
-                if y >= body_end {
-                    break;
-                }
-                y = self.render_agent(changes, cols, y, body_end, agent, agent_idx);
+                self.agent_lines(&mut lines, cols, agent, agent_idx);
                 agent_idx += 1;
             }
         }
-
-        self.groups = groups;
-        y
+        lines
     }
 
-    fn render_agent(
-        &mut self,
-        changes: &mut Vec<Change>,
+    fn agent_lines(
+        &self,
+        lines: &mut Vec<BodyLine>,
         cols: usize,
-        mut y: usize,
-        body_end: usize,
         agent: &HerdAgent,
         agent_idx: usize,
-    ) -> usize {
+    ) {
         let selected = agent_idx == self.selected;
-
-        // Status dot.
-        move_to(changes, MARGIN, y);
-        if selected {
-            changes.push(Change::Attribute(AttributeChange::Reverse(true)));
-        }
-        changes.push(Change::Attribute(AttributeChange::Foreground(
-            self.theme.status_color(agent.status, &agent.provider),
-        )));
-        changes.push(Change::Text(format!("{} ", agent.status.glyph())));
-
-        // Name.
-        changes.push(Change::Attribute(AttributeChange::Foreground(
-            ColorAttribute::Default,
-        )));
         let meta = self.agent_meta(agent);
         let meta_w = unicode_column_width(&meta, None);
         let stop_w = if selected && agent.can_stop() {
@@ -586,102 +726,227 @@ impl HerdState {
         let name_budget = cols
             .saturating_sub(MARGIN * 2 + 2 + meta_w + stop_w + 2)
             .max(8);
-        changes.push(Change::Text(truncate(&agent.name, name_budget)));
 
-        // Right-aligned metadata, then the Stop control on the selected row.
+        let mut segments = vec![
+            Segment {
+                x: MARGIN,
+                text: format!("{} ", agent.status.glyph()),
+                fg: self.theme.status_color(agent.status, &agent.provider),
+                bold: false,
+                reverse: selected,
+            },
+            Segment {
+                x: MARGIN + 2,
+                text: truncate(&agent.name, name_budget),
+                fg: ColorAttribute::Default,
+                bold: false,
+                reverse: selected,
+            },
+        ];
+
         let meta_x = cols.saturating_sub(MARGIN + meta_w + stop_w);
         if meta_x > MARGIN + 2 {
-            move_to(changes, meta_x, y);
-            changes.push(Change::Attribute(AttributeChange::Foreground(rgb(self
-                .theme
-                .dim))));
-            changes.push(Change::Text(meta));
+            segments.push(Segment {
+                x: meta_x,
+                text: meta,
+                fg: rgb(self.theme.dim),
+                bold: false,
+                reverse: selected,
+            });
         }
+        let mut stop = None;
         if stop_w > 0 {
             let stop_x = cols.saturating_sub(MARGIN + stop_w);
-            move_to(changes, stop_x, y);
-            changes.push(Change::Attribute(AttributeChange::Foreground(rgb(self
-                .theme
-                .attention))));
-            changes.push(Change::Attribute(AttributeChange::Intensity(
-                Intensity::Bold,
-            )));
-            changes.push(Change::Text(STOP_LABEL.to_string()));
-            changes.push(Change::Attribute(AttributeChange::Intensity(
-                Intensity::Normal,
-            )));
-            self.stop_cell = Some((y, stop_x..stop_x + stop_w));
+            segments.push(Segment {
+                x: stop_x,
+                text: STOP_LABEL.to_string(),
+                fg: rgb(self.theme.attention),
+                bold: true,
+                reverse: selected,
+            });
+            stop = Some(stop_x..stop_x + stop_w);
         }
-        changes.push(Change::Attribute(AttributeChange::Reverse(false)));
-        self.rows[y] = Row::Agent(agent_idx);
-        y += 1;
+        lines.push(BodyLine {
+            row: Row::Agent(agent_idx),
+            segments,
+            stop,
+        });
 
         // Block reason, with how long it has been waiting.
         if let Some(reason) = &agent.blocked_reason {
-            if y < body_end {
-                move_to(changes, SUB_INDENT, y);
-                changes.push(Change::Attribute(AttributeChange::Foreground(rgb(self
-                    .theme
-                    .attention))));
-                changes.push(Change::Text(truncate(
-                    reason,
-                    cols.saturating_sub(SUB_INDENT + MARGIN + 10),
-                )));
-                if let Some(elapsed) = elapsed_label(agent.status_changed_at) {
-                    let w = unicode_column_width(&elapsed, None);
-                    let x = cols.saturating_sub(MARGIN + w);
-                    if x > SUB_INDENT {
-                        move_to(changes, x, y);
-                        changes.push(Change::Attribute(AttributeChange::Foreground(rgb(self
-                            .theme
-                            .dim))));
-                        changes.push(Change::Text(elapsed));
-                    }
+            let mut segments = vec![Segment {
+                x: SUB_INDENT,
+                text: truncate(reason, cols.saturating_sub(SUB_INDENT + MARGIN + 10)),
+                fg: rgb(self.theme.attention),
+                bold: false,
+                reverse: false,
+            }];
+            if let Some(elapsed) = elapsed_label(agent.status_changed_at) {
+                let w = unicode_column_width(&elapsed, None);
+                let x = cols.saturating_sub(MARGIN + w);
+                if x > SUB_INDENT {
+                    segments.push(Segment::dim(x, elapsed, self.theme.dim));
                 }
-                self.rows[y] = Row::Detail(agent_idx);
-                y += 1;
             }
+            lines.push(BodyLine {
+                row: Row::Detail(agent_idx),
+                segments,
+                stop: None,
+            });
         }
+
+        self.activity_lines(lines, cols, agent, agent_idx);
 
         // Subagents.
         let last = agent.subagents.len().saturating_sub(1);
         for (sub_idx, sub) in agent.subagents.iter().enumerate() {
-            if y >= body_end {
-                break;
-            }
             let branch = if sub_idx == last { "└" } else { "├" };
-            move_to(changes, SUB_INDENT, y);
-            changes.push(Change::Attribute(AttributeChange::Foreground(rgb(self
-                .theme
-                .dim))));
-            changes.push(Change::Text(format!("{branch} ")));
-            changes.push(Change::Attribute(AttributeChange::Foreground(
-                ColorAttribute::Default,
-            )));
-
             let status_w = unicode_column_width(sub.status.label(), None);
             let type_label = format!("{:<12} ", truncate(&sub.agent_type, 12));
-            changes.push(Change::Text(type_label.clone()));
-            let used = SUB_INDENT + 2 + unicode_column_width(&type_label, None);
+            let type_w = unicode_column_width(&type_label, None);
+            let used = SUB_INDENT + 2 + type_w;
             let desc_budget = cols.saturating_sub(used + MARGIN + status_w + 2).max(6);
-            changes.push(Change::Attribute(AttributeChange::Foreground(rgb(self
-                .theme
-                .dim))));
-            changes.push(Change::Text(truncate(&sub.description, desc_budget)));
 
+            let mut segments = vec![
+                Segment::dim(SUB_INDENT, format!("{branch} "), self.theme.dim),
+                Segment {
+                    x: SUB_INDENT + 2,
+                    text: type_label,
+                    fg: ColorAttribute::Default,
+                    bold: false,
+                    reverse: false,
+                },
+                Segment::dim(
+                    used,
+                    truncate(&sub.description, desc_budget),
+                    self.theme.dim,
+                ),
+            ];
             let status_x = cols.saturating_sub(MARGIN + status_w);
             if status_x > used {
-                move_to(changes, status_x, y);
-                changes.push(Change::Attribute(AttributeChange::Foreground(
-                    self.theme.status_color(sub.status, &agent.provider),
-                )));
-                changes.push(Change::Text(sub.status.label().to_string()));
+                segments.push(Segment {
+                    x: status_x,
+                    text: sub.status.label().to_string(),
+                    fg: self.theme.status_color(sub.status, &agent.provider),
+                    bold: false,
+                    reverse: false,
+                });
             }
-            self.rows[y] = Row::Subagent(agent_idx, sub_idx);
-            y += 1;
+            lines.push(BodyLine {
+                row: Row::Subagent(agent_idx, sub_idx),
+                segments,
+                stop: None,
+            });
+        }
+    }
+
+    /// The `now:` headline and, when expanded, the recent-activity log.
+    fn activity_lines(
+        &self,
+        lines: &mut Vec<BodyLine>,
+        cols: usize,
+        agent: &HerdAgent,
+        agent_idx: usize,
+    ) {
+        if !self.show_activity {
+            return;
+        }
+        let Some(activity) = &agent.activity else {
+            return;
+        };
+        let expanded = self.expanded.contains(&Self::key(agent));
+        let now = SystemTime::now();
+
+        if let Some((label, text)) = activity.headline(agent.status, now) {
+            // The marker only claims to expand something when there is
+            // something behind it.
+            let marker = if activity.recent.is_empty() {
+                "↳"
+            } else if expanded {
+                "▾"
+            } else {
+                "▸"
+            };
+            let prefix = format!("{marker} {label}: ");
+            let prefix_w = unicode_column_width(&prefix, None);
+            let budget = cols.saturating_sub(SUB_INDENT + prefix_w + MARGIN).max(8);
+            lines.push(BodyLine {
+                row: Row::Activity(agent_idx),
+                segments: vec![
+                    Segment::dim(SUB_INDENT, prefix, self.theme.dim),
+                    Segment {
+                        x: SUB_INDENT + prefix_w,
+                        text: truncate(text, budget),
+                        fg: ColorAttribute::Default,
+                        bold: false,
+                        reverse: false,
+                    },
+                ],
+                stop: None,
+            });
         }
 
-        y
+        if !expanded {
+            return;
+        }
+        for (event_idx, event) in activity.recent.iter().enumerate() {
+            let age = elapsed_label(event.at).unwrap_or_else(|| "—".to_string());
+            let age = format!("{age:>6}  ");
+            let age_w = unicode_column_width(&age, None);
+            let x = SUB_INDENT + 2;
+            let budget = cols.saturating_sub(x + age_w + MARGIN).max(8);
+            lines.push(BodyLine {
+                row: Row::Event(agent_idx, event_idx),
+                segments: vec![
+                    Segment::dim(x, age, self.theme.dim),
+                    Segment {
+                        x: x + age_w,
+                        text: truncate(&event.text, budget),
+                        fg: if event.kind == HerdEventKind::Tool {
+                            ColorAttribute::Default
+                        } else {
+                            rgb(self.theme.dim)
+                        },
+                        bold: false,
+                        reverse: false,
+                    },
+                ],
+                stop: None,
+            });
+        }
+    }
+
+    /// Paint the visible slice of the body, scrolling so the selected agent
+    /// stays on screen in **both** directions.
+    fn paint_body(&mut self, changes: &mut Vec<Change>, cols: usize, y: usize, body_end: usize) {
+        let lines = self.body_lines(cols);
+        let height = body_end.saturating_sub(y);
+        self.scroll = clamp_scroll(&lines, self.selected, self.scroll, height);
+
+        for (offset, line) in lines.iter().skip(self.scroll).take(height).enumerate() {
+            let screen_y = y + offset;
+            for segment in &line.segments {
+                move_to(changes, segment.x, screen_y);
+                changes.push(Change::Attribute(AttributeChange::Reverse(segment.reverse)));
+                changes.push(Change::Attribute(AttributeChange::Foreground(segment.fg)));
+                changes.push(Change::Attribute(AttributeChange::Intensity(
+                    if segment.bold {
+                        Intensity::Bold
+                    } else {
+                        Intensity::Normal
+                    },
+                )));
+                changes.push(Change::Text(segment.text.clone()));
+            }
+            changes.push(Change::Attribute(AttributeChange::Reverse(false)));
+            changes.push(Change::Attribute(AttributeChange::Intensity(
+                Intensity::Normal,
+            )));
+            if let Some(range) = &line.stop {
+                self.stop_cell = Some((screen_y, range.clone()));
+            }
+            self.rows[screen_y] = line.row.clone();
+        }
     }
 
     /// `working · claude · opus 5`, trimmed to what is actually known.
@@ -704,7 +969,7 @@ impl HerdState {
         changes.push(Change::Attribute(AttributeChange::Foreground(rgb(self
             .theme
             .dim))));
-        let keys = "↑↓ select   s stop   ⏎ focus   tab view   r refresh   q close";
+        let keys = "↑↓ select   ⏎ details   f focus   s stop   tab view   r refresh   q close";
         match &self.footer {
             Some(message) => {
                 changes.push(Change::Attribute(AttributeChange::Foreground(rgb(self
@@ -763,6 +1028,7 @@ fn elapsed_label(since: Option<SystemTime>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent_herd::HerdEvent;
     use mux::pane::PaneId;
 
     #[test]
@@ -813,6 +1079,8 @@ mod tests {
             include_subagents: true,
             read_claude_sessions: false,
             initial_panes: Vec::new(),
+            show_activity: true,
+            activity_history: 30,
         })
     }
 
@@ -832,6 +1100,7 @@ mod tests {
             started_at: None,
             status_changed_at: None,
             subagents: Vec::new(),
+            activity: None,
         }
     }
 
@@ -899,5 +1168,147 @@ mod tests {
         state.selected = 5;
         state.rebuild();
         assert_eq!(state.selected, 0);
+    }
+
+    fn activity(current: Option<&str>, recent: &[&str]) -> HerdActivity {
+        let now = SystemTime::now();
+        let event = |text: &str| HerdEvent {
+            at: Some(now),
+            kind: HerdEventKind::Tool,
+            text: text.to_string(),
+        };
+        HerdActivity {
+            current: current.map(event),
+            recent: recent.iter().map(|text| event(text)).collect(),
+        }
+    }
+
+    /// Load `state` with `agents` as a single group, the way `rebuild` would.
+    fn seed(state: &mut HerdState, agents: Vec<HerdAgent>) {
+        state.agents = agents.clone();
+        state.groups = vec![HerdGroup {
+            label: "repo".to_string(),
+            show_header: false,
+            agents,
+        }];
+    }
+
+    #[test]
+    fn the_activity_headline_is_a_line_of_its_own_under_the_agent() {
+        let mut state = state();
+        let mut working = agent("alpha", HerdStatus::Working, Some(1));
+        working.activity = Some(activity(Some("Bash cargo check"), &["Read config.rs"]));
+        seed(&mut state, vec![working]);
+
+        let rows: Vec<Row> = state
+            .body_lines(80)
+            .into_iter()
+            .map(|line| line.row)
+            .collect();
+        assert_eq!(rows, vec![Row::Agent(0), Row::Activity(0)]);
+
+        // Turning the feature off removes the line entirely.
+        state.show_activity = false;
+        assert_eq!(state.body_lines(80).len(), 1);
+    }
+
+    #[test]
+    fn an_agent_with_no_activity_gets_no_activity_line() {
+        let mut state = state();
+        seed(
+            &mut state,
+            vec![agent("alpha", HerdStatus::Working, Some(1))],
+        );
+        assert_eq!(state.body_lines(80).len(), 1);
+    }
+
+    #[test]
+    fn expanding_an_agent_adds_exactly_its_event_lines() {
+        let mut state = state();
+        let mut working = agent("alpha", HerdStatus::Working, Some(1));
+        working.activity = Some(activity(
+            Some("Bash cargo check"),
+            &["Read config.rs", "Edit sidebar.rs", "Bash cargo check"],
+        ));
+        seed(&mut state, vec![working]);
+        assert_eq!(state.body_lines(80).len(), 2);
+
+        state.selected = 0;
+        state.toggle_expand_selected();
+        let rows: Vec<Row> = state
+            .body_lines(80)
+            .into_iter()
+            .map(|line| line.row)
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                Row::Agent(0),
+                Row::Activity(0),
+                Row::Event(0, 0),
+                Row::Event(0, 1),
+                Row::Event(0, 2),
+            ]
+        );
+
+        // And collapses back.
+        state.toggle_expand_selected();
+        assert_eq!(state.body_lines(80).len(), 2);
+    }
+
+    #[test]
+    fn expanding_an_agent_with_no_log_says_so_instead_of_expanding_nothing() {
+        let mut state = state();
+        seed(
+            &mut state,
+            vec![agent("alpha", HerdStatus::Working, Some(1))],
+        );
+        state.selected = 0;
+        state.toggle_expand_selected();
+
+        assert!(state.expanded.is_empty());
+        assert_eq!(
+            state.footer.as_deref(),
+            Some("no recorded activity for alpha")
+        );
+    }
+
+    #[test]
+    fn scrolling_follows_the_selection_below_the_fold() {
+        let agents: Vec<HerdAgent> = (0..10)
+            .map(|idx| agent(&format!("a{idx}"), HerdStatus::Idle, Some(idx as PaneId)))
+            .collect();
+        let mut state = state();
+        seed(&mut state, agents);
+
+        // One line per agent here, and room for three of them.
+        state.selected = 7;
+        let lines = state.body_lines(80);
+        // The bug this replaced: scroll only ever shrank, so a selection below
+        // the fold stayed off screen forever.
+        assert_eq!(clamp_scroll(&lines, 7, 0, 3), 5);
+        // Moving back up pulls it the other way.
+        assert_eq!(clamp_scroll(&lines, 1, 5, 3), 1);
+        // Already visible: left alone.
+        assert_eq!(clamp_scroll(&lines, 6, 5, 3), 5);
+        // Never past the end of the list.
+        assert_eq!(clamp_scroll(&lines, 9, 99, 3), 7);
+    }
+
+    #[test]
+    fn scrolling_accounts_for_lines_the_agents_bring_with_them() {
+        let mut state = state();
+        let mut agents = Vec::new();
+        for idx in 0..4 {
+            let mut a = agent(&format!("a{idx}"), HerdStatus::Working, Some(idx as PaneId));
+            a.activity = Some(activity(Some("Bash cargo check"), &[]));
+            agents.push(a);
+        }
+        seed(&mut state, agents);
+
+        let lines = state.body_lines(80);
+        // Two lines per agent, so the third agent starts on line 4.
+        assert_eq!(lines.len(), 8);
+        assert_eq!(clamp_scroll(&lines, 3, 0, 4), 3);
     }
 }
