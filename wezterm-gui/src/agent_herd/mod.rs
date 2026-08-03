@@ -15,6 +15,8 @@
 //! [`join_sessions_with_panes`] stitches the two together. Everything else
 //! here is pure and unit tested.
 
+#![allow(dead_code)]
+
 pub mod claude;
 pub mod codex;
 pub mod copilot;

@@ -658,7 +658,10 @@ impl crate::agent_herd::vendor::SessionSource for ClaudeDetector {
         crate::agent_herd::vendor::AgentVendor::Claude
     }
 
-    fn collect_sessions(&self, home: &std::path::Path) -> Vec<crate::agent_herd::vendor::VendorSession> {
+    fn collect_sessions(
+        &self,
+        home: &std::path::Path,
+    ) -> Vec<crate::agent_herd::vendor::VendorSession> {
         let claude_sessions = collect_sessions(home, true);
         claude_sessions
             .into_iter()

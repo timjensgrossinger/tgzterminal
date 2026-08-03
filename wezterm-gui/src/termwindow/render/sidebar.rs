@@ -1,6 +1,6 @@
 use crate::agent_herd::claude::{self, ProjectDirError as ClaudeLogsPathError};
 use crate::agent_herd::vendor::{AgentVendor, VendorSession};
-use crate::agent_herd::{HerdAgent, HerdStatus, PaneAgentRow};
+use crate::agent_herd::{HerdAgent, HerdStatus};
 use crate::quad::TripleLayerQuadAllocator;
 use crate::spawn::SpawnWhere;
 use crate::tabbar::TabBarItem;
@@ -455,6 +455,7 @@ fn adapter_patterns<'a>(
 }
 
 #[derive(Clone, Copy)]
+#[allow(dead_code)]
 enum PatternField {
     Visible,
     Strip,
@@ -1386,6 +1387,7 @@ fn resolve_claude_logs_path_under(home: &Path, cwd: &Path) -> Result<PathBuf, Cl
 /// The overview renders into terminal cells, which take sRGB components, and
 /// `parse_adapter_color` already stores config hex values componentwise, so this
 /// is a plain scale rather than a gamma conversion.
+#[allow(dead_code)]
 fn srgb8(color: LinearRgba) -> (u8, u8, u8) {
     let to_u8 = |v: f32| (v.clamp(0., 1.) * 255.).round() as u8;
     (to_u8(color.0), to_u8(color.1), to_u8(color.2))
@@ -1413,6 +1415,7 @@ fn herd_status_from_agent(status: AgentStatus) -> HerdStatus {
 ///
 /// `AllowStale` is deliberate — a fresh process walk must never happen on a
 /// per-frame path.
+#[allow(dead_code)]
 fn foreground_process_pids(pane: &Arc<dyn Pane>) -> HashSet<u32> {
     fn flatten(info: &procinfo::LocalProcessInfo, pids: &mut HashSet<u32>) {
         pids.insert(info.pid);
@@ -1638,6 +1641,7 @@ fn resolve_command_path(command: &str) -> Option<PathBuf> {
         .find(|candidate| path_is_executable(candidate))
 }
 
+#[allow(dead_code)]
 fn command_exists_on_path(command: &str) -> bool {
     resolve_command_path(command).is_some()
 }
@@ -2594,6 +2598,7 @@ fn visible_agent_candidates(
     candidates
 }
 
+#[allow(dead_code)]
 fn visible_agent_kind_hint(text: &str, adapter: Option<&AgentAdapterConfig>) -> Option<String> {
     let lower = text.to_ascii_lowercase();
     adapter_patterns(adapter, PatternField::Visible)
@@ -2601,6 +2606,7 @@ fn visible_agent_kind_hint(text: &str, adapter: Option<&AgentAdapterConfig>) -> 
         .find(|pattern| agent_word_pattern_matches_pre_lowered(&lower, pattern))
 }
 
+#[allow(dead_code)]
 fn visible_agent_match_from_adapters(
     text: &str,
     adapters: impl Iterator<Item = (String, AgentAdapterConfig)>,
@@ -3629,7 +3635,7 @@ impl crate::TermWindow {
             // Neither utility pane is a place to put an agent: the worktree
             // picker is already a narrow column, and splitting the insight pane
             // would hide half of the very list you launched from.
-             .filter(|pos| !is_worktree_pane(&pos.pane))
+            .filter(|pos| !is_worktree_pane(&pos.pane))
             .map(|pos| agent_launch::PaneGeom {
                 pane_id: pos.pane.pane_id(),
                 index: pos.index,
@@ -3872,10 +3878,6 @@ impl crate::TermWindow {
         text
     }
 
-    fn visible_agent_match(&self, text: &str) -> Option<(String, AgentKind)> {
-        visible_agent_match_from_adapters(text, self.merged_agent_adapters().iter().cloned())
-    }
-
     fn relevant_agent_user_vars(vars: &HashMap<String, String>) -> Vec<(String, String)> {
         let mut relevant = vars
             .iter()
@@ -3894,80 +3896,6 @@ impl crate::TermWindow {
     /// Exposed for the rich-input composer's agent-only gating.
     pub(crate) fn pane_is_agent(&self, pane: &Arc<dyn Pane>) -> bool {
         self.detect_agent_pane(pane).is_some()
-    }
-
-    /// Colors for the herd overview, resolved here so the overview's own thread
-    /// never reads config or the palette.
-    pub(crate) fn agent_herd_theme(&self) -> crate::agent_herd::HerdTheme {
-        let mut adapter_colors = HashMap::new();
-        for (id, adapter) in self.merged_agent_adapters().iter() {
-            let kind = AgentKind::from_adapter_id(id)
-                .unwrap_or_else(|| AgentKind::Unknown(id.to_string()));
-            adapter_colors.insert(id.to_string(), srgb8(adapter_color(Some(adapter), &kind)));
-        }
-
-        let colors = self
-            .config
-            .resolved_palette
-            .tab_bar
-            .clone()
-            .unwrap_or_else(TabBarColors::default);
-        crate::agent_herd::HerdTheme {
-            adapter_colors,
-            attention: crate::agent_herd::ATTENTION_RGB,
-            dim: srgb8(colors.inactive_tab().fg_color.to_linear()),
-            accent: srgb8(colors.active_tab().fg_color.to_linear()),
-        }
-    }
-
-    /// Snapshot every detected agent pane in this window's workspace for the
-    /// herd overview.
-    ///
-    /// Lives here rather than in `agent_herd` because `AgentPaneState`'s fields
-    /// are private to this module. Must run on the GUI thread — it touches the
-    /// mux and the detection cache, so the overview thread reaches it through
-    /// `TermWindowNotif::Apply`.
-    ///
-    /// Cost is bounded by `detect_agent_pane`'s 500 ms cache, so polling this a
-    /// couple of times a second does no filesystem work per call.
-    pub(crate) fn agent_herd_pane_rows(&self) -> Vec<PaneAgentRow> {
-        let mux = Mux::get();
-        let workspace = mux.active_workspace();
-        let mut rows = Vec::new();
-
-        for window_id in mux.iter_windows_in_workspace(&workspace) {
-            // Clone the tabs out before doing any work: `get_window` holds a
-            // read guard over the mux.
-            let tabs: Vec<Arc<mux::tab::Tab>> = match mux.get_window(window_id) {
-                Some(window) => window.iter().cloned().collect(),
-                None => continue,
-            };
-            for tab in tabs {
-                for pos in tab.iter_panes_ignoring_zoom() {
-                    let Some(agent) = self.detect_agent_pane(&pos.pane) else {
-                        continue;
-                    };
-                    let cwd = agent.cwd.clone().or_else(|| pane_working_dir(&pos.pane));
-                    rows.push(PaneAgentRow {
-                        pane_id: pos.pane.pane_id(),
-                        provider: agent
-                            .adapter_id
-                            .clone()
-                            .or_else(|| Some(agent.kind.label().to_ascii_lowercase())),
-                        title: pos.pane.get_title(),
-                        status: herd_status_from_agent(agent.status),
-                        model: agent.model.clone(),
-                        session_id: agent.session_id.clone(),
-                        project_root: cwd.as_deref().and_then(crate::agent_herd::project_root_for),
-                        git_branch: cwd.as_deref().and_then(find_git_branch),
-                        cwd,
-                        pids: foreground_process_pids(&pos.pane),
-                    });
-                }
-            }
-        }
-
-        rows
     }
 
     fn detect_agent_pane(&self, pane: &Arc<dyn Pane>) -> Option<AgentPaneState> {
@@ -5557,10 +5485,35 @@ impl crate::TermWindow {
         // Thin border stroke so the menu stands out against overlapping rows.
         let border = lerp_rgba(bg, fg, 0.12);
         let border_w = (1. * dpi_scale).max(1.);
-        self.filled_rectangle(layers, 2, euclid::rect(menu_x, menu_y, menu_w, border_w), border)?;
-        self.filled_rectangle(layers, 2, euclid::rect(menu_x, menu_y + menu_h - border_w, menu_w, border_w), border)?;
-        self.filled_rectangle(layers, 2, euclid::rect(menu_x, menu_y + border_w, border_w, menu_h - border_w * 2.), border)?;
-        self.filled_rectangle(layers, 2, euclid::rect(menu_x + menu_w - border_w, menu_y + border_w, border_w, menu_h - border_w * 2.), border)?;
+        self.filled_rectangle(
+            layers,
+            2,
+            euclid::rect(menu_x, menu_y, menu_w, border_w),
+            border,
+        )?;
+        self.filled_rectangle(
+            layers,
+            2,
+            euclid::rect(menu_x, menu_y + menu_h - border_w, menu_w, border_w),
+            border,
+        )?;
+        self.filled_rectangle(
+            layers,
+            2,
+            euclid::rect(menu_x, menu_y + border_w, border_w, menu_h - border_w * 2.),
+            border,
+        )?;
+        self.filled_rectangle(
+            layers,
+            2,
+            euclid::rect(
+                menu_x + menu_w - border_w,
+                menu_y + border_w,
+                border_w,
+                menu_h - border_w * 2.,
+            ),
+            border,
+        )?;
 
         let palette = self.palette().clone();
         let gl_state = self.render_state.as_ref().unwrap();
@@ -6164,10 +6117,35 @@ impl crate::TermWindow {
         // Thin border stroke so the menu stands out against overlapping rows.
         let border = lerp_rgba(bg, fg, 0.12);
         let border_w = (1. * dpi_scale).max(1.);
-        self.filled_rectangle(layers, 2, euclid::rect(menu_x, menu_y, menu_w, border_w), border)?;
-        self.filled_rectangle(layers, 2, euclid::rect(menu_x, menu_y + menu_h - border_w, menu_w, border_w), border)?;
-        self.filled_rectangle(layers, 2, euclid::rect(menu_x, menu_y + border_w, border_w, menu_h - border_w * 2.), border)?;
-        self.filled_rectangle(layers, 2, euclid::rect(menu_x + menu_w - border_w, menu_y + border_w, border_w, menu_h - border_w * 2.), border)?;
+        self.filled_rectangle(
+            layers,
+            2,
+            euclid::rect(menu_x, menu_y, menu_w, border_w),
+            border,
+        )?;
+        self.filled_rectangle(
+            layers,
+            2,
+            euclid::rect(menu_x, menu_y + menu_h - border_w, menu_w, border_w),
+            border,
+        )?;
+        self.filled_rectangle(
+            layers,
+            2,
+            euclid::rect(menu_x, menu_y + border_w, border_w, menu_h - border_w * 2.),
+            border,
+        )?;
+        self.filled_rectangle(
+            layers,
+            2,
+            euclid::rect(
+                menu_x + menu_w - border_w,
+                menu_y + border_w,
+                border_w,
+                menu_h - border_w * 2.,
+            ),
+            border,
+        )?;
 
         let palette = self.palette().clone();
         let gl_state = self.render_state.as_ref().unwrap();
@@ -7665,14 +7643,8 @@ impl crate::TermWindow {
             // Always reserve the agent launcher area even when no adapter is
             // installed: the button opens a dropdown whose "Agent insight" and
             // "Resume session" rows are useful without any adapter.
-            let bottom_row = sidebar_bottom_row_layout(
-                item_x,
-                item_w,
-                content_x,
-                content_w,
-                dot_size,
-                true,
-            );
+            let bottom_row =
+                sidebar_bottom_row_layout(item_x, item_w, content_x, content_w, dot_size, true);
 
             let worktree_type = UIItemType::SidebarWorktreeButton;
             let worktree_hovered = hovered_item.as_ref() == Some(&worktree_type);
@@ -8062,9 +8034,7 @@ impl crate::TermWindow {
 
     /// Refresh vendor session files without blocking paint on filesystem I/O.
     fn kick_agent_herd_scan(&mut self) {
-        let ttl = Duration::from_millis(
-            self.config.agent_ui.section.refresh_ms.clamp(100, 10000),
-        );
+        let ttl = Duration::from_millis(self.config.agent_ui.section.refresh_ms.clamp(100, 10000));
         if self.agent_herd_scan_pending
             || self
                 .agent_herd_session_cache
