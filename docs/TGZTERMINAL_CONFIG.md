@@ -83,6 +83,28 @@ Which tabs are expanded is remembered across restarts in `tgz-ui-state.json`.
 Tab index is the only identity the row list has, so reordering or closing tabs
 between sessions can shift which tab comes back expanded.
 
+## Tab close context menu
+
+```lua
+config.tab_close_context_menu = true
+```
+
+Right-clicking the × (close button) of a tab opens a submenu offering to close
+the surrounding tabs without touching the one you clicked. The menu appears on
+both surfaces — the top tab bar and the sidebar — and labels itself accordingly:
+
+| Entry (sidebar) | Entry (tab bar) | Effect |
+|---|---|---|
+| Close Tabs Above | Close Tabs to the Left | Close every tab with a lower index than the clicked one |
+| Close Tabs Below | Close Tabs to the Right | Close every tab with a higher index than the clicked one |
+| Close All Other Tabs | Close All Other Tabs | Close every tab except the clicked one |
+
+The clicked tab is always preserved, so the window never empties. Batch closes
+are silent — they bypass the per-tab confirmation overlay that a normal
+left-click × would still show when a tab's foreground process needs prompting.
+Setting `tab_close_context_menu = false` disables the submenu entirely and
+restores right-click to its upstream behaviour (opening the tab navigator).
+
 ## Scrollbar
 
 ```lua
@@ -770,6 +792,86 @@ active pane; independent per-pane strips inside splits are not yet supported.
 Note: because bound key assignments are handled before the strip, a bound
 clipboard-paste shortcut still pastes into the pane rather than the strip while
 the strip is focused; use the overlay composer if you need paste-into-buffer.
+
+## SSH Quick-Launch (mosh / Eternal Terminal)
+
+TGZTerminal adds a standalone sidebar button (below the agent launcher)
+that opens a dropdown of pre-registered SSH connections. Each row spawns
+into a new tab. The list comes from `config.ssh_domains` — the same key
+upstream WezTerm uses — plus two new per-domain fields:
+
+| Key (on `SshDomain`) | Type | Default | Meaning |
+|---|---|---|---|
+| `transport` | enum | `"WezTerm"` | `"WezTerm"` (native mux, default for `SSHMUX:`), `"Ssh"` (plain ssh, default for `SSH:`), `"Mosh"` (requires `mosh` on `PATH`), `"Et"` (requires `et` on `PATH`), or `"Custom"` (run an arbitrary argv you supply — see `custom_command`). |
+| `extra_args` | list of string | unset | Appended to the spawn argv for `Mosh`/`Et`/`Custom` only. Ignored for `WezTerm`/`Ssh` (use `ssh_option` for those). |
+| `custom_command` | list of string | unset | Literal argv run when `transport = "Custom"`. Use a wrapper script, an autossh invocation, a Secretive-mediated `ssh user@secretive_alias`, or anything the built-in transports cannot name. First element is probed on `PATH`; missing binary hides the row. |
+
+```lua
+config.ssh_domains = {
+  {
+    name = "prod",
+    remote_address = "prod.example.com",
+    username = "tim",
+    transport = "Mosh",        -- mosh user@prod.example.com
+    extra_args = { "--predict=adaptive" },
+  },
+  {
+    name = "jumpy",
+    remote_address = "jumpy.example.com:2022",
+    username = "tim",
+    transport = "Et",           -- et tim@jumpy.example.com:2022
+  },
+  -- Secretive (macOS): a regular `ssh` invocation whose Host alias is
+  -- resolved by ~/.ssh/config to the actual host, while the key is served
+  -- by the Secretive ssh-agent (SSH_AUTH_SOCK). A plain `Ssh`/`WezTerm`
+  -- transport already works with Secretive because wezterm-ssh forwards
+  -- the agent — use `Custom` only when you want a wrapper command, e.g.
+  -- autossh or a host alias that bypasses ~/.ssh/config.
+  {
+    name = "secretive-ansible",
+    remote_address = "ignored",  -- required by SshDomain schema, unused by Custom
+    transport = "Custom",
+    custom_command = {
+      "ssh",                     -- probed on PATH first
+      "ansible_direct@ansible_secretive",
+    },
+  },
+}
+```
+
+Discovery and behavior:
+
+- `WezTerm`/`Ssh` rows spawn through `SpawnTabDomain::DomainName("<name>")`
+  and reuse the wezterm-native SSH path (auth, ssh_config, optional mux).
+  An SSH agent — including macOS Secretive, which exposes keys via
+  `SSH_AUTH_SOCK` — is forwarded automatically because
+  `mux_enable_ssh_agent` defaults to `true`. No `Custom` config needed for
+  plain Secretive: just declare the host with `transport = "Ssh"` (or put
+  an `Host ansible_secretive` block in `~/.ssh/config` and let the
+  auto-generated domain pick it up).
+- `Mosh` rows spawn `mosh <user@host>` as a plain shell command in the
+  **local** domain — mosh owns its own reconnect and bypasses the wezterm
+  mux entirely. The row is hidden when `mosh` is not on `PATH`.
+- `Et` rows similarly spawn `et <user@host[:port]>`. Hidden when `et` is
+  not on `PATH`.
+- `Custom` rows run `custom_command` verbatim (plus `extra_args`) as a
+  plain shell command in the local domain. Use this for autossh
+  (`custom_command = { "autossh", "-M", "0", "user@host" }`), a wrapper
+  script, or any program that brandishes its own connection lifecycle. An
+  empty `custom_command` or a non-executable first element silently hides
+  the row, matching the mosh/et behavior.
+- Auto-generated entries from `wezterm.default_ssh_domains()` always use
+  `transport = "WezTerm"`, matching previous behavior; only your own
+  `ssh_domains` entries opt into mosh/et/custom.
+- Binary lookup uses `PATH` and then `fallback_command_dirs`
+  (`~/.local/bin`, `~/bin`, `/opt/homebrew/bin`, …) for the same
+  Finder/Dock launchd-PATH reason as the agent launcher. The resolved
+  absolute path is what gets spawned.
+- Reconnect, roaming, and UDP/TCP behavior for mosh/et are owned by
+  those transports — TGZTerminal only pre-registers and launches them.
+
+The dropdown is hidden entirely when no row is usable (no `ssh_domains`
+and no sidecar binaries installed).
 
 ## Update Checking
 

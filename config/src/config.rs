@@ -15,7 +15,7 @@ use crate::keyassignment::{
 };
 use crate::keys::{Key, LeaderKey, Mouse};
 use crate::lua::make_lua_context;
-use crate::ssh::{SshBackend, SshDomain};
+use crate::ssh::{SshBackend, SshDomain, SshTransport};
 use crate::tls::{TlsDomainClient, TlsDomainServer};
 use crate::units::Dimension;
 use crate::unix::UnixDomain;
@@ -805,87 +805,28 @@ impl Default for AgentLauncherConfig {
 /// Expressed as a side rather than a `SplitDirection` plus a flag because that
 /// is what the choice actually is; the mux-level orientation is derived at the
 /// call site.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, FromDynamic, ToDynamic)]
-pub enum AgentInsightSide {
-    Left,
-    Right,
-    Top,
-    Bottom,
-}
-
-impl Default for AgentInsightSide {
-    fn default() -> Self {
-        Self::Left
-    }
-}
-
-/// Which agents the insight pane lists when it opens.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, FromDynamic, ToDynamic)]
-pub enum AgentInsightView {
-    /// Only agents in the launching pane's project.
-    CurrentProject,
-    /// Every agent, grouped by project.
-    AllProjects,
-}
-
-impl Default for AgentInsightView {
-    fn default() -> Self {
-        Self::CurrentProject
-    }
-}
-
-pub fn default_agent_insight_split_size_percent() -> u8 {
-    30
-}
-
-pub fn default_agent_insight_refresh_ms() -> u64 {
+pub fn default_agent_section_refresh_ms() -> u64 {
     500
 }
 
-pub fn default_agent_insight_activity_history() -> u16 {
-    30
-}
-
-/// The agent insight pane: a real split pane listing every detected agent, its
-/// subagents, and what each is currently doing.
+/// Configuration for the agent section embedded in the sidebar.
 #[derive(Debug, Clone, FromDynamic, ToDynamic)]
-pub struct AgentInsightConfig {
-    /// Which side of the tab the pane occupies.
-    #[dynamic(default)]
-    pub side: AgentInsightSide,
-
-    /// Percentage of the split assigned to the insight pane. Clamped to 5..=95.
-    #[dynamic(default = "default_agent_insight_split_size_percent")]
-    pub split_size_percent: u8,
-
-    /// How often the pane re-reads agent state, in milliseconds. Clamped to
-    /// 100..=10000; the lower bound keeps a stray `0` from spinning the thread.
-    #[dynamic(default = "default_agent_insight_refresh_ms")]
-    pub refresh_ms: u64,
-
-    /// Scope the pane opens with.
-    #[dynamic(default)]
-    pub default_view: AgentInsightView,
-
-    /// Show what each agent is currently doing, read from the agent's own
-    /// on-disk transcript. Turning this off skips those reads entirely.
+pub struct AgentSectionConfig {
+    /// Whether the agent section is visible in the sidebar.
     #[dynamic(default = "default_true")]
-    pub show_activity: bool,
+    pub enabled: bool,
 
-    /// How many recent events the per-agent activity log keeps.
-    #[dynamic(default = "default_agent_insight_activity_history")]
-    pub activity_history: u16,
+    /// How often the section re-reads agent state, in milliseconds.
+    /// Clamped to 100..=10000.
+    #[dynamic(default = "default_agent_section_refresh_ms")]
+    pub refresh_ms: u64,
 }
 
-impl Default for AgentInsightConfig {
+impl Default for AgentSectionConfig {
     fn default() -> Self {
         Self {
-            side: AgentInsightSide::default(),
-            split_size_percent: default_agent_insight_split_size_percent(),
-            refresh_ms: default_agent_insight_refresh_ms(),
-            default_view: AgentInsightView::default(),
-            show_activity: true,
-            activity_history: default_agent_insight_activity_history(),
+            enabled: true,
+            refresh_ms: default_agent_section_refresh_ms(),
         }
     }
 }
@@ -964,9 +905,9 @@ pub struct AgentUiConfig {
     #[dynamic(default)]
     pub launcher: AgentLauncherConfig,
 
-    /// The agent insight split pane.
+    /// Sidebar agent section configuration.
     #[dynamic(default)]
-    pub insight: AgentInsightConfig,
+    pub section: AgentSectionConfig,
 
     /// Distinct adapter-exclusive patterns that must agree before visible pane
     /// text is accepted as an agent's identity.
@@ -1010,7 +951,7 @@ impl Default for AgentUiConfig {
             toolbelt_position: AgentToolbeltPosition::Top,
             adapters: default_agent_adapters(),
             launcher: AgentLauncherConfig::default(),
-            insight: AgentInsightConfig::default(),
+            section: AgentSectionConfig::default(),
             visible_identity_signals: default_agent_visible_identity_signals(),
             trust_visible_evidence: true,
             pulse_working_dot: true,
@@ -1476,6 +1417,12 @@ pub struct Config {
 
     #[dynamic(default = "default_true")]
     pub show_close_tab_button_in_tabs: bool,
+
+    /// If true, right-clicking a tab's × (close) button opens a submenu
+    /// offering to close tabs above, below, or all other tabs. Silent
+    /// (no per-tab confirmation overlay) — left-click × still prompts.
+    #[dynamic(default = "default_true")]
+    pub tab_close_context_menu: bool,
 
     /// If true, show_tab_index_in_tab_bar uses a zero-based index.
     /// The default is false and the tab shows a one-based index.
@@ -3020,15 +2967,11 @@ mod agent_ui_tests {
     }
 
     #[test]
-    fn agent_insight_defaults_match_the_documented_pane() {
-        let insight = Config::default_config().agent_ui.insight;
+    fn agent_section_defaults_match_the_sidebar_config() {
+        let section = Config::default_config().agent_ui.section;
 
-        assert_eq!(insight.side, AgentInsightSide::Left);
-        assert_eq!(insight.split_size_percent, 30);
-        assert_eq!(insight.refresh_ms, 500);
-        assert_eq!(insight.default_view, AgentInsightView::CurrentProject);
-        assert!(insight.show_activity);
-        assert_eq!(insight.activity_history, 30);
+        assert!(section.enabled);
+        assert_eq!(section.refresh_ms, 500);
     }
 
     #[test]
@@ -3354,6 +3297,50 @@ mod agent_ui_tests {
         assert!(menu.show_domains);
         assert!(menu.show_shells);
         assert!(menu.show_launch_menu);
+    }
+
+    #[test]
+    fn tab_close_context_menu_defaults_on() {
+        let config = Config::default_config();
+        assert!(config.tab_close_context_menu);
+    }
+
+    #[test]
+    fn ssh_transport_round_trips_through_dynamic() {
+        use wezterm_dynamic::{FromDynamic, ToDynamic};
+
+        for value in [
+            SshTransport::WezTerm,
+            SshTransport::Ssh,
+            SshTransport::Mosh,
+            SshTransport::Et,
+            SshTransport::Custom,
+        ] {
+            let dynamic = value.to_dynamic();
+            assert_eq!(
+                SshTransport::from_dynamic(&dynamic, Default::default()).unwrap(),
+                value
+            );
+        }
+    }
+
+    #[test]
+    fn ssh_domain_defaults_to_wezterm_transport_with_empty_extra_args() {
+        let domain = SshDomain::default();
+        assert_eq!(domain.transport, SshTransport::WezTerm);
+        assert!(domain.extra_args.is_empty());
+        assert!(domain.custom_command.is_empty());
+    }
+
+    #[test]
+    fn ssh_transport_binary_name_is_none_for_mux_paths() {
+        assert_eq!(SshTransport::WezTerm.binary_name(), None);
+        assert_eq!(SshTransport::Ssh.binary_name(), None);
+        assert_eq!(SshTransport::Mosh.binary_name(), Some("mosh"));
+        assert_eq!(SshTransport::Et.binary_name(), Some("et"));
+        // Custom's binary is whatever the user put in `custom_command`; no
+        // fixed name to probe against.
+        assert_eq!(SshTransport::Custom.binary_name(), None);
     }
 
     #[test]

@@ -16,9 +16,17 @@
 //! here is pure and unit tested.
 
 pub mod claude;
+pub mod codex;
+pub mod copilot;
+pub mod gemini;
+pub mod opencode;
 pub mod sessions;
 pub mod transcript;
+pub mod vendor;
 
+use std::collections::HashMap;
+
+use crate::agent_herd::vendor::AgentVendor;
 use mux::pane::PaneId;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -149,6 +157,18 @@ pub struct HerdSubagent {
     pub last_activity: Option<SystemTime>,
 }
 
+/// Colors resolved on the GUI thread and handed to the renderer,
+/// so the renderer thread never reads config or the palette.
+#[derive(Clone, Debug)]
+pub struct HerdTheme {
+    /// Adapter id → dot colour.
+    pub adapter_colors: HashMap<String, (u8, u8, u8)>,
+    /// sRGB colour for agents waiting on the human.
+    pub attention: (u8, u8, u8),
+    pub dim: (u8, u8, u8),
+    pub accent: (u8, u8, u8),
+}
+
 /// What kind of thing an agent did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HerdEventKind {
@@ -158,6 +178,37 @@ pub enum HerdEventKind {
     Assistant,
     /// Anything the source told us about that is neither of the above.
     Notice,
+    /// Claude thinking block.
+    Thinking,
+    /// A tool result/output.
+    ToolResult,
+    /// Agent spawned a subagent.
+    SubagentSpawn,
+}
+
+/// Rich content payload for a herd event.
+#[derive(Clone, Debug, PartialEq)]
+pub enum HerdContent {
+    /// Single-line summary text.
+    SingleLine(String),
+    /// Multi-line text (prose, logs).
+    MultiLine(String),
+    /// A fenced code block with optional language tag.
+    CodeBlock { lang: String, code: String },
+    /// Structured tool arguments as JSON.
+    ToolArgs { args: serde_json::Value },
+    /// Tool execution output, possibly truncated.
+    ToolResult { output: String, truncated: bool },
+}
+
+impl HerdContent {
+    /// True for variants that span more than one visual line.
+    pub fn is_multiline(&self) -> bool {
+        matches!(
+            self,
+            Self::MultiLine(_) | Self::CodeBlock { .. } | Self::ToolResult { .. }
+        )
+    }
 }
 
 /// One thing an agent did, as read from its own transcript.
@@ -166,8 +217,72 @@ pub struct HerdEvent {
     /// When it happened, when the source timestamps it.
     pub at: Option<SystemTime>,
     pub kind: HerdEventKind,
-    /// Already humanized and single-line; renderers only truncate.
-    pub text: String,
+    /// Rich content payload.
+    pub content: HerdContent,
+    /// Correlates a Tool call with its ToolResult.
+    pub tool_use_id: Option<String>,
+    /// Links a subagent event back to its parent agent.
+    pub parent_id: Option<String>,
+}
+
+impl HerdEvent {
+    /// Backward-compatible single-line display text.
+    pub fn display_text(&self) -> String {
+        match &self.content {
+            HerdContent::SingleLine(s) => s.clone(),
+            HerdContent::MultiLine(s) => s.lines().next().unwrap_or("").to_string(),
+            HerdContent::CodeBlock { lang, code } => {
+                if lang.is_empty() {
+                    format!("```{}", code.lines().next().unwrap_or(""))
+                } else {
+                    format!("```{lang} {}", code.lines().next().unwrap_or(""))
+                }
+            }
+            HerdContent::ToolArgs { args } => {
+                let s = args.to_string();
+                if s.len() > 80 {
+                    format!("{}…", &s[..77])
+                } else {
+                    s
+                }
+            }
+            HerdContent::ToolResult { output, truncated } => {
+                let first = output.lines().next().unwrap_or("");
+                if *truncated {
+                    format!("{first}…")
+                } else {
+                    first.to_string()
+                }
+            }
+        }
+    }
+}
+
+/// Recursive subagent tree node.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SubagentNode {
+    pub agent_id: String,
+    pub agent_type: String,
+    pub description: String,
+    pub status: HerdStatus,
+    pub depth: u32,
+    pub children: Vec<SubagentNode>,
+    pub events: Vec<HerdEvent>,
+}
+
+impl SubagentNode {
+    /// Find a node by agent_id, searching recursively.
+    pub fn find_mut(&mut self, agent_id: &str) -> Option<&mut SubagentNode> {
+        if self.agent_id == agent_id {
+            return Some(self);
+        }
+        for child in &mut self.children {
+            if let Some(found) = child.find_mut(agent_id) {
+                return Some(found);
+            }
+        }
+        None
+    }
 }
 
 /// What an agent is doing, and what it did just before that.
@@ -180,6 +295,8 @@ pub struct HerdActivity {
     pub current: Option<HerdEvent>,
     /// Oldest first, so the log renders top-down and appends at the bottom.
     pub recent: Vec<HerdEvent>,
+    /// Recursive subagent tree, parallel to the flat `subagents` list.
+    pub subagent_tree: Vec<SubagentNode>,
 }
 
 impl HerdActivity {
@@ -201,7 +318,7 @@ impl HerdActivity {
     /// newest event is recent enough to still be in flight; otherwise the
     /// honest label is `last:`. Guessing "now" from a stale transcript is how a
     /// finished agent ends up looking busy.
-    pub fn headline(&self, status: HerdStatus, now: SystemTime) -> Option<(&'static str, &str)> {
+    pub fn headline(&self, status: HerdStatus, now: SystemTime) -> Option<(&'static str, String)> {
         let event = self.current.as_ref().or_else(|| self.recent.last())?;
         let fresh = event
             .at
@@ -213,7 +330,7 @@ impl HerdActivity {
         } else {
             "last"
         };
-        Some((label, event.text.as_str()))
+        Some((label, event.display_text()))
     }
 }
 
@@ -224,6 +341,8 @@ pub struct HerdAgent {
     pub name: String,
     /// Adapter id: `"claude"`, `"codex"`, … Empty when wholly unidentified.
     pub provider: String,
+    /// The vendor this agent belongs to.
+    pub vendor: AgentVendor,
     pub status: HerdStatus,
     /// Why it is blocked, when the source tells us.
     pub blocked_reason: Option<String>,
@@ -259,6 +378,16 @@ impl HerdAgent {
     /// there is something to interrupt.
     pub fn can_stop(&self) -> bool {
         self.pane_id.is_some() && self.status.is_interruptible()
+    }
+
+    /// Status dot colour for this agent's vendor.
+    pub fn vendor_dot_color(&self) -> (u8, u8, u8) {
+        self.vendor.dot_color()
+    }
+
+    /// Unicode glyph for this agent's vendor.
+    pub fn vendor_glyph(&self) -> &'static str {
+        self.vendor.glyph()
     }
 }
 
@@ -332,6 +461,7 @@ pub fn join_sessions_with_panes(
                 .or_else(|| pane.map(|p| p.title.clone()))
                 .unwrap_or_else(|| session.session_id.clone()),
             provider: "claude".to_string(),
+            vendor: AgentVendor::Claude,
             status: session.status,
             blocked_reason: session.blocked_reason.clone(),
             // The session file carries no model; pane detection sometimes does.
@@ -360,9 +490,24 @@ pub fn join_sessions_with_panes(
         if claimed.contains(&row.pane_id) {
             continue;
         }
+        let vendor = row
+            .provider
+            .as_deref()
+            .and_then(|p| match p {
+                "claude" => Some(AgentVendor::Claude),
+                "codex" => Some(AgentVendor::Codex),
+                "copilot" => Some(AgentVendor::Copilot),
+                "opencode" => Some(AgentVendor::OpenCode),
+                "gemini" => Some(AgentVendor::Gemini),
+                "cursor" => Some(AgentVendor::Cursor),
+                "amp" => Some(AgentVendor::Amp),
+                _ => None,
+            })
+            .unwrap_or_else(|| AgentVendor::Custom(row.provider.clone().unwrap_or_default()));
         agents.push(HerdAgent {
             name: row.title.clone(),
             provider: row.provider.clone().unwrap_or_default(),
+            vendor,
             status: row.status,
             blocked_reason: None,
             model: row.model.clone(),
@@ -583,6 +728,7 @@ mod tests {
         HerdAgent {
             name: name.to_string(),
             provider: "claude".to_string(),
+            vendor: AgentVendor::Claude,
             status,
             blocked_reason: None,
             model: None,
@@ -861,4 +1007,15 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         assert_eq!(project_root_for(temp.path()), None);
     }
+}
+
+/// Create a registry with all built-in vendor detectors registered.
+pub fn default_registry() -> vendor::VendorRegistry {
+    let mut registry = vendor::VendorRegistry::new();
+    registry.register(Box::new(claude::ClaudeDetector));
+    registry.register(Box::new(codex::CodexDetector));
+    registry.register(Box::new(copilot::CopilotDetector));
+    registry.register(Box::new(opencode::OpenCodeDetector));
+    registry.register(Box::new(gemini::GeminiDetector));
+    registry
 }

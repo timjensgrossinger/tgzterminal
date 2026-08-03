@@ -1,5 +1,6 @@
 use crate::agent_herd::claude::{self, ProjectDirError as ClaudeLogsPathError};
-use crate::agent_herd::{HerdStatus, PaneAgentRow};
+use crate::agent_herd::vendor::{AgentVendor, VendorSession};
+use crate::agent_herd::{HerdAgent, HerdStatus, PaneAgentRow};
 use crate::quad::TripleLayerQuadAllocator;
 use crate::spawn::SpawnWhere;
 use crate::tabbar::TabBarItem;
@@ -10,7 +11,8 @@ use crate::termwindow::render::corners::{
 use crate::termwindow::render::RenderScreenLineParams;
 use crate::termwindow::{
     agent_launch, wsl_paths, AgentCopyAction, AgentLauncherEntry, AgentToolbeltAction,
-    ExpandedMenuRow, NewTabMenuEntry, NewTabTarget, TermWindowNotif, UIItem, UIItemType,
+    CloseTabMenuAction, CloseTabSource, ExpandedMenuRow, NewTabMenuEntry, NewTabTarget,
+    SshQuickLaunchEntry, TermWindowNotif, UIItem, UIItemType,
 };
 use config::keyassignment::{SpawnCommand, SpawnTabDomain};
 use config::{
@@ -74,6 +76,10 @@ const AGENT_TOOLBELT_RIGHT_INSET: f32 = 44.;
 const AGENT_COPY_MENU_W: f32 = 360.;
 /// Narrower than the copy menu: rows are short agent names, not sentences.
 const AGENT_LAUNCH_MENU_W: f32 = 200.;
+/// Minimum width of the close-tab context submenu. The labels here
+/// ("Close Tabs to the Right", "Close All Other Tabs") are sentences, not
+/// one-word commands, so the agent-launch width clips the trailing word.
+const CLOSE_TAB_MENU_MIN_W: f32 = 320.;
 /// Width of the launch dropdown while the resume submenu is open. Session rows
 /// carry a project name, an optional branch and a sentence of description, none
 /// of which fits the width a list of agent names needs.
@@ -209,6 +215,10 @@ fn agent_status_dot_accent(
 
 fn opaque(color: LinearRgba) -> LinearRgba {
     LinearRgba(color.0, color.1, color.2, 1.0)
+}
+
+fn srgb8_to_linear(r: u8, g: u8, b: u8) -> LinearRgba {
+    LinearRgba::with_srgba(r, g, b, 255)
 }
 
 fn contrast_label_color(bg: LinearRgba) -> LinearRgba {
@@ -952,6 +962,7 @@ pub(crate) fn sidebar_reserved_width_for_config(config: &ConfigHandle, dpi: f64)
 /// Label ladders for the sidebar's fixed-width buttons, widest first.
 const WORKTREE_LABELS: [&str; 3] = ["Worktree", "Tree", "Wt"];
 const NEW_TAB_LABELS: [&str; 3] = ["+ New Tab", "+ Tab", "+"];
+const SSH_ROW_LABELS: [&str; 3] = ["SSH Connect", "SSH", ">_"];
 const SEARCH_PLACEHOLDER_LABELS: [&str; 3] = ["Search tabs...", "Search...", "Search"];
 
 fn compact_label(value: &str, fallback: &str) -> String {
@@ -2137,6 +2148,34 @@ pub(crate) struct AgentPaneState {
     actions: AgentActions,
 }
 
+fn herd_agent_from_vendor_session(session: &VendorSession) -> HerdAgent {
+    let project_root = session
+        .project_root
+        .clone()
+        .or_else(|| crate::agent_herd::project_root_for(&session.cwd));
+    HerdAgent {
+        name: session
+            .name
+            .clone()
+            .unwrap_or_else(|| session.vendor.label().to_string()),
+        provider: session.vendor.label().to_ascii_lowercase(),
+        vendor: session.vendor.clone(),
+        status: session.status,
+        blocked_reason: session.blocked_reason.clone(),
+        model: None,
+        cwd: Some(session.cwd.clone()),
+        project_root,
+        git_branch: None,
+        pid: Some(session.pid),
+        pane_id: None,
+        session_id: (!session.session_id.is_empty()).then(|| session.session_id.clone()),
+        started_at: session.started_at,
+        status_changed_at: session.status_changed_at,
+        subagents: session.subagents.clone(),
+        activity: None,
+    }
+}
+
 fn agent_toolbelt_buttons(
     agent_ui: &config::AgentUiConfig,
     agent: &AgentPaneState,
@@ -3051,6 +3090,107 @@ impl crate::TermWindow {
         result
     }
 
+    /// Pre-registered SSH connections offered by the sidebar SSH quick-launch
+    /// dropdown.
+    ///
+    /// `WezTerm`/`Ssh` transports spawn through `SpawnTabDomain::DomainName`,
+    /// so their `argv` stays empty. `Mosh`/`Et` bypass the mux and run as a
+    /// plain shell command; their `argv` is the fully resolved program path
+    /// plus `user@host` (plus port for Et) plus the domain's `extra_args`.
+    /// Entries whose declared `Mosh`/`Et` sidecar binary is not on `PATH` (and
+    /// the fallback dirs below) are dropped, so the dropdown never offers a
+    /// row that would fail to spawn.
+    ///
+    /// Building this probes `$PATH`, so the result is cached per config
+    /// generation and must never be rebuilt per frame — same pattern as
+    /// `agent_launcher_entries`.
+    pub fn ssh_quick_launch_entries(&self) -> Arc<Vec<SshQuickLaunchEntry>> {
+        let gen = self.config.generation();
+        {
+            let cached = self.ssh_launcher_cache.borrow();
+            if let Some((cached_gen, ref entries)) = *cached {
+                if cached_gen == gen {
+                    return Arc::clone(entries);
+                }
+            }
+        }
+
+        let mut entries = Vec::new();
+        for domain in self.config.ssh_domains() {
+            let transport = domain.transport;
+            let argv = match transport {
+                config::SshTransport::WezTerm | config::SshTransport::Ssh => Vec::new(),
+                config::SshTransport::Mosh | config::SshTransport::Et => {
+                    let Some(binary) = transport.binary_name() else {
+                        continue;
+                    };
+                    let Some(resolved) = resolve_command_path(binary) else {
+                        continue;
+                    };
+                    let mut argv = Vec::with_capacity(2 + domain.extra_args.len());
+                    argv.push(resolved.to_string_lossy().into_owned());
+                    if let Some(user) = domain.username.as_deref() {
+                        argv.push(format!("{user}@{}", domain.remote_address));
+                    } else {
+                        argv.push(domain.remote_address.clone());
+                    }
+                    argv.extend(domain.extra_args.iter().cloned());
+                    argv
+                }
+                config::SshTransport::Custom => {
+                    // The user-supplied argv is the source of truth: no
+                    // host/user synthesis, no port flag. An empty command is
+                    // a config error; skip it quietly rather than spawn an
+                    // empty shell.
+                    if domain.custom_command.is_empty() {
+                        continue;
+                    }
+                    let Some(resolved) = resolve_command_path(&domain.custom_command[0]) else {
+                        continue;
+                    };
+                    let mut argv =
+                        Vec::with_capacity(domain.custom_command.len() + domain.extra_args.len());
+                    argv.push(resolved.to_string_lossy().into_owned());
+                    argv.extend(domain.custom_command.iter().skip(1).cloned());
+                    argv.extend(domain.extra_args.iter().cloned());
+                    argv
+                }
+            };
+
+            // Display label: the bare user@host for mosh/et (the dropdown badge
+            // already says which transport), otherwise the domain name with
+            // the conventional SSH:/SSHMUX: prefix stripped. Custom keeps the
+            // domain name verbatim — there is no host synthesis to lean on.
+            let label = match transport {
+                config::SshTransport::WezTerm | config::SshTransport::Ssh => domain
+                    .name
+                    .strip_prefix("SSH:")
+                    .or_else(|| domain.name.strip_prefix("SSHMUX:"))
+                    .unwrap_or(&domain.name)
+                    .to_string(),
+                config::SshTransport::Mosh | config::SshTransport::Et => {
+                    if let Some(user) = domain.username.as_deref() {
+                        format!("{user}@{}", domain.remote_address)
+                    } else {
+                        domain.remote_address.clone()
+                    }
+                }
+                config::SshTransport::Custom => domain.name.clone(),
+            };
+
+            entries.push(SshQuickLaunchEntry {
+                domain_name: domain.name.clone(),
+                label,
+                transport,
+                argv,
+            });
+        }
+
+        let result = Arc::new(entries);
+        *self.ssh_launcher_cache.borrow_mut() = Some((gen, Arc::clone(&result)));
+        result
+    }
+
     /// Shells and domains offered by the new-tab dropdown.
     ///
     /// Probing for shells walks `$PATH` and stats files, so like
@@ -3136,6 +3276,52 @@ impl crate::TermWindow {
         };
         let cwd = crate::termwindow::composer::active_pane_cwd(self)
             .and_then(|cwd| self.translate_cwd_for_domain(PathBuf::from(cwd), &domain));
+        self.spawn_command(
+            &SpawnCommand {
+                label: Some(entry.label),
+                args,
+                cwd,
+                domain,
+                ..Default::default()
+            },
+            SpawnWhere::NewTab,
+        );
+    }
+
+    /// Spawn a sidebar SSH quick-launch entry into a new tab.
+    ///
+    /// `WezTerm`/`Ssh` transports route through the registered mux domain
+    /// (`SpawnTabDomain::DomainName`); `Mosh`/`Et` bypass the mux and run as a
+    /// plain shell command in the local domain. The cwd translation that the
+    /// new-tab menu applies is skipped for mosh/et: the remote path is opaque
+    /// to the local mux and the transport owns its own working directory.
+    pub fn spawn_ssh_quick_launch_entry(&mut self, domain_name: &str) {
+        let Some(entry) = self
+            .ssh_quick_launch_entries()
+            .iter()
+            .find(|e| e.domain_name == domain_name)
+            .cloned()
+        else {
+            return;
+        };
+        let (domain, args, cwd) = match entry.transport {
+            config::SshTransport::WezTerm | config::SshTransport::Ssh => {
+                let domain = SpawnTabDomain::DomainName(entry.domain_name.clone());
+                let cwd = crate::termwindow::composer::active_pane_cwd(self)
+                    .and_then(|cwd| self.translate_cwd_for_domain(PathBuf::from(cwd), &domain));
+                (domain, None, cwd)
+            }
+            // Local-domain shell command; no cwd translation. Custom lands
+            // here too: the argv is opaque to the mux, so it runs in `local`
+            // exactly like mosh/et.
+            config::SshTransport::Mosh
+            | config::SshTransport::Et
+            | config::SshTransport::Custom => (
+                SpawnTabDomain::DomainName("local".to_string()),
+                Some(entry.argv),
+                None,
+            ),
+        };
         self.spawn_command(
             &SpawnCommand {
                 label: Some(entry.label),
@@ -3443,7 +3629,7 @@ impl crate::TermWindow {
             // Neither utility pane is a place to put an agent: the worktree
             // picker is already a narrow column, and splitting the insight pane
             // would hide half of the very list you launched from.
-            .filter(|pos| !is_worktree_pane(&pos.pane) && !self.is_agent_insight_pane(&pos.pane))
+             .filter(|pos| !is_worktree_pane(&pos.pane))
             .map(|pos| agent_launch::PaneGeom {
                 pane_id: pos.pane.pane_id(),
                 index: pos.index,
@@ -3480,8 +3666,7 @@ impl crate::TermWindow {
     ///
     /// Statting every transcript and head-reading the newest few is filesystem
     /// work, so it happens on a worker thread and is applied back on the GUI
-    /// thread — the same shape `open_agent_insight_pane` uses. Called from the
-    /// click that opens the submenu, never from paint.
+    /// thread. Called from the click that opens the submenu, never from paint.
     pub fn kick_agent_session_scan(&mut self) {
         if self.agent_session_scan_pending {
             return;
@@ -3713,7 +3898,7 @@ impl crate::TermWindow {
 
     /// Colors for the herd overview, resolved here so the overview's own thread
     /// never reads config or the palette.
-    pub(crate) fn agent_herd_theme(&self) -> crate::overlay::agent_herd::HerdTheme {
+    pub(crate) fn agent_herd_theme(&self) -> crate::agent_herd::HerdTheme {
         let mut adapter_colors = HashMap::new();
         for (id, adapter) in self.merged_agent_adapters().iter() {
             let kind = AgentKind::from_adapter_id(id)
@@ -3727,7 +3912,7 @@ impl crate::TermWindow {
             .tab_bar
             .clone()
             .unwrap_or_else(TabBarColors::default);
-        crate::overlay::agent_herd::HerdTheme {
+        crate::agent_herd::HerdTheme {
             adapter_colors,
             attention: crate::agent_herd::ATTENTION_RGB,
             dim: srgb8(colors.inactive_tab().fg_color.to_linear()),
@@ -3792,9 +3977,7 @@ impl crate::TermWindow {
         // The insight pane prints adapter names, status words and agent chrome
         // by definition, so visible-evidence detection would badge it as an
         // agent and then list it as one of the agents it is listing.
-        if self.is_agent_insight_pane(pane) {
-            return None;
-        }
+        // The insight pane no longer exists as a separate mux pane.
 
         let vars = pane.copy_user_vars();
         let foreground_process = pane.get_foreground_process_name(CachePolicy::AllowStale);
@@ -4535,16 +4718,31 @@ impl crate::TermWindow {
     /// clamp and the scrollbar cannot disagree.
     fn sidebar_bottom_button_rows(&self) -> f32 {
         let collapsed = self.config.sidebar_auto_hide && !self.sidebar_auto_hide_open;
+        let ssh_present = !self.ssh_quick_launch_entries().is_empty();
         if collapsed {
+            let mut rows = 1.;
             if self.agent_launcher_default().is_some() {
+                rows += 1.;
+            }
+            if ssh_present {
+                rows += 1.;
+            }
+            rows
+        } else if self.sidebar_width() > 180 {
+            // worktree/agent shared row + new tab, plus a dedicated SSH row when
+            // the SSH quick-launch has any usable entries.
+            if ssh_present {
+                3.
+            } else {
+                2.
+            }
+        } else {
+            // Narrow expanded: only the new-tab row, plus an SSH row when present.
+            if ssh_present {
                 2.
             } else {
                 1.
             }
-        } else if self.sidebar_width() > 180 {
-            2.
-        } else {
-            1.
         }
     }
 
@@ -4796,7 +4994,7 @@ impl crate::TermWindow {
     /// Neither one has a working directory, a branch or a command worth
     /// showing, so neither may stand in for a tab in the sidebar.
     fn is_sidebar_utility_pane(&self, pane: &Arc<dyn Pane>) -> bool {
-        is_worktree_pane(pane) || self.is_agent_insight_pane(pane)
+        is_worktree_pane(pane)
     }
 
     /// Short human label for a pane row: the agent name when one is detected,
@@ -4804,9 +5002,6 @@ impl crate::TermWindow {
     fn sidebar_pane_label(&self, pane: &Arc<dyn Pane>) -> String {
         if is_worktree_pane(pane) {
             return "Worktree".to_string();
-        }
-        if self.is_agent_insight_pane(pane) {
-            return crate::termwindow::agent_insight::INSIGHT_PANE_TITLE.to_string();
         }
         if self.config.agent_ui.enabled {
             if let Some(agent) = self.detect_agent_pane(pane) {
@@ -5359,6 +5554,14 @@ impl crate::TermWindow {
             bg,
         )?;
 
+        // Thin border stroke so the menu stands out against overlapping rows.
+        let border = lerp_rgba(bg, fg, 0.12);
+        let border_w = (1. * dpi_scale).max(1.);
+        self.filled_rectangle(layers, 2, euclid::rect(menu_x, menu_y, menu_w, border_w), border)?;
+        self.filled_rectangle(layers, 2, euclid::rect(menu_x, menu_y + menu_h - border_w, menu_w, border_w), border)?;
+        self.filled_rectangle(layers, 2, euclid::rect(menu_x, menu_y + border_w, border_w, menu_h - border_w * 2.), border)?;
+        self.filled_rectangle(layers, 2, euclid::rect(menu_x + menu_w - border_w, menu_y + border_w, border_w, menu_h - border_w * 2.), border)?;
+
         let palette = self.palette().clone();
         let gl_state = self.render_state.as_ref().unwrap();
         let white_space = gl_state.util_sprites.white_space.texture_coords();
@@ -5492,12 +5695,9 @@ impl crate::TermWindow {
             return Ok(());
         };
         let entries = self.agent_launcher_entries();
-        if entries.is_empty() {
-            // Every agent disappeared (config reload, uninstall) while the
-            // menu was open; nothing left to show.
-            self.agent_launch_menu = None;
-            return Ok(());
-        }
+        // Don't bail when entries is empty: the "Agent insight" and
+        // "Resume session" rows are useful even with no adapters configured,
+        // so the dropdown stays open and shows them.
 
         const TARGET_ROWS: [(&str, AgentLaunchTarget); 3] = [
             ("Split pane", AgentLaunchTarget::SplitPane),
@@ -5548,11 +5748,7 @@ impl crate::TermWindow {
         });
         // Below the launch actions: this one inspects rather than launches.
         rows.push(SidebarDropdownRow {
-            label: if self.find_agent_insight_pane().is_some() {
-                "Close agent insight".to_string()
-            } else {
-                "Agent insight".to_string()
-            },
+            label: "Agent insight".to_string(),
             dot_color: None,
             checkbox: None,
             divider_above: false,
@@ -5586,7 +5782,7 @@ impl crate::TermWindow {
         } else {
             AGENT_LAUNCH_MENU_W
         };
-        self.paint_sidebar_dropdown(layers, menu.x as f32, menu.y as f32, menu_w, &rows)
+        self.paint_sidebar_dropdown(layers, menu.x as f32, menu.y as f32, menu_w, false, &rows)
     }
 
     /// How many past sessions the resume submenu may offer.
@@ -5688,6 +5884,156 @@ impl crate::TermWindow {
             menu.x as f32,
             menu.y as f32,
             AGENT_LAUNCH_MENU_W,
+            false,
+            &rows,
+        )
+    }
+
+    /// Right-click submenu on a tab's × (close) button. Three entries:
+    /// close the tabs above (sidebar) / to the left (tab bar), below / to the
+    /// right, or all others. The clicked tab is always preserved.
+    pub fn paint_close_tab_menu(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+    ) -> anyhow::Result<()> {
+        let Some(menu) = self.close_tab_menu.clone() else {
+            return Ok(());
+        };
+        if !self.config.tab_close_context_menu {
+            self.close_tab_menu = None;
+            return Ok(());
+        }
+
+        let (above_label, below_label) = match menu.source {
+            CloseTabSource::Sidebar => ("Close Tabs Above", "Close Tabs Below"),
+            CloseTabSource::TabBar => ("Close Tabs to the Left", "Close Tabs to the Right"),
+        };
+
+        let rows: Vec<SidebarDropdownRow> = vec![
+            SidebarDropdownRow {
+                label: above_label.to_string(),
+                dot_color: None,
+                checkbox: None,
+                divider_above: false,
+                indent: false,
+                trailing_chevron: false,
+                item_type: UIItemType::CloseTabMenuItem {
+                    source: menu.source,
+                    action: CloseTabMenuAction::CloseAbove,
+                },
+            },
+            SidebarDropdownRow {
+                label: below_label.to_string(),
+                dot_color: None,
+                checkbox: None,
+                divider_above: false,
+                indent: false,
+                trailing_chevron: false,
+                item_type: UIItemType::CloseTabMenuItem {
+                    source: menu.source,
+                    action: CloseTabMenuAction::CloseBelow,
+                },
+            },
+            SidebarDropdownRow {
+                label: "Close All Other Tabs".to_string(),
+                dot_color: None,
+                checkbox: None,
+                divider_above: false,
+                indent: false,
+                trailing_chevron: false,
+                item_type: UIItemType::CloseTabMenuItem {
+                    source: menu.source,
+                    action: CloseTabMenuAction::CloseAllOther,
+                },
+            },
+        ];
+
+        // Tab-bar source anchors downward (× sits at the top of the window);
+        // sidebar source anchors upward (× sits in the vertical list near
+        // other buttons at the bottom of the sidebar column).
+        let downward = matches!(menu.source, CloseTabSource::TabBar);
+
+        // Size the panel to the longest row label rather than the fixed
+        // agent-launch width: cell width and the boxy sentence labels ("Close
+        // Tabs to the Right") need ~24 columns, which `AGENT_LAUNCH_MENU_W`
+        // clips to ~16 and drops the final word. Work in pre-DPI logical
+        // pixels to match the `paint_sidebar_dropdown` `width` parameter.
+        let dpi_scale = (self.dimensions.dpi as f32 / 96.).clamp(1., 2.5);
+        let cell_w_logical = self.render_metrics.cell_size.width as f32 / dpi_scale;
+        let longest_cols = [above_label, below_label, "Close All Other Tabs"]
+            .iter()
+            .map(|s| unicode_column_width(s, None))
+            .max()
+            .unwrap_or(0) as f32;
+        // Two `row_text_inset` gutters (12 logical px each, scaled to device
+        // pixels to match `paint_sidebar_dropdown`'s internal `dpi_scale`)
+        // plus a one-cell loose margin for rounding.
+        let needed_w =
+            longest_cols * cell_w_logical + 2. * 12. * dpi_scale + cell_w_logical * dpi_scale;
+        let menu_w = needed_w.max(CLOSE_TAB_MENU_MIN_W);
+
+        self.paint_sidebar_dropdown(
+            layers,
+            menu.x as f32,
+            menu.y as f32,
+            menu_w,
+            downward,
+            &rows,
+        )
+    }
+
+    /// Sidebar SSH quick-launch dropdown. One row per pre-registered
+    /// `SshDomain` whose transport is usable (installed binary for mosh/et).
+    /// Clicking a row spawns the connection into a new tab — `WezTerm`/`Ssh`
+    /// through the mux domain, `Mosh`/`Et` as a plain shell command. There is
+    /// no expandable submenu: every row is a single click, mirroring the
+    /// new-tab dropdown's flat list.
+    pub fn paint_ssh_launch_menu(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+    ) -> anyhow::Result<()> {
+        let Some(menu) = self.ssh_launch_menu.clone() else {
+            return Ok(());
+        };
+        let entries = self.ssh_quick_launch_entries();
+        if entries.is_empty() {
+            self.ssh_launch_menu = None;
+            return Ok(());
+        }
+
+        let rows: Vec<SidebarDropdownRow> = entries
+            .iter()
+            .map(|entry| {
+                let badge = match entry.transport {
+                    config::SshTransport::Mosh => "mosh",
+                    config::SshTransport::Et => "et",
+                    config::SshTransport::Custom => "custom",
+                    config::SshTransport::WezTerm => "mux",
+                    config::SshTransport::Ssh => "ssh",
+                };
+                let label = format!("{}  · {}", entry.label, badge);
+                SidebarDropdownRow {
+                    label,
+                    dot_color: None,
+                    checkbox: None,
+                    divider_above: false,
+                    indent: false,
+                    trailing_chevron: false,
+                    item_type: UIItemType::SidebarSshMenuItem {
+                        domain_name: entry.domain_name.clone(),
+                    },
+                }
+            })
+            .collect();
+
+        // The button anchors at the bottom of the sidebar, so the dropdown
+        // grows upward — same as the agent launch menu.
+        self.paint_sidebar_dropdown(
+            layers,
+            menu.x as f32,
+            menu.y as f32,
+            AGENT_LAUNCH_MENU_W,
+            false,
             &rows,
         )
     }
@@ -5731,12 +6077,18 @@ impl crate::TermWindow {
     /// Rows may carry an adapter-colored dot, a checkbox, or neither, and may
     /// request a divider above them. Geometry matches `paint_agent_copy_menu`
     /// so all three menus look identical.
+    ///
+    /// `downward` controls which side of the anchor the menu opens toward.
+    /// Sidebar buttons near the bottom of the window pass `false` so the menu
+    /// opens upward; tab-bar close buttons near the top pass `true` so the
+    /// menu opens downward.
     fn paint_sidebar_dropdown(
         &mut self,
         layers: &mut TripleLayerQuadAllocator,
         anchor_x: f32,
         anchor_y: f32,
         width: f32,
+        downward: bool,
         rows: &[SidebarDropdownRow],
     ) -> anyhow::Result<()> {
         if rows.is_empty() {
@@ -5769,10 +6121,24 @@ impl crate::TermWindow {
             .max(AGENT_TOOLBELT_GAP);
         let max_y = (self.dimensions.pixel_height as f32 - menu_h - AGENT_TOOLBELT_GAP)
             .max(AGENT_TOOLBELT_GAP);
-        // Anchor to the button, opening upwards: these buttons sit near the
-        // bottom of the sidebar, so a downward menu would fall off-screen.
         let menu_x = anchor_x.clamp(AGENT_TOOLBELT_GAP, max_x);
-        let menu_y = (anchor_y - menu_h - AGENT_TOOLBELT_GAP).clamp(AGENT_TOOLBELT_GAP, max_y);
+        // Open in the requested direction; if that would run off-screen,
+        // flip to the other side so the menu stays visible.
+        let menu_y = if downward {
+            let down_y = anchor_y + AGENT_TOOLBELT_GAP;
+            if down_y + menu_h > self.dimensions.pixel_height as f32 - AGENT_TOOLBELT_GAP {
+                (anchor_y - menu_h - AGENT_TOOLBELT_GAP).clamp(AGENT_TOOLBELT_GAP, max_y)
+            } else {
+                down_y.clamp(AGENT_TOOLBELT_GAP, max_y)
+            }
+        } else {
+            let up_y = anchor_y - menu_h - AGENT_TOOLBELT_GAP;
+            if up_y < AGENT_TOOLBELT_GAP {
+                (anchor_y + AGENT_TOOLBELT_GAP).clamp(AGENT_TOOLBELT_GAP, max_y)
+            } else {
+                up_y.clamp(AGENT_TOOLBELT_GAP, max_y)
+            }
+        };
 
         let colors = self
             .config
@@ -5794,6 +6160,14 @@ impl crate::TermWindow {
             menu_radius,
             bg,
         )?;
+
+        // Thin border stroke so the menu stands out against overlapping rows.
+        let border = lerp_rgba(bg, fg, 0.12);
+        let border_w = (1. * dpi_scale).max(1.);
+        self.filled_rectangle(layers, 2, euclid::rect(menu_x, menu_y, menu_w, border_w), border)?;
+        self.filled_rectangle(layers, 2, euclid::rect(menu_x, menu_y + menu_h - border_w, menu_w, border_w), border)?;
+        self.filled_rectangle(layers, 2, euclid::rect(menu_x, menu_y + border_w, border_w, menu_h - border_w * 2.), border)?;
+        self.filled_rectangle(layers, 2, euclid::rect(menu_x + menu_w - border_w, menu_y + border_w, border_w, menu_h - border_w * 2.), border)?;
 
         let palette = self.palette().clone();
         let gl_state = self.render_state.as_ref().unwrap();
@@ -6305,8 +6679,19 @@ impl crate::TermWindow {
             // The launcher takes the slot directly above "+", so the tab list
             // must give up that stride or it would paint over the button.
             let rail_launcher_entry = self.agent_launcher_default();
-            let rail_launch_y = rail_launcher_entry.as_ref().map(|_| new_tab_y - row_stride);
-            let list_bottom = rail_launch_y.unwrap_or(new_tab_y);
+            // SSH quick-launch rail slot sits directly above "+"; the agent
+            // rail slot (if any) sits one more stride above that. When neither
+            // is present, list_bottom collapses to the new-tab row.
+            let ssh_rail_present = !self.ssh_quick_launch_entries().is_empty();
+            let ssh_rail_y = if ssh_rail_present {
+                Some(new_tab_y - row_stride)
+            } else {
+                None
+            };
+            let rail_launch_y = rail_launcher_entry
+                .as_ref()
+                .map(|_| ssh_rail_y.unwrap_or(new_tab_y) - row_stride);
+            let list_bottom = rail_launch_y.or(ssh_rail_y).unwrap_or(new_tab_y);
             let list_height = (list_bottom - GAP - list_top).max(0.);
             let visible_rows = ((list_height + GAP) / row_stride).floor().max(0.) as usize;
             let max_offset = tabs.len().saturating_sub(visible_rows);
@@ -6404,6 +6789,59 @@ impl crate::TermWindow {
                     item_type: tab_type,
                 });
                 rail_y += row_stride;
+            }
+
+            // SSH quick-launch rail slot, directly above "+". A flat glyph
+            // pair (`>_`) instead of a per-adapter badge: this row opens the
+            // dropdown rather than launching a single default connection.
+            if let Some(ssh_y) = ssh_rail_y {
+                let ssh_type = UIItemType::SidebarSshLaunchButton;
+                let ssh_hovered = hovered_item.as_ref() == Some(&ssh_type);
+                let ssh_pressed =
+                    ssh_hovered && left_pressed && self.pressed_ui_item.as_ref() == Some(&ssh_type);
+                let ssh_bg = if ssh_pressed {
+                    pressed_fill
+                } else if ssh_hovered {
+                    hover_fill
+                } else {
+                    search_fill
+                };
+                let ssh_offset = if ssh_pressed { 1. } else { 0. };
+                self.sidebar_rounded_fill(
+                    layers,
+                    1,
+                    euclid::rect(rail_x, ssh_y + ssh_offset, rail_side, rail_side),
+                    rail_radius,
+                    ssh_bg,
+                )?;
+                let mut symbol = ">_".to_string();
+                let mut symbol_w = 2. * cell_width as f32;
+                if symbol_w + 4. > rail_side {
+                    symbol = symbol.chars().take(1).collect();
+                    symbol_w = cell_width as f32;
+                }
+                render_text(
+                    self,
+                    layers,
+                    &symbol,
+                    &CellAttributes::default(),
+                    rail_x + (rail_side - symbol_w) * 0.5,
+                    ssh_y + ssh_offset + (rail_side - cell_height as f32) * 0.5,
+                    symbol_w,
+                    if ssh_hovered {
+                        hover_fg
+                    } else {
+                        inactive_fg.mul_alpha(0.86)
+                    },
+                    ssh_bg,
+                )?;
+                self.ui_items.push(UIItem {
+                    x: left as usize,
+                    y: ssh_y as usize,
+                    width,
+                    height: rail_side as usize,
+                    item_type: ssh_type,
+                });
             }
 
             if let (Some(entry), Some(launch_y)) = (rail_launcher_entry, rail_launch_y) {
@@ -6863,7 +7301,7 @@ impl crate::TermWindow {
                 }
             };
             let tab_type = UIItemType::SidebarTab { tab_idx, active };
-            let close_type = UIItemType::CloseTab(tab_idx);
+            let close_type = UIItemType::SidebarCloseTab(tab_idx);
             let tab_hovered = hovered_item.as_ref() == Some(&tab_type);
             let close_hovered = hovered_item.as_ref() == Some(&close_type);
             let tab_dragging = matches!(
@@ -7161,20 +7599,79 @@ impl crate::TermWindow {
             });
         }
 
-        let worktree_y = new_tab_y - row_height as f32 - GAP;
+        let ssh_rail_present = !self.ssh_quick_launch_entries().is_empty();
+        // SSH row sits directly above the new-tab row; the worktree/agent row
+        // moves one stride higher when the SSH row is present.
+        let ssh_row_y = new_tab_y - row_height as f32 - GAP;
+        let worktree_y = if ssh_rail_present {
+            ssh_row_y - row_height as f32 - GAP
+        } else {
+            ssh_row_y
+        };
+        if ssh_rail_present {
+            let ssh_type = UIItemType::SidebarSshLaunchButton;
+            let ssh_hovered = hovered_item.as_ref() == Some(&ssh_type);
+            let ssh_pressed =
+                ssh_hovered && left_pressed && self.pressed_ui_item.as_ref() == Some(&ssh_type);
+            let ssh_bg = if ssh_pressed {
+                pressed_fill
+            } else if ssh_hovered {
+                hover_fill
+            } else {
+                search_fill
+            };
+            let ssh_offset = if ssh_pressed { 1. } else { 0. };
+            self.sidebar_rounded_fill(
+                layers,
+                1,
+                euclid::rect(item_x, ssh_row_y + ssh_offset, item_w, row_height as f32),
+                RADIUS,
+                ssh_bg,
+            )?;
+            let ssh_label_w = (item_w - PAD_X * 2. - ACTIVE_TEXT_GAP).max(0.);
+            if let Some(ssh_label) =
+                fit_label(&SSH_ROW_LABELS, sidebar_text_cols(ssh_label_w, cell_width))
+            {
+                render_text(
+                    self,
+                    layers,
+                    ssh_label,
+                    &CellAttributes::default(),
+                    text_x,
+                    ssh_row_y + ssh_offset + (row_height as f32 - cell_height as f32) * 0.5,
+                    ssh_label_w,
+                    if ssh_hovered {
+                        hover_fg
+                    } else {
+                        inactive_fg.mul_alpha(0.86)
+                    },
+                    ssh_bg,
+                )?;
+            }
+            self.ui_items.push(UIItem {
+                x: content_x as usize,
+                y: ssh_row_y as usize,
+                width: item_w as usize,
+                height: row_height,
+                item_type: ssh_type,
+            });
+        }
         if width > 180 {
             // The row is shared: Worktree on the left, the agent launcher on
             // the right. With no agent installed the worktree button keeps the
             // full width it had before the launcher existed.
             let launcher_entry = self.agent_launcher_default();
             let dot_size = sidebar_status_dot_size(cell_height as f32);
+            // Always reserve the agent launcher area even when no adapter is
+            // installed: the button opens a dropdown whose "Agent insight" and
+            // "Resume session" rows are useful without any adapter.
             let bottom_row = sidebar_bottom_row_layout(
                 item_x,
                 item_w,
                 content_x,
                 content_w,
                 dot_size,
-                launcher_entry.is_some(),
+                true,
             );
 
             let worktree_type = UIItemType::SidebarWorktreeButton;
@@ -7257,7 +7754,7 @@ impl crate::TermWindow {
                 item_type: worktree_type,
             });
 
-            if let Some(entry) = launcher_entry {
+            {
                 let agent_type = UIItemType::SidebarAgentLaunchButton;
                 let agent_hovered = hovered_item.as_ref() == Some(&agent_type);
                 let agent_pressed = agent_hovered
@@ -7284,29 +7781,39 @@ impl crate::TermWindow {
                     agent_bg,
                 )?;
 
-                // Adapter-colored dot, vertically centered on the text row.
+                // Adapter-colored dot (or a neutral dot when no adapter).
                 let dot_y = worktree_y + agent_offset + (row_height as f32 - dot_size) * 0.5;
+                let dot_color = if let Some(ref entry) = launcher_entry {
+                    if agent_hovered {
+                        entry.color
+                    } else {
+                        entry.color.mul_alpha(0.88)
+                    }
+                } else {
+                    inactive_fg.mul_alpha(0.5)
+                };
                 self.sidebar_rounded_fill(
                     layers,
                     2,
                     euclid::rect(bottom_row.agent_dot_x, dot_y, dot_size, dot_size),
                     dot_size * 0.5,
-                    if agent_hovered {
-                        entry.color
-                    } else {
-                        entry.color.mul_alpha(0.88)
-                    },
+                    dot_color,
                 )?;
 
-                // Ladder from the adapter's own labels, so a configured
-                // `label = "Claude Code"` is fitted rather than guessed at.
-                let agent_label_rungs = [entry.label.as_str(), entry.short_label.as_str()];
-                let agent_cols = sidebar_text_cols(bottom_row.agent_text_w, cell_width);
-                if let Some(agent_label) = fit_label(&agent_label_rungs, agent_cols) {
+                // Label: adapter label when available, generic "Agents" otherwise.
+                let agent_label_opt = if let Some(ref entry) = launcher_entry {
+                    let agent_label_rungs = [entry.label.as_str(), entry.short_label.as_str()];
+                    let agent_cols = sidebar_text_cols(bottom_row.agent_text_w, cell_width);
+                    fit_label(&agent_label_rungs, agent_cols).map(|s| s.to_string())
+                } else {
+                    let agent_cols = sidebar_text_cols(bottom_row.agent_text_w, cell_width);
+                    fit_label(&["Agents", "Agent"], agent_cols).map(|s| s.to_string())
+                };
+                if let Some(agent_label) = agent_label_opt {
                     render_text(
                         self,
                         layers,
-                        agent_label,
+                        &agent_label,
                         &CellAttributes::default(),
                         bottom_row.agent_text_x,
                         worktree_y + agent_offset + (row_height as f32 - cell_height as f32) * 0.5,
@@ -7457,6 +7964,488 @@ impl crate::TermWindow {
             height: height as usize,
             item_type: UIItemType::SidebarResize { start_width: width },
         });
+
+        // Agent herd section: rendered below the tab list.
+        if self.config.agent_ui.section.enabled {
+            self.update_agent_herd_state();
+            self.paint_agent_herd_section(
+                layers,
+                width as f32,
+                left as f32,
+                top as f32,
+                height as f32,
+            )?;
+        }
+
+        Ok(())
+    }
+
+    /// Populate `AgentHerdState` from the per-pane agent detection cache.
+    /// Converts the older `AgentPaneState` detections into the new
+    /// `HerdAgent` model so the agent section renders with live data.
+    fn update_agent_herd_state(&mut self) {
+        self.kick_agent_herd_scan();
+        let mux = Mux::get();
+        let Some(window) = mux.get_window(self.mux_window_id) else {
+            return;
+        };
+        let mut agents = Vec::new();
+        let mut session_ids = HashSet::new();
+
+        for tab_idx in 0..window.len() {
+            let agent = match self.sidebar_agent_for_tab_idx(tab_idx) {
+                Some(a) => a,
+                None => continue,
+            };
+            let pane_id = self
+                .sidebar_primary_pane_for_tab_idx(tab_idx)
+                .map(|pane| pane.pane_id());
+
+            let vendor = match agent.kind {
+                AgentKind::Claude => AgentVendor::Claude,
+                AgentKind::Codex => AgentVendor::Codex,
+                AgentKind::Gemini => AgentVendor::Gemini,
+                AgentKind::OpenCode => AgentVendor::OpenCode,
+                AgentKind::Copilot => AgentVendor::Copilot,
+                AgentKind::Cursor => AgentVendor::Cursor,
+                AgentKind::Amp => AgentVendor::Amp,
+                AgentKind::Unknown(_) => {
+                    AgentVendor::Custom(agent.adapter_id.clone().unwrap_or_default())
+                }
+            };
+
+            let status = herd_status_from_agent(agent.status);
+
+            let name = agent.model.as_deref().unwrap_or(vendor.label()).to_string();
+
+            let project_root = agent
+                .cwd
+                .as_ref()
+                .and_then(|p| p.parent())
+                .map(|p| p.to_path_buf());
+
+            agents.push(HerdAgent {
+                provider: agent.adapter_id.clone().unwrap_or_default(),
+                vendor,
+                name,
+                status,
+                model: agent.model,
+                cwd: agent.cwd,
+                project_root,
+                pane_id,
+                session_id: agent.session_id,
+                blocked_reason: None,
+                git_branch: None,
+                pid: None,
+                started_at: None,
+                status_changed_at: None,
+                activity: None,
+                subagents: Vec::new(),
+            });
+            if let Some(session_id) = agents.last().and_then(|agent| agent.session_id.clone()) {
+                session_ids.insert(session_id);
+            }
+        }
+
+        if let Some((_, sessions)) = self.agent_herd_session_cache.as_ref() {
+            for session in sessions.iter() {
+                if !session.session_id.is_empty() && session_ids.contains(&session.session_id) {
+                    continue;
+                }
+                agents.push(herd_agent_from_vendor_session(session));
+            }
+        }
+
+        let mut state = self.agent_herd_state.borrow_mut();
+        state.agents = agents;
+    }
+
+    /// Refresh vendor session files without blocking paint on filesystem I/O.
+    fn kick_agent_herd_scan(&mut self) {
+        let ttl = Duration::from_millis(
+            self.config.agent_ui.section.refresh_ms.clamp(100, 10000),
+        );
+        if self.agent_herd_scan_pending
+            || self
+                .agent_herd_session_cache
+                .as_ref()
+                .is_some_and(|(scanned_at, _)| scanned_at.elapsed() < ttl)
+        {
+            return;
+        }
+        let Some(home) = dirs_next::home_dir() else {
+            return;
+        };
+        let Some(window) = self.window.clone() else {
+            return;
+        };
+
+        self.agent_herd_scan_pending = true;
+        let future = promise::spawn::spawn_into_new_thread(move || {
+            let sessions = crate::agent_herd::default_registry().collect_all(&home);
+            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                term_window.agent_herd_scan_pending = false;
+                term_window.agent_herd_session_cache = Some((Instant::now(), Arc::new(sessions)));
+            })));
+            Ok::<(), anyhow::Error>(())
+        });
+        promise::spawn::spawn(async move {
+            if let Err(err) = future.await {
+                log::error!("agent herd session scan failed: {err:#}");
+            }
+        })
+        .detach();
+    }
+
+    /// Render a single line of text as GPU quads.
+    fn paint_text(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+        text: &str,
+        x: f32,
+        y: f32,
+        pixel_width: f32,
+        fg: LinearRgba,
+        bg: LinearRgba,
+        bold: bool,
+    ) -> anyhow::Result<()> {
+        let cell_width = self.render_metrics.cell_size.width as f32;
+        let cell_height = self.render_metrics.cell_size.height as f32;
+        let cols = (pixel_width / cell_width).floor().max(0.0) as usize;
+        if cols == 0 || text.is_empty() {
+            return Ok(());
+        }
+        let text: String = text
+            .chars()
+            .take_while(|c| {
+                let w = unicode_column_width(&c.to_string(), None);
+                if w > cols {
+                    return false;
+                }
+                true
+            })
+            .collect();
+        let mut attrs = CellAttributes::default();
+        attrs.set_foreground(ColorAttribute::TrueColorWithDefaultFallback(fg.to_srgb()));
+        attrs.set_background(ColorAttribute::TrueColorWithDefaultFallback(bg.to_srgb()));
+        if bold {
+            attrs.set_intensity(Intensity::Bold);
+        }
+        let line = Line::from_text(&text, &attrs, 1, None);
+        let palette = self.palette().clone();
+        let white_space = self
+            .render_state
+            .as_ref()
+            .map(|s| s.util_sprites.white_space.texture_coords())
+            .unwrap_or_default();
+        let filled_box = self
+            .render_state
+            .as_ref()
+            .map(|s| s.util_sprites.filled_box.texture_coords())
+            .unwrap_or_default();
+        let config = &self.config;
+        let render_metrics = self.render_metrics;
+        let dimensions_dpi = self.dimensions.dpi as u32;
+        let experimental_pixel_positioning = config.experimental_pixel_positioning;
+        self.render_screen_line(
+            RenderScreenLineParams {
+                top_pixel_y: y,
+                left_pixel_x: x,
+                pixel_width,
+                stable_line_idx: None,
+                line: &line,
+                selection: 0..0,
+                cursor: &Default::default(),
+                palette: &palette,
+                dims: &RenderableDimensions {
+                    cols,
+                    physical_top: 0,
+                    scrollback_rows: 0,
+                    scrollback_top: 0,
+                    viewport_rows: 1,
+                    dpi: dimensions_dpi,
+                    pixel_height: cell_height as usize,
+                    pixel_width: pixel_width as usize,
+                    reverse_video: false,
+                },
+                config,
+                cursor_border_color: LinearRgba::default(),
+                foreground: fg,
+                pane: None,
+                is_active: true,
+                selection_fg: LinearRgba::default(),
+                selection_bg: LinearRgba::default(),
+                cursor_fg: LinearRgba::default(),
+                cursor_bg: LinearRgba::default(),
+                cursor_is_default_color: true,
+                white_space,
+                filled_box,
+                window_is_transparent: true,
+                default_bg: bg,
+                style: None,
+                font: None,
+                use_pixel_positioning: experimental_pixel_positioning,
+                render_metrics,
+                shape_key: None,
+                password_input: false,
+            },
+            layers,
+        )?;
+        Ok(())
+    }
+
+    /// Paint the agent herd section at the bottom of the sidebar.
+    /// Renders a collapsible header with agent count, then each agent
+    /// as a row with a status dot, vendor glyph, name, project, and
+    /// status hint. Clicking a row expands inline detail.
+    fn paint_agent_herd_section(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+        sidebar_w: f32,
+        sidebar_left: f32,
+        sidebar_top: f32,
+        sidebar_h: f32,
+    ) -> anyhow::Result<()> {
+        let state = self.agent_herd_state.borrow();
+        let collapsed = state.collapsed;
+        let agents = state.agents.clone();
+        let expanded = state.expanded;
+        drop(state);
+
+        let dpi = (self.dimensions.dpi as f32 / 96.0).clamp(1.0, 2.5);
+        let cell_h = self.render_metrics.cell_size.height as f32;
+        let base_row_h = cell_h + 4.0 * dpi;
+        let header_h = cell_h + 8.0 * dpi;
+        let pad = 8.0 * dpi;
+
+        let colors = self
+            .config
+            .resolved_palette
+            .tab_bar
+            .clone()
+            .unwrap_or_else(TabBarColors::default);
+        let bg = opaque(colors.background().to_linear());
+        let fg = srgb8_to_linear(200, 200, 200);
+        let dim = srgb8_to_linear(130, 130, 130);
+
+        let section_x = sidebar_left;
+        let section_w = sidebar_w;
+
+        // Count agents.
+        let agent_count = agents.len();
+
+        // Anchor section to bottom while keeping header visible when collapsed.
+        let content_h = if collapsed {
+            0.0
+        } else {
+            agents
+                .iter()
+                .enumerate()
+                .map(|(idx, _)| {
+                    let detail_h = if expanded == Some(idx) {
+                        base_row_h * 2.0
+                    } else {
+                        0.0
+                    };
+                    base_row_h + detail_h + 2.0 * dpi
+                })
+                .sum()
+        };
+        let section_bottom = sidebar_top + sidebar_h - pad;
+        let header_y = (section_bottom - header_h - content_h).max(sidebar_top);
+        let header_rect = euclid::rect(section_x, header_y, section_w, header_h);
+        self.filled_rectangle(layers, 0, header_rect, bg)?;
+
+        // Chevron toggle.
+        let chevron = if collapsed { "▸" } else { "▾" };
+        self.paint_text(
+            layers,
+            chevron,
+            section_x + pad,
+            header_y + (header_h - cell_h) * 0.5,
+            cell_h,
+            fg,
+            bg,
+            false,
+        )?;
+
+        // "Agents · N" label.
+        let label = format!("Agents · {agent_count}");
+        self.paint_text(
+            layers,
+            &label,
+            section_x + pad + cell_h + 4.0 * dpi,
+            header_y + (header_h - cell_h) * 0.5,
+            section_w - 2.0 * pad - cell_h,
+            fg,
+            bg,
+            true,
+        )?;
+
+        // Push UIItem for the header click.
+        self.ui_items.push(UIItem {
+            x: section_x as usize,
+            y: header_y as usize,
+            width: section_w as usize,
+            height: header_h as usize,
+            item_type: UIItemType::SidebarAgentSectionHeader,
+        });
+
+        // Agent rows below header.
+        if collapsed {
+            return Ok(());
+        }
+
+        let mut y = header_y + header_h;
+        for (idx, agent) in agents.iter().enumerate() {
+            let is_expanded = expanded == Some(idx);
+            let row_h = base_row_h;
+            let detail_h = if is_expanded { row_h * 2.0 } else { 0.0 };
+
+            if y + row_h + detail_h > section_bottom {
+                break;
+            }
+
+            // Row background.
+            let row_rect = euclid::rect(section_x, y, section_w, row_h);
+            self.filled_rectangle(layers, 0, row_rect, bg)?;
+
+            // Status dot.
+            let dot_x = section_x + pad + 8.0 * dpi;
+            let dot_y = y + row_h * 0.5;
+            let dot_color = agent.vendor_dot_color();
+            let dot_rect = euclid::rect(dot_x - 4.0 * dpi, dot_y - 4.0 * dpi, 8.0 * dpi, 8.0 * dpi);
+            self.filled_rectangle(
+                layers,
+                1,
+                dot_rect,
+                srgb8_to_linear(dot_color.0, dot_color.1, dot_color.2),
+            )?;
+
+            // Vendor glyph + name.
+            let name_x = section_x + pad + 20.0 * dpi;
+            let name = format!("{} {}", agent.vendor_glyph(), agent.name);
+            self.paint_text(
+                layers,
+                &name,
+                name_x,
+                y + (row_h - cell_h) * 0.5,
+                section_w - 2.0 * pad - 40.0 * dpi,
+                fg,
+                bg,
+                true,
+            )?;
+
+            // Project label (right-aligned, dim).
+            let project = agent.project_label();
+            let project_w = (project.len() as f32) * cell_h * 0.6;
+            self.paint_text(
+                layers,
+                &project,
+                section_x + section_w - pad - project_w,
+                y + (row_h - cell_h) * 0.5,
+                project_w,
+                dim,
+                bg,
+                false,
+            )?;
+
+            // Push UIItem for the row click.
+            self.ui_items.push(UIItem {
+                x: section_x as usize,
+                y: y as usize,
+                width: section_w as usize,
+                height: row_h as usize,
+                item_type: UIItemType::SidebarAgentRow { index: idx },
+            });
+
+            // Expanded detail view.
+            if is_expanded {
+                let detail_y = y + row_h;
+                let detail_rect = euclid::rect(section_x, detail_y, section_w, detail_h);
+                self.filled_rectangle(layers, 0, detail_rect, bg)?;
+
+                let detail_x = section_x + pad + 20.0 * dpi;
+                let mut detail_line_y = detail_y + pad;
+
+                // Status + model line.
+                let status_label = agent.status.label();
+                let model_text = agent.model.as_deref().unwrap_or("");
+                let status_line = if model_text.is_empty() {
+                    status_label.to_string()
+                } else {
+                    format!("{} · {}", status_label, model_text)
+                };
+                self.paint_text(
+                    layers,
+                    &status_line,
+                    detail_x,
+                    detail_line_y,
+                    section_w - 2.0 * pad - 40.0 * dpi,
+                    fg,
+                    bg,
+                    false,
+                )?;
+                detail_line_y += cell_h + 2.0 * dpi;
+
+                // Project root line.
+                if let Some(ref root) = agent.project_root {
+                    let root_text = format!("📁 {}", root.display());
+                    self.paint_text(
+                        layers,
+                        &root_text,
+                        detail_x,
+                        detail_line_y,
+                        section_w - 2.0 * pad - 40.0 * dpi,
+                        dim,
+                        bg,
+                        false,
+                    )?;
+                    detail_line_y += cell_h + 2.0 * dpi;
+                }
+
+                // Activity hint.
+                if let Some(ref activity) = agent.activity {
+                    let activity_text = activity
+                        .current
+                        .as_ref()
+                        .map(|e| e.display_text())
+                        .unwrap_or_default();
+                    if !activity_text.is_empty() {
+                        self.paint_text(
+                            layers,
+                            &activity_text,
+                            detail_x,
+                            detail_line_y,
+                            section_w - 2.0 * pad - 40.0 * dpi,
+                            dim,
+                            bg,
+                            false,
+                        )?;
+                    }
+                }
+
+                // Push UIItem for the detail expand click.
+                self.ui_items.push(UIItem {
+                    x: section_x as usize,
+                    y: detail_y as usize,
+                    width: section_w as usize,
+                    height: detail_h as usize,
+                    item_type: UIItemType::SidebarAgentDetailExpand { index: idx },
+                });
+
+                // Push UIItem for the focus pane click.
+                self.ui_items.push(UIItem {
+                    x: (section_x + section_w - pad - 40.0 * dpi) as usize,
+                    y: (detail_y + pad) as usize,
+                    width: 40,
+                    height: cell_h as usize,
+                    item_type: UIItemType::SidebarAgentFocusPane { index: idx },
+                });
+            }
+
+            y += row_h + detail_h + 2.0 * dpi;
+        }
 
         Ok(())
     }
@@ -7690,6 +8679,31 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn vendor_session_conversion_preserves_identity_and_project() {
+        let session = VendorSession {
+            pid: 42,
+            vendor: AgentVendor::Codex,
+            session_id: "session-42".to_string(),
+            cwd: PathBuf::from("/tmp/project/src"),
+            project_root: Some(PathBuf::from("/tmp/project")),
+            name: Some("build agent".to_string()),
+            status: HerdStatus::Blocked,
+            blocked_reason: Some("permission".to_string()),
+            started_at: None,
+            status_changed_at: None,
+            subagents: Vec::new(),
+        };
+
+        let agent = herd_agent_from_vendor_session(&session);
+        assert_eq!(agent.name, "build agent");
+        assert_eq!(agent.provider, "codex");
+        assert_eq!(agent.vendor, AgentVendor::Codex);
+        assert_eq!(agent.status, HerdStatus::Blocked);
+        assert_eq!(agent.session_id.as_deref(), Some("session-42"));
+        assert_eq!(agent.project_root, Some(PathBuf::from("/tmp/project")));
     }
 
     #[test]

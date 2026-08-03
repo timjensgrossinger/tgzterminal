@@ -649,3 +649,32 @@ mod tests {
         assert!(!process_is_alive(0x7fff_fff0));
     }
 }
+
+/// Detector that reads Claude sessions from the filesystem.
+pub struct ClaudeDetector;
+
+impl crate::agent_herd::vendor::SessionSource for ClaudeDetector {
+    fn vendor(&self) -> crate::agent_herd::vendor::AgentVendor {
+        crate::agent_herd::vendor::AgentVendor::Claude
+    }
+
+    fn collect_sessions(&self, home: &std::path::Path) -> Vec<crate::agent_herd::vendor::VendorSession> {
+        let claude_sessions = collect_sessions(home, true);
+        claude_sessions
+            .into_iter()
+            .map(|s| crate::agent_herd::vendor::VendorSession {
+                pid: s.pid,
+                vendor: crate::agent_herd::vendor::AgentVendor::Claude,
+                session_id: s.session_id,
+                cwd: s.cwd,
+                project_root: s.project_root,
+                name: s.name,
+                status: s.status,
+                blocked_reason: s.blocked_reason,
+                started_at: s.started_at,
+                status_changed_at: s.status_changed_at,
+                subagents: s.subagents,
+            })
+            .collect()
+    }
+}

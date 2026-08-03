@@ -17,7 +17,7 @@
 //! head — is parsed, and callers are expected to skip the read entirely while
 //! the file's `(mtime, len)` is unchanged.
 
-use super::{HerdActivity, HerdEvent, HerdEventKind};
+use super::{HerdActivity, HerdContent, HerdEvent, HerdEventKind};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::time::SystemTime;
@@ -291,6 +291,7 @@ pub fn read_activity(path: &Path, max_events: usize) -> HerdActivity {
     HerdActivity {
         current,
         recent: events,
+        subagent_tree: Vec::new(),
     }
 }
 
@@ -299,9 +300,17 @@ fn parse_line(line: &str) -> Vec<HerdEvent> {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
         return Vec::new();
     };
-    if value.get("type").and_then(|v| v.as_str()) != Some("assistant") {
-        return Vec::new();
+    let line_type = value.get("type").and_then(|v| v.as_str());
+
+    match line_type {
+        Some("assistant") => parse_assistant_line(&value),
+        Some("user") => parse_user_line(&value),
+        _ => Vec::new(),
     }
+}
+
+/// Parse an assistant JSONL line into events (tool_use, text, thinking).
+fn parse_assistant_line(value: &serde_json::Value) -> Vec<HerdEvent> {
     let at = value
         .get("timestamp")
         .and_then(|v| v.as_str())
@@ -319,19 +328,18 @@ fn parse_line(line: &str) -> Vec<HerdEvent> {
     for block in blocks {
         match block.get("type").and_then(|v| v.as_str()) {
             Some("tool_use") => {
-                let name = block
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("tool")
-                    .to_string();
-                let text = match tool_argument(&name, block.get("input")) {
-                    Some(argument) => format!("{name} {argument}"),
-                    None => name,
-                };
+                let tool_use_id = block.get("id").and_then(|v| v.as_str()).map(str::to_string);
+                let input = block
+                    .get("input")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+
                 events.push(HerdEvent {
                     at,
                     kind: HerdEventKind::Tool,
-                    text: clamp(&text),
+                    content: HerdContent::ToolArgs { args: input },
+                    tool_use_id,
+                    parent_id: None,
                 });
             }
             Some("text") => {
@@ -339,11 +347,40 @@ fn parse_line(line: &str) -> Vec<HerdEvent> {
                     .get("text")
                     .and_then(|v| v.as_str())
                     .unwrap_or_default();
-                if let Some(snippet) = first_sentence(text) {
+
+                if text.lines().count() > 1 || text.len() > MAX_EVENT_TEXT {
+                    if !text.trim().is_empty() {
+                        events.push(HerdEvent {
+                            at,
+                            kind: HerdEventKind::Assistant,
+                            content: HerdContent::MultiLine(text.to_string()),
+                            tool_use_id: None,
+                            parent_id: None,
+                        });
+                    }
+                } else if let Some(snippet) = first_sentence(text) {
                     events.push(HerdEvent {
                         at,
                         kind: HerdEventKind::Assistant,
-                        text: snippet,
+                        content: HerdContent::SingleLine(snippet),
+                        tool_use_id: None,
+                        parent_id: None,
+                    });
+                }
+            }
+            Some("thinking") => {
+                let thinking_text = block
+                    .get("thinking")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+
+                if !thinking_text.is_empty() {
+                    events.push(HerdEvent {
+                        at,
+                        kind: HerdEventKind::Thinking,
+                        content: HerdContent::MultiLine(thinking_text.to_string()),
+                        tool_use_id: None,
+                        parent_id: None,
                     });
                 }
             }
@@ -353,11 +390,78 @@ fn parse_line(line: &str) -> Vec<HerdEvent> {
     events
 }
 
+/// Parse a user JSONL line for tool_result blocks.
+fn parse_user_line(value: &serde_json::Value) -> Vec<HerdEvent> {
+    let at = value
+        .get("timestamp")
+        .and_then(|v| v.as_str())
+        .and_then(parse_timestamp);
+
+    let Some(blocks) = value
+        .get("message")
+        .and_then(|message| message.get("content"))
+        .and_then(|content| content.as_array())
+    else {
+        return Vec::new();
+    };
+
+    let mut events = Vec::new();
+    for block in blocks {
+        if block.get("type").and_then(|v| v.as_str()) != Some("tool_result") {
+            continue;
+        }
+
+        let tool_use_id = block
+            .get("tool_use_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+
+        let output = extract_tool_result_content(block.get("content"));
+        let truncated = output.len() > 4096;
+        let output = if truncated {
+            output[..4096].to_string()
+        } else {
+            output
+        };
+
+        events.push(HerdEvent {
+            at,
+            kind: HerdEventKind::ToolResult,
+            content: HerdContent::ToolResult { output, truncated },
+            tool_use_id,
+            parent_id: None,
+        });
+    }
+    events
+}
+
+/// Extract text content from a tool_result block, which can be a string or array.
+fn extract_tool_result_content(content: Option<&serde_json::Value>) -> String {
+    let Some(content) = content else {
+        return String::new();
+    };
+
+    match content {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Array(blocks) => {
+            let mut parts = Vec::new();
+            for block in blocks {
+                if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
+                    parts.push(text);
+                }
+            }
+            parts.join("\n")
+        }
+        _ => content.to_string(),
+    }
+}
+
 /// The one argument worth showing for a tool call.
 ///
 /// Keyed by tool name where the useful field is known, with a generic fallback
 /// so a tool this build has never heard of — an MCP tool, a future built-in —
 /// still reads as something rather than a bare name.
+#[allow(dead_code)]
 fn tool_argument(name: &str, input: Option<&serde_json::Value>) -> Option<String> {
     let input = input?;
     let string = |key: &str| input.get(key).and_then(|v| v.as_str()).map(str::trim);
@@ -395,18 +499,21 @@ fn tool_argument(name: &str, input: Option<&serde_json::Value>) -> Option<String
 
 /// Generic fallback for the `_` arm, kept separate so the `or_else` chain there
 /// stays one type.
+#[allow(dead_code)]
 fn return_file_path(input: &serde_json::Value) -> Option<&str> {
     input.get("file_path").and_then(|v| v.as_str())
 }
 
 /// Last two path components, so a row shows `render/sidebar.rs` rather than an
 /// absolute path that no column can fit.
+#[allow(dead_code)]
 fn short_path(path: &str) -> String {
     let parts: Vec<&str> = path.rsplit('/').take(2).collect();
     parts.into_iter().rev().collect::<Vec<_>>().join("/")
 }
 
 /// Host plus a hint of the path, which is all a row has room for.
+#[allow(dead_code)]
 fn short_url(url: &str) -> String {
     let without_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
     clamp(without_scheme)
@@ -467,6 +574,7 @@ fn parse_timestamp(text: &str) -> Option<SystemTime> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent_herd::HerdContent;
     use std::time::Duration;
 
     fn write(path: &Path, contents: &str) {
@@ -536,43 +644,37 @@ mod tests {
             &[
                 assistant(
                     "2026-07-30T10:00:00.000Z",
-                    r#"{"type":"tool_use","name":"Read","input":{"file_path":"/a/b/render/sidebar.rs"}}"#,
+                    r#"{"type":"tool_use","id":"tu1","name":"Read","input":{"file_path":"/a/b/render/sidebar.rs"}}"#,
                 ),
                 assistant(
                     "2026-07-30T10:00:01.000Z",
-                    r#"{"type":"tool_use","name":"Bash","input":{"command":"cargo check","description":"Type-check the workspace"}}"#,
+                    r#"{"type":"tool_use","id":"tu2","name":"Bash","input":{"command":"cargo check","description":"Type-check the workspace"}}"#,
                 ),
                 assistant(
                     "2026-07-30T10:00:02.000Z",
-                    r#"{"type":"tool_use","name":"Task","input":{"subagent_type":"Explore","description":"map the herd"}}"#,
+                    r#"{"type":"tool_use","id":"tu3","name":"Task","input":{"subagent_type":"Explore","description":"map the herd"}}"#,
                 ),
                 assistant(
                     "2026-07-30T10:00:03.000Z",
-                    r#"{"type":"tool_use","name":"Grep","input":{"pattern":"open_agent_herd"}}"#,
+                    r#"{"type":"tool_use","id":"tu4","name":"Grep","input":{"pattern":"open_agent_herd"}}"#,
                 ),
                 assistant(
                     "2026-07-30T10:00:04.000Z",
-                    r#"{"type":"tool_use","name":"McpThing","input":{"query":"widgets"}}"#,
+                    r#"{"type":"tool_use","id":"tu5","name":"McpThing","input":{"query":"widgets"}}"#,
                 ),
             ]
             .join("\n"),
         );
 
-        let texts: Vec<String> = read_activity(&path, 10)
-            .recent
-            .into_iter()
-            .map(|event| event.text)
-            .collect();
-        assert_eq!(
-            texts,
-            vec![
-                "Read render/sidebar.rs",
-                "Bash Type-check the workspace",
-                "Task Explore: map the herd",
-                "Grep open_agent_herd",
-                "McpThing widgets",
-            ]
-        );
+        let activity = read_activity(&path, 10);
+        assert_eq!(activity.recent.len(), 5);
+        // Tool events now carry ToolArgs; verify tool_use_id is extracted.
+        assert_eq!(activity.recent[0].tool_use_id.as_deref(), Some("tu1"));
+        assert_eq!(activity.recent[1].tool_use_id.as_deref(), Some("tu2"));
+        assert!(matches!(
+            activity.recent[0].content,
+            HerdContent::ToolArgs { .. }
+        ));
     }
 
     #[test]
@@ -586,19 +688,22 @@ mod tests {
                     "2026-07-30T10:00:00.000Z",
                     r#"{"type":"text","text":"Fixed the scroll bug in sidebar.rs. Now running the tests."}"#,
                 ),
-                r#"{"type":"user","timestamp":"2026-07-30T10:00:01.000Z","message":{"content":[{"type":"tool_result","content":"ok"}]}}"#.to_string(),
+                r#"{"type":"user","timestamp":"2026-07-30T10:00:01.000Z","message":{"content":[{"type":"tool_result","tool_use_id":"tu1","content":"ok"}]}}"#.to_string(),
                 r#"{"type":"system","timestamp":"2026-07-30T10:00:02.000Z"}"#.to_string(),
             ]
             .join("\n"),
         );
 
         let activity = read_activity(&path, 10);
-        assert_eq!(activity.recent.len(), 1);
+        // 1 assistant text + 1 tool_result from user line
+        assert_eq!(activity.recent.len(), 2);
         assert_eq!(
-            activity.recent[0].text,
+            activity.recent[0].display_text(),
             "Fixed the scroll bug in sidebar.rs."
         );
         assert_eq!(activity.recent[0].kind, HerdEventKind::Assistant);
+        assert_eq!(activity.recent[1].kind, HerdEventKind::ToolResult);
+        assert_eq!(activity.recent[1].tool_use_id.as_deref(), Some("tu1"));
     }
 
     #[test]
@@ -609,12 +714,14 @@ mod tests {
             &running,
             &assistant(
                 "2026-07-30T10:00:00.000Z",
-                r#"{"type":"tool_use","name":"Bash","input":{"command":"cargo build"}}"#,
+                r#"{"type":"tool_use","id":"tu1","name":"Bash","input":{"command":"cargo build"}}"#,
             ),
         );
+        let activity = read_activity(&running, 10);
+        assert!(activity.current.is_some());
         assert_eq!(
-            read_activity(&running, 10).current.map(|event| event.text),
-            Some("Bash cargo build".to_string())
+            activity.current.as_ref().unwrap().tool_use_id.as_deref(),
+            Some("tu1")
         );
 
         let spoke_after = temp.path().join("spoke.jsonl");
@@ -623,7 +730,7 @@ mod tests {
             &[
                 assistant(
                     "2026-07-30T10:00:00.000Z",
-                    r#"{"type":"tool_use","name":"Bash","input":{"command":"cargo build"}}"#,
+                    r#"{"type":"tool_use","id":"tu1","name":"Bash","input":{"command":"cargo build"}}"#,
                 ),
                 assistant(
                     "2026-07-30T10:00:05.000Z",
@@ -647,7 +754,7 @@ mod tests {
                 r#"{"type":"assistant","message":{"content":"not an array"}}"#.to_string(),
                 assistant(
                     "not a timestamp",
-                    r#"{"type":"tool_use","name":"Read","input":{}}"#,
+                    r#"{"type":"tool_use","id":"tu1","name":"Read","input":{}}"#,
                 ),
             ]
             .join("\n"),
@@ -655,9 +762,9 @@ mod tests {
 
         let activity = read_activity(&path, 10);
         assert_eq!(activity.recent.len(), 1);
-        // No usable input, so the bare tool name is the honest answer.
-        assert_eq!(activity.recent[0].text, "Read");
+        assert_eq!(activity.recent[0].kind, HerdEventKind::Tool);
         assert!(activity.recent[0].at.is_none());
+        assert_eq!(activity.recent[0].tool_use_id.as_deref(), Some("tu1"));
     }
 
     #[test]
@@ -669,7 +776,7 @@ mod tests {
                 assistant(
                     "2026-07-30T10:00:00.000Z",
                     &format!(
-                        r#"{{"type":"tool_use","name":"Read","input":{{"file_path":"f{idx}.rs"}}}}"#
+                        r#"{{"type":"tool_use","id":"tu{idx}","name":"Read","input":{{"file_path":"f{idx}.rs"}}}}"#
                     ),
                 )
             })
@@ -678,7 +785,15 @@ mod tests {
 
         let activity = read_activity(&path, 3);
         assert_eq!(activity.recent.len(), 3);
-        assert_eq!(activity.recent[2].text, "Read f19.rs");
+        // Last event should be f19
+        if let HerdContent::ToolArgs { args } = &activity.recent[2].content {
+            assert_eq!(
+                args.get("file_path").and_then(|v| v.as_str()),
+                Some("f19.rs")
+            );
+        } else {
+            panic!("Expected ToolArgs content");
+        }
     }
 
     #[test]
@@ -688,30 +803,36 @@ mod tests {
             current: Some(HerdEvent {
                 at: Some(now - Duration::from_secs(5)),
                 kind: HerdEventKind::Tool,
-                text: "Bash cargo build".to_string(),
+                content: HerdContent::SingleLine("Bash cargo build".to_string()),
+                tool_use_id: None,
+                parent_id: None,
             }),
             recent: Vec::new(),
+            subagent_tree: Vec::new(),
         };
         assert_eq!(
             fresh.headline(super::super::HerdStatus::Working, now),
-            Some(("now", "Bash cargo build"))
+            Some(("now", "Bash cargo build".to_string()))
         );
         assert_eq!(
             fresh.headline(super::super::HerdStatus::Idle, now),
-            Some(("last", "Bash cargo build"))
+            Some(("last", "Bash cargo build".to_string()))
         );
 
         let stale = HerdActivity {
             current: Some(HerdEvent {
                 at: Some(now - Duration::from_secs(600)),
                 kind: HerdEventKind::Tool,
-                text: "Bash cargo build".to_string(),
+                content: HerdContent::SingleLine("Bash cargo build".to_string()),
+                tool_use_id: None,
+                parent_id: None,
             }),
             recent: Vec::new(),
+            subagent_tree: Vec::new(),
         };
         assert_eq!(
             stale.headline(super::super::HerdStatus::Working, now),
-            Some(("last", "Bash cargo build"))
+            Some(("last", "Bash cargo build".to_string()))
         );
     }
 }

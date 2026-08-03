@@ -644,7 +644,6 @@ pub enum KeyAssignment {
     ActivateCommandPalette,
     ActivateComposer,
     ToggleDockedInput,
-    ShowAgentHerd,
     ActivateWindow(usize),
     ActivateWindowRelative(isize),
     ActivateWindowRelativeNoWrap(isize),

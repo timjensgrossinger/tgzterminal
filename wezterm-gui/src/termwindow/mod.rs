@@ -110,7 +110,6 @@ impl PaneRemoteSignals {
 }
 use wezterm_term::{Alert, Progress, StableRowIndex, TerminalConfiguration, TerminalSize};
 
-pub mod agent_insight;
 mod agent_launch;
 pub mod background;
 pub mod box_model;
@@ -222,6 +221,15 @@ pub enum AgentCopyAction {
 pub enum UIItemType {
     TabBar(TabBarItem),
     CloseTab(usize),
+    /// Sidebar close button — separate from `CloseTab` so the dispatcher can
+    /// tell the vertical sidebar apart from the horizontal top tab bar and
+    /// emit surface-appropriate menu labels (Above/Below vs Left/Right).
+    SidebarCloseTab(usize),
+    /// A row in the right-click close-tab submenu.
+    CloseTabMenuItem {
+        source: CloseTabSource,
+        action: CloseTabMenuAction,
+    },
     SidebarTab {
         tab_idx: usize,
         active: bool,
@@ -279,6 +287,12 @@ pub enum UIItemType {
     SidebarNewTabMenuItem {
         index: usize,
     },
+    /// Sidebar button that opens the SSH quick-launch dropdown.
+    SidebarSshLaunchButton,
+    /// A row in the SSH quick-launch dropdown.
+    SidebarSshMenuItem {
+        domain_name: String,
+    },
     AgentToolbeltButton {
         pane_id: PaneId,
         action: AgentToolbeltAction,
@@ -291,6 +305,20 @@ pub enum UIItemType {
     ScrollThumb,
     BelowScrollThumb,
     Split(PositionedSplit),
+    /// Agent section header in the sidebar: toggle expand/collapse.
+    SidebarAgentSectionHeader,
+    /// A single agent row in the sidebar agent section.
+    SidebarAgentRow {
+        index: usize,
+    },
+    /// Clicking expands the detail view for this agent.
+    SidebarAgentDetailExpand {
+        index: usize,
+    },
+    /// Focus button: jump to the agent's pane.
+    SidebarAgentFocusPane {
+        index: usize,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -300,6 +328,40 @@ pub struct UIItem {
     pub width: usize,
     pub height: usize,
     pub item_type: UIItemType,
+}
+
+/// Which surface emitted the close-tab right-click: controls the submenu's
+/// labels and which direction the dropdown opens.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CloseTabSource {
+    /// Horizontal top tab bar: labels say "to the Left" / "to the Right".
+    TabBar,
+    /// Vertical sidebar: labels say "Above" / "Below".
+    Sidebar,
+}
+
+/// One row in the right-click close-tab submenu.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CloseTabMenuAction {
+    /// Close every tab above (sidebar) / to the left (tab bar) of the anchor.
+    CloseAbove,
+    /// Close every tab below (sidebar) / to the right (tab bar) of the anchor.
+    CloseBelow,
+    /// Close every tab except the anchor.
+    CloseAllOther,
+}
+
+/// Anchor for the right-click close-tab submenu. Rendered as an anchored
+/// dropdown mirroring the `agent_launch_menu` / `new_tab_menu` pattern.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CloseTabMenuState {
+    pub x: usize,
+    pub y: usize,
+    /// Which surface opened the menu — also carried on each row's item_type
+    /// so mouse-item handlers know which surface to act on.
+    pub source: CloseTabSource,
+    /// The tab whose × was right-clicked; preserved across all batch actions.
+    pub anchor_tab_idx: usize,
 }
 
 impl UIItem {
@@ -347,6 +409,16 @@ pub struct AgentLaunchMenuState {
     pub expanded: Option<ExpandedMenuRow>,
 }
 
+/// Anchor for the sidebar SSH quick-launch dropdown. Mirrors
+/// `AgentLaunchMenuState` but lists pre-registered `ssh_domains` (and any
+/// mosh/et sidecars) rather than installed agents. No expandable rows — every
+/// entry is a single click that spawns in a new tab.
+#[derive(Clone, Debug)]
+pub struct SshLaunchMenuState {
+    pub x: usize,
+    pub y: usize,
+}
+
 /// What a new-tab dropdown row spawns.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NewTabTarget {
@@ -379,6 +451,55 @@ pub struct AgentLauncherEntry {
     /// Fully resolved argv. Contains no `{...}` placeholders: the launcher
     /// passes the working directory out of band via `SpawnCommand::cwd`.
     pub argv: Vec<String>,
+}
+
+/// One pre-registered SSH connection offered by the sidebar SSH quick-launch
+/// dropdown. Built from `config.ssh_domains`; see `ssh_quick_launch_entries`.
+///
+/// For `WezTerm`/`Ssh` transports `argv` is empty and the spawn goes through
+/// `SpawnTabDomain::DomainName(domain_name)`. For `Mosh`/`Et` `argv` is the
+/// fully resolved command (absolute program path + `user@host` + extras) and
+/// the spawn runs in the local domain: those transports own their own
+/// reconnect state and bypass the wezterm mux.
+#[derive(Clone, Debug)]
+pub struct SshQuickLaunchEntry {
+    /// The `SshDomain::name` to pass to `SpawnTabDomain::DomainName` for
+    /// mux-driven transports. Carried on the row's `UIItemType` so the mouse
+    /// handler can look the entry up by name.
+    pub domain_name: String,
+    /// Display label — the bare host (with `user@` if set) for mosh/et,
+    /// otherwise the domain name with any `SSH:`/`SSHMUX:` prefix stripped.
+    pub label: String,
+    /// One-word transport tag rendered as a trailing badge so several entries
+    /// against the same host are distinguishable.
+    pub transport: config::SshTransport,
+    /// Resolved argv for `Mosh`/`Et` (absolute program path first); empty for
+    /// `WezTerm`/`Ssh`, which spawn through the mux domain instead.
+    pub argv: Vec<String>,
+}
+
+/// State for the agent section embedded in the sidebar.
+///
+/// Lives on TermWindow and is updated by a background refresh thread.
+/// The section renders as part of the sidebar paint pass.
+#[derive(Clone, Debug)]
+pub struct AgentHerdState {
+    /// Flattened agent list in display order.
+    pub agents: Vec<crate::agent_herd::HerdAgent>,
+    /// Which agent row is expanded inline (index into `agents`).
+    pub expanded: Option<usize>,
+    /// Whether the section is collapsed (hidden).
+    pub collapsed: bool,
+}
+
+impl Default for AgentHerdState {
+    fn default() -> Self {
+        Self {
+            agents: Vec::new(),
+            expanded: None,
+            collapsed: false,
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -602,6 +723,9 @@ pub struct TermWindow {
     agent_copy_menu: Option<AgentCopyMenuState>,
     agent_launch_menu: Option<AgentLaunchMenuState>,
     new_tab_menu: Option<AgentLaunchMenuState>,
+    close_tab_menu: Option<CloseTabMenuState>,
+    /// Sidebar SSH quick-launch dropdown anchor. `None` when closed.
+    ssh_launch_menu: Option<SshLaunchMenuState>,
     /// Shells/domains offered by the new-tab dropdown. Probing for shells
     /// touches the filesystem, so this is rebuilt only when the config
     /// generation changes.
@@ -614,12 +738,19 @@ pub struct TermWindow {
     /// Panes that are agent insight views. Membership is the identity check —
     /// these panes must never be badged as agents, split into, or picked as a
     /// target by anything that wants a shell.
-    agent_insight_panes: RefCell<HashSet<PaneId>>,
+    agent_herd_state: RefCell<AgentHerdState>,
+    /// Vendor session scan result. Filesystem work runs off the GUI thread.
+    agent_herd_session_cache: Option<(Instant, Arc<Vec<crate::agent_herd::vendor::VendorSession>>)>,
+    agent_herd_scan_pending: bool,
     adapter_cache: RefCell<Option<(usize, Arc<Vec<(String, AgentAdapterConfig)>>)>>,
     /// Installed-agent launcher entries, rebuilt only when the config
     /// generation changes. Building probes `$PATH`, so this must never be
     /// recomputed per frame.
     launcher_cache: RefCell<Option<(usize, Arc<Vec<AgentLauncherEntry>>)>>,
+    /// SSH quick-launch entries, rebuilt only when the config generation
+    /// changes. Building probes `$PATH` for `mosh`/`et`, so this must never
+    /// be recomputed per frame.
+    ssh_launcher_cache: RefCell<Option<(usize, Arc<Vec<SshQuickLaunchEntry>>)>>,
     /// Past sessions offered by the launcher's "Resume session" submenu, with
     /// the instant they were scanned.
     ///
@@ -992,13 +1123,21 @@ impl TermWindow {
             agent_copy_menu: None,
             agent_launch_menu: None,
             new_tab_menu: None,
+            close_tab_menu: None,
+            ssh_launch_menu: None,
             new_tab_menu_cache: RefCell::new(None),
             agent_launcher_project_root: tgz_ui_state::load_agent_launcher_project_root()
                 .unwrap_or(config.agent_ui.launcher.cwd == config::AgentLauncherCwd::ProjectRoot),
             agent_detection_cache: RefCell::new(HashMap::new()),
-            agent_insight_panes: RefCell::new(HashSet::new()),
+            agent_herd_state: RefCell::new(AgentHerdState {
+                collapsed: tgz_ui_state::load_agent_section_collapsed().unwrap_or(false),
+                ..AgentHerdState::default()
+            }),
+            agent_herd_session_cache: None,
+            agent_herd_scan_pending: false,
             adapter_cache: RefCell::new(None),
             launcher_cache: RefCell::new(None),
+            ssh_launcher_cache: RefCell::new(None),
             agent_session_cache: None,
             agent_session_scan_pending: false,
             composer_history: RefCell::new(Vec::new()),
@@ -3919,15 +4058,10 @@ done
             return shell;
         }
 
-        // Last resort: any pane that is not one of the utility views. The
-        // insight pane has no process, so the ssh/shell probes above never pick
-        // it, but this fallback would.
+        // Last resort: any pane that is not a utility view.
         tab.iter_panes_ignoring_zoom()
             .iter()
-            .find(|pos| {
-                !self.is_worktree_pane_for_file_browser(&pos.pane)
-                    && !self.is_agent_insight_pane(&pos.pane)
-            })
+            .find(|pos| !self.is_worktree_pane_for_file_browser(&pos.pane))
             .map(|pos| pos.pane.clone())
             .unwrap_or_else(|| Arc::clone(requested))
     }
@@ -4640,9 +4774,6 @@ done
             ToggleDockedInput => {
                 self.toggle_docked_input();
             }
-            ShowAgentHerd => {
-                self.toggle_agent_insight_pane(&pane);
-            }
             PromptInputLine(args) => self.show_prompt_input_line(args),
             InputSelector(args) => self.show_input_selector(args),
             Confirmation(args) => self.show_confirmation(args),
@@ -4854,6 +4985,78 @@ done
             self.assign_overlay(tab_id, overlay);
             promise::spawn::spawn(future).detach();
         } else {
+            mux.remove_tab(tab_id);
+        }
+    }
+
+    /// Collect the tab_ids for indices in `range` (exclusive of the anchor),
+    /// drop the mux window borrow, then remove them in descending order so
+    /// earlier indices remain valid during the sweep.
+    fn close_tabs_in_range(&mut self, range: std::ops::Range<usize>) {
+        let mux = Mux::get();
+        let mux_window = match mux.get_window(self.mux_window_id) {
+            Some(w) => w,
+            None => return,
+        };
+        let mut tab_ids: Vec<TabId> = Vec::new();
+        for i in range {
+            if let Some(tab) = mux_window.get_by_idx(i) {
+                tab_ids.push(tab.tab_id());
+            }
+        }
+        drop(mux_window);
+        for tab_id in tab_ids.into_iter().rev() {
+            mux.remove_tab(tab_id);
+        }
+    }
+
+    /// Close every tab above (idx < anchor). Preserves the anchor tab.
+    pub fn close_tabs_above(&mut self, anchor_tab_idx: usize) {
+        if anchor_tab_idx == 0 {
+            return;
+        }
+        self.close_tabs_in_range(0..anchor_tab_idx);
+    }
+
+    /// Close every tab below (idx > anchor). Preserves the anchor tab.
+    pub fn close_tabs_below(&mut self, anchor_tab_idx: usize) {
+        let mux = Mux::get();
+        let len = match mux.get_window(self.mux_window_id) {
+            Some(w) => w.len(),
+            None => return,
+        };
+        drop(mux);
+        if anchor_tab_idx + 1 >= len {
+            return;
+        }
+        self.close_tabs_in_range((anchor_tab_idx + 1)..len);
+    }
+
+    /// Close every tab except the anchor. Preserves the anchor tab.
+    ///
+    /// Collects all target tab_ids in a single pass before any removal so the
+    /// index shifts from closing the above-tabs don't invalidate the below-tab
+    /// indices — a problem two separate `close_tabs_in_range` calls would have.
+    pub fn close_all_other_tabs(&mut self, anchor_tab_idx: usize) {
+        let mux = Mux::get();
+        let mux_window = match mux.get_window(self.mux_window_id) {
+            Some(w) => w,
+            None => return,
+        };
+        let len = mux_window.len();
+        if len <= 1 {
+            return;
+        }
+        let mut tab_ids: Vec<TabId> = Vec::new();
+        for i in 0..len {
+            if i != anchor_tab_idx {
+                if let Some(tab) = mux_window.get_by_idx(i) {
+                    tab_ids.push(tab.tab_id());
+                }
+            }
+        }
+        drop(mux_window);
+        for tab_id in tab_ids.into_iter().rev() {
             mux.remove_tab(tab_id);
         }
     }

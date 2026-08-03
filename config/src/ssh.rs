@@ -30,6 +30,59 @@ impl Default for SshMultiplexing {
     }
 }
 
+/// Which transport a sidebar SSH quick-launch entry uses to reach the host.
+///
+/// `WezTerm` and `Ssh` are driven through the wezterm mux domain subsystem
+/// (`SpawnTabDomain::DomainName`). `Mosh` and `Et` bypass the mux entirely:
+/// they are opaque CLI programs that own their own reconnect state, so the
+/// sidebar spawns them as a plain shell command in a local-domain pane.
+/// `Custom` is the same bypass — it lets the user supply an arbitrary argv
+/// (a wrapper script, a Secretive-mediated `ssh` invocation, autossh, a
+/// tunneling helper), so the dropdown can reach hosts the four known
+/// transports cannot describe by name. The argv comes from the domain's
+/// `custom_command` field, plus `extra_args`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromDynamic, ToDynamic)]
+pub enum SshTransport {
+    /// wezterm's native SSH multiplexer (default for `SSHMUX:` entries).
+    WezTerm,
+    /// Plain `ssh` via the wezterm SSH domain with no multiplexing
+    /// (default for `SSH:` entries).
+    Ssh,
+    /// `mosh` — requires `mosh` (and `mosh-server` on the host) installed.
+    Mosh,
+    /// Eternal Terminal — requires `et` installed.
+    Et,
+    /// User-supplied argv (see `SshDomain::custom_command`). Used for
+    /// Secretive-mediated ssh, autossh, tunneling wrappers, or anything the
+    /// four built-in transports cannot name. Probes `$PATH` for the first
+    /// element; bad/missing binaries silently hide the row, matching the
+    /// mosh/et behavior.
+    Custom,
+}
+
+impl Default for SshTransport {
+    fn default() -> Self {
+        Self::WezTerm
+    }
+}
+
+impl SshTransport {
+    /// Bare command name the sidebar probes on `$PATH` to decide whether this
+    /// transport is installed. Returns `None` for transports that don't need
+    /// a sidecar binary (they go through the built-in wezterm-ssh path) — the
+    /// `Custom` variant is an exception: its binary is whatever the user put
+    /// first in `custom_command`, so no fixed name applies and probing is
+    /// done at the call site against that argv instead.
+    pub fn binary_name(self) -> Option<&'static str> {
+        match self {
+            SshTransport::WezTerm | SshTransport::Ssh => None,
+            SshTransport::Mosh => Some("mosh"),
+            SshTransport::Et => Some("et"),
+            SshTransport::Custom => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, FromDynamic, ToDynamic)]
 pub enum Shell {
     /// Unknown command shell: no assumptions can be made
@@ -95,6 +148,30 @@ pub struct SshDomain {
     /// to using `wezterm ssh` to connect.
     #[dynamic(default)]
     pub multiplexing: SshMultiplexing,
+
+    /// Which transport the sidebar SSH quick-launch uses to reach this host.
+    /// Defaults to `WezTerm`, the wezterm-native mux path. Set `Ssh` for plain
+    /// non-multiplexed ssh, `Mosh` for mobile-shell (requires `mosh` on
+    /// `$PATH`), or `Et` for Eternal Terminal (requires `et` on `$PATH`).
+    /// `Mosh`/`Et` bypass the wezterm mux and run as plain shell commands.
+    #[dynamic(default)]
+    pub transport: SshTransport,
+
+    /// Extra argv appended after the transport's own arguments when launching
+    /// via the sidebar SSH quick-launch. For `Mosh`/`Et` these go after the
+    /// resolved `user@host` (and any port flag); for `WezTerm`/`Ssh` they are
+    /// ignored (use `ssh_option` for those).
+    #[dynamic(default)]
+    pub extra_args: Vec<String>,
+
+    /// Literal argv run by the sidebar SSH quick-launch when
+    /// `transport = "Custom"`. Used for Secretive-mediated `ssh`, autossh,
+    /// tunneling helpers, or any wrapper program the four built-in transports
+    /// cannot express. Ignored for all other transports. The first element is
+    /// probed on `$PATH` (and the usual fallback dirs); a missing binary
+    /// silently hides the row. `extra_args` are appended after this argv.
+    #[dynamic(default)]
+    pub custom_command: Vec<String>,
 
     /// ssh_config option values
     #[dynamic(default)]

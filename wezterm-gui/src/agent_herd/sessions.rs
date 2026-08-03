@@ -28,7 +28,7 @@
 //! Even so this touches the filesystem and must never run on the GUI thread —
 //! callers scan on a worker thread and cache the result.
 
-use super::transcript;
+use super::{transcript, HerdActivity, HerdContent, HerdEvent, HerdEventKind, SubagentNode};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -799,6 +799,149 @@ fn is_codex_instruction_blob(text: &str) -> bool {
     head.starts_with("# AGENTS.md")
         || head.starts_with("<INSTRUCTIONS>")
         || head.contains("# AGENTS.md instructions")
+}
+
+// ---------------------------------------------------------------------------
+// Subagent tree building
+// ---------------------------------------------------------------------------
+
+/// Build recursive tree from flat subagent list.
+///
+/// Depth 0 = roots. Children follow their parent contiguously in the flat list.
+pub fn build_subagent_tree(flat: &[super::HerdSubagent]) -> Vec<SubagentNode> {
+    let mut nodes: Vec<SubagentNode> = flat
+        .iter()
+        .map(|sub| SubagentNode {
+            agent_id: sub.agent_id.clone(),
+            agent_type: sub.agent_type.clone(),
+            description: sub.description.clone(),
+            status: sub.status,
+            depth: sub.depth,
+            children: Vec::new(),
+            events: Vec::new(),
+        })
+        .collect();
+    assemble_tree(&mut nodes, 0)
+}
+
+/// Consume nodes from the front of the slice, building a tree at the given depth.
+///
+/// Each node's children are the contiguous run of following nodes at `depth + 1`.
+fn assemble_tree(nodes: &mut Vec<SubagentNode>, depth: u32) -> Vec<SubagentNode> {
+    let mut result = Vec::new();
+    while nodes.first().map_or(false, |n| n.depth == depth) {
+        let mut node = nodes.remove(0);
+        node.children = assemble_tree(nodes, depth + 1);
+        result.push(node);
+    }
+    result
+}
+
+/// Link events to subagent tree nodes by parent_id.
+///
+/// Events with parent_id = Some(agent_id) go into that node's events.
+/// Events with parent_id = None stay in top-level HerdActivity.recent.
+pub fn link_events_to_tree(tree: &mut Vec<SubagentNode>, events: Vec<HerdEvent>) {
+    for event in events {
+        if let Some(parent_id) = &event.parent_id {
+            if let Some(node) = tree.iter_mut().find_map(|root| root.find_mut(parent_id)) {
+                node.events.push(event);
+                continue;
+            }
+        }
+    }
+}
+
+/// Read subagent transcript events from disk.
+///
+/// Path: `<project_path>/<session_id>/subagents/<agent_id>.jsonl`
+/// Returns events with parent_id = Some(agent_id).
+pub fn read_subagent_transcript(
+    project_path: &Path,
+    session_id: &str,
+    agent_id: &str,
+) -> Vec<HerdEvent> {
+    let path = project_path
+        .join(session_id)
+        .join("subagents")
+        .join(format!("{agent_id}.jsonl"));
+    if !path.is_file() {
+        return Vec::new();
+    }
+    let mut events = Vec::new();
+    for line in transcript::tail_lines(&path, transcript::HEAD_LINES * 2) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if value.get("type").and_then(|v| v.as_str()) != Some("assistant") {
+            continue;
+        }
+        let at = value
+            .get("timestamp")
+            .and_then(|v| v.as_str())
+            .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
+            .map(SystemTime::from);
+        let Some(blocks) = value
+            .get("message")
+            .and_then(|msg| msg.get("content"))
+            .and_then(|c| c.as_array())
+        else {
+            continue;
+        };
+        for block in blocks {
+            match block.get("type").and_then(|v| v.as_str()) {
+                Some("tool_use") => {
+                    let name = block
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("tool")
+                        .to_string();
+                    events.push(HerdEvent {
+                        at,
+                        kind: HerdEventKind::Tool,
+                        content: HerdContent::SingleLine(name),
+                        tool_use_id: block.get("id").and_then(|v| v.as_str()).map(str::to_string),
+                        parent_id: Some(agent_id.to_string()),
+                    });
+                }
+                Some("text") => {
+                    let text = block
+                        .get("text")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    if !text.is_empty() {
+                        events.push(HerdEvent {
+                            at,
+                            kind: HerdEventKind::Assistant,
+                            content: HerdContent::MultiLine(text),
+                            tool_use_id: None,
+                            parent_id: Some(agent_id.to_string()),
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    events
+}
+
+/// Populate HerdActivity.subagent_tree from flat subagents list.
+///
+/// Builds tree, reads each subagent transcript, links events.
+pub fn populate_subagent_tree(
+    activity: &mut HerdActivity,
+    project_path: &Path,
+    session_id: &str,
+    flat_subagents: &[super::HerdSubagent],
+) {
+    let mut tree = build_subagent_tree(flat_subagents);
+    for sub in flat_subagents {
+        let events = read_subagent_transcript(project_path, session_id, &sub.agent_id);
+        link_events_to_tree(&mut tree, events);
+    }
+    activity.subagent_tree = tree;
 }
 
 #[cfg(test)]

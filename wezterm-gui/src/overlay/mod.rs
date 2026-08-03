@@ -6,7 +6,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 use wezterm_term::{TerminalConfiguration, TerminalSize};
 
-pub mod agent_herd;
 pub mod confirm;
 pub mod confirm_close_pane;
 pub mod copy;

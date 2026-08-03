@@ -2047,19 +2047,6 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             menubar: &["Edit"],
             icon: None,
         },
-        ShowAgentHerd => CommandDef {
-            brief: "Toggle Agent Insight Pane".into(),
-            doc: "Splits off a pane listing every detected agent, what it is \
-                  currently doing, and its subagents, with Stop and focus \
-                  controls. Press again to close it"
-                .into(),
-            // No default binding: leaves the user's map untouched. Also
-            // reachable from the sidebar agent button's dropdown.
-            keys: vec![],
-            args: &[ArgType::ActivePane],
-            menubar: &["Shell"],
-            icon: Some("md_view_dashboard_outline"),
-        },
     })
 }
 
@@ -2106,7 +2093,6 @@ fn compute_default_actions() -> Vec<KeyAssignment> {
         ActivateCommandPalette,
         ActivateComposer,
         ToggleDockedInput,
-        ShowAgentHerd,
         // ----------------- View
         DecreaseFontSize,
         IncreaseFontSize,

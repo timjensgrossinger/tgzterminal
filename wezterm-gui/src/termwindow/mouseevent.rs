@@ -1,8 +1,8 @@
 use crate::tabbar::TabBarItem;
 use crate::termwindow::{
     AgentCopyAction, AgentCopyMenuState, AgentLaunchMenuState, AgentToolbeltAction,
-    ExpandedMenuRow, GuiWin, MouseCapture, PositionedSplit, ScrollHit, TermWindowNotif, UIItem,
-    UIItemType, TMB,
+    CloseTabMenuAction, CloseTabMenuState, CloseTabSource, ExpandedMenuRow, GuiWin, MouseCapture,
+    PositionedSplit, ScrollHit, SshLaunchMenuState, TermWindowNotif, UIItem, UIItemType, TMB,
 };
 use ::window::{
     MouseButtons as WMB, MouseCursor, MouseEvent, MouseEventKind as WMEK, MousePress,
@@ -51,6 +51,8 @@ impl super::TermWindow {
             | UIItemType::SidebarScrollTrack
             | UIItemType::SidebarScrollThumb
             | UIItemType::CloseTab(_)
+            | UIItemType::SidebarCloseTab(_)
+            | UIItemType::CloseTabMenuItem { .. }
             | UIItemType::SidebarResize { .. }
             | UIItemType::SidebarSearch
             | UIItemType::SidebarAutoHideToggle
@@ -62,8 +64,14 @@ impl super::TermWindow {
             | UIItemType::SidebarAgentMenuTarget { .. }
             | UIItemType::SidebarAgentMenuResume
             | UIItemType::SidebarAgentMenuResumeSession { .. }
+            | UIItemType::SidebarAgentSectionHeader
+            | UIItemType::SidebarAgentRow { .. }
+            | UIItemType::SidebarAgentDetailExpand { .. }
+            | UIItemType::SidebarAgentFocusPane { .. }
             | UIItemType::SidebarNewTabMenuButton
             | UIItemType::SidebarNewTabMenuItem { .. }
+            | UIItemType::SidebarSshLaunchButton
+            | UIItemType::SidebarSshMenuItem { .. }
             | UIItemType::AgentToolbeltButton { .. }
             | UIItemType::AgentCopyMenuItem { .. }
             | UIItemType::AboveScrollThumb
@@ -84,6 +92,8 @@ impl super::TermWindow {
             | UIItemType::SidebarScrollTrack
             | UIItemType::SidebarScrollThumb
             | UIItemType::CloseTab(_)
+            | UIItemType::SidebarCloseTab(_)
+            | UIItemType::CloseTabMenuItem { .. }
             | UIItemType::SidebarResize { .. }
             | UIItemType::SidebarSearch
             | UIItemType::SidebarAutoHideToggle
@@ -95,8 +105,14 @@ impl super::TermWindow {
             | UIItemType::SidebarAgentMenuTarget { .. }
             | UIItemType::SidebarAgentMenuResume
             | UIItemType::SidebarAgentMenuResumeSession { .. }
+            | UIItemType::SidebarAgentSectionHeader
+            | UIItemType::SidebarAgentRow { .. }
+            | UIItemType::SidebarAgentDetailExpand { .. }
+            | UIItemType::SidebarAgentFocusPane { .. }
             | UIItemType::SidebarNewTabMenuButton
             | UIItemType::SidebarNewTabMenuItem { .. }
+            | UIItemType::SidebarSshLaunchButton
+            | UIItemType::SidebarSshMenuItem { .. }
             | UIItemType::AgentToolbeltButton { .. }
             | UIItemType::AgentCopyMenuItem { .. }
             | UIItemType::AboveScrollThumb
@@ -349,6 +365,10 @@ impl super::TermWindow {
                             | UIItemType::SidebarAgentMenuTarget { .. }
                             | UIItemType::SidebarAgentMenuResume
                             | UIItemType::SidebarAgentMenuResumeSession { .. }
+             | UIItemType::SidebarAgentSectionHeader
+             | UIItemType::SidebarAgentRow { .. }
+             | UIItemType::SidebarAgentDetailExpand { .. }
+             | UIItemType::SidebarAgentFocusPane { .. }
                     )
             );
             if !on_launch_menu {
@@ -369,6 +389,39 @@ impl super::TermWindow {
             );
             if !on_new_tab_menu {
                 self.new_tab_menu = None;
+                context.invalidate();
+            }
+        }
+
+        if matches!(&event.kind, WMEK::Press(_)) && self.close_tab_menu.is_some() {
+            let on_close_tab_menu = matches!(
+                &ui_item,
+                Some(item)
+                    if matches!(
+                        item.item_type,
+                        UIItemType::CloseTab(_)
+                            | UIItemType::SidebarCloseTab(_)
+                            | UIItemType::CloseTabMenuItem { .. }
+                    )
+            );
+            if !on_close_tab_menu {
+                self.close_tab_menu = None;
+                context.invalidate();
+            }
+        }
+
+        if matches!(&event.kind, WMEK::Press(_)) && self.ssh_launch_menu.is_some() {
+            let on_ssh_menu = matches!(
+                &ui_item,
+                Some(item)
+                    if matches!(
+                        item.item_type,
+                        UIItemType::SidebarSshLaunchButton
+                            | UIItemType::SidebarSshMenuItem { .. }
+                    )
+            );
+            if !on_ssh_menu {
+                self.ssh_launch_menu = None;
                 context.invalidate();
             }
         }
@@ -557,7 +610,13 @@ impl super::TermWindow {
                 self.mouse_event_split(item, split, event, context);
             }
             UIItemType::CloseTab(idx) => {
-                self.mouse_event_close_tab(idx, event, context);
+                self.mouse_event_close_tab(idx, CloseTabSource::TabBar, &item, event, context);
+            }
+            UIItemType::SidebarCloseTab(idx) => {
+                self.mouse_event_close_tab(idx, CloseTabSource::Sidebar, &item, event, context);
+            }
+            UIItemType::CloseTabMenuItem { source, action } => {
+                self.mouse_event_close_tab_menu_item(source, action, event, context);
             }
             UIItemType::SidebarTab { tab_idx, .. } => {
                 self.mouse_event_sidebar_tab(item, tab_idx, event, context);
@@ -613,11 +672,29 @@ impl super::TermWindow {
             UIItemType::SidebarAgentMenuResumeSession { index } => {
                 self.mouse_event_sidebar_agent_menu_resume_session(index, event, context);
             }
+            UIItemType::SidebarAgentSectionHeader => {
+                self.mouse_event_sidebar_agent_section_header(event, context);
+            }
+            UIItemType::SidebarAgentRow { index } => {
+                self.mouse_event_sidebar_agent_row(index, event, context);
+            }
+            UIItemType::SidebarAgentDetailExpand { index } => {
+                self.mouse_event_sidebar_agent_detail_expand(index, event, context);
+            }
+            UIItemType::SidebarAgentFocusPane { index } => {
+                self.mouse_event_sidebar_agent_focus_pane(index, event, context);
+            }
             UIItemType::SidebarNewTabMenuButton => {
                 self.mouse_event_sidebar_new_tab_menu_button(item, event, context);
             }
             UIItemType::SidebarNewTabMenuItem { index } => {
                 self.mouse_event_sidebar_new_tab_menu_item(index, event, context);
+            }
+            UIItemType::SidebarSshLaunchButton => {
+                self.mouse_event_sidebar_ssh_launch_button(item, event, context);
+            }
+            UIItemType::SidebarSshMenuItem { domain_name } => {
+                self.mouse_event_sidebar_ssh_menu_item(domain_name, event, context);
             }
             UIItemType::AgentToolbeltButton { pane_id, action } => {
                 self.mouse_event_agent_toolbelt_button(pane_id, action, event, context);
@@ -766,6 +843,15 @@ impl super::TermWindow {
                     if let Some(entry) = self.agent_launcher_default() {
                         let invert = event.modifiers.contains(KeyModifiers::ALT);
                         self.launch_agent(&entry, None, invert);
+                    } else {
+                        // No adapter configured: open the dropdown so the
+                        // "Agent insight" and "Resume session" rows are
+                        // still reachable.
+                        self.agent_launch_menu = Some(AgentLaunchMenuState {
+                            x: item.x,
+                            y: item.y,
+                            expanded: None,
+                        });
                     }
                 }
             }
@@ -862,6 +948,49 @@ impl super::TermWindow {
         context.invalidate();
     }
 
+    /// Sidebar SSH quick-launch button: toggles the dropdown of pre-registered
+    /// ssh_domains. Other open menus dismiss themselves through their own
+    /// outside-click guards when this click is dispatched.
+    fn mouse_event_sidebar_ssh_launch_button(
+        &mut self,
+        item: UIItem,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        if event.kind == WMEK::Release(MousePress::Left) {
+            self.pressed_ui_item = None;
+            // Don't open an empty dropdown — the button shouldn't have been
+            // hit-testable in that case, but be defensive against a stale
+            // render between the cache rebuild and the click.
+            if self.ssh_quick_launch_entries().is_empty() {
+                self.ssh_launch_menu = None;
+            } else {
+                self.ssh_launch_menu = match self.ssh_launch_menu.take() {
+                    Some(_) => None,
+                    None => Some(SshLaunchMenuState {
+                        x: item.x,
+                        y: item.y,
+                    }),
+                };
+            }
+        }
+        context.invalidate();
+    }
+
+    fn mouse_event_sidebar_ssh_menu_item(
+        &mut self,
+        domain_name: String,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        if event.kind == WMEK::Release(MousePress::Left) {
+            self.ssh_launch_menu = None;
+            self.pressed_ui_item = None;
+            self.spawn_ssh_quick_launch_entry(&domain_name);
+        }
+        context.invalidate();
+    }
+
     fn mouse_event_sidebar_agent_menu_project_root_toggle(
         &mut self,
         event: MouseEvent,
@@ -927,9 +1056,6 @@ impl super::TermWindow {
             // Unlike the project-root tick, this acts on the tab layout, so
             // the menu has no reason to stay open.
             self.agent_launch_menu = None;
-            if let Some(pane) = self.get_active_pane_no_overlay() {
-                self.toggle_agent_insight_pane(&pane);
-            }
         }
         context.invalidate();
     }
@@ -1275,10 +1401,15 @@ impl super::TermWindow {
     pub fn mouse_event_close_tab(
         &mut self,
         idx: usize,
+        source: CloseTabSource,
+        item: &UIItem,
         event: MouseEvent,
         context: &dyn WindowOps,
     ) {
-        let close_type = UIItemType::CloseTab(idx);
+        let close_type = match source {
+            CloseTabSource::TabBar => UIItemType::CloseTab(idx),
+            CloseTabSource::Sidebar => UIItemType::SidebarCloseTab(idx),
+        };
         match event.kind {
             WMEK::Press(MousePress::Left) => {
                 self.pressed_ui_item.replace(close_type);
@@ -1288,6 +1419,52 @@ impl super::TermWindow {
                 if self.pressed_ui_item.as_ref() == Some(&close_type) {
                     log::debug!("Should close tab {}", idx);
                     self.close_specific_tab(idx, true);
+                }
+            }
+            WMEK::Press(MousePress::Right) => {
+                if self.config.tab_close_context_menu {
+                    self.close_tab_menu = Some(CloseTabMenuState {
+                        x: item.x,
+                        y: item.y + item.height,
+                        source,
+                        anchor_tab_idx: idx,
+                    });
+                    context.invalidate();
+                }
+            }
+            _ => {}
+        }
+        context.set_cursor(Some(MouseCursor::Arrow));
+    }
+
+    pub fn mouse_event_close_tab_menu_item(
+        &mut self,
+        source: CloseTabSource,
+        action: CloseTabMenuAction,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        let item_type = UIItemType::CloseTabMenuItem { source, action };
+        match event.kind {
+            WMEK::Press(MousePress::Left) => {
+                self.pressed_ui_item.replace(item_type);
+                context.invalidate();
+            }
+            WMEK::Release(MousePress::Left) => {
+                if self.pressed_ui_item.as_ref() == Some(&item_type) {
+                    let anchor_tab_idx = self
+                        .close_tab_menu
+                        .as_ref()
+                        .map(|m| m.anchor_tab_idx)
+                        .unwrap_or(0);
+                    self.close_tab_menu = None;
+                    match action {
+                        CloseTabMenuAction::CloseAbove => self.close_tabs_above(anchor_tab_idx),
+                        CloseTabMenuAction::CloseBelow => self.close_tabs_below(anchor_tab_idx),
+                        CloseTabMenuAction::CloseAllOther => {
+                            self.close_all_other_tabs(anchor_tab_idx)
+                        }
+                    }
                 }
             }
             _ => {}
@@ -1932,6 +2109,69 @@ impl super::TermWindow {
             _ => {
                 context.invalidate();
             }
+        }
+    }
+
+    fn mouse_event_sidebar_agent_section_header(
+        &mut self,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        if event.kind == WMEK::Release(MousePress::Left) {
+            let collapsed = {
+                let mut state = self.agent_herd_state.borrow_mut();
+                state.collapsed = !state.collapsed;
+                state.collapsed
+            };
+            crate::termwindow::tgz_ui_state::save_agent_section_collapsed(collapsed);
+            context.invalidate();
+        }
+    }
+
+    fn mouse_event_sidebar_agent_row(
+        &mut self,
+        index: usize,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        if event.kind == WMEK::Release(MousePress::Left) {
+            let mut state = self.agent_herd_state.borrow_mut();
+            state.expanded = if state.expanded == Some(index) {
+                None
+            } else {
+                Some(index)
+            };
+            drop(state);
+            context.invalidate();
+        }
+    }
+
+    fn mouse_event_sidebar_agent_detail_expand(
+        &mut self,
+        index: usize,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        self.mouse_event_sidebar_agent_row(index, event, context);
+    }
+
+    fn mouse_event_sidebar_agent_focus_pane(
+        &mut self,
+        index: usize,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        if event.kind != WMEK::Release(MousePress::Left) {
+            return;
+        }
+        let pane_id = {
+            let state = self.agent_herd_state.borrow();
+            state.agents.get(index).and_then(|a| a.pane_id)
+        };
+        if let Some(pane_id) = pane_id {
+            let mux = Mux::get();
+            mux.focus_pane_and_containing_tab(pane_id).ok();
+            context.invalidate();
         }
     }
 }

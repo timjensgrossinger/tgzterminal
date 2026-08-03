@@ -26,6 +26,10 @@ struct TgzUiState {
     /// restart this is a hint, not a guarantee.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sidebar_expanded_tabs: Option<Vec<usize>>,
+
+    /// Whether the agent section in the sidebar is collapsed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    agent_section_collapsed: Option<bool>,
 }
 
 fn state_path() -> PathBuf {
@@ -77,6 +81,18 @@ pub fn save_sidebar_expanded_tabs(tabs: &HashSet<usize>) {
     let mut tabs: Vec<usize> = tabs.iter().copied().collect();
     tabs.sort_unstable();
     state.sidebar_expanded_tabs = Some(tabs);
+    write_state(&state);
+}
+
+/// Persisted agent section collapsed state, or `None` when unset.
+pub fn load_agent_section_collapsed() -> Option<bool> {
+    read_state().agent_section_collapsed
+}
+
+/// Persist the agent section collapsed state. Best-effort.
+pub fn save_agent_section_collapsed(value: bool) {
+    let mut state = read_state();
+    state.agent_section_collapsed = Some(value);
     write_state(&state);
 }
 
@@ -181,6 +197,7 @@ mod tests {
             sidebar_auto_hide: Some(false),
             agent_launcher_project_root: Some(true),
             sidebar_expanded_tabs: Some(vec![0, 2]),
+            agent_section_collapsed: None,
         };
         let json = serde_json::to_string_pretty(&state).unwrap();
         let parsed: TgzUiState = serde_json::from_str(&json).unwrap();
@@ -216,6 +233,7 @@ mod tests {
             sidebar_auto_hide: None,
             agent_launcher_project_root: Some(true),
             sidebar_expanded_tabs: Some(vec![0]),
+            agent_section_collapsed: None,
         });
         assert_eq!(overrides, Value::Null);
     }
