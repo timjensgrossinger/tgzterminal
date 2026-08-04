@@ -22,8 +22,8 @@ pub struct RenderMetrics {
 impl RenderMetrics {
     pub fn with_font_metrics(metrics: &FontMetrics) -> Self {
         let (cell_height, cell_width) = (
-            metrics.cell_height.get().ceil() as usize,
-            metrics.cell_width.get().ceil() as usize,
+            (metrics.cell_height.get().ceil() as usize).max(1),
+            (metrics.cell_width.get().ceil() as usize).max(1),
         );
 
         let underline_height = metrics.underline_thickness.get().round().max(1.) as isize;
@@ -77,8 +77,8 @@ impl RenderMetrics {
         let cell_width = fonts.config().cell_width;
 
         let (cell_height, cell_width) = (
-            (metrics.cell_height.get() * line_height).ceil() as usize,
-            (metrics.cell_width.get() * cell_width).ceil() as usize,
+            ((metrics.cell_height.get() * line_height).ceil() as usize).max(1),
+            ((metrics.cell_width.get() * cell_width).ceil() as usize).max(1),
         );
 
         // When line_height != 1.0, we want to adjust the baseline position

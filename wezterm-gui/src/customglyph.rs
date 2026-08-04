@@ -5018,6 +5018,10 @@ impl GlyphCache {
         blend_mode: BlendMode,
     ) {
         let (width, height) = buffer.image_dimensions();
+        if width == 0 || height == 0 {
+            // A zero-sized buffer would panic tiny_skia's PixmapMut::from_bytes.
+            return;
+        }
         let mut pixmap =
             PixmapMut::from_bytes(buffer.pixel_data_slice_mut(), width as u32, height as u32)
                 .expect("make pixmap from existing bitmap");
