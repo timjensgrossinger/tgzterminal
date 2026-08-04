@@ -5420,46 +5420,50 @@ impl GlyphCache {
                 let topleft_offset_y = dot_area_height / 2. - square_length / 2.;
 
                 let (width, height) = buffer.image_dimensions();
-                let mut pixmap = PixmapMut::from_bytes(
-                    buffer.pixel_data_slice_mut(),
-                    width as u32,
-                    height as u32,
-                )
-                .expect("make pixmap from existing bitmap");
-                let mut paint = Paint::default();
-                paint.set_color(tiny_skia::Color::WHITE);
-                paint.force_hq_pipeline = true;
-                paint.anti_alias = true;
-                let identity = Transform::identity();
+                if width == 0 || height == 0 {
+                    // A zero-sized buffer would panic tiny_skia's PixmapMut::from_bytes.
+                } else {
+                    let mut pixmap = PixmapMut::from_bytes(
+                        buffer.pixel_data_slice_mut(),
+                        width as u32,
+                        height as u32,
+                    )
+                    .expect("make pixmap from existing bitmap");
+                    let mut paint = Paint::default();
+                    paint.set_color(tiny_skia::Color::WHITE);
+                    paint.force_hq_pipeline = true;
+                    paint.anti_alias = true;
+                    let identity = Transform::identity();
 
-                const BIT_MASK_AND_DOT_POSITION: [(u8, f32, f32); 8] = [
-                    (1 << 0, 0., 0.),
-                    (1 << 1, 0., 1.),
-                    (1 << 2, 0., 2.),
-                    (1 << 3, 1., 0.),
-                    (1 << 4, 1., 1.),
-                    (1 << 5, 1., 2.),
-                    (1 << 6, 0., 3.),
-                    (1 << 7, 1., 3.),
-                ];
-                for (bit_mask, dot_pos_x, dot_pos_y) in &BIT_MASK_AND_DOT_POSITION {
-                    if dots_pattern & bit_mask == 0 {
-                        // Bit for this dot position is not set
-                        continue;
+                    const BIT_MASK_AND_DOT_POSITION: [(u8, f32, f32); 8] = [
+                        (1 << 0, 0., 0.),
+                        (1 << 1, 0., 1.),
+                        (1 << 2, 0., 2.),
+                        (1 << 3, 1., 0.),
+                        (1 << 4, 1., 1.),
+                        (1 << 5, 1., 2.),
+                        (1 << 6, 0., 3.),
+                        (1 << 7, 1., 3.),
+                    ];
+                    for (bit_mask, dot_pos_x, dot_pos_y) in &BIT_MASK_AND_DOT_POSITION {
+                        if dots_pattern & bit_mask == 0 {
+                            // Bit for this dot position is not set
+                            continue;
+                        }
+                        let topleft_x = (*dot_pos_x) * dot_area_width + topleft_offset_x;
+                        let topleft_y = (*dot_pos_y) * dot_area_height + topleft_offset_y;
+
+                        let path = PathBuilder::from_rect(
+                            tiny_skia::Rect::from_xywh(
+                                topleft_x,
+                                topleft_y,
+                                square_length,
+                                square_length,
+                            )
+                            .expect("valid rect"),
+                        );
+                        pixmap.fill_path(&path, &paint, FillRule::Winding, identity, None);
                     }
-                    let topleft_x = (*dot_pos_x) * dot_area_width + topleft_offset_x;
-                    let topleft_y = (*dot_pos_y) * dot_area_height + topleft_offset_y;
-
-                    let path = PathBuilder::from_rect(
-                        tiny_skia::Rect::from_xywh(
-                            topleft_x,
-                            topleft_y,
-                            square_length,
-                            square_length,
-                        )
-                        .expect("valid rect"),
-                    );
-                    pixmap.fill_path(&path, &paint, FillRule::Winding, identity, None);
                 }
             }
             BlockKey::Progress(chunks) => {
@@ -6013,6 +6017,10 @@ impl GlyphCache {
 // Fill a rectangular region described by the x and y ranges
 fn fill_rect(buffer: &mut Image, x: Range<f32>, y: Range<f32>, intensity: BlockAlpha) {
     let (width, height) = buffer.image_dimensions();
+    if width == 0 || height == 0 {
+        // A zero-sized buffer would panic tiny_skia's PixmapMut::from_bytes.
+        return;
+    }
     let mut pixmap =
         PixmapMut::from_bytes(buffer.pixel_data_slice_mut(), width as u32, height as u32)
             .expect("make pixmap from existing bitmap");
