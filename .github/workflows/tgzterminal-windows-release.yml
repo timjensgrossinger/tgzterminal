@@ -134,9 +134,10 @@ jobs:
             exit 1
           fi
           iscc.exe //DMyAppName=TGZTerminal //DMyAppVersion="${VERSION}" //FTGZTerminal-Setup ci/windows-installer.iss
-          # iscc writes next to the .iss (ci/).
-          if [ -f ci/TGZTerminal-Setup.exe ]; then
-            echo "SETUP_EXE=ci/TGZTerminal-Setup.exe" >> "$GITHUB_ENV"
+          # ci/windows-installer.iss has OutputDir=.. (relative to the .iss file
+          # in ci/), so iscc writes the installer to the repo root, not ci/.
+          if [ -f TGZTerminal-Setup.exe ]; then
+            echo "SETUP_EXE=TGZTerminal-Setup.exe" >> "$GITHUB_ENV"
           fi
 
       - name: Upload artifacts
@@ -145,7 +146,7 @@ jobs:
           name: TGZTerminal-windows
           path: |
             TGZTerminal-windows-portable-*.zip
-            ci/TGZTerminal-Setup.exe
+            TGZTerminal-Setup.exe
           if-no-files-found: warn
 
       - name: Publish to GitHub Release
@@ -154,5 +155,5 @@ jobs:
         with:
           files: |
             TGZTerminal-windows-portable-*.zip
-            ci/TGZTerminal-Setup.exe
+            TGZTerminal-Setup.exe
           fail_on_unmatched_files: false
