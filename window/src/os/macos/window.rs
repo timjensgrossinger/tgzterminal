@@ -478,10 +478,9 @@ impl Window {
             let conn = Connection::get().expect("Connection::init has not been called");
 
             let window_id = conn.next_window_id();
-            let events = WindowEventSender::new(event_handler);
+            let events = Rc::new(RefCell::new(WindowEventSender::new(event_handler)));
 
             let inner = Rc::new(RefCell::new(Inner {
-                events,
                 view_id: None,
                 window_id,
                 window: None,
@@ -586,7 +585,7 @@ impl Window {
             window.setTitle_(*nsstring(&name));
             window.setAcceptsMouseMovedEvents_(YES);
 
-            let view = WindowView::init_with_frame(&inner, rect)?;
+            let view = WindowView::init_with_frame(&inner, events.clone(), rect)?;
             view.setAutoresizingMask_(NSViewHeightSizable | NSViewWidthSizable);
 
             let () = msg_send![
@@ -621,8 +620,8 @@ impl Window {
             let height = backing_frame.size.height;
 
             let dpi = dpi_for_window_screen(*window, &config)
-                .unwrap_or(crate::DEFAULT_DPI * (backing_frame.size.width / frame.size.width))
-                as usize;
+                .and_then(valid_dpi)
+                .unwrap_or_else(|| dpi_from_backing_frame(frame, backing_frame));
 
             let weak_window = window.weak();
             let window_handle = Window {
@@ -640,25 +639,25 @@ impl Window {
                 .borrow_mut()
                 .insert(window_id, Rc::clone(&window_inner));
 
-            inner
-                .borrow_mut()
-                .events
-                .assign_window(window_handle.clone());
+            events.borrow_mut().assign_window(window_handle.clone());
 
             window_handle.config_did_change(&config);
 
             // Synthesize a resize event immediately; this allows
             // the embedding application an opportunity to discover
             // the dpi and adjust for display scaling
-            inner.borrow_mut().events.dispatch(WindowEvent::Resized {
-                dimensions: Dimensions {
-                    pixel_width: width as usize,
-                    pixel_height: height as usize,
-                    dpi,
+            WindowEventSender::dispatch_reentrant(
+                &events,
+                WindowEvent::Resized {
+                    dimensions: Dimensions {
+                        pixel_width: width as usize,
+                        pixel_height: height as usize,
+                        dpi,
+                    },
+                    window_state: WindowState::default(),
+                    live_resizing: false,
                 },
-                window_state: WindowState::default(),
-                live_resizing: false,
-            });
+            );
 
             Ok(window_handle)
         }
@@ -724,11 +723,10 @@ impl WindowOps for Window {
     {
         Connection::with_window_inner(self.id, move |inner| {
             if let Some(window_view) = WindowView::get_this(unsafe { &**inner.view }) {
-                window_view
-                    .inner
-                    .borrow_mut()
-                    .events
-                    .dispatch(WindowEvent::Notification(Box::new(t)));
+                WindowEventSender::dispatch_reentrant(
+                    &window_view.events,
+                    WindowEvent::Notification(Box::new(t)),
+                );
             }
             Ok(())
         });
@@ -795,11 +793,10 @@ impl WindowOps for Window {
         Connection::with_window_inner(self.id, move |inner| {
             inner.set_inner_size(width, height);
             if let Some(window_view) = WindowView::get_this(unsafe { &**inner.view }) {
-                window_view
-                    .inner
-                    .borrow_mut()
-                    .events
-                    .dispatch(WindowEvent::SetInnerSizeCompleted);
+                WindowEventSender::dispatch_reentrant(
+                    &window_view.events,
+                    WindowEvent::SetInnerSizeCompleted,
+                );
             }
             Ok(())
         });
@@ -1534,7 +1531,6 @@ struct DeadKeyState {
 }
 
 struct Inner {
-    events: WindowEventSender,
     view_id: Option<WeakPtr>,
     window: Option<WeakPtr>,
     screen_changed: bool,
@@ -1824,6 +1820,7 @@ const TITLEBAR_VIEW_NAME: &str = "NSTitlebarContainerView";
 
 struct WindowView {
     inner: Rc<RefCell<Inner>>,
+    events: Rc<RefCell<WindowEventSender>>,
 }
 
 pub fn superclass(this: &Object) -> &'static Class {
@@ -1842,6 +1839,28 @@ fn dpi_for_window_screen(ns_window: *mut Object, config: &ConfigHandle) -> Optio
     let info = crate::os::macos::connection::nsscreen_to_screen_info(screen);
 
     config.dpi_by_screen.get(&info.name).copied()
+}
+
+fn dpi_from_backing_frame(frame: NSRect, backing_frame: NSRect) -> usize {
+    let scale = if frame.size.width > 0.0 && frame.size.height > 0.0 {
+        backing_frame.size.width / frame.size.width
+    } else {
+        1.0
+    };
+    let dpi = crate::DEFAULT_DPI * scale;
+    if dpi.is_finite() && dpi >= 1.0 {
+        dpi as usize
+    } else {
+        crate::DEFAULT_DPI as usize
+    }
+}
+
+fn valid_dpi(dpi: f64) -> Option<usize> {
+    if dpi.is_finite() && dpi > 0.0 {
+        Some(dpi as usize)
+    } else {
+        None
+    }
 }
 
 #[allow(clippy::identity_op)]
@@ -2012,11 +2031,12 @@ impl WindowView {
             };
 
             inner.ime_text.clear();
-            inner
-                .events
-                .dispatch(WindowEvent::AdviseDeadKeyStatus(DeadKeyStatus::None));
+            WindowEventSender::dispatch_reentrant(
+                &myself.events,
+                WindowEvent::AdviseDeadKeyStatus(DeadKeyStatus::None),
+            );
             inner.ime_last_event.replace(event.clone());
-            inner.events.dispatch(WindowEvent::KeyEvent(event));
+            WindowEventSender::dispatch_reentrant(&myself.events, WindowEvent::KeyEvent(event));
             inner.ime_state = ImeDisposition::Acted;
         }
     }
@@ -2053,7 +2073,7 @@ impl WindowView {
             .normalize_shift();
 
             inner.ime_last_event.replace(event.clone());
-            inner.events.dispatch(WindowEvent::KeyEvent(event));
+            inner.events.borrow_mut().dispatch(WindowEvent::KeyEvent(event));
             */
             inner.ime_last_event.take();
             inner.ime_state = ImeDisposition::Acted;
@@ -2152,10 +2172,10 @@ impl WindowView {
     extern "C" fn view_did_change_effective_appearance(this: &mut Object, _sel: Sel) {
         if let Some(this) = Self::get_this(this) {
             let appearance = Connection::get().unwrap().get_appearance();
-            this.inner
-                .borrow_mut()
-                .events
-                .dispatch(WindowEvent::AppearanceChanged(appearance));
+            WindowEventSender::dispatch_reentrant(
+                &this.events,
+                WindowEvent::AppearanceChanged(appearance),
+            );
         }
     }
 
@@ -2194,10 +2214,7 @@ impl WindowView {
         }
 
         if let Some(this) = Self::get_this(this) {
-            this.inner
-                .borrow_mut()
-                .events
-                .dispatch(WindowEvent::CloseRequested);
+            WindowEventSender::dispatch_reentrant(&this.events, WindowEvent::CloseRequested);
             NO
         } else {
             YES
@@ -2242,20 +2259,14 @@ impl WindowView {
 
     extern "C" fn did_become_key(this: &mut Object, _sel: Sel, _id: id) {
         if let Some(this) = Self::get_this(this) {
-            this.inner
-                .borrow_mut()
-                .events
-                .dispatch(WindowEvent::FocusChanged(true));
+            WindowEventSender::dispatch_reentrant(&this.events, WindowEvent::FocusChanged(true));
             this.update_application_presentation(true);
         }
     }
 
     extern "C" fn did_resign_key(this: &mut Object, _sel: Sel, _id: id) {
         if let Some(this) = Self::get_this(this) {
-            this.inner
-                .borrow_mut()
-                .events
-                .dispatch(WindowEvent::FocusChanged(false));
+            WindowEventSender::dispatch_reentrant(&this.events, WindowEvent::FocusChanged(false));
             this.update_application_presentation(true);
         }
     }
@@ -2288,10 +2299,10 @@ impl WindowView {
         match action {
             Some(RepresentedItem::KeyAssignment(action)) => {
                 if let Some(this) = Self::get_this(this) {
-                    this.inner
-                        .borrow_mut()
-                        .events
-                        .dispatch(WindowEvent::PerformKeyAssignment(action));
+                    WindowEventSender::dispatch_reentrant(
+                        &this.events,
+                        WindowEvent::PerformKeyAssignment(action),
+                    );
                 }
             }
             None => {}
@@ -2301,10 +2312,7 @@ impl WindowView {
     extern "C" fn window_will_close(this: &mut Object, _sel: Sel, _id: id) {
         if let Some(this) = Self::get_this(this) {
             // Advise the window of its impending death
-            this.inner
-                .borrow_mut()
-                .events
-                .dispatch(WindowEvent::Destroyed);
+            WindowEventSender::dispatch_reentrant(&this.events, WindowEvent::Destroyed);
             this.update_application_presentation(false);
             let conn = Connection::get().unwrap();
             let window_id = this.inner.borrow_mut().window_id;
@@ -2341,8 +2349,7 @@ impl WindowView {
         };
 
         if let Some(myself) = Self::get_this(this) {
-            let mut inner = myself.inner.borrow_mut();
-            inner.events.dispatch(WindowEvent::MouseEvent(event));
+            WindowEventSender::dispatch_reentrant(&myself.events, WindowEvent::MouseEvent(event));
         }
     }
 
@@ -2461,11 +2468,7 @@ impl WindowView {
 
     extern "C" fn mouse_exited(this: &mut Object, _sel: Sel, _nsevent: id) {
         if let Some(myself) = Self::get_this(this) {
-            myself
-                .inner
-                .borrow_mut()
-                .events
-                .dispatch(WindowEvent::MouseLeave);
+            WindowEventSender::dispatch_reentrant(&myself.events, WindowEvent::MouseLeave);
         }
     }
 
@@ -2540,10 +2543,10 @@ impl WindowView {
             handled: raw_key_handled.clone(),
         };
         if let Some(myself) = Self::get_this(this) {
-            let mut inner = myself.inner.borrow_mut();
-            inner
-                .events
-                .dispatch(WindowEvent::RawKeyEvent(raw_key_event.clone()));
+            WindowEventSender::dispatch_reentrant(
+                &myself.events,
+                WindowEvent::RawKeyEvent(raw_key_event.clone()),
+            );
         }
 
         if raw_key_handled.is_handled() {
@@ -2563,16 +2566,18 @@ impl WindowView {
                 match inner.translate_key_event(virtual_key, modifier_flags) {
                     Ok(TranslateStatus::Composing(composing)) => {
                         // Next key press in dead key sequence is pending.
-                        inner.events.dispatch(WindowEvent::AdviseDeadKeyStatus(
-                            DeadKeyStatus::Composing(composing),
-                        ));
+                        WindowEventSender::dispatch_reentrant(
+                            &myself.events,
+                            WindowEvent::AdviseDeadKeyStatus(DeadKeyStatus::Composing(composing)),
+                        );
 
                         return;
                     }
                     Ok(TranslateStatus::Composed(translated)) => {
-                        inner
-                            .events
-                            .dispatch(WindowEvent::AdviseDeadKeyStatus(DeadKeyStatus::None));
+                        WindowEventSender::dispatch_reentrant(
+                            &myself.events,
+                            WindowEvent::AdviseDeadKeyStatus(DeadKeyStatus::None),
+                        );
                         let event = KeyEvent {
                             key: KeyCode::composed(&translated),
                             modifiers: Modifiers::NONE,
@@ -2581,7 +2586,10 @@ impl WindowView {
                             key_is_down,
                             raw: None,
                         };
-                        inner.events.dispatch(WindowEvent::KeyEvent(event));
+                        WindowEventSender::dispatch_reentrant(
+                            &myself.events,
+                            WindowEvent::KeyEvent(event),
+                        );
                         return;
                     }
                     Ok(TranslateStatus::NotDead) => {
@@ -2677,9 +2685,10 @@ impl WindowView {
                             } else {
                                 DeadKeyStatus::None
                             };
-                            inner
-                                .events
-                                .dispatch(WindowEvent::AdviseDeadKeyStatus(status));
+                            WindowEventSender::dispatch_reentrant(
+                                &myself.events,
+                                WindowEvent::AdviseDeadKeyStatus(status),
+                            );
                             return;
                         }
                         ImeDisposition::None => {
@@ -2696,7 +2705,10 @@ impl WindowView {
                                 if let Some(event) =
                                     inner.ime_last_event.as_ref().map(|e| e.clone())
                                 {
-                                    inner.events.dispatch(WindowEvent::KeyEvent(event));
+                                    WindowEventSender::dispatch_reentrant(
+                                        &myself.events,
+                                        WindowEvent::KeyEvent(event),
+                                    );
                                     return;
                                 }
                             }
@@ -2705,9 +2717,10 @@ impl WindowView {
                             } else {
                                 DeadKeyStatus::Composing(inner.ime_text.clone())
                             };
-                            inner
-                                .events
-                                .dispatch(WindowEvent::AdviseDeadKeyStatus(status));
+                            WindowEventSender::dispatch_reentrant(
+                                &myself.events,
+                                WindowEvent::AdviseDeadKeyStatus(status),
+                            );
                             return;
                         }
                     }
@@ -2821,7 +2834,7 @@ impl WindowView {
                 if key_is_down {
                     inner.ime_last_event.take();
                 }
-                inner.events.dispatch(WindowEvent::KeyEvent(event));
+                WindowEventSender::dispatch_reentrant(&myself.events, WindowEvent::KeyEvent(event));
             }
         }
     }
@@ -2866,10 +2879,10 @@ impl WindowView {
         };
 
         if let Some(myself) = Self::get_this(this) {
-            let mut inner = myself.inner.borrow_mut();
-            inner
-                .events
-                .dispatch(WindowEvent::AdviseModifiersLedStatus(modifiers, leds));
+            WindowEventSender::dispatch_reentrant(
+                &myself.events,
+                WindowEvent::AdviseModifiersLedStatus(modifiers, leds),
+            );
         }
     }
 
@@ -2907,6 +2920,22 @@ impl WindowView {
     }
 
     extern "C" fn did_resize(this: &mut Object, _sel: Sel, _notification: id) {
+        let frame = unsafe { NSView::frame(this as *mut _) };
+        let backing_frame = unsafe { NSView::convertRectToBacking(this as *mut _, frame) };
+        let width = backing_frame.size.width;
+        let height = backing_frame.size.height;
+
+        if !width.is_finite() || !height.is_finite() || width < 1.0 || height < 1.0 {
+            // AppKit can report a zero-sized backing view while a display is
+            // being attached or detached. Do not turn that transient state
+            // into a resize event or a GPU reconfiguration.
+            log::trace!("ignoring transient zero-sized macOS resize");
+            if let Some(this) = Self::get_this(this) {
+                this.inner.borrow_mut().screen_changed = true;
+            }
+            return;
+        }
+
         if let Some(this) = Self::get_this(this) {
             let inner = this.inner.borrow_mut();
 
@@ -2915,10 +2944,6 @@ impl WindowView {
             }
         }
 
-        let frame = unsafe { NSView::frame(this as *mut _) };
-        let backing_frame = unsafe { NSView::convertRectToBacking(this as *mut _, frame) };
-        let width = backing_frame.size.width;
-        let height = backing_frame.size.height;
         if let Some(this) = Self::get_this(this) {
             let mut inner = this.inner.borrow_mut();
 
@@ -2976,10 +3001,10 @@ impl WindowView {
                     let window = window.load();
                     dpi_for_window_screen(*window, &inner.config)
                 })
-                .unwrap_or(crate::DEFAULT_DPI * (backing_frame.size.width / frame.size.width))
-                as usize;
+                .and_then(valid_dpi)
+                .unwrap_or_else(|| dpi_from_backing_frame(frame, backing_frame));
 
-            inner.events.dispatch(WindowEvent::Resized {
+            let event = WindowEvent::Resized {
                 dimensions: Dimensions {
                     pixel_width: width as usize,
                     pixel_height: height as usize,
@@ -2987,7 +3012,10 @@ impl WindowView {
                 },
                 window_state: screen_state | level_state,
                 live_resizing,
-            });
+            };
+            inner.screen_changed = false;
+            drop(inner);
+            WindowEventSender::dispatch_reentrant(&this.events, event);
         }
     }
 
@@ -3060,15 +3088,25 @@ impl WindowView {
                 return;
             }
 
-            if inner.paint_throttled {
+            let repaint = if inner.paint_throttled {
                 inner.invalidated = true;
+                None
             } else {
-                inner.events.dispatch(WindowEvent::NeedRepaint);
                 inner.invalidated = false;
                 inner.paint_throttled = true;
 
                 let window_id = inner.window_id;
-                let max_fps = inner.config.max_fps;
+                let max_fps = inner.config.max_fps.clamp(1, 1000);
+                Some((window_id, max_fps))
+            };
+            drop(inner);
+
+            if let Some((window_id, max_fps)) = repaint {
+                // Do not invoke the application callback while holding the
+                // WindowView::inner RefCell borrow. Rendering can synchronously
+                // schedule another invalidation during display changes.
+                WindowEventSender::dispatch_reentrant(&this.events, WindowEvent::NeedRepaint);
+
                 promise::spawn::spawn(async move {
                     async_io::Timer::after(std::time::Duration::from_millis(1000 / max_fps as u64))
                         .await;
@@ -3092,8 +3130,6 @@ impl WindowView {
 
     extern "C" fn dragging_entered(this: &mut Object, _: Sel, sender: id) -> BOOL {
         if let Some(this) = Self::get_this(this) {
-            let mut inner = this.inner.borrow_mut();
-
             let pb: id = unsafe { msg_send![sender, draggingPasteboard] };
             if pb.is_null() {
                 return NO;
@@ -3111,15 +3147,13 @@ impl WindowView {
                     PathBuf::from(path)
                 })
                 .collect::<Vec<_>>();
-            inner.events.dispatch(WindowEvent::DraggedFile(paths));
+            WindowEventSender::dispatch_reentrant(&this.events, WindowEvent::DraggedFile(paths));
         }
         YES
     }
 
     extern "C" fn perform_drag_operation(this: &mut Object, _: Sel, sender: id) -> BOOL {
         if let Some(this) = Self::get_this(this) {
-            let mut inner = this.inner.borrow_mut();
-
             let pb: id = unsafe { msg_send![sender, draggingPasteboard] };
             if pb.is_null() {
                 return NO;
@@ -3137,7 +3171,7 @@ impl WindowView {
                     PathBuf::from(path)
                 })
                 .collect::<Vec<_>>();
-            inner.events.dispatch(WindowEvent::DroppedFile(paths));
+            WindowEventSender::dispatch_reentrant(&this.events, WindowEvent::DroppedFile(paths));
         }
         YES
     }
@@ -3153,7 +3187,11 @@ impl WindowView {
         }
     }
 
-    fn init_with_frame(inner: &Rc<RefCell<Inner>>, rect: NSRect) -> anyhow::Result<StrongPtr> {
+    fn init_with_frame(
+        inner: &Rc<RefCell<Inner>>,
+        events: Rc<RefCell<WindowEventSender>>,
+        rect: NSRect,
+    ) -> anyhow::Result<StrongPtr> {
         let cls = Self::get_class();
 
         let view_id: id = unsafe { msg_send![cls, alloc] };
@@ -3162,6 +3200,7 @@ impl WindowView {
 
         let view = Box::into_raw(Box::new(Self {
             inner: Rc::clone(&inner),
+            events,
         }));
 
         unsafe {
@@ -3436,5 +3475,39 @@ impl WindowView {
         }
 
         cls.register()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_sized_backing_frame_uses_default_dpi() {
+        let frame = NSRect::new(NSPoint::new(0., 0.), NSSize::new(0., 0.));
+        let backing = NSRect::new(NSPoint::new(0., 0.), NSSize::new(0., 0.));
+
+        assert_eq!(
+            dpi_from_backing_frame(frame, backing),
+            crate::DEFAULT_DPI as usize
+        );
+    }
+
+    #[test]
+    fn backing_frame_scale_is_preserved_for_valid_frames() {
+        let frame = NSRect::new(NSPoint::new(0., 0.), NSSize::new(800., 600.));
+        let backing = NSRect::new(NSPoint::new(0., 0.), NSSize::new(1600., 1200.));
+
+        assert_eq!(
+            dpi_from_backing_frame(frame, backing),
+            (crate::DEFAULT_DPI * 2.0) as usize
+        );
+    }
+
+    #[test]
+    fn invalid_configured_dpi_uses_the_automatic_fallback() {
+        assert_eq!(valid_dpi(0.0), None);
+        assert_eq!(valid_dpi(f64::NAN), None);
+        assert_eq!(valid_dpi(144.0), Some(144));
     }
 }

@@ -4,6 +4,10 @@ use config::window::WindowLevel;
 use config::{ConfigHandle, Dimension, GeometryOrigin};
 use promise::Future;
 use std::any::Any;
+#[cfg(target_os = "macos")]
+use std::cell::RefCell;
+#[cfg(target_os = "macos")]
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::rc::Rc;
 use thiserror::Error;
@@ -221,6 +225,10 @@ pub enum WindowEvent {
 pub struct WindowEventSender {
     handler: Box<dyn FnMut(WindowEvent, &Window)>,
     window: Option<Window>,
+    #[cfg(target_os = "macos")]
+    pending: VecDeque<WindowEvent>,
+    #[cfg(target_os = "macos")]
+    dispatching: bool,
 }
 
 impl WindowEventSender {
@@ -228,6 +236,10 @@ impl WindowEventSender {
         Self {
             handler: Box::new(handler),
             window: None,
+            #[cfg(target_os = "macos")]
+            pending: VecDeque::new(),
+            #[cfg(target_os = "macos")]
+            dispatching: false,
         }
     }
 
@@ -239,6 +251,55 @@ impl WindowEventSender {
         if let Some(window) = self.window.as_ref() {
             log::trace!("{:?}", event);
             (self.handler)(event, window);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn dispatch_reentrant(sender: &Rc<RefCell<Self>>, event: WindowEvent) {
+        let sender = Rc::clone(sender);
+        let mut handler = {
+            let mut state = sender.borrow_mut();
+            if state.window.is_none() {
+                return;
+            }
+            if matches!(&event, WindowEvent::NeedRepaint)
+                && state
+                    .pending
+                    .iter()
+                    .any(|queued| matches!(queued, WindowEvent::NeedRepaint))
+            {
+                return;
+            }
+            state.pending.push_back(event);
+            if state.dispatching {
+                return;
+            }
+            state.dispatching = true;
+            std::mem::replace(&mut state.handler, Box::new(|_, _| {}))
+        };
+
+        loop {
+            let next = {
+                let mut state = sender.borrow_mut();
+                match state.pending.pop_front() {
+                    Some(event) => state.window.clone().map(|window| (event, window)),
+                    None => {
+                        state.handler = handler;
+                        state.dispatching = false;
+                        return;
+                    }
+                }
+            };
+
+            if let Some((event, window)) = next {
+                handler(event, &window);
+            } else {
+                let mut state = sender.borrow_mut();
+                state.pending.clear();
+                state.handler = handler;
+                state.dispatching = false;
+                return;
+            }
         }
     }
 }

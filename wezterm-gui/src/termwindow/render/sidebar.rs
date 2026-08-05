@@ -919,6 +919,86 @@ fn sidebar_bottom_row_layout(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SidebarAgentHerdMetrics {
+    base_row_h: f32,
+    header_h: f32,
+    pad: f32,
+    content_h: f32,
+    detail_h: f32,
+}
+
+impl SidebarAgentHerdMetrics {
+    fn reserved_h(self) -> f32 {
+        self.header_h + self.content_h
+    }
+}
+
+fn sidebar_agent_herd_metrics(
+    cell_h: f32,
+    dpi: f32,
+    collapsed: bool,
+    agent_count: usize,
+    expanded: Option<usize>,
+    max_content_h: Option<f32>,
+) -> SidebarAgentHerdMetrics {
+    let dpi = dpi.clamp(1.0, 2.5);
+    let base_row_h = cell_h + 4.0 * dpi;
+    let header_h = cell_h + 8.0 * dpi;
+    let pad = 8.0 * dpi;
+    let full_detail_h = if !collapsed && expanded.is_some_and(|index| index < agent_count) {
+        // Detail can contain status, project root, and activity lines. Keep
+        // enough room for all three, including the top padding and line gaps.
+        pad + 3.0 * cell_h + 4.0 * dpi
+    } else {
+        0.0
+    };
+    let row_h = base_row_h + 2.0 * dpi;
+    let max_rows_without_detail = max_content_h
+        .map(|height| (height.max(0.) / row_h).floor() as usize)
+        .unwrap_or(agent_count);
+    let max_rows_with_detail = max_content_h
+        .map(|height| ((height - full_detail_h).max(0.) / row_h).floor() as usize)
+        .unwrap_or(agent_count);
+    let expanded_can_be_visible = !collapsed
+        && expanded.is_some_and(|index| index < agent_count && index < max_rows_without_detail);
+    let detail_h =
+        if expanded_can_be_visible && expanded.is_some_and(|index| index < max_rows_with_detail) {
+            full_detail_h
+        } else {
+            0.0
+        };
+    let max_rows = if detail_h > 0.0 {
+        max_rows_with_detail
+    } else {
+        max_rows_without_detail
+    };
+    let layout_agent_count = agent_count.min(max_rows);
+    let content_h = if collapsed {
+        0.0
+    } else {
+        layout_agent_count as f32 * row_h + detail_h
+    };
+
+    SidebarAgentHerdMetrics {
+        base_row_h,
+        header_h,
+        pad,
+        content_h,
+        detail_h,
+    }
+}
+
+fn sidebar_bottom_controls_top(
+    top: f32,
+    height: f32,
+    row_height: f32,
+    bottom_button_rows: f32,
+) -> f32 {
+    let new_tab_y = top + height - INSET - row_height;
+    new_tab_y - GAP - (bottom_button_rows - 1.) * (row_height + GAP)
+}
+
 /// Density factor applied to the configured sidebar widths.
 ///
 /// The config values are calibrated for a 2x display, so a 2x display uses them
@@ -4638,6 +4718,57 @@ impl crate::TermWindow {
         query_matches(title, metadata, query)
     }
 
+    fn sidebar_agent_herd_metrics(
+        &self,
+        top: f32,
+        height: f32,
+        row_height: f32,
+    ) -> Option<SidebarAgentHerdMetrics> {
+        if !self.config.agent_ui.section.enabled
+            || (self.config.sidebar_auto_hide && !self.sidebar_auto_hide_open)
+        {
+            return None;
+        }
+
+        let state = self.agent_herd_state.borrow();
+        let metrics = sidebar_agent_herd_metrics(
+            self.render_metrics.cell_size.height as f32,
+            self.dimensions.dpi as f32 / 96.0,
+            state.collapsed,
+            state.agents.len(),
+            state.expanded,
+            None,
+        );
+        let section_bottom = self.sidebar_bottom_controls_top(top, height, row_height);
+        let mut list_top = top + INSET;
+        list_top += row_height + GAP;
+        let available_h = (section_bottom - list_top).max(0.);
+        if available_h < metrics.header_h {
+            return None;
+        }
+
+        Some(sidebar_agent_herd_metrics(
+            self.render_metrics.cell_size.height as f32,
+            self.dimensions.dpi as f32 / 96.0,
+            state.collapsed,
+            state.agents.len(),
+            state.expanded,
+            Some(available_h - metrics.header_h),
+        ))
+    }
+
+    fn sidebar_bottom_controls_top(&self, top: f32, height: f32, row_height: f32) -> f32 {
+        sidebar_bottom_controls_top(top, height, row_height, self.sidebar_bottom_button_rows())
+    }
+
+    fn sidebar_tab_list_bottom(&self, top: f32, height: f32, row_height: f32) -> f32 {
+        self.sidebar_bottom_controls_top(top, height, row_height)
+            - self
+                .sidebar_agent_herd_metrics(top, height, row_height)
+                .map(|metrics| metrics.reserved_h())
+                .unwrap_or(0.)
+    }
+
     /// Rows reserved below the tab list for the bottom buttons.
     ///
     /// Expanded: "+ New Tab" plus the shared Worktree/agent row. Collapsed:
@@ -4688,13 +4819,11 @@ impl crate::TermWindow {
             .max(0.);
         let row_height = self.sidebar_row_height() as f32;
         let mut list_top = top + INSET;
-        if width > 96 {
+        if width > 96 || !(self.config.sidebar_auto_hide && !self.sidebar_auto_hide_open) {
             list_top += row_height + GAP;
         }
-        let bottom_button_rows = self.sidebar_bottom_button_rows();
-        let new_tab_y = top + height - INSET - row_height;
         let list_height =
-            (new_tab_y - GAP - (bottom_button_rows - 1.) * (row_height + GAP) - list_top).max(0.);
+            (self.sidebar_tab_list_bottom(top, height, row_height) - list_top).max(0.);
         ((list_height + GAP) / (row_height + GAP)).floor() as usize
     }
 
@@ -4743,13 +4872,13 @@ impl crate::TermWindow {
             .max(0.);
         let row_height = self.sidebar_row_height() as f32;
         let mut list_top = top + INSET;
-        if self.sidebar_width() > 96 {
+        if self.sidebar_width() > 96
+            || !(self.config.sidebar_auto_hide && !self.sidebar_auto_hide_open)
+        {
             list_top += row_height + GAP;
         }
-        let bottom_button_rows = self.sidebar_bottom_button_rows();
-        let new_tab_y = top + height - INSET - row_height;
         let list_height =
-            (new_tab_y - GAP - (bottom_button_rows - 1.) * (row_height + GAP) - list_top).max(0.);
+            (self.sidebar_tab_list_bottom(top, height, row_height) - list_top).max(0.);
         let list_top = list_top + SIDEBAR_SCROLLBAR_INSET_Y;
         let list_height = list_height - SIDEBAR_SCROLLBAR_INSET_Y * 2.;
         if list_height <= 0. {
@@ -7107,6 +7236,11 @@ impl crate::TermWindow {
             y += toggle_side + GAP;
         }
 
+        // Refresh the state before calculating the tab-list bounds so the
+        // agent section reserves the same height that it will render below.
+        if self.config.agent_ui.section.enabled {
+            self.update_agent_herd_state();
+        }
         let rows = self.sidebar_rows();
 
         let tab_list_top = y;
@@ -7115,10 +7249,8 @@ impl crate::TermWindow {
         // the glyphs; only the corner radius (an unscaled px constant) needs
         // dpi_scale applied.
         let tab_row_radius = (RADIUS * dpi_scale).min(row_height as f32 * 0.5);
-        let bottom_button_rows = self.sidebar_bottom_button_rows();
         let new_tab_y = top + height - INSET - row_height as f32;
-        let tab_list_bottom =
-            new_tab_y - GAP - (bottom_button_rows - 1.) * (row_height as f32 + GAP);
+        let tab_list_bottom = self.sidebar_tab_list_bottom(top, height, row_height as f32);
         let tab_list_height = (tab_list_bottom - tab_list_top).max(0.);
         let row_stride = row_height as f32 + GAP;
         let visible_rows = ((tab_list_height + GAP) / row_stride).floor().max(0.) as usize;
@@ -7937,15 +8069,17 @@ impl crate::TermWindow {
             item_type: UIItemType::SidebarResize { start_width: width },
         });
 
-        // Agent herd section: rendered below the tab list.
-        if self.config.agent_ui.section.enabled {
-            self.update_agent_herd_state();
+        // Agent herd section: rendered between the tab list and bottom controls.
+        if let Some(agent_metrics) = self.sidebar_agent_herd_metrics(top, height, row_height as f32)
+        {
+            let section_bottom = self.sidebar_bottom_controls_top(top, height, row_height as f32);
             self.paint_agent_herd_section(
                 layers,
                 width as f32,
                 left as f32,
                 top as f32,
-                height as f32,
+                section_bottom,
+                agent_metrics,
             )?;
         }
 
@@ -8164,7 +8298,7 @@ impl crate::TermWindow {
         Ok(())
     }
 
-    /// Paint the agent herd section at the bottom of the sidebar.
+    /// Paint the agent herd section above the sidebar's bottom controls.
     /// Renders a collapsible header with agent count, then each agent
     /// as a row with a status dot, vendor glyph, name, project, and
     /// status hint. Clicking a row expands inline detail.
@@ -8174,7 +8308,8 @@ impl crate::TermWindow {
         sidebar_w: f32,
         sidebar_left: f32,
         sidebar_top: f32,
-        sidebar_h: f32,
+        section_bottom: f32,
+        metrics: SidebarAgentHerdMetrics,
     ) -> anyhow::Result<()> {
         let state = self.agent_herd_state.borrow();
         let collapsed = state.collapsed;
@@ -8184,9 +8319,9 @@ impl crate::TermWindow {
 
         let dpi = (self.dimensions.dpi as f32 / 96.0).clamp(1.0, 2.5);
         let cell_h = self.render_metrics.cell_size.height as f32;
-        let base_row_h = cell_h + 4.0 * dpi;
-        let header_h = cell_h + 8.0 * dpi;
-        let pad = 8.0 * dpi;
+        let base_row_h = metrics.base_row_h;
+        let header_h = metrics.header_h;
+        let pad = metrics.pad;
 
         let colors = self
             .config
@@ -8200,28 +8335,16 @@ impl crate::TermWindow {
 
         let section_x = sidebar_left;
         let section_w = sidebar_w;
+        let hit_x = match self.config.sidebar_position {
+            SidebarPosition::Left => section_x,
+            SidebarPosition::Right => section_x + RESIZE_GRIP_W as f32,
+        };
+        let hit_w = (section_w - RESIZE_GRIP_W as f32).max(0.);
 
         // Count agents.
         let agent_count = agents.len();
 
-        // Anchor section to bottom while keeping header visible when collapsed.
-        let content_h = if collapsed {
-            0.0
-        } else {
-            agents
-                .iter()
-                .enumerate()
-                .map(|(idx, _)| {
-                    let detail_h = if expanded == Some(idx) {
-                        base_row_h * 2.0
-                    } else {
-                        0.0
-                    };
-                    base_row_h + detail_h + 2.0 * dpi
-                })
-                .sum()
-        };
-        let section_bottom = sidebar_top + sidebar_h - pad;
+        let content_h = metrics.content_h;
         let header_y = (section_bottom - header_h - content_h).max(sidebar_top);
         let header_rect = euclid::rect(section_x, header_y, section_w, header_h);
         self.filled_rectangle(layers, 0, header_rect, bg)?;
@@ -8254,9 +8377,9 @@ impl crate::TermWindow {
 
         // Push UIItem for the header click.
         self.ui_items.push(UIItem {
-            x: section_x as usize,
+            x: hit_x as usize,
             y: header_y as usize,
-            width: section_w as usize,
+            width: hit_w as usize,
             height: header_h as usize,
             item_type: UIItemType::SidebarAgentSectionHeader,
         });
@@ -8270,7 +8393,7 @@ impl crate::TermWindow {
         for (idx, agent) in agents.iter().enumerate() {
             let is_expanded = expanded == Some(idx);
             let row_h = base_row_h;
-            let detail_h = if is_expanded { row_h * 2.0 } else { 0.0 };
+            let detail_h = if is_expanded { metrics.detail_h } else { 0.0 };
 
             if y + row_h + detail_h > section_bottom {
                 break;
@@ -8322,9 +8445,9 @@ impl crate::TermWindow {
 
             // Push UIItem for the row click.
             self.ui_items.push(UIItem {
-                x: section_x as usize,
+                x: hit_x as usize,
                 y: y as usize,
-                width: section_w as usize,
+                width: hit_w as usize,
                 height: row_h as usize,
                 item_type: UIItemType::SidebarAgentRow { index: idx },
             });
@@ -8397,18 +8520,21 @@ impl crate::TermWindow {
 
                 // Push UIItem for the detail expand click.
                 self.ui_items.push(UIItem {
-                    x: section_x as usize,
+                    x: hit_x as usize,
                     y: detail_y as usize,
-                    width: section_w as usize,
+                    width: hit_w as usize,
                     height: detail_h as usize,
                     item_type: UIItemType::SidebarAgentDetailExpand { index: idx },
                 });
 
                 // Push UIItem for the focus pane click.
+                let focus_x =
+                    (section_x + section_w - pad - 40.0 * dpi).clamp(hit_x, hit_x + hit_w);
+                let focus_w = (40.0_f32).min((hit_x + hit_w - focus_x).max(0.));
                 self.ui_items.push(UIItem {
-                    x: (section_x + section_w - pad - 40.0 * dpi) as usize,
+                    x: focus_x as usize,
                     y: (detail_y + pad) as usize,
-                    width: 40,
+                    width: focus_w as usize,
                     height: cell_h as usize,
                     item_type: UIItemType::SidebarAgentFocusPane { index: idx },
                 });
@@ -8479,11 +8605,18 @@ impl crate::TermWindow {
         radius: f32,
         color: LinearRgba,
     ) -> anyhow::Result<()> {
-        let r = radius
-            .min(rect.size.width * 0.5)
-            .min(rect.size.height * 0.5)
-            .max(0.0);
-        if r <= 0.5 {
+        if !rect.origin.x.is_finite()
+            || !rect.origin.y.is_finite()
+            || !rect.size.width.is_finite()
+            || !rect.size.height.is_finite()
+        {
+            return Ok(());
+        }
+        let r = sidebar_rounded_corner_radius(rect, radius);
+        // poly_quad converts the corner size to integer pixels before creating
+        // its bitmap. Keep subpixel corners on the rectangle path so a small
+        // transient window cannot become a zero-sized custom glyph.
+        if r < 1.0 {
             self.filled_rectangle(layers, layer_num, rect, color)?;
             return Ok(());
         }
@@ -8615,6 +8748,16 @@ impl crate::TermWindow {
     }
 }
 
+fn sidebar_rounded_corner_radius(rect: RectF, radius: f32) -> f32 {
+    if !radius.is_finite() || !rect.size.width.is_finite() || !rect.size.height.is_finite() {
+        return 0.0;
+    }
+    radius
+        .min(rect.size.width * 0.5)
+        .min(rect.size.height * 0.5)
+        .max(0.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -8626,6 +8769,15 @@ mod tests {
             label: format!("pane {pane_id}"),
             is_remote: false,
         }
+    }
+
+    #[test]
+    fn subpixel_rounded_corner_radius_is_not_sent_to_custom_glyphs() {
+        let tiny_rect = euclid::rect(0., 0., 1.5, 1.5);
+        let normal_rect = euclid::rect(0., 0., 4., 4.);
+
+        assert!(sidebar_rounded_corner_radius(tiny_rect, 8.0) < 1.0);
+        assert!(sidebar_rounded_corner_radius(normal_rect, 2.0) >= 1.0);
     }
 
     fn tab_input(tab_idx: usize, title: &str, pane_ids: &[PaneId]) -> SidebarTabInput {
@@ -9121,6 +9273,108 @@ mod tests {
         let layout = sidebar_bottom_row_layout(8., 384., 8., 348., 10., true);
         assert_eq!(layout.worktree_fill_x, 8.);
         assert_eq!(layout.agent_fill_x + layout.agent_fill_w, 8. + 384.);
+    }
+
+    #[test]
+    fn agent_herd_section_stays_above_bottom_controls_at_each_dpi() {
+        for (dpi, cell_height) in [(1.0, 16.), (1.5, 24.), (2.0, 32.)] {
+            let top = 0.;
+            let height = 720.;
+            let row_height = (cell_height + 6.0_f32).max(28.0_f32);
+            let new_tab_y = top + height - INSET - row_height;
+
+            for (collapsed, expanded, bottom_button_rows) in
+                [(true, None, 2.), (false, None, 2.), (false, Some(0), 3.)]
+            {
+                let metrics =
+                    sidebar_agent_herd_metrics(cell_height, dpi, collapsed, 2, expanded, None);
+                let controls_top =
+                    sidebar_bottom_controls_top(top, height, row_height, bottom_button_rows);
+                let section_top = controls_top - metrics.reserved_h();
+                let lowest_control_top = new_tab_y - (bottom_button_rows - 1.) * (row_height + GAP);
+
+                assert!(
+                    section_top >= top,
+                    "agent section starts above the sidebar at {dpi}x"
+                );
+                assert!(
+                    section_top + metrics.reserved_h() <= lowest_control_top - GAP + 0.001,
+                    "agent section crosses the bottom-control boundary at {dpi}x"
+                );
+                assert!(
+                    lowest_control_top + row_height <= new_tab_y + 0.001,
+                    "bottom controls cross the New Tab row at {dpi}x"
+                );
+
+                // This is the failure shape from the original implementation:
+                // anchoring the header to the window bottom puts it inside the
+                // New Tab row at hidpi sizes.
+                if collapsed {
+                    let old_section_bottom = top + height - 8. * dpi;
+                    let old_header_y = old_section_bottom - metrics.header_h - metrics.content_h;
+                    assert!(
+                        old_header_y + metrics.header_h > new_tab_y,
+                        "fixture no longer reproduces the original overlap at {dpi}x"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn collapsed_agent_herd_reserves_only_its_header() {
+        for (dpi, cell_height) in [(-1.0, 16.), (1.0, 16.), (2.5, 32.), (10.0, 32.)] {
+            let metrics = sidebar_agent_herd_metrics(cell_height, dpi, true, 100, Some(0), None);
+            assert!(metrics.header_h > 0.);
+            assert!((metrics.content_h - 0.).abs() < f32::EPSILON);
+            assert!((metrics.detail_h - 0.).abs() < f32::EPSILON);
+            assert!((metrics.reserved_h() - metrics.header_h).abs() < f32::EPSILON);
+        }
+    }
+
+    #[test]
+    fn expanded_agent_detail_fits_status_project_and_activity_lines() {
+        let metrics = sidebar_agent_herd_metrics(32., 2., false, 1, Some(0), None);
+        let expected_detail_h = 8. * 2. + 3. * 32. + 4. * 2.;
+
+        assert!(metrics.detail_h >= expected_detail_h);
+        assert!(metrics.content_h >= metrics.base_row_h + metrics.detail_h);
+    }
+
+    #[test]
+    fn expanded_agent_row_stays_visible_when_detail_does_not_fit() {
+        let cell_height = 32.;
+        let dpi = 2.;
+        let row_height = cell_height + 4. * dpi + 2. * dpi;
+        let metrics =
+            sidebar_agent_herd_metrics(cell_height, dpi, false, 2, Some(1), Some(row_height * 2.));
+
+        assert!((metrics.detail_h - 0.).abs() < f32::EPSILON);
+        assert!((metrics.content_h - row_height * 2.).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn large_agent_lists_are_bounded_by_available_sidebar_height() {
+        let metrics = sidebar_agent_herd_metrics(16., 1., false, usize::MAX, None, Some(200.));
+
+        assert!((metrics.content_h - 198.).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn stale_expansion_indexes_do_not_reserve_detail_space() {
+        for expanded in [Some(2), Some(usize::MAX)] {
+            let metrics = sidebar_agent_herd_metrics(16., 1., false, 2, expanded, None);
+            assert!((metrics.detail_h - 0.).abs() < f32::EPSILON);
+        }
+    }
+
+    #[test]
+    fn tiny_available_height_renders_no_agent_rows_or_detail() {
+        for available_h in [-1., 0., 1.] {
+            let metrics = sidebar_agent_herd_metrics(16., 1., false, 4, Some(0), Some(available_h));
+            assert!((metrics.content_h - 0.).abs() < f32::EPSILON);
+            assert!((metrics.detail_h - 0.).abs() < f32::EPSILON);
+        }
     }
 
     #[test]
