@@ -885,7 +885,12 @@ pub struct AgentUiConfig {
     #[dynamic(default = "default_true")]
     pub detect_processes: bool,
 
-    /// Maximum scrollback lines copied by agent copy actions.
+    /// Maximum **physical** rows copied by agent copy actions, counted from the
+    /// bottom of the pane's buffer regardless of the current scroll position.
+    /// Wrapped output costs several physical rows per logical line, which is why
+    /// the previous 500 truncated real agent sessions down to their last turn.
+    /// The GUI additionally clamps this to 100_000 rows per action. Lower it to
+    /// limit how much output a single copy can capture.
     #[dynamic(default = "default_agent_copy_scrollback_lines")]
     pub copy_scrollback_lines: usize,
 
@@ -2943,7 +2948,11 @@ fn default_agent_telemetry_fields() -> Vec<AgentTelemetryField> {
 }
 
 fn default_agent_copy_scrollback_lines() -> usize {
-    500
+    // Above the default `scrollback_lines` (3500), so a copy action reaches
+    // everything the pane still remembers: `agent_transcript_start` clamps the
+    // window to the top of the scrollback, so a cap larger than the buffer
+    // simply means "the whole buffer".
+    20_000
 }
 
 fn default_rich_input_history_limit() -> usize {
@@ -2961,6 +2970,9 @@ fn default_update_interval() -> u64 {
 #[cfg(test)]
 mod agent_ui_tests {
     use super::*;
+    // `SshTransport` lives in the ssh module and is only re-exported at the
+    // crate root, so `use super::*` does not bring it into scope.
+    use crate::SshTransport;
 
     fn strings(items: &[&str]) -> Vec<String> {
         items.iter().map(|item| item.to_string()).collect()
@@ -2983,7 +2995,7 @@ mod agent_ui_tests {
         assert!(config.agent_ui.show_pane_toolbelt);
         assert!(!config.agent_ui.enable_control_actions);
         assert!(config.agent_ui.detect_processes);
-        assert_eq!(config.agent_ui.copy_scrollback_lines, 500);
+        assert_eq!(config.agent_ui.copy_scrollback_lines, 20_000);
         assert!(config.agent_ui.waiting_notification);
         assert_eq!(
             config.agent_ui.toolbelt_position,

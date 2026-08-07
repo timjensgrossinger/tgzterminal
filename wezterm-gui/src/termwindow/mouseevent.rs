@@ -1361,28 +1361,20 @@ impl super::TermWindow {
             WMEK::Release(MousePress::Left) => {
                 if self.pressed_ui_item.as_ref() == Some(&item_type) {
                     if let Some(pane) = Mux::get().get_pane(pane_id) {
-                        let (text, message) = match action {
-                            AgentCopyAction::Conversation => (
-                                self.agent_pane_conversation_text(&pane),
-                                "Copied the agent conversation",
-                            ),
-                            AgentCopyAction::Markdown => (
-                                self.agent_pane_markdown_text(&pane),
-                                "Copied the agent conversation as Markdown",
-                            ),
-                            AgentCopyAction::LastAgentMessage => (
-                                self.agent_pane_last_message_text(&pane),
-                                "Copied the latest visible agent message",
-                            ),
-                            AgentCopyAction::Summary => {
-                                (self.agent_pane_summary(&pane), "Copied the agent details")
-                            }
-                        };
-                        self.copy_to_clipboard(ClipboardCopyDestination::Clipboard, text);
+                        let payload = self.agent_pane_copy_payload(&pane, &action);
+                        let message = self.agent_copy_toast_message(&action, &payload);
+                        // Never overwrite the clipboard with nothing: an empty
+                        // copy plus a success toast is how this bug hid.
+                        if !payload.text.trim().is_empty() {
+                            self.copy_to_clipboard(
+                                ClipboardCopyDestination::Clipboard,
+                                payload.text,
+                            );
+                        }
                         wezterm_toast_notification::show(
                             wezterm_toast_notification::ToastNotification {
                                 title: "Agent copy".to_string(),
-                                message: message.to_string(),
+                                message,
                                 url: None,
                                 timeout: Some(Duration::from_millis(1800)),
                             },

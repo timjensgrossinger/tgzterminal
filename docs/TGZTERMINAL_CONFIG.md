@@ -150,7 +150,7 @@ config.agent_ui = {
   show_pane_toolbelt = true,
   enable_control_actions = false,
   detect_processes = true,
-  copy_scrollback_lines = 500,
+  copy_scrollback_lines = 20000,
   waiting_notification = true,
   toolbelt_position = "Top", -- or "Bottom"
   visible_identity_signals = 2,
@@ -267,7 +267,7 @@ vendor-neutral agent.
 | `show_pane_toolbelt` | bool | `true` | |
 | `enable_control_actions` | bool | `false` | Opt-in half of the control-action gate; see below. |
 | `detect_processes` | bool | `true` | When off, only user vars identify an agent — no process, title or visible-text detection, and therefore no inferred status. |
-| `copy_scrollback_lines` | int | `500` | |
+| `copy_scrollback_lines` | int | `20000` | Maximum **physical** rows a copy action reads, counted from the bottom of the pane buffer. Wrapped output costs several rows per logical line, which is why the previous `500` truncated real sessions. Clamped to 100000 rows per action. Lower it to capture less. |
 | `waiting_notification` | bool | `true` | |
 | `toolbelt_position` | enum | `"Top"` | `"Top"`, `"Bottom"` |
 | `visible_identity_signals` | int | `2` | Distinct adapter-exclusive patterns that must agree before visible text names an agent. Clamped by how many the adapter declares. |
@@ -297,8 +297,14 @@ safe local CLI workflow exists on your machine.
 
 When an agent pane is detected, the sidebar can show a compact badge and the
 active pane can show a slim toolbelt. `Stop` and copy actions stay user
-initiated. Copy actions read at most `copy_scrollback_lines` recent scrollback
-lines and may include terminal output or secrets printed in that range.
+initiated. Copy actions read at most `copy_scrollback_lines` physical rows from
+the **bottom of the pane buffer, regardless of the current scroll position**, so
+scrolling up does not change what a copy returns. When older rows exist but fall
+outside that window, the copied text starts with
+`[… earlier scrollback not included …]`. If transcript cleanup ends up with
+nothing, the raw pane text (or, failing that, the agent details) is copied
+instead and the notification says which one it used. Copied text may include
+terminal output or secrets printed in that range.
 
 `enable_control_actions` is `false` by default. Resume, Attach and log-opening
 controls require **both** an explicit opt-in — `agent_ui.enable_control_actions
@@ -576,76 +582,33 @@ Project-root mode works from a WSL pane too: because Windows cannot stat a Linux
 path directly, the marker walk runs against the `\\wsl.localhost` view of the
 distro and the result is mapped back before launching.
 
-### Agent insight pane
+### Agent herd section
 
-The agent launcher's dropdown has an **Agent insight** entry, and the command
-palette and *Shell* menubar carry the same action as **Toggle Agent Insight
-Pane** (`ShowAgentHerd`, unbound by default — bind it if you want a key).
+The sidebar has a collapsible **Agents** section listing agents TGZTerminal
+can see, headed `Agents · N`. It merges two sources: agents detected live in
+this window's own tabs/panes, and agents found by scanning each vendor's
+on-disk session files (so an agent in a pane outside the current window can
+still show up). Both sources are filtered before display:
 
-It opens a **real split pane**, not an overlay: it sits beside your work like
-the worktree pane, survives focus changes, and closes when you press the same
-control again, press `q` inside it, or close the pane normally. It has no child
-process — the view is drawn by TGZTerminal itself.
-
-The pane lists every agent this terminal can see, grouped by project:
-
-- status glyph, name, and `status · provider · model` per agent,
-- what it is **doing right now**, when its transcript can be read —
-  `▸ now: Bash cargo check`. The label is `last:` instead of `now:` when the
-  agent is not working, or when its newest event is too old to still be in
-  flight, so a finished agent never looks busy,
-- an expandable log of its recent tool calls and messages,
-- its subagents, with type, description and status,
-- the block reason and how long it has been waiting, for anything blocked.
-
-Keys inside the pane:
-
-| Key | Action |
-|---|---|
-| `↑` `↓` / `k` `j` | move the selection |
-| `⏎` / `→` / `←` | expand or collapse the selected agent's activity log |
-| `f` | focus that agent's pane (the insight pane stays open) |
-| `s` | stop it — a synthetic Ctrl-C to the owning pane, never a signal to a pid |
-| `tab` | switch between this project and all projects |
-| `r` | refresh now |
-| `q` / `Esc` | close the pane |
-
-Clicking works too: a click selects a row, a click on the activity line expands
-it, and a click on `Stop` stops that agent.
+- **Liveness**: a vendor session file is only shown while its process is
+  still alive. A session whose process has exited is a stale leftover and is
+  dropped silently — it does not linger as a phantom row.
+- **Project scope**: only agents belonging to the active pane's project (the
+  repo root of its working directory, or a directory nested under it) are
+  shown. If the active pane's project can't be determined, the section falls
+  back to showing everything rather than going blank.
+- **Per-adapter opt-out**: a vendor with `agent_ui.adapters.<id>.enabled =
+  false` is excluded from the disk-scanned source (live pane detection is
+  already gated by the same adapter config).
 
 ```lua
 agent_ui = {
-  insight = {
-    side = 'Left',              -- 'Left' | 'Right' | 'Top' | 'Bottom'
-    split_size_percent = 30,    -- clamped to 5..=95
-    refresh_ms = 500,           -- clamped to 100..=10000
-    default_view = 'CurrentProject',  -- or 'AllProjects'
-    show_activity = true,
-    activity_history = 30,
+  section = {
+    enabled = true,      -- show the Agents section in the sidebar at all
+    refresh_ms = 500,     -- how often the disk-scanned source re-reads, clamped 100..=10000
   },
 }
 ```
-
-| Key | Default | Meaning |
-|---|---|---|
-| `side` | `"Left"` | Which edge of the tab the pane splits off. |
-| `split_size_percent` | `30` | Share of the split given to the pane. |
-| `refresh_ms` | `500` | How often agent state is re-read. |
-| `default_view` | `"CurrentProject"` | Scope the pane opens with. |
-| `show_activity` | `true` | Read transcripts for the activity line and log. |
-| `activity_history` | `30` | Events kept per agent. |
-
-Activity comes from the agent's own on-disk transcript, which is an
-**undocumented internal** of the agent CLI (currently only Claude Code writes
-one this can read). Every field is optional and every parse failure drops a
-single event, so the worst case is no activity line rather than a broken pane;
-agents from other vendors simply have none. Reads are bounded — a transcript is
-only re-read when it actually changed, only its tail is parsed, and all of it
-happens on the pane's own thread, never the render path. Set
-`show_activity = false` to skip these reads entirely.
-
-The insight pane is never treated as an agent, never used as a launch target by
-the agent launcher, and never stands in for its tab in the sidebar.
 
 ### New-tab dropdown
 

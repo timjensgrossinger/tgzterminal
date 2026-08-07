@@ -115,7 +115,7 @@ fn epoch_millis(value: Option<&serde_json::Value>) -> Option<SystemTime> {
 ///
 /// `EPERM` counts as alive: the process exists, we just don't own it.
 #[cfg(unix)]
-fn process_is_alive(pid: u32) -> bool {
+pub(crate) fn process_is_alive(pid: u32) -> bool {
     if pid == 0 || pid > i32::MAX as u32 {
         return false;
     }
@@ -128,7 +128,7 @@ fn process_is_alive(pid: u32) -> bool {
 }
 
 #[cfg(not(unix))]
-fn process_is_alive(_pid: u32) -> bool {
+pub(crate) fn process_is_alive(_pid: u32) -> bool {
     // Claude Code's session registry is a unix-only surface today; without a
     // liveness check we would show stale sessions, so report none.
     false

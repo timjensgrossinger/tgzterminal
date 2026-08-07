@@ -1,6 +1,6 @@
 use crate::agent_herd::claude::{self, ProjectDirError as ClaudeLogsPathError};
 use crate::agent_herd::vendor::{AgentVendor, VendorSession};
-use crate::agent_herd::{HerdAgent, HerdStatus};
+use crate::agent_herd::{group_by_project, HerdAgent, HerdStatus, HerdView};
 use crate::quad::TripleLayerQuadAllocator;
 use crate::spawn::SpawnWhere;
 use crate::tabbar::TabBarItem;
@@ -90,6 +90,18 @@ const MAX_RESUME_MENU_SESSIONS: u8 = 25;
 const AGENT_COPY_MENU_ROW_H: f32 = 28.;
 const MAX_AGENT_PATTERN_LEN: usize = 256;
 const AGENT_PATTERN_REGEX_CACHE_LIMIT: usize = 128;
+/// Physical rows read per `get_logical_lines` call when scraping a transcript.
+/// Chunking bounds the peak clone and releases the pane's terminal mutex
+/// between chunks, so copying a multi-thousand-row scrollback never stalls the
+/// pane reader thread inside one long critical section.
+const AGENT_TRANSCRIPT_CHUNK_ROWS: isize = 512;
+/// Ceiling on the rows one copy action may read, whatever
+/// `agent_ui.copy_scrollback_lines` says: `scrollback_lines` accepts values up
+/// to 999_999_999 and a mouse click must not try to materialize that.
+const AGENT_TRANSCRIPT_MAX_ROWS: usize = 100_000;
+/// Prepended when older rows are still in the pane but fell outside the copy
+/// window, so a partial copy is never presented as a whole conversation.
+const AGENT_TRANSCRIPT_CLIPPED_MARKER: &str = "[… earlier scrollback not included …]";
 const WAITING_NOTIFICATION_THROTTLE: Duration = Duration::from_secs(60);
 const DEFAULT_AGENT_ADAPTER_IDS: [&str; 7] = [
     "claude", "codex", "gemini", "opencode", "copilot", "cursor", "amp",
@@ -462,6 +474,57 @@ enum PatternField {
     Model,
 }
 
+/// Leading whitespace and TUI decoration removed, so an anchored strip pattern
+/// still matches chrome that the agent draws inside a frame or behind a bullet:
+/// `│ Tips: …`, `▎ Model: …`, `⏺ …`. `%` is deliberately *not* decoration —
+/// two built-in strip patterns start with it.
+fn strip_agent_line_decoration(line: &str) -> &str {
+    line.trim_start_matches(|ch: char| {
+        ch.is_whitespace()
+            || matches!(
+                ch,
+                '│' | '┃'
+                    | '▎'
+                    | '▏'
+                    | '▌'
+                    | '▐'
+                    | '|'
+                    | '⏺'
+                    | '●'
+                    | '○'
+                    | '•'
+                    | '·'
+                    | '‣'
+                    | '▪'
+            )
+    })
+}
+
+/// Plain strip patterns match only at the *start* of a transcript line (after
+/// decoration) and must end on a word boundary; `re:` patterns keep their exact
+/// unanchored meaning.
+///
+/// Unanchored substring matching deleted real content: the built-in Claude list
+/// carries bare `"tokens"`, `"model:"`, `"cwd:"` and `"expires"`, all of which
+/// occur in ordinary agent prose, and when the adapter is unknown
+/// `adapter_patterns(None, Strip)` applies every built-in adapter's list at
+/// once. Chrome that appears mid-line is caught by the structural rules in
+/// `is_agent_transcript_chrome_line` instead, and a user who genuinely needs a
+/// mid-line literal can spell it as a `re:` pattern.
+fn agent_strip_pattern_matches(trimmed: &str, pattern: &str) -> bool {
+    let pattern = pattern.trim();
+    if pattern.is_empty() || pattern.len() > MAX_AGENT_PATTERN_LEN + 3 {
+        return false;
+    }
+    if pattern.starts_with("re:") {
+        return agent_pattern_matches(trimmed, pattern);
+    }
+
+    let haystack = strip_agent_line_decoration(trimmed).to_ascii_lowercase();
+    let needle = pattern.to_ascii_lowercase();
+    haystack.starts_with(&needle) && word_boundary_after(haystack.as_bytes(), needle.len())
+}
+
 fn is_agent_transcript_chrome_line(line: &str, adapter: Option<&AgentAdapterConfig>) -> bool {
     let trimmed = line.trim();
     if trimmed.is_empty() || is_agent_separator_line(trimmed) {
@@ -482,10 +545,18 @@ fn is_agent_transcript_chrome_line(line: &str, adapter: Option<&AgentAdapterConf
     if matches!(trimmed.chars().next(), Some('✻' | '✽' | '✶' | '✢' | '*')) {
         return true;
     }
+    // Usage/progress bars drawn from block glyphs. Anchored strip patterns can
+    // no longer reach the text that trails such a bar, so match the bar itself.
+    if trimmed
+        .chars()
+        .any(|ch| matches!(ch, '█' | '░' | '▓' | '▒'))
+    {
+        return true;
+    }
 
     adapter_patterns(adapter, PatternField::Strip)
         .iter()
-        .any(|pattern| agent_pattern_matches(trimmed, pattern))
+        .any(|pattern| agent_strip_pattern_matches(trimmed, pattern))
 }
 
 fn trim_blank_edges(lines: &mut Vec<String>) {
@@ -520,35 +591,105 @@ fn push_agent_transcript_line(lines: &mut Vec<String>, text: String) {
     }
 }
 
-fn clean_agent_conversation_transcript(raw: &str, adapter: Option<&AgentAdapterConfig>) -> String {
-    let mut lines = Vec::new();
-    let skip_until_first_prompt = raw.lines().any(is_agent_user_prompt_line);
-    let mut seen_prompt = !skip_until_first_prompt;
-    for line in raw.lines() {
-        if !seen_prompt {
-            if is_agent_user_prompt_line(line) {
-                seen_prompt = true;
-            } else {
-                continue;
-            }
-        }
+/// Whether everything before the first user prompt may be treated as the
+/// agent's start-up banner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AgentBannerSkip {
+    /// The head of the text really is the start of the pane's history, so
+    /// anything before the first prompt is banner/pre-agent shell output.
+    Allowed,
+    /// The head is mid-conversation — the pane evicted older rows, or the copy
+    /// window was clipped — so nothing before the first prompt may be assumed
+    /// to be a banner. Dropping it there is what made "Copy conversation"
+    /// behave like "copy the last message".
+    Forbidden,
+}
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AgentTranscriptRole {
+    User,
+    Agent,
+}
+
+/// The single cleaning pass. Roles fall out of the classification that already
+/// happens per line, so the Markdown renderer no longer re-scans `raw` once per
+/// output line (O(n²)) nor attributes roles by string equality — which
+/// relabelled an agent line that happened to repeat a prompt verbatim.
+fn clean_agent_transcript_entries(
+    raw: &str,
+    adapter: Option<&AgentAdapterConfig>,
+    banner: AgentBannerSkip,
+) -> Vec<(AgentTranscriptRole, String)> {
+    let banner_end = match banner {
+        AgentBannerSkip::Allowed => raw.lines().position(is_agent_user_prompt_line),
+        AgentBannerSkip::Forbidden => None,
+    };
+
+    let mut entries: Vec<(AgentTranscriptRole, String)> = Vec::new();
+    let mut push = |role: AgentTranscriptRole, text: String| {
+        if text.trim().is_empty() {
+            if entries
+                .last()
+                .is_some_and(|(_, last)| !last.trim().is_empty())
+            {
+                entries.push((role, String::new()));
+            }
+        } else {
+            entries.push((role, text.trim_end().to_string()));
+        }
+    };
+
+    for (idx, line) in raw.lines().enumerate() {
+        if banner_end.is_some_and(|end| idx < end) {
+            continue;
+        }
         if line.trim().is_empty() {
-            push_agent_transcript_line(&mut lines, String::new());
+            push(AgentTranscriptRole::Agent, String::new());
+            continue;
+        }
+        // The prompt check comes first: after decoration stripping, a user
+        // prompt such as `❯ tokens are cheap now` would anchor on a strip
+        // pattern and be deleted. Prompt-shaped lines are never chrome.
+        if is_agent_user_prompt_line(line) {
+            let prompt = split_agent_user_prompt_line(line).unwrap_or("");
+            push(AgentTranscriptRole::User, prompt.to_string());
             continue;
         }
         if is_agent_transcript_chrome_line(line, adapter) {
             continue;
         }
-        if is_agent_user_prompt_line(line) {
-            let prompt = split_agent_user_prompt_line(line).unwrap_or("");
-            push_agent_transcript_line(&mut lines, prompt.to_string());
-        } else {
-            push_agent_transcript_line(&mut lines, clean_agent_content_line(line));
-        }
+        push(AgentTranscriptRole::Agent, clean_agent_content_line(line));
     }
-    trim_blank_edges(&mut lines);
-    lines.join("\n")
+
+    while entries
+        .first()
+        .is_some_and(|(_, text)| text.trim().is_empty())
+    {
+        entries.remove(0);
+    }
+    while entries
+        .last()
+        .is_some_and(|(_, text)| text.trim().is_empty())
+    {
+        entries.pop();
+    }
+    entries
+}
+
+fn clean_agent_conversation_transcript_with(
+    raw: &str,
+    adapter: Option<&AgentAdapterConfig>,
+    banner: AgentBannerSkip,
+) -> String {
+    clean_agent_transcript_entries(raw, adapter, banner)
+        .into_iter()
+        .map(|(_, text)| text)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn clean_agent_conversation_transcript(raw: &str, adapter: Option<&AgentAdapterConfig>) -> String {
+    clean_agent_conversation_transcript_with(raw, adapter, AgentBannerSkip::Allowed)
 }
 
 fn clean_agent_last_message_transcript(raw: &str, adapter: Option<&AgentAdapterConfig>) -> String {
@@ -560,15 +701,18 @@ fn clean_agent_last_message_transcript(raw: &str, adapter: Option<&AgentAdapterC
             push_agent_transcript_line(&mut current, String::new());
             continue;
         }
-        if is_agent_transcript_chrome_line(line, adapter) {
-            continue;
-        }
+        // Prompt before chrome, for the same reason as in
+        // `clean_agent_transcript_entries`: an anchored strip pattern must not
+        // be able to swallow a user prompt and merge two turns into one.
         if is_agent_user_prompt_line(line) {
             trim_blank_edges(&mut current);
             if !current.is_empty() {
                 last_message = current;
             }
             current = Vec::new();
+            continue;
+        }
+        if is_agent_transcript_chrome_line(line, adapter) {
             continue;
         }
         push_agent_transcript_line(&mut current, clean_agent_content_line(line));
@@ -600,48 +744,201 @@ fn agent_copy_payload_from_text(
     }
 }
 
-fn clean_agent_markdown_transcript(raw: &str, adapter: Option<&AgentAdapterConfig>) -> String {
-    let conversation = clean_agent_conversation_transcript(raw, adapter);
-    if conversation.trim().is_empty() {
-        return String::new();
-    }
-
-    let mut sections = Vec::new();
-    let mut current_heading: Option<&'static str> = None;
-    let mut current = Vec::new();
-    for line in conversation.lines() {
-        let heading = if raw.lines().any(|raw_line| {
-            split_agent_user_prompt_line(raw_line)
-                .map(|prompt| prompt == line)
-                .unwrap_or(false)
-        }) {
-            "User"
-        } else {
-            "Agent"
-        };
-        if current_heading != Some(heading) {
-            if let Some(existing) = current_heading {
-                trim_blank_edges(&mut current);
-                if !current.is_empty() {
-                    sections.push(format!("## {existing}\n\n{}", current.join("\n")));
-                }
+fn clean_agent_markdown_transcript_with(
+    raw: &str,
+    adapter: Option<&AgentAdapterConfig>,
+    banner: AgentBannerSkip,
+) -> String {
+    let entries = clean_agent_transcript_entries(raw, adapter, banner);
+    let mut sections: Vec<String> = Vec::new();
+    let mut current_role: Option<AgentTranscriptRole> = None;
+    let mut current: Vec<String> = Vec::new();
+    let flush =
+        |role: Option<AgentTranscriptRole>, lines: &mut Vec<String>, out: &mut Vec<String>| {
+            let Some(role) = role else {
+                return;
+            };
+            trim_blank_edges(lines);
+            if lines.is_empty() {
+                return;
             }
-            current_heading = Some(heading);
+            let heading = match role {
+                AgentTranscriptRole::User => "User",
+                AgentTranscriptRole::Agent => "Agent",
+            };
+            out.push(format!("## {heading}\n\n{}", lines.join("\n")));
+        };
+
+    for (role, text) in entries {
+        // Blank separators belong to whichever section is open; they must not
+        // open a section of their own.
+        if text.trim().is_empty() {
+            push_agent_transcript_line(&mut current, String::new());
+            continue;
+        }
+        if current_role != Some(role) {
+            flush(current_role, &mut current, &mut sections);
+            current_role = Some(role);
             current = Vec::new();
         }
-        push_agent_transcript_line(&mut current, line.to_string());
+        push_agent_transcript_line(&mut current, text);
     }
-    if let Some(existing) = current_heading {
-        trim_blank_edges(&mut current);
-        if !current.is_empty() {
-            sections.push(format!("## {existing}\n\n{}", current.join("\n")));
-        }
-    }
+    flush(current_role, &mut current, &mut sections);
     sections.join("\n\n")
+}
+
+fn clean_agent_markdown_transcript(raw: &str, adapter: Option<&AgentAdapterConfig>) -> String {
+    clean_agent_markdown_transcript_with(raw, adapter, AgentBannerSkip::Allowed)
 }
 
 fn agent_transcript_start(scrollback_top: isize, end: isize, max_rows: isize) -> isize {
     scrollback_top.max(end.saturating_sub(max_rows.max(1)))
+}
+
+/// Physical-row windows covering `start..end`, so one copy never asks the pane
+/// for its whole buffer in a single call. Pure, so the coverage/termination
+/// property is unit-testable without a `Pane`.
+fn agent_transcript_chunks(start: isize, end: isize, chunk: isize) -> Vec<std::ops::Range<isize>> {
+    let mut chunks = Vec::new();
+    if end <= start {
+        return chunks;
+    }
+    let chunk = if chunk <= 0 { end - start } else { chunk };
+    let mut row = start;
+    while row < end {
+        let next = row.saturating_add(chunk).min(end);
+        chunks.push(row..next);
+        row = next;
+    }
+    chunks
+}
+
+/// Pane text as scraped, plus what the scrape could not deliver.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct AgentRawTranscript {
+    text: String,
+    /// Older rows are still in the pane but fell outside the copy window.
+    clipped: bool,
+    /// The first row read is the earliest row the pane remembers, so a start-up
+    /// banner ahead of the first prompt may legitimately be skipped.
+    head_is_session_start: bool,
+}
+
+impl AgentRawTranscript {
+    fn banner_skip(&self) -> AgentBannerSkip {
+        if self.head_is_session_start {
+            AgentBannerSkip::Allowed
+        } else {
+            AgentBannerSkip::Forbidden
+        }
+    }
+}
+
+/// Which rung of the fallback ladder produced the copied text. Reported in the
+/// toast so a cleanup failure is visible instead of an empty clipboard.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AgentCopySource {
+    /// The cleaned transcript, i.e. what the menu item promised.
+    Transcript,
+    /// Cleaning removed everything, so the untouched pane text was copied.
+    RawPaneText,
+    /// There was no transcript at all; the agent details were copied instead.
+    Summary,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AgentCopyPayload {
+    pub text: String,
+    pub source: AgentCopySource,
+    pub clipped: bool,
+}
+
+/// The fallback ladder and the clipped marker, on top of the unchanged
+/// `agent_copy_payload_from_text`. Never yields an empty payload while any of
+/// the raw transcript or the summary carries text.
+fn agent_copy_payload_from_raw(
+    action: &AgentCopyAction,
+    raw: &AgentRawTranscript,
+    summary: &str,
+    adapter: Option<&AgentAdapterConfig>,
+) -> AgentCopyPayload {
+    if matches!(action, AgentCopyAction::Summary) {
+        return AgentCopyPayload {
+            text: summary.to_string(),
+            source: AgentCopySource::Summary,
+            clipped: false,
+        };
+    }
+
+    let banner = raw.banner_skip();
+    let cleaned = match action {
+        AgentCopyAction::Conversation => {
+            clean_agent_conversation_transcript_with(&raw.text, adapter, banner)
+        }
+        AgentCopyAction::Markdown => {
+            clean_agent_markdown_transcript_with(&raw.text, adapter, banner)
+        }
+        AgentCopyAction::LastAgentMessage => {
+            let message = clean_agent_last_message_transcript(&raw.text, adapter);
+            if message.trim().is_empty() {
+                clean_agent_conversation_transcript_with(&raw.text, adapter, banner)
+            } else {
+                message
+            }
+        }
+        AgentCopyAction::Summary => unreachable!("handled above"),
+    };
+
+    let (text, source) = if !cleaned.trim().is_empty() {
+        (cleaned, AgentCopySource::Transcript)
+    } else if !raw.text.trim().is_empty() {
+        (raw.text.clone(), AgentCopySource::RawPaneText)
+    } else {
+        (summary.to_string(), AgentCopySource::Summary)
+    };
+
+    // The marker is prepended after cleaning: inside the raw text it would sit
+    // in the banner-skip region and be eaten by the cleaner.
+    let clipped = raw.clipped && source != AgentCopySource::Summary;
+    let text = if clipped && !text.trim().is_empty() {
+        format!("{AGENT_TRANSCRIPT_CLIPPED_MARKER}\n{text}")
+    } else {
+        text
+    };
+
+    AgentCopyPayload {
+        text,
+        source,
+        clipped,
+    }
+}
+
+/// What the toast should say, given the action and which rung produced the
+/// text. Pure, so the toast can never claim a success that did not happen.
+fn agent_copy_toast_message(action: &AgentCopyAction, payload: &AgentCopyPayload) -> String {
+    if payload.text.trim().is_empty() {
+        return "Nothing to copy from this pane".to_string();
+    }
+    let base = match payload.source {
+        AgentCopySource::Summary => match action {
+            AgentCopyAction::Summary => "Copied the agent details",
+            _ => "No transcript in this pane; copied the agent details instead",
+        },
+        AgentCopySource::RawPaneText => {
+            "Transcript cleanup found nothing; copied the raw pane text"
+        }
+        AgentCopySource::Transcript => match action {
+            AgentCopyAction::Conversation => "Copied the agent conversation",
+            AgentCopyAction::Markdown => "Copied the agent conversation as Markdown",
+            AgentCopyAction::LastAgentMessage => "Copied the latest agent message",
+            AgentCopyAction::Summary => "Copied the agent details",
+        },
+    };
+    if payload.clipped {
+        format!("{base} (older scrollback was not available)")
+    } else {
+        base.to_string()
+    }
 }
 
 fn agent_toolbelt_button_width(label: &str, cell_width: usize, dpi_scale: f32) -> f32 {
@@ -2258,6 +2555,36 @@ fn herd_agent_from_vendor_session(session: &VendorSession) -> HerdAgent {
         subagents: session.subagents.clone(),
         activity: None,
     }
+}
+
+/// Narrow the herd to the active pane's project.
+///
+/// The disk scan sweeps every vendor store under `$HOME`, so without this the
+/// section lists agents from unrelated checkouts. `group_by_project` already
+/// falls back to the full list when there is no project context, which is what
+/// we want: an empty section would just look broken.
+fn scope_herd_agents_to_project(
+    agents: Vec<HerdAgent>,
+    current_project: Option<&Path>,
+) -> Vec<HerdAgent> {
+    group_by_project(agents, HerdView::CurrentProject, current_project)
+        .into_iter()
+        .flat_map(|group| group.agents)
+        .collect()
+}
+
+/// Whether a disk-scanned session's vendor is still enabled in config.
+///
+/// Unknown ids default to enabled: a vendor with no adapter entry is not the
+/// same as one the user turned off.
+fn vendor_session_adapter_enabled(
+    adapters: &config::AgentAdaptersConfig,
+    vendor: &AgentVendor,
+) -> bool {
+    adapters
+        .get(&vendor.label().to_ascii_lowercase())
+        .map(|adapter| adapter.enabled)
+        .unwrap_or(true)
 }
 
 fn agent_toolbelt_buttons(
@@ -4384,16 +4711,34 @@ impl crate::TermWindow {
         lines.join("\n")
     }
 
-    fn agent_pane_raw_conversation_text(&self, pane: &Arc<dyn Pane>) -> String {
+    fn agent_pane_raw_conversation_text(&self, pane: &Arc<dyn Pane>) -> AgentRawTranscript {
         let dims = pane.get_dimensions();
+        // Deliberately the bottom of the *buffer*, not of the scrolled
+        // viewport: "Copy conversation" means the conversation, and deriving
+        // this from the scroll position would make scrolling up silently
+        // truncate the copy.
         let end = dims.physical_top + dims.viewport_rows as isize;
-        let max_rows = self.config.agent_ui.copy_scrollback_lines.max(1) as isize;
+        let max_rows = self
+            .config
+            .agent_ui
+            .copy_scrollback_lines
+            .clamp(1, AGENT_TRANSCRIPT_MAX_ROWS) as isize;
         let start = agent_transcript_start(dims.scrollback_top, end, max_rows);
         let mut lines = Vec::new();
 
-        for logical in pane.get_logical_lines(start..end) {
-            let text = line_to_string(&logical.logical).trim_end().to_string();
-            lines.push(text);
+        // Read in chunks: a single call over a multi-thousand-row range clones
+        // every `Line` in that range while holding the pane's terminal mutex.
+        // `get_logical_lines` widens each chunk outwards to complete wrapped
+        // lines, so chunks overlap; `next_row` drops the repeats.
+        let mut next_row = start;
+        for chunk in agent_transcript_chunks(start, end, AGENT_TRANSCRIPT_CHUNK_ROWS) {
+            for logical in pane.get_logical_lines(chunk) {
+                if logical.first_row < next_row {
+                    continue;
+                }
+                next_row = logical.first_row + logical.physical_lines.len() as isize;
+                lines.push(line_to_string(&logical.logical).trim_end().to_string());
+            }
         }
 
         while lines
@@ -4404,45 +4749,46 @@ impl crate::TermWindow {
             lines.pop();
         }
 
-        lines.join("\n")
+        AgentRawTranscript {
+            text: lines.join("\n"),
+            clipped: start > dims.scrollback_top,
+            head_is_session_start: dims.scrollback_top == 0 && start == 0,
+        }
     }
 
-    pub(crate) fn agent_pane_conversation_text(&self, pane: &Arc<dyn Pane>) -> String {
-        let raw = self.agent_pane_raw_conversation_text(pane);
-        let adapter = self
-            .detect_agent_pane(pane)
-            .and_then(|agent| self.agent_adapter_config_by_id(agent.adapter_id.as_deref()));
-        agent_copy_payload_from_text(&AgentCopyAction::Conversation, &raw, "", adapter.as_ref())
-    }
-
-    pub(crate) fn agent_pane_markdown_text(&self, pane: &Arc<dyn Pane>) -> String {
-        let raw = self.agent_pane_raw_conversation_text(pane);
-        let adapter = self
-            .detect_agent_pane(pane)
-            .and_then(|agent| self.agent_adapter_config_by_id(agent.adapter_id.as_deref()));
-        agent_copy_payload_from_text(&AgentCopyAction::Markdown, &raw, "", adapter.as_ref())
-    }
-
-    pub(crate) fn agent_pane_last_message_text(&self, pane: &Arc<dyn Pane>) -> String {
-        let raw = self.agent_pane_raw_conversation_text(pane);
-        if raw.trim().is_empty() {
-            return self.agent_pane_summary(pane);
+    pub(crate) fn agent_pane_copy_payload(
+        &self,
+        pane: &Arc<dyn Pane>,
+        action: &AgentCopyAction,
+    ) -> AgentCopyPayload {
+        if matches!(action, AgentCopyAction::Summary) {
+            // No transcript read at all for the metadata action.
+            return agent_copy_payload_from_raw(
+                action,
+                &AgentRawTranscript::default(),
+                &self.agent_pane_summary(pane),
+                None,
+            );
         }
 
+        let raw = self.agent_pane_raw_conversation_text(pane);
         let adapter = self
             .detect_agent_pane(pane)
             .and_then(|agent| self.agent_adapter_config_by_id(agent.adapter_id.as_deref()));
-        let message = agent_copy_payload_from_text(
-            &AgentCopyAction::LastAgentMessage,
+        agent_copy_payload_from_raw(
+            action,
             &raw,
-            "",
+            &self.agent_pane_summary(pane),
             adapter.as_ref(),
-        );
-        if message.is_empty() {
-            clean_agent_conversation_transcript(&raw, adapter.as_ref())
-        } else {
-            message
-        }
+        )
+    }
+
+    pub(crate) fn agent_copy_toast_message(
+        &self,
+        action: &AgentCopyAction,
+        payload: &AgentCopyPayload,
+    ) -> String {
+        agent_copy_toast_message(action, payload)
     }
 
     pub(crate) fn agent_resume_pane(&self, pane: &Arc<dyn Pane>) {
@@ -8158,12 +8504,26 @@ impl crate::TermWindow {
                 if !session.session_id.is_empty() && session_ids.contains(&session.session_id) {
                     continue;
                 }
+                if !vendor_session_adapter_enabled(&self.config.agent_ui.adapters, &session.vendor)
+                {
+                    continue;
+                }
                 agents.push(herd_agent_from_vendor_session(session));
             }
         }
 
+        let current_project = self.current_project_root();
+        let agents = scope_herd_agents_to_project(agents, current_project.as_deref());
+
         let mut state = self.agent_herd_state.borrow_mut();
         state.agents = agents;
+    }
+
+    /// Repo root of the active pane, used to scope the herd to this project.
+    fn current_project_root(&self) -> Option<PathBuf> {
+        let pane = self.get_active_pane_or_overlay()?;
+        let cwd = pane_working_dir(&pane)?;
+        crate::agent_herd::project_root_for(&cwd)
     }
 
     /// Refresh vendor session files without blocking paint on filesystem I/O.
@@ -8826,6 +9186,84 @@ mod tests {
         assert_eq!(agent.status, HerdStatus::Blocked);
         assert_eq!(agent.session_id.as_deref(), Some("session-42"));
         assert_eq!(agent.project_root, Some(PathBuf::from("/tmp/project")));
+    }
+
+    fn herd_agent(name: &str, cwd: &str, project_root: Option<&str>) -> HerdAgent {
+        HerdAgent {
+            name: name.to_string(),
+            provider: "claude".to_string(),
+            vendor: AgentVendor::Claude,
+            status: HerdStatus::Idle,
+            blocked_reason: None,
+            model: None,
+            cwd: Some(PathBuf::from(cwd)),
+            project_root: project_root.map(PathBuf::from),
+            git_branch: None,
+            pid: None,
+            pane_id: None,
+            session_id: None,
+            started_at: None,
+            status_changed_at: None,
+            subagents: Vec::new(),
+            activity: None,
+        }
+    }
+
+    fn herd_names(agents: &[HerdAgent]) -> Vec<&str> {
+        agents.iter().map(|agent| agent.name.as_str()).collect()
+    }
+
+    #[test]
+    fn herd_scoping_drops_agents_from_other_projects() {
+        // The disk scan sweeps every vendor store under $HOME, so the section
+        // used to list agents from checkouts the user is not looking at.
+        let agents = vec![
+            herd_agent("here", "/repos/mine/src", Some("/repos/mine")),
+            herd_agent("nested", "/repos/mine/src/deep", None),
+            herd_agent("elsewhere", "/repos/other/src", Some("/repos/other")),
+            herd_agent("homeless", "/tmp/scratch", None),
+        ];
+
+        let scoped = scope_herd_agents_to_project(agents, Some(&PathBuf::from("/repos/mine")));
+
+        assert_eq!(herd_names(&scoped), vec!["here", "nested"]);
+    }
+
+    #[test]
+    fn herd_scoping_without_project_context_keeps_everything() {
+        // An empty section would read as "no agents running" rather than "we
+        // could not tell which project you are in".
+        let agents = vec![
+            herd_agent("here", "/repos/mine/src", Some("/repos/mine")),
+            herd_agent("elsewhere", "/repos/other/src", Some("/repos/other")),
+        ];
+
+        let scoped = scope_herd_agents_to_project(agents, None);
+
+        assert_eq!(scoped.len(), 2);
+    }
+
+    #[test]
+    fn vendor_session_adapter_gate_follows_config() {
+        let mut adapters = default_agent_adapters();
+        adapters
+            .get_mut("codex")
+            .expect("codex is a built-in adapter")
+            .enabled = false;
+
+        assert!(vendor_session_adapter_enabled(
+            &adapters,
+            &AgentVendor::Claude
+        ));
+        assert!(!vendor_session_adapter_enabled(
+            &adapters,
+            &AgentVendor::Codex
+        ));
+        // No adapter entry is not the same as a disabled one.
+        assert!(vendor_session_adapter_enabled(
+            &adapters,
+            &AgentVendor::Custom("wildcat".to_string())
+        ));
     }
 
     #[test]
@@ -10021,6 +10459,225 @@ mod tests {
         assert_eq!(agent_transcript_start(-5000, 200, 500), -300);
         assert_eq!(agent_transcript_start(0, 200, 500), 0);
         assert_eq!(agent_transcript_start(-5000, 200, 0), 199);
+        // A cap above the buffer means "the whole buffer" — the mechanism
+        // behind the 20_000 default.
+        assert_eq!(agent_transcript_start(1000, 5000, 20_000), 1000);
+    }
+
+    #[test]
+    fn agent_copy_conversation_keeps_prose_that_mentions_chrome_words() {
+        let raw = [
+            "❯ summarize",
+            "We cut input tokens by 30%.",
+            "The model: choice is yours.",
+            "Run it from cwd: /tmp and it expires later.",
+        ]
+        .join("\n");
+        let expected = "summarize\nWe cut input tokens by 30%.\nThe model: choice is yours.\nRun it from cwd: /tmp and it expires later.";
+        let adapter = default_agent_adapters().remove("claude").unwrap();
+
+        assert_eq!(
+            clean_agent_conversation_transcript(&raw, Some(&adapter)),
+            expected
+        );
+        // Worst case: an unknown adapter applies every built-in strip list at
+        // once. Unanchored substring matching deleted all three lines here.
+        assert_eq!(clean_agent_conversation_transcript(&raw, None), expected);
+    }
+
+    #[test]
+    fn agent_copy_conversation_keeps_history_when_the_head_is_mid_conversation() {
+        let raw = [
+            "Buttons are measured from their rendered labels.",
+            "",
+            "❯ and now",
+            "Now it copies everything.",
+        ]
+        .join("\n");
+        let adapter = default_agent_adapters().remove("claude").unwrap();
+
+        assert_eq!(
+            clean_agent_conversation_transcript_with(
+                &raw,
+                Some(&adapter),
+                AgentBannerSkip::Forbidden
+            ),
+            "Buttons are measured from their rendered labels.\n\nand now\nNow it copies everything."
+        );
+        // With the head at the session start the same text is a banner.
+        assert_eq!(
+            clean_agent_conversation_transcript_with(
+                &raw,
+                Some(&adapter),
+                AgentBannerSkip::Allowed
+            ),
+            "and now\nNow it copies everything."
+        );
+    }
+
+    #[test]
+    fn agent_copy_conversation_drops_pre_agent_output_only_at_session_start() {
+        let raw = [
+            "cargo build --release",
+            "   Compiling wezterm-gui v0.1.0",
+            "    Finished release in 91s",
+            "❯ hello",
+            "Hi.",
+        ]
+        .join("\n");
+        let adapter = default_agent_adapters().remove("claude").unwrap();
+
+        assert_eq!(
+            clean_agent_conversation_transcript_with(
+                &raw,
+                Some(&adapter),
+                AgentBannerSkip::Allowed
+            ),
+            "hello\nHi."
+        );
+    }
+
+    #[test]
+    fn agent_copy_markdown_roles_survive_duplicate_text() {
+        let raw = ["❯ done", "Working on it.", "❯ next", "done"].join("\n");
+        let adapter = default_agent_adapters().remove("claude").unwrap();
+
+        assert_eq!(
+            clean_agent_markdown_transcript(&raw, Some(&adapter)),
+            "## User\n\ndone\n\n## Agent\n\nWorking on it.\n\n## User\n\nnext\n\n## Agent\n\ndone"
+        );
+    }
+
+    #[test]
+    fn usage_bars_drawn_from_block_glyphs_are_chrome() {
+        assert!(is_agent_transcript_chrome_line(
+            "  █░░░░░░░ 7% of the weekly allowance",
+            None
+        ));
+        assert!(!is_agent_transcript_chrome_line(
+            "The bar chart is rendered elsewhere",
+            None
+        ));
+    }
+
+    #[test]
+    fn agent_transcript_chunks_cover_the_range_exactly_once() {
+        assert_eq!(agent_transcript_chunks(0, 5, 2), vec![0..2, 2..4, 4..5]);
+        assert!(agent_transcript_chunks(10, 10, 512).is_empty());
+        assert!(agent_transcript_chunks(10, 5, 512).is_empty());
+        // A non-positive chunk degenerates to a single window instead of looping.
+        assert_eq!(agent_transcript_chunks(-3, 2, 0), vec![-3..2]);
+
+        let chunks = agent_transcript_chunks(-1000, 2500, 512);
+        assert_eq!(chunks.first().unwrap().start, -1000);
+        assert_eq!(chunks.last().unwrap().end, 2500);
+        for pair in chunks.windows(2) {
+            assert_eq!(pair[0].end, pair[1].start);
+        }
+    }
+
+    #[test]
+    fn agent_copy_payload_marks_a_clipped_window() {
+        let clipped = AgentRawTranscript {
+            text: "❯ hi\nthere".to_string(),
+            clipped: true,
+            head_is_session_start: false,
+        };
+        let payload =
+            agent_copy_payload_from_raw(&AgentCopyAction::Conversation, &clipped, "details", None);
+        assert_eq!(payload.source, AgentCopySource::Transcript);
+        assert!(payload.clipped);
+        assert_eq!(
+            payload.text,
+            format!("{AGENT_TRANSCRIPT_CLIPPED_MARKER}\nhi\nthere")
+        );
+
+        let whole = AgentRawTranscript {
+            clipped: false,
+            ..clipped.clone()
+        };
+        let payload =
+            agent_copy_payload_from_raw(&AgentCopyAction::Conversation, &whole, "details", None);
+        assert_eq!(payload.text, "hi\nthere");
+        assert!(!payload.clipped);
+
+        // The metadata action never carries a transcript marker.
+        let payload =
+            agent_copy_payload_from_raw(&AgentCopyAction::Summary, &clipped, "details", None);
+        assert_eq!(payload.text, "details");
+        assert!(!payload.clipped);
+    }
+
+    #[test]
+    fn agent_copy_payload_falls_back_instead_of_copying_nothing() {
+        let only_chrome = AgentRawTranscript {
+            text: "✻ Brewed for 5s".to_string(),
+            clipped: false,
+            head_is_session_start: true,
+        };
+        let payload = agent_copy_payload_from_raw(
+            &AgentCopyAction::Conversation,
+            &only_chrome,
+            "details",
+            None,
+        );
+        assert_eq!(payload.source, AgentCopySource::RawPaneText);
+        assert_eq!(payload.text, "✻ Brewed for 5s");
+
+        let empty = AgentRawTranscript::default();
+        let payload =
+            agent_copy_payload_from_raw(&AgentCopyAction::Markdown, &empty, "details", None);
+        assert_eq!(payload.source, AgentCopySource::Summary);
+        assert_eq!(payload.text, "details");
+    }
+
+    #[test]
+    fn agent_copy_toast_message_reports_the_fallback() {
+        let payload = |source, clipped| AgentCopyPayload {
+            text: "text".to_string(),
+            source,
+            clipped,
+        };
+        assert_eq!(
+            agent_copy_toast_message(
+                &AgentCopyAction::Conversation,
+                &payload(AgentCopySource::Transcript, false)
+            ),
+            "Copied the agent conversation"
+        );
+        assert!(agent_copy_toast_message(
+            &AgentCopyAction::Conversation,
+            &payload(AgentCopySource::Transcript, true)
+        )
+        .contains("older scrollback"));
+        assert!(agent_copy_toast_message(
+            &AgentCopyAction::Conversation,
+            &payload(AgentCopySource::RawPaneText, false)
+        )
+        .contains("raw pane text"));
+        assert!(agent_copy_toast_message(
+            &AgentCopyAction::Conversation,
+            &payload(AgentCopySource::Summary, false)
+        )
+        .contains("agent details"));
+        assert_eq!(
+            agent_copy_toast_message(
+                &AgentCopyAction::Summary,
+                &payload(AgentCopySource::Summary, false)
+            ),
+            "Copied the agent details"
+        );
+        assert_eq!(
+            agent_copy_toast_message(
+                &AgentCopyAction::Conversation,
+                &AgentCopyPayload {
+                    text: String::new(),
+                    source: AgentCopySource::Summary,
+                    clipped: false,
+                }
+            ),
+            "Nothing to copy from this pane"
+        );
     }
 
     #[test]

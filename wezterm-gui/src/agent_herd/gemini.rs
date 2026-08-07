@@ -1,3 +1,4 @@
+use crate::agent_herd::claude::process_is_alive;
 use crate::agent_herd::vendor::{AgentVendor, SessionSource, VendorSession};
 use crate::agent_herd::HerdStatus;
 use std::path::{Path, PathBuf};
@@ -32,7 +33,15 @@ impl SessionSource for GeminiDetector {
         for file in files {
             if let Ok(data) = std::fs::read_to_string(&file) {
                 if let Ok(json) = serde_json::from_str::<serde_json::Value>(&data) {
-                    let pid = json.get("pid").and_then(|v| v.as_u64()).map(|p| p as u32);
+                    let pid = match json.get("pid").and_then(|v| v.as_u64()) {
+                        Some(pid) if pid <= u32::MAX as u64 => pid as u32,
+                        // No usable pid means we cannot verify liveness; skip
+                        // this session rather than show a phantom row.
+                        _ => continue,
+                    };
+                    if !process_is_alive(pid) {
+                        continue;
+                    }
                     let session_id = json
                         .get("session_id")
                         .and_then(|v| v.as_str())
@@ -58,7 +67,7 @@ impl SessionSource for GeminiDetector {
                         })
                         .unwrap_or(HerdStatus::Unknown);
                     sessions.push(VendorSession {
-                        pid: pid.unwrap_or(0),
+                        pid,
                         vendor: AgentVendor::Gemini,
                         session_id,
                         cwd,
@@ -74,5 +83,46 @@ impl SessionSource for GeminiDetector {
             }
         }
         sessions
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write(path: &Path, contents: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, contents).unwrap();
+    }
+
+    fn session_json(pid: u32) -> String {
+        format!(r#"{{"pid":{pid},"session_id":"sess-{pid}","cwd":"/repo","status":"busy"}}"#)
+    }
+
+    #[test]
+    fn a_session_whose_process_is_gone_is_dropped() {
+        let temp = tempfile::tempdir().unwrap();
+        // Implausibly high pid: something genuinely dead to reject.
+        let dead = 0x7fff_fff0u32;
+        write(
+            &temp.path().join(".gemini").join("dead.json"),
+            &session_json(dead),
+        );
+        assert!(GeminiDetector.collect_sessions(temp.path()).is_empty());
+    }
+
+    #[test]
+    fn a_session_whose_process_is_alive_is_returned() {
+        let temp = tempfile::tempdir().unwrap();
+        let me = std::process::id();
+        write(
+            &temp.path().join(".gemini").join("live.json"),
+            &session_json(me),
+        );
+        let sessions = GeminiDetector.collect_sessions(temp.path());
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].pid, me);
     }
 }
