@@ -68,6 +68,9 @@ impl SessionSource for CodexDetector {
                         .unwrap_or(HerdStatus::Unknown);
                     sessions.push(VendorSession {
                         pid,
+                        // This store does not distinguish harness-spawned
+                        // sessions from interactive ones.
+                        interactive: true,
                         vendor: AgentVendor::Codex,
                         session_id,
                         cwd,

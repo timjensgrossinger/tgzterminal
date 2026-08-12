@@ -12,6 +12,15 @@ selector, in order to make your usage more convenient. It is used only
 by the local process, and care is taken to limit access for the associated
 files on disk to only your local user identity.
 
+When the agent launcher's "Reopen last window" button is enabled (it is by
+default, `agent_ui.launcher.restore_last_window_sessions`), TGZTerminal records
+which agent sessions a window had open — the adapter id, the vendor's session id
+and the working directory — in a `tgz-last-session.json` file in its local data
+directory, so those agents can be offered back after a restart. It contains no
+conversation content, is written with owner-only permissions, never leaves your
+device, and can be deleted at any time; setting the option to `0` stops the file
+being written or read at all.
+
 TGZTerminal tracks the output from the commands that you have executed in
 a scrollback buffer.  At the time of writing, that scrollback buffer
 is an in-memory structure that is not visible to other users of the machine.

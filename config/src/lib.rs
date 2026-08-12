@@ -65,6 +65,23 @@ pub use wsl::*;
 
 type ErrorCallback = fn(&str);
 
+/// Marker file that opts a Windows build into portable mode.
+///
+/// In portable mode, config, colour schemes and Lua modules sitting next to the
+/// executable take precedence over the user's own. That is right for a thumb
+/// drive and wrong for an installed application: `%LOCALAPPDATA%\Programs` (or
+/// worse, `Program Files`) is not the user's to write, and a stray file dropped
+/// there would silently override every user's config on the machine. The
+/// portable zip ships this marker; the installer never does.
+pub const PORTABLE_MARKER: &str = ".portable";
+
+/// Environment escape hatch for portable mode.
+///
+/// Set to `0` (or empty) to force it off, anything else to force it on. Exists
+/// for people who copy the binaries into a folder of their own and for debugging
+/// an installed build.
+const PORTABLE_ENV: &str = "TGZTERMINAL_PORTABLE";
+
 lazy_static! {
     pub static ref HOME_DIR: PathBuf = dirs_next::home_dir().expect("can't find HOME dir");
     pub static ref CONFIG_DIRS: Vec<PathBuf> = config_dirs();
@@ -79,6 +96,50 @@ lazy_static! {
         Mutex::new(Some(|e| log::error!("{}", e)));
     static ref LUA_PIPE: LuaPipe = LuaPipe::new();
     pub static ref COLOR_SCHEMES: HashMap<String, Palette> = build_default_schemes();
+    /// Directory holding the running executable, when it can be resolved.
+    pub static ref EXE_DIR: Option<PathBuf> = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.to_path_buf()));
+    static ref PORTABLE_MODE: bool = compute_portable_mode(EXE_DIR.as_deref());
+}
+
+/// Is the portable marker a *file* next to the executable?
+///
+/// Pure and takes the directory as an argument so the rule is testable on any
+/// host. A directory named `.portable` does not count — that would let an
+/// unrelated folder flip the mode by accident.
+pub(crate) fn portable_marker_present(exe_dir: Option<&Path>) -> bool {
+    exe_dir.is_some_and(|dir| dir.join(PORTABLE_MARKER).is_file())
+}
+
+fn compute_portable_mode(exe_dir: Option<&Path>) -> bool {
+    // Only Windows ever had exe-dir precedence; keeping the check compiled in
+    // (rather than `#[cfg]`-ing it out) is what makes it testable from macOS.
+    if !cfg!(windows) {
+        return false;
+    }
+    match std::env::var(PORTABLE_ENV).ok().as_deref() {
+        Some("0") | Some("") => false,
+        Some(_) => true,
+        None => portable_marker_present(exe_dir),
+    }
+}
+
+/// `Some(exe_dir)` only when exe-dir precedence applies.
+///
+/// Every site that used to reach for `current_exe().parent()` on Windows asks
+/// this instead, so there is one answer to "are we portable" rather than three.
+pub fn portable_exe_dir() -> Option<&'static Path> {
+    if *PORTABLE_MODE {
+        EXE_DIR.as_deref()
+    } else {
+        None
+    }
+}
+
+/// Whether this build is running in portable mode.
+pub fn portable_mode() -> bool {
+    *PORTABLE_MODE
 }
 
 thread_local! {

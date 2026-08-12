@@ -763,6 +763,13 @@ pub struct AgentLauncherConfig {
     /// not a session browser, and every row costs a transcript read.
     #[dynamic(default = "default_resume_menu_sessions")]
     pub resume_menu_sessions: u8,
+
+    /// How many agent sessions the launcher's "Reopen last window" button may
+    /// restore in one click. `0` hides the button and skips reading the snapshot
+    /// file entirely. Clamped to 0..=25: every restored session is a new tab and
+    /// a new agent process, so the default is deliberately well under the cap.
+    #[dynamic(default = "default_restore_last_window_sessions")]
+    pub restore_last_window_sessions: u8,
 }
 
 pub fn default_prefer_wsl() -> bool {
@@ -771,6 +778,10 @@ pub fn default_prefer_wsl() -> bool {
 
 pub fn default_resume_menu_sessions() -> u8 {
     10
+}
+
+pub fn default_restore_last_window_sessions() -> u8 {
+    8
 }
 
 /// Claude Code leads the launcher out of the box; an uninstalled default still
@@ -796,6 +807,7 @@ impl Default for AgentLauncherConfig {
             domain: None,
             prefer_wsl: default_prefer_wsl(),
             resume_menu_sessions: default_resume_menu_sessions(),
+            restore_last_window_sessions: default_restore_last_window_sessions(),
         }
     }
 }
@@ -820,6 +832,14 @@ pub struct AgentSectionConfig {
     /// Clamped to 100..=10000.
     #[dynamic(default = "default_agent_section_refresh_ms")]
     pub refresh_ms: u64,
+
+    /// Also list agent processes no human is typing into: SDK harnesses,
+    /// one-shot `-p` runs, hook children. They write the same session files as
+    /// an interactive agent but cannot be focused or resumed, so they are
+    /// hidden by default — turn this on to see every agent process the vendor
+    /// stores report.
+    #[dynamic(default)]
+    pub show_non_interactive: bool,
 }
 
 impl Default for AgentSectionConfig {
@@ -827,6 +847,7 @@ impl Default for AgentSectionConfig {
         Self {
             enabled: true,
             refresh_ms: default_agent_section_refresh_ms(),
+            show_non_interactive: false,
         }
     }
 }
@@ -1931,6 +1952,76 @@ impl Default for Config {
     }
 }
 
+/// Config file candidates, highest precedence first, before the
+/// `WEZTERM_CONFIG_FILE` and `--config-file` overrides are prepended.
+///
+/// `portable_exe_dir` is `Some` only in portable mode (see
+/// `config::portable_exe_dir`). Historically a `wezterm.lua` next to the
+/// executable always won on Windows — right for a thumb drive, wrong for an
+/// installed app, where that directory belongs to the installer rather than to
+/// the user.
+pub(crate) fn config_file_candidates(
+    home: &Path,
+    config_dirs: &[PathBuf],
+    portable_exe_dir: Option<&Path>,
+) -> Vec<PathPossibility> {
+    let mut paths = vec![PathPossibility::optional(home.join(".wezterm.lua"))];
+    for dir in config_dirs {
+        paths.push(PathPossibility::optional(dir.join("wezterm.lua")));
+    }
+    if let Some(dir) = portable_exe_dir {
+        paths.insert(0, PathPossibility::optional(dir.join("wezterm.lua")));
+    }
+    paths
+}
+
+/// Colour scheme directories, highest precedence first.
+pub(crate) fn color_scheme_dir_candidates(
+    configured: &[PathBuf],
+    config_dirs: &[PathBuf],
+    portable_exe_dir: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut paths = configured.to_vec();
+    for dir in config_dirs {
+        paths.push(dir.join("colors"));
+    }
+    if let Some(dir) = portable_exe_dir {
+        paths.insert(0, dir.join("colors"));
+    }
+    paths
+}
+
+/// Tell a portable user, once, why the config beside their executable stopped
+/// being read.
+///
+/// This warning is the only signal someone upgrading from a portable layout gets
+/// that the rule changed, so it names the marker and where the config should go.
+fn warn_about_ignored_exe_dir_config() {
+    use std::sync::Once;
+    static WARNED: Once = Once::new();
+    if !cfg!(windows) || crate::portable_mode() {
+        return;
+    }
+    WARNED.call_once(|| {
+        let Some(dir) = crate::EXE_DIR.as_deref() else {
+            return;
+        };
+        let candidate = dir.join("wezterm.lua");
+        if !candidate.is_file() {
+            return;
+        }
+        log::warn!(
+            "ignoring {}: it is next to the executable but there is no `{}` marker file there. \
+             Create an empty `{}` beside the executable to enable portable mode, or move the \
+             config to {}",
+            candidate.display(),
+            crate::PORTABLE_MARKER,
+            crate::PORTABLE_MARKER,
+            HOME_DIR.join(".wezterm.lua").display(),
+        );
+    });
+}
+
 impl Config {
     pub fn load() -> LoadedConfig {
         Self::load_with_overrides(&wezterm_dynamic::Value::default())
@@ -2023,26 +2114,9 @@ impl Config {
         // multiple.  In addition, it spawns a lot of subprocesses,
         // so we do this bit "by-hand"
 
-        let mut paths = vec![PathPossibility::optional(HOME_DIR.join(".wezterm.lua"))];
-        for dir in CONFIG_DIRS.iter() {
-            paths.push(PathPossibility::optional(dir.join("wezterm.lua")))
-        }
+        let mut paths = config_file_candidates(&HOME_DIR, &CONFIG_DIRS, crate::portable_exe_dir());
+        warn_about_ignored_exe_dir_config();
 
-        if cfg!(windows) {
-            // On Windows, a common use case is to maintain a thumb drive
-            // with a set of portable tools that don't need to be installed
-            // to run on a target system.  In that scenario, the user would
-            // like to run with the config from their thumbdrive because
-            // either the target system won't have any config, or will have
-            // the config of another user.
-            // So we prioritize that here: if there is a config in the same
-            // dir as the executable that will take precedence.
-            if let Ok(exe_name) = std::env::current_exe() {
-                if let Some(exe_dir) = exe_name.parent() {
-                    paths.insert(0, PathPossibility::optional(exe_dir.join("wezterm.lua")));
-                }
-            }
-        }
         if let Some(path) = std::env::var_os("WEZTERM_CONFIG_FILE") {
             log::trace!("Note: WEZTERM_CONFIG_FILE is set in the environment");
             paths.insert(0, PathPossibility::required(path.into()));
@@ -2425,19 +2499,11 @@ impl Config {
     }
 
     fn compute_color_scheme_dirs(&self) -> Vec<PathBuf> {
-        let mut paths = self.color_scheme_dirs.clone();
-        for dir in CONFIG_DIRS.iter() {
-            paths.push(dir.join("colors"));
-        }
-        if cfg!(windows) {
-            // See commentary re: portable tools above!
-            if let Ok(exe_name) = std::env::current_exe() {
-                if let Some(exe_dir) = exe_name.parent() {
-                    paths.insert(0, exe_dir.join("colors"));
-                }
-            }
-        }
-        paths
+        color_scheme_dir_candidates(
+            &self.color_scheme_dirs,
+            &CONFIG_DIRS,
+            crate::portable_exe_dir(),
+        )
     }
 
     fn load_color_schemes(&mut self, paths: &[PathBuf]) -> anyhow::Result<()> {
@@ -2965,6 +3031,91 @@ fn default_rich_input_dock_rows() -> usize {
 
 fn default_update_interval() -> u64 {
     86400
+}
+
+#[cfg(test)]
+mod portable_tests {
+    use super::*;
+
+    fn candidate_paths(portable: Option<&Path>) -> Vec<PathBuf> {
+        let home = PathBuf::from("/home/me");
+        let dirs = vec![PathBuf::from("/home/me/.config/wezterm")];
+        config_file_candidates(&home, &dirs, portable)
+            .into_iter()
+            .map(|p| p.path)
+            .collect()
+    }
+
+    #[test]
+    fn exe_dir_config_wins_only_in_portable_mode() {
+        let exe = PathBuf::from("/apps/tgzterminal");
+
+        let portable = candidate_paths(Some(&exe));
+        assert_eq!(portable[0], exe.join("wezterm.lua"));
+
+        // Installed: the program directory is not consulted at all, so a file
+        // dropped there cannot override anyone's config.
+        let installed = candidate_paths(None);
+        assert!(
+            !installed.iter().any(|p| p.starts_with(&exe)),
+            "installed builds must not read config next to the executable"
+        );
+        assert_eq!(installed[0], PathBuf::from("/home/me/.wezterm.lua"));
+    }
+
+    #[test]
+    fn home_config_still_precedes_the_xdg_dirs() {
+        // Pre-existing order, locked so the refactor cannot quietly flip it.
+        let paths = candidate_paths(None);
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from("/home/me/.wezterm.lua"),
+                PathBuf::from("/home/me/.config/wezterm/wezterm.lua"),
+            ]
+        );
+    }
+
+    #[test]
+    fn color_scheme_dirs_prefer_the_exe_dir_only_in_portable_mode() {
+        let configured = vec![PathBuf::from("/my/schemes")];
+        let dirs = vec![PathBuf::from("/home/me/.config/wezterm")];
+        let exe = PathBuf::from("/apps/tgzterminal");
+
+        let portable = color_scheme_dir_candidates(&configured, &dirs, Some(&exe));
+        assert_eq!(portable[0], exe.join("colors"));
+        // Explicitly configured dirs still outrank the config dirs.
+        assert_eq!(portable[1], PathBuf::from("/my/schemes"));
+
+        let installed = color_scheme_dir_candidates(&configured, &dirs, None);
+        assert_eq!(
+            installed,
+            vec![
+                PathBuf::from("/my/schemes"),
+                PathBuf::from("/home/me/.config/wezterm/colors"),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_portable_marker_must_be_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!crate::portable_marker_present(Some(dir.path())));
+
+        // A *directory* named `.portable` does not count: that would let an
+        // unrelated folder flip the mode by accident.
+        std::fs::create_dir(dir.path().join(crate::PORTABLE_MARKER)).unwrap();
+        assert!(!crate::portable_marker_present(Some(dir.path())));
+
+        std::fs::remove_dir(dir.path().join(crate::PORTABLE_MARKER)).unwrap();
+        std::fs::write(dir.path().join(crate::PORTABLE_MARKER), "").unwrap();
+        assert!(crate::portable_marker_present(Some(dir.path())));
+    }
+
+    #[test]
+    fn no_exe_dir_is_never_portable() {
+        assert!(!crate::portable_marker_present(None));
+    }
 }
 
 #[cfg(test)]

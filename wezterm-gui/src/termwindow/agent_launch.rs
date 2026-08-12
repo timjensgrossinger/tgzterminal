@@ -278,6 +278,74 @@ impl super::TermWindow {
             }
         }
     }
+
+    /// Spawn several agents into new tabs of this window, one after another.
+    ///
+    /// Both halves matter. A batch must not go through `agent_launch_placement`
+    /// per item — every in-flight `NewTab` spawn would resolve its target against
+    /// the pre-restore layout — and awaiting each spawn is what keeps the
+    /// restored tabs in the order they were captured. Goes straight to
+    /// `spawn_command_internal` rather than `spawn_command`, which is
+    /// fire-and-forget and would give up both properties.
+    ///
+    /// `skipped` is reported in the summary so a partial restore is visible
+    /// rather than looking like everything worked.
+    pub(crate) fn spawn_agents_in_new_tabs(&self, spawns: Vec<SpawnCommand>, skipped: usize) {
+        if spawns.is_empty() {
+            notify_restore_outcome(0, skipped);
+            return;
+        }
+        let size = self.terminal_size;
+        let term_config = Arc::new(TermConfig::with_config(self.config.clone()));
+        let window_id = self.mux_window_id;
+        promise::spawn::spawn(async move {
+            let mut restored = 0usize;
+            let mut failed = 0usize;
+            for spawn in spawns {
+                match crate::spawn::spawn_command_internal(
+                    spawn,
+                    SpawnWhere::NewTab,
+                    size,
+                    Some(window_id),
+                    term_config.clone(),
+                )
+                .await
+                {
+                    Ok(()) => restored += 1,
+                    Err(err) => {
+                        failed += 1;
+                        log::error!("agent session restore failed: {err:#}");
+                    }
+                }
+            }
+            notify_restore_outcome(restored, skipped + failed);
+        })
+        .detach();
+    }
+}
+
+/// One toast for the whole batch — never one per session.
+fn notify_restore_outcome(restored: usize, unavailable: usize) {
+    let message = match (restored, unavailable) {
+        (0, 0) => return,
+        (0, _) => "No agent sessions could be reopened".to_string(),
+        (n, 0) => format!("Reopened {n} agent session{}", plural(n)),
+        (n, u) => format!("Reopened {n} agent session{}, {u} unavailable", plural(n)),
+    };
+    wezterm_toast_notification::show(wezterm_toast_notification::ToastNotification {
+        title: "Agent restore".to_string(),
+        message,
+        url: None,
+        timeout: Some(std::time::Duration::from_millis(2600)),
+    });
+}
+
+fn plural(n: usize) -> &'static str {
+    if n == 1 {
+        ""
+    } else {
+        "s"
+    }
 }
 
 #[cfg(test)]

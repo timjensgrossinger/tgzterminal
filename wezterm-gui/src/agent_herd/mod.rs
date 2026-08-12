@@ -28,7 +28,7 @@ pub mod vendor;
 
 use std::collections::HashMap;
 
-use crate::agent_herd::vendor::AgentVendor;
+use crate::agent_herd::vendor::{AgentVendor, VendorSession};
 use mux::pane::PaneId;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -382,6 +382,24 @@ impl HerdAgent {
         self.pane_id.is_some() && self.status.is_interruptible()
     }
 
+    /// Identity that survives the list being rebuilt and re-sorted.
+    pub fn key(&self) -> AgentKey {
+        match (&self.session_id, self.pane_id, self.pid) {
+            (Some(session_id), _, _) if !session_id.is_empty() => {
+                AgentKey::Session(session_id.clone())
+            }
+            (_, Some(pane_id), _) => AgentKey::Pane(pane_id),
+            (_, _, Some(pid)) => AgentKey::Pid(pid),
+            _ => AgentKey::Name(self.name.clone()),
+        }
+    }
+
+    /// Can this row be brought on screen? A session with no bound pane is
+    /// "detached": it exists, but there is nothing here to focus.
+    pub fn is_detached(&self) -> bool {
+        self.pane_id.is_none()
+    }
+
     /// Status dot colour for this agent's vendor.
     pub fn vendor_dot_color(&self) -> (u8, u8, u8) {
         self.vendor.dot_color()
@@ -398,6 +416,8 @@ impl HerdAgent {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ClaudeSession {
     pub pid: u32,
+    /// See [`crate::agent_herd::vendor::VendorSession::interactive`].
+    pub interactive: bool,
     pub session_id: String,
     pub cwd: PathBuf,
     pub project_root: Option<PathBuf>,
@@ -407,6 +427,23 @@ pub struct ClaudeSession {
     pub started_at: Option<SystemTime>,
     pub status_changed_at: Option<SystemTime>,
     pub subagents: Vec<HerdSubagent>,
+}
+
+/// Stable identity of a herd row, used instead of its position in the list.
+///
+/// The list is rebuilt on every paint and `sort_agents` reorders it by status,
+/// so an index captured at paint time can address a different agent by the time
+/// the click arrives — expanding one row and focusing another.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum AgentKey {
+    /// The vendor's own session id: survives the agent moving between panes.
+    Session(String),
+    /// A pane-only agent (detected live, no session file).
+    Pane(PaneId),
+    /// A session file with no id recorded.
+    Pid(u32),
+    /// Nothing identifying at all; the display name is the last resort.
+    Name(String),
 }
 
 /// An agent pane as detected on the GUI thread.
@@ -434,7 +471,7 @@ pub struct PaneAgentRow {
 /// same vendor in the same directory are genuinely ambiguous, and guessing
 /// would point Stop at the wrong pane; such a session stays unbound instead.
 pub fn join_sessions_with_panes(
-    sessions: Vec<ClaudeSession>,
+    sessions: Vec<VendorSession>,
     panes: Vec<PaneAgentRow>,
 ) -> Vec<HerdAgent> {
     let mut sessions = sessions;
@@ -462,8 +499,8 @@ pub fn join_sessions_with_panes(
                 .clone()
                 .or_else(|| pane.map(|p| p.title.clone()))
                 .unwrap_or_else(|| session.session_id.clone()),
-            provider: "claude".to_string(),
-            vendor: AgentVendor::Claude,
+            provider: session.vendor.adapter_id().to_string(),
+            vendor: session.vendor.clone(),
             status: session.status,
             blocked_reason: session.blocked_reason.clone(),
             // The session file carries no model; pane detection sometimes does.
@@ -471,12 +508,16 @@ pub fn join_sessions_with_panes(
             project_root: session
                 .project_root
                 .clone()
-                .or_else(|| pane.and_then(|p| p.project_root.clone())),
+                .or_else(|| pane.and_then(|p| p.project_root.clone()))
+                // Most vendor stores record no root at all, and an agent with
+                // no root escapes project scoping entirely.
+                .or_else(|| project_root_for(&session.cwd)),
             cwd: Some(session.cwd.clone()),
             git_branch: pane.and_then(|p| p.git_branch.clone()),
             pid: Some(session.pid),
             pane_id: bound,
-            session_id: Some(session.session_id.clone()),
+            // An empty id is "not reported", not an id equal to "".
+            session_id: (!session.session_id.is_empty()).then(|| session.session_id.clone()),
             started_at: session.started_at,
             status_changed_at: session.status_changed_at,
             subagents: session.subagents,
@@ -530,7 +571,7 @@ pub fn join_sessions_with_panes(
 }
 
 fn bind_by_pid(
-    session: &ClaudeSession,
+    session: &VendorSession,
     panes: &[PaneAgentRow],
     claimed: &HashSet<PaneId>,
 ) -> Option<PaneId> {
@@ -541,14 +582,19 @@ fn bind_by_pid(
 }
 
 fn bind_by_cwd(
-    session: &ClaudeSession,
+    session: &VendorSession,
     panes: &[PaneAgentRow],
     claimed: &HashSet<PaneId>,
 ) -> Option<PaneId> {
     let mut candidates = panes.iter().filter(|row| {
         !claimed.contains(&row.pane_id)
             && row.cwd.as_deref() == Some(session.cwd.as_path())
-            && matches!(row.provider.as_deref(), None | Some("claude"))
+            // A pane whose vendor is known must match; an undetected provider
+            // stays eligible, since pane detection is the weaker signal.
+            && match row.provider.as_deref() {
+                None => true,
+                Some(provider) => provider == session.vendor.adapter_id(),
+            }
     });
     let first = candidates.next()?;
     // Ambiguous: refuse to guess rather than aim Stop at the wrong pane.
@@ -711,9 +757,11 @@ mod tests {
         }
     }
 
-    fn session(pid: u32, name: &str, cwd: &str) -> ClaudeSession {
-        ClaudeSession {
+    fn session(pid: u32, name: &str, cwd: &str) -> VendorSession {
+        VendorSession {
             pid,
+            interactive: true,
+            vendor: AgentVendor::Claude,
             session_id: format!("session-{pid}"),
             cwd: PathBuf::from(cwd),
             project_root: Some(PathBuf::from(cwd)),

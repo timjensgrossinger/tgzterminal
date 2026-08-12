@@ -20,6 +20,13 @@ use super::{status_from_claude, subagent_status, ClaudeSession, HerdSubagent};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+/// `entrypoint` values that mean "a human is typing into this".
+///
+/// Anything else — `sdk-cli`, `sdk-py`, `sdk-ts`, hook children — is a process
+/// spawned by a harness. Matching the allowed set rather than excluding the
+/// known harnesses means a new harness name defaults to hidden.
+const INTERACTIVE_ENTRYPOINTS: &[&str] = &["cli", "vscode", "jetbrains"];
+
 /// Why a project's log directory could not be used.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProjectDirError {
@@ -87,8 +94,18 @@ fn parse_session_file(path: &Path) -> Option<ClaudeSession> {
         .map(str::to_string);
     let status = status_from_claude(status_text, blocked_reason.as_deref());
 
+    // `kind` is "interactive" even for SDK-spawned sessions, so `entrypoint`
+    // is the discriminator: "cli" is a terminal a human types into, while
+    // "sdk-cli" and friends are harness/hook children. An absent entrypoint
+    // predates the field, so assume interactive rather than hiding the row.
+    let interactive = match value.get("entrypoint").and_then(|v| v.as_str()) {
+        None => true,
+        Some(entrypoint) => INTERACTIVE_ENTRYPOINTS.contains(&entrypoint),
+    };
+
     Some(ClaudeSession {
         pid,
+        interactive,
         session_id,
         project_root: super::project_root_for(&cwd),
         cwd,
@@ -667,6 +684,7 @@ impl crate::agent_herd::vendor::SessionSource for ClaudeDetector {
             .into_iter()
             .map(|s| crate::agent_herd::vendor::VendorSession {
                 pid: s.pid,
+                interactive: s.interactive,
                 vendor: crate::agent_herd::vendor::AgentVendor::Claude,
                 session_id: s.session_id,
                 cwd: s.cwd,

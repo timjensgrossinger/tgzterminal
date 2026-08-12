@@ -1,6 +1,6 @@
 use crate::agent_herd::claude::{self, ProjectDirError as ClaudeLogsPathError};
 use crate::agent_herd::vendor::{AgentVendor, VendorSession};
-use crate::agent_herd::{group_by_project, HerdAgent, HerdStatus, HerdView};
+use crate::agent_herd::{group_by_project, HerdAgent, HerdStatus, HerdView, PaneAgentRow};
 use crate::quad::TripleLayerQuadAllocator;
 use crate::spawn::SpawnWhere;
 use crate::tabbar::TabBarItem;
@@ -9,10 +9,11 @@ use crate::termwindow::render::corners::{
     TOP_RIGHT_ROUNDED_CORNER,
 };
 use crate::termwindow::render::RenderScreenLineParams;
+use crate::termwindow::tgz_last_session::{self, SnapshotSession};
 use crate::termwindow::{
-    agent_launch, wsl_paths, AgentCopyAction, AgentLauncherEntry, AgentToolbeltAction,
-    CloseTabMenuAction, CloseTabSource, ExpandedMenuRow, NewTabMenuEntry, NewTabTarget,
-    SshQuickLaunchEntry, TermWindowNotif, UIItem, UIItemType,
+    agent_launch, wsl_paths, AgentCopyAction, AgentLauncherEntry, AgentRowAction,
+    AgentToolbeltAction, CloseTabMenuAction, CloseTabSource, ExpandedMenuRow, NewTabMenuEntry,
+    NewTabTarget, SshQuickLaunchEntry, TermWindowNotif, UIItem, UIItemType,
 };
 use config::keyassignment::{SpawnCommand, SpawnTabDomain};
 use config::{
@@ -26,11 +27,12 @@ use mux::renderable::RenderableDimensions;
 use mux::tab::{PositionedPane, SplitDirection};
 use mux::Mux;
 use regex::RegexBuilder;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 use std::{env, fs};
 use termwiz::cell::{grapheme_column_width, unicode_column_width, CellAttributes, Intensity};
@@ -181,15 +183,43 @@ fn lerp_rgba(a: LinearRgba, b: LinearRgba, t: f32) -> LinearRgba {
     )
 }
 
+/// How long a window waits before writing its agent-session snapshot again.
+///
+/// The set is checked every paint but changes rarely; this bounds a burst of
+/// tab churn to one write rather than one per frame.
+const SNAPSHOT_WRITE_INTERVAL: Duration = Duration::from_secs(2);
+
 /// Repaint cadence while a status dot is pulsing. ~30fps is ample for a 1.6s
 /// breath and half the cost of the 16ms drop-flash interval.
 const AGENT_PULSE_FRAME_INTERVAL: Duration = Duration::from_millis(33);
 
+/// Reference instant for the agent status pulse.
+///
+/// Process-global rather than per-window (`TermWindow::created`): a window
+/// opened later would otherwise breathe out of step with the first one, and the
+/// point of the pulse is that every working agent reads as working at the same
+/// moment. Deliberately unseeded per item, unlike the tab bar's
+/// `spinner_phase`, which exists to spread tabs apart.
+static AGENT_PULSE_EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+/// Instant at which the pulse next needs a frame, snapped to the frame grid
+/// measured from [`AGENT_PULSE_EPOCH`].
+///
+/// Snapping matters: `now + interval` drifts by however long the repaint took,
+/// so several dots asking on different frames would slowly spread apart. On a
+/// grid boundary every caller within one frame gets the same answer.
+fn next_agent_pulse_frame_due() -> Instant {
+    let interval = AGENT_PULSE_FRAME_INTERVAL.as_nanos();
+    let elapsed = AGENT_PULSE_EPOCH.elapsed().as_nanos();
+    let next_frame = elapsed / interval + 1;
+    *AGENT_PULSE_EPOCH + Duration::from_nanos((next_frame * interval) as u64)
+}
+
 /// Slow pulse in `0.0..=1.0`, smoothstep-eased.
 ///
-/// Derived from wall clock so every dot in the window breathes in phase with no
-/// per-dot state. Smoothstep over a triangle wave is continuous in value and
-/// first derivative at the turnaround, so the dot breathes instead of ticking.
+/// Derived from wall clock so every dot breathes in phase with no per-dot
+/// state. Smoothstep over a triangle wave is continuous in value and first
+/// derivative at the turnaround, so the dot breathes instead of ticking.
 fn agent_pulse_phase(elapsed: Duration, period: Duration) -> f32 {
     let period_ms = period.as_millis() as f32;
     if period_ms <= 1. {
@@ -1059,6 +1089,65 @@ fn fit_label<'a>(candidates: &[&'a str], cols: usize) -> Option<&'a str> {
         .find(|candidate| unicode_column_width(candidate, None) <= cols)
 }
 
+/// Like [`truncate_to_cols`] but marks elision with a trailing `…`.
+///
+/// Use where the caller cannot offer shorter variants to [`fit_label`] and a
+/// silent cut would read as data (`"tgzterminal-2"` looks like a real name).
+/// The ellipsis is one column wide, so it replaces the last column of the
+/// budget; a one-column budget yields the ellipsis alone.
+fn truncate_with_ellipsis(text: &str, cols: usize) -> Cow<'_, str> {
+    if cols == 0 {
+        return Cow::Borrowed("");
+    }
+    if unicode_column_width(text, None) <= cols {
+        return Cow::Borrowed(text);
+    }
+    let kept = truncate_to_cols(text, cols - 1);
+    Cow::Owned(format!("{kept}…"))
+}
+
+/// Elide a path from the *head*, keeping the tail: `…/Documents/tgzterminal`.
+///
+/// The informative end of a path is its last components, so head truncation
+/// (which is what an untruncated `paint_text` used to produce by overflowing)
+/// hides exactly what the user needs.
+fn elide_path_head(text: &str, cols: usize) -> Cow<'_, str> {
+    if cols == 0 {
+        return Cow::Borrowed("");
+    }
+    if unicode_column_width(text, None) <= cols {
+        return Cow::Borrowed(text);
+    }
+    let kept = truncate_to_cols_from_end(text, cols - 1);
+    Cow::Owned(format!("…{kept}"))
+}
+
+/// Split an agent herd row's content columns into `(name_cols, project_cols)`.
+///
+/// The two labels are painted at opposite ends of the same row, so their column
+/// budgets must be disjoint or the glyphs composite on top of each other — the
+/// project label is allowed at most a third of the row, always leaves a
+/// one-column gap, and is dropped entirely rather than starving the name, which
+/// is the row's identity.
+fn herd_row_columns(content_cols: usize, project_cols_wanted: usize) -> (usize, usize) {
+    /// Below this the name is unreadable, so the project label loses.
+    const MIN_NAME_COLS: usize = 6;
+
+    if content_cols == 0 {
+        return (0, 0);
+    }
+    let project = project_cols_wanted.min(content_cols / 3);
+    if project == 0 {
+        return (content_cols, 0);
+    }
+    // The gap keeps the two regions from sharing a column.
+    let name = content_cols.saturating_sub(project + 1);
+    if name < MIN_NAME_COLS {
+        return (content_cols, 0);
+    }
+    (name, project)
+}
+
 /// Diameter of an agent status dot. Single source of truth: the sidebar tab
 /// badge and the launcher button used to disagree (a fixed 7px vs a cell-derived
 /// clamp), so the same status read differently in two places.
@@ -1244,9 +1333,10 @@ fn sidebar_agent_herd_metrics(
     let header_h = cell_h + 8.0 * dpi;
     let pad = 8.0 * dpi;
     let full_detail_h = if !collapsed && expanded.is_some_and(|index| index < agent_count) {
-        // Detail can contain status, project root, and activity lines. Keep
-        // enough room for all three, including the top padding and line gaps.
-        pad + 3.0 * cell_h + 4.0 * dpi
+        // Detail can contain status, project root and activity lines, plus the
+        // action button row. Keep room for all four, including the top padding,
+        // the line gaps and the padding under the buttons.
+        pad + 4.0 * cell_h + 10.0 * dpi
     } else {
         0.0
     };
@@ -2529,34 +2619,6 @@ pub(crate) struct AgentPaneState {
     actions: AgentActions,
 }
 
-fn herd_agent_from_vendor_session(session: &VendorSession) -> HerdAgent {
-    let project_root = session
-        .project_root
-        .clone()
-        .or_else(|| crate::agent_herd::project_root_for(&session.cwd));
-    HerdAgent {
-        name: session
-            .name
-            .clone()
-            .unwrap_or_else(|| session.vendor.label().to_string()),
-        provider: session.vendor.label().to_ascii_lowercase(),
-        vendor: session.vendor.clone(),
-        status: session.status,
-        blocked_reason: session.blocked_reason.clone(),
-        model: None,
-        cwd: Some(session.cwd.clone()),
-        project_root,
-        git_branch: None,
-        pid: Some(session.pid),
-        pane_id: None,
-        session_id: (!session.session_id.is_empty()).then(|| session.session_id.clone()),
-        started_at: session.started_at,
-        status_changed_at: session.status_changed_at,
-        subagents: session.subagents.clone(),
-        activity: None,
-    }
-}
-
 /// Narrow the herd to the active pane's project.
 ///
 /// The disk scan sweeps every vendor store under `$HOME`, so without this the
@@ -2585,6 +2647,119 @@ fn vendor_session_adapter_enabled(
         .get(&vendor.label().to_ascii_lowercase())
         .map(|adapter| adapter.enabled)
         .unwrap_or(true)
+}
+
+/// The agent sessions running in this window, in tab order, as the snapshot
+/// records them.
+///
+/// Takes the **unscoped** herd list: project scoping is a display filter, and
+/// snapshotting after it would silently forget every agent outside the active
+/// pane's project. Only pane-bound agents count — a pane-bound agent is by
+/// construction a pane of this window, whereas a detached row came from the
+/// machine-wide disk scan and may belong to anyone.
+fn window_agent_sessions(agents: &[HerdAgent]) -> Vec<SnapshotSession> {
+    let mut seen = HashSet::new();
+    agents
+        .iter()
+        .filter(|agent| agent.pane_id.is_some())
+        .filter_map(|agent| {
+            let session_id = agent.session_id.clone()?;
+            let cwd = agent.cwd.clone()?;
+            Some(SnapshotSession {
+                adapter_id: agent.provider.clone(),
+                session_id,
+                cwd,
+                label: Some(agent.name.clone()),
+            })
+        })
+        .filter(|session| seen.insert((session.adapter_id.clone(), session.session_id.clone())))
+        .collect()
+}
+
+/// What a restore click will actually do.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RestorePlan {
+    /// Sessions to spawn, in capture order.
+    spawn: Vec<SnapshotSession>,
+    /// How many entries were dropped, for the summary toast.
+    skipped: usize,
+}
+
+/// Decide which snapshot entries are worth spawning.
+///
+/// Pure — no config handle, no mux, no filesystem — so the cap, the dedup and the
+/// id gate are testable. Per-entry rejections are *counted*, never fatal: one
+/// uninstalled vendor must not cost the user the other five sessions.
+fn plan_session_restore(
+    entries: &[SnapshotSession],
+    live: &HashSet<(String, String)>,
+    enabled_adapters: &HashSet<String>,
+    cap: usize,
+) -> RestorePlan {
+    let mut plan = RestorePlan::default();
+    let mut planned = HashSet::new();
+    for entry in entries {
+        let key = (entry.adapter_id.clone(), entry.session_id.clone());
+        let usable = crate::agent_herd::sessions::session_id_is_sane(&entry.session_id)
+            && enabled_adapters.contains(&entry.adapter_id)
+            // Already running — here, in another window, or in another process.
+            // Restoring it again would point two agents at one transcript.
+            && !live.contains(&key)
+            && planned.insert(key);
+        if !usable || plan.spawn.len() >= cap {
+            plan.skipped += 1;
+            continue;
+        }
+        plan.spawn.push(entry.clone());
+    }
+    plan
+}
+
+/// Buttons offered by an expanded herd row, in display order.
+///
+/// A detached agent has no pane to focus, attach to, read logs from or signal,
+/// so it is offered the one thing that can work: relaunching it through its
+/// adapter's resume command.
+fn agent_row_actions(agent: &HerdAgent) -> Vec<AgentRowAction> {
+    if agent.is_detached() {
+        return vec![AgentRowAction::Resume];
+    }
+    let mut actions = vec![
+        AgentRowAction::Focus,
+        AgentRowAction::Attach,
+        AgentRowAction::Logs,
+    ];
+    if agent.can_stop() {
+        actions.push(AgentRowAction::Stop);
+    }
+    actions
+}
+
+/// Which disk-scanned sessions the herd should list.
+///
+/// Drops sessions whose vendor the user disabled, hides harness-spawned
+/// processes unless asked for, and collapses repeats. Identity is
+/// `(vendor, session_id, pid)`: SDK siblings share one session id across
+/// several files, so the id alone both over- and under-counts.
+fn herd_sessions_for_display(
+    sessions: &[VendorSession],
+    adapters: &config::AgentAdaptersConfig,
+    show_non_interactive: bool,
+) -> Vec<VendorSession> {
+    let mut seen: HashSet<(String, String, u32)> = HashSet::new();
+    sessions
+        .iter()
+        .filter(|session| vendor_session_adapter_enabled(adapters, &session.vendor))
+        .filter(|session| session.interactive || show_non_interactive)
+        .filter(|session| {
+            seen.insert((
+                session.vendor.adapter_id().to_string(),
+                session.session_id.clone(),
+                session.pid,
+            ))
+        })
+        .cloned()
+        .collect()
 }
 
 fn agent_toolbelt_buttons(
@@ -4143,49 +4318,174 @@ impl crate::TermWindow {
             // The scan was replaced between paint and click; nothing to do.
             return;
         };
-        let Some(adapter) = self.agent_adapter_config_by_id(Some(&session.adapter_id)) else {
+        self.resume_agent_session_by_id(
+            &session.adapter_id,
+            &session.session_id,
+            session.cwd.clone(),
+            target,
+        );
+    }
+
+    /// Resume a session identified directly rather than by cache position.
+    ///
+    /// The herd section knows an agent's adapter, session id and cwd but has no
+    /// index into `agent_session_cache`, and a detached herd row (no pane to
+    /// signal) can only be brought back this way.
+    pub fn resume_agent_session_by_id(
+        &mut self,
+        adapter_id: &str,
+        session_id: &str,
+        session_cwd: PathBuf,
+        target: Option<AgentLaunchTarget>,
+    ) {
+        let Some(spawn) =
+            self.agent_resume_spawn_command(adapter_id, session_id, session_cwd, false)
+        else {
             return;
         };
-        let label = adapter_label(&adapter, &session.adapter_id);
+        let placement = self.agent_launch_placement(false, target);
+        self.spawn_agent(spawn, placement);
+    }
+
+    /// How many sessions one restore click may reopen.
+    fn agent_restore_limit(&self) -> usize {
+        self.config
+            .agent_ui
+            .launcher
+            .restore_last_window_sessions
+            .min(MAX_RESUME_MENU_SESSIONS) as usize
+    }
+
+    /// Agent sessions offered by the launcher's "Reopen last window" row.
+    pub(crate) fn agent_restore_candidates(&self) -> Option<Arc<Vec<SnapshotSession>>> {
+        if self.agent_restore_limit() == 0 {
+            return None;
+        }
+        self.last_window_sessions.clone()
+    }
+
+    /// Reopen the agent sessions that were running in the last window of the
+    /// previous run, one per new tab.
+    ///
+    /// Placement is not consulted: the user asked for tabs, and recomputing
+    /// `agent_launch_placement` per session would be wrong anyway — each call
+    /// would see the pre-restore layout, because the earlier spawns are still in
+    /// flight.
+    pub fn restore_last_window_agent_sessions(&mut self) {
+        // Taken, not cloned: the row disappears once used, so a double-click
+        // cannot restore everything twice.
+        let Some(entries) = self.last_window_sessions.take() else {
+            return;
+        };
+
+        // Machine-wide and liveness-filtered, so this also catches a session
+        // running in another window or another TGZTerminal process.
+        let live: HashSet<(String, String)> = self
+            .agent_herd_session_cache
+            .as_ref()
+            .map(|(_, sessions)| {
+                sessions
+                    .iter()
+                    .map(|s| (s.vendor.adapter_id().to_string(), s.session_id.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // `agent_adapter_config_by_id` deliberately does not check `enabled`, so
+        // the batch has to.
+        let enabled: HashSet<String> = self
+            .merged_agent_adapters()
+            .iter()
+            .filter(|(_, adapter)| adapter.enabled)
+            .map(|(id, _)| id.clone())
+            .collect();
+
+        let plan = plan_session_restore(&entries, &live, &enabled, self.agent_restore_limit());
+        let mut skipped = plan.skipped;
+        let mut spawns = Vec::with_capacity(plan.spawn.len());
+        for entry in plan.spawn {
+            // A directory that has since been deleted or unmounted cannot host a
+            // resumed agent, and spawning there fails obscurely.
+            if !entry.cwd.is_dir() {
+                skipped += 1;
+                continue;
+            }
+            match self.agent_resume_spawn_command(
+                &entry.adapter_id,
+                &entry.session_id,
+                entry.cwd.clone(),
+                true,
+            ) {
+                Some(spawn) => spawns.push(spawn),
+                None => skipped += 1,
+            }
+        }
+
+        self.spawn_agents_in_new_tabs(spawns, skipped);
+    }
+
+    /// Build the spawn for a resume, or `None` when this session cannot be
+    /// resumed.
+    ///
+    /// The one place a resume argv is constructed, so the id gate, the adapter
+    /// lookup, the domain choice and the cwd translation cannot drift apart
+    /// between the single-row click and a batch restore.
+    ///
+    /// `quiet` suppresses the per-session toast: a batch reports once at the end
+    /// rather than once per skipped session.
+    fn agent_resume_spawn_command(
+        &self,
+        adapter_id: &str,
+        session_id: &str,
+        session_cwd: PathBuf,
+        quiet: bool,
+    ) -> Option<SpawnCommand> {
+        // Ids reach argv as their own element. The transcript scan gates its own
+        // ids, but the last-session snapshot is a file under `$HOME` like any
+        // other, and this is the last place before argv that can still say no.
+        if !crate::agent_herd::sessions::session_id_is_sane(session_id) {
+            log::warn!("refusing to resume session id {session_id:?}: unsafe for argv");
+            return None;
+        }
+        let adapter = self.agent_adapter_config_by_id(Some(adapter_id))?;
+        let label = adapter_label(&adapter, adapter_id);
         let values = AgentActionTemplateValues {
-            session_id: Some(session.session_id.clone()),
-            cwd: Some(session.cwd.clone()),
+            session_id: Some(session_id.to_string()),
+            cwd: Some(session_cwd.clone()),
             home: dirs_next::home_dir(),
             attach_url: None,
         };
         let Some(argv) = resolve_agent_resume_command(&adapter, &values) else {
-            wezterm_toast_notification::show(wezterm_toast_notification::ToastNotification {
-                title: "Agent resume".to_string(),
-                message: format!("{label} has no resume command, or it is not on PATH"),
-                url: None,
-                timeout: Some(Duration::from_millis(2600)),
-            });
-            return;
+            if !quiet {
+                wezterm_toast_notification::show(wezterm_toast_notification::ToastNotification {
+                    title: "Agent resume".to_string(),
+                    message: format!("{label} has no resume command, or it is not on PATH"),
+                    url: None,
+                    timeout: Some(Duration::from_millis(2600)),
+                });
+            }
+            return None;
         };
 
         let forced_local = self.agent_launch_forced_local();
         let domain = match self
             .agent_launcher_entries()
             .iter()
-            .find(|entry| entry.adapter_id == session.adapter_id)
+            .find(|entry| entry.adapter_id == adapter_id)
         {
             Some(entry) => self.agent_launch_domain(entry, forced_local),
             // The agent is resumable but not installed as a launcher entry;
             // fall back to the active pane's domain rather than refusing.
             None => SpawnTabDomain::CurrentPaneDomain,
         };
-        let cwd = self.translate_cwd_for_domain(session.cwd.clone(), &domain);
-        let placement = self.agent_launch_placement(false, target);
-        self.spawn_agent(
-            SpawnCommand {
-                label: Some(format!("{label} resume")),
-                args: Some(argv),
-                cwd,
-                domain,
-                ..Default::default()
-            },
-            placement,
-        );
+        let cwd = self.translate_cwd_for_domain(session_cwd, &domain);
+        Some(SpawnCommand {
+            label: Some(format!("{label} resume")),
+            args: Some(argv),
+            cwd,
+            domain,
+            ..Default::default()
+        })
     }
 
     /// Launch the agent with the given adapter id, if it is still installed.
@@ -5077,12 +5377,18 @@ impl crate::TermWindow {
         }
 
         let state = self.agent_herd_state.borrow();
+        // Layout works in row positions; the expansion is stored by identity,
+        // so resolve it against the list as it stands right now.
+        let expanded_idx = state
+            .expanded
+            .as_ref()
+            .and_then(|key| state.agents.iter().position(|agent| &agent.key() == key));
         let metrics = sidebar_agent_herd_metrics(
             self.render_metrics.cell_size.height as f32,
             self.dimensions.dpi as f32 / 96.0,
             state.collapsed,
             state.agents.len(),
-            state.expanded,
+            expanded_idx,
             None,
         );
         let section_bottom = self.sidebar_bottom_controls_top(top, height, row_height);
@@ -5098,7 +5404,7 @@ impl crate::TermWindow {
             self.dimensions.dpi as f32 / 96.0,
             state.collapsed,
             state.agents.len(),
-            state.expanded,
+            expanded_idx,
             Some(available_h - metrics.header_h),
         ))
     }
@@ -5438,12 +5744,49 @@ impl crate::TermWindow {
             .is_some_and(|domain| domain.downcast_ref::<mux::ssh::RemoteSshDomain>().is_some())
     }
 
+    /// Agent shown as a badge on this tab's row, if any.
+    ///
+    /// Badge-only: gated by `show_sidebar_badges`, which is a paint-time
+    /// preference. Data paths must use [`Self::sidebar_agent_panes_for_tab_idx`]
+    /// instead — turning a badge off may not switch off agent tracking.
     fn sidebar_agent_for_tab_idx(&self, tab_idx: usize) -> Option<AgentPaneState> {
-        if !self.config.agent_ui.enabled || !self.config.agent_ui.show_sidebar_badges {
+        if !self.config.agent_ui.show_sidebar_badges {
             return None;
         }
         let pane = self.sidebar_primary_pane_for_tab_idx(tab_idx)?;
+        if !self.config.agent_ui.enabled {
+            return None;
+        }
         self.detect_agent_pane(&pane)
+    }
+
+    /// Every agent running in this tab, one entry per pane.
+    ///
+    /// The herd looks at all of a tab's panes, not just the primary one: the
+    /// launcher opens agents into splits by default, and an agent in the second
+    /// half of a split used to bind to no pane at all — so it rendered as
+    /// "detached" and could not be focused or stopped.
+    fn sidebar_agent_panes_for_tab_idx(
+        &self,
+        tab_idx: usize,
+    ) -> Vec<(Arc<dyn Pane>, AgentPaneState)> {
+        if !self.config.agent_ui.enabled {
+            return Vec::new();
+        }
+        let Some(tab) = Mux::get()
+            .get_window(self.mux_window_id)
+            .and_then(|window| window.get_by_idx(tab_idx).cloned())
+        else {
+            return Vec::new();
+        };
+        tab.iter_panes_ignoring_zoom()
+            .into_iter()
+            .filter(|pos| !self.is_sidebar_utility_pane(&pos.pane))
+            .filter_map(|pos| {
+                self.detect_agent_pane(&pos.pane)
+                    .map(|agent| (pos.pane.clone(), agent))
+            })
+            .collect()
     }
 
     /// Phase to draw this agent's status dot at, or `None` when it must not
@@ -5463,8 +5806,8 @@ impl crate::TermWindow {
             return None;
         }
         let period = Duration::from_millis(self.config.agent_ui.pulse_period_ms.clamp(400, 6000));
-        self.update_next_frame_time(Some(Instant::now() + AGENT_PULSE_FRAME_INTERVAL));
-        Some(agent_pulse_phase(self.created.elapsed(), period))
+        self.update_next_frame_time(Some(next_agent_pulse_frame_due()));
+        Some(agent_pulse_phase(AGENT_PULSE_EPOCH.elapsed(), period))
     }
 
     fn sidebar_primary_pane_for_tab_idx(&self, tab_idx: usize) -> Option<Arc<dyn Pane>> {
@@ -5486,7 +5829,17 @@ impl crate::TermWindow {
             .or(active_pane)
     }
 
-    fn sidebar_compact_tab_icon(&self, tab_idx: usize, title: &str) -> (String, LinearRgba) {
+    /// Icon, colour, and the agent behind them, for one collapsed-rail tab.
+    ///
+    /// The agent is returned rather than discarded so the rail can show the same
+    /// status dot the expanded rows do: with the sidebar narrowed there is no
+    /// title and no badge column, so without this the rail was the one place
+    /// where a working agent looked exactly like an idle one.
+    fn sidebar_compact_tab_icon(
+        &self,
+        tab_idx: usize,
+        title: &str,
+    ) -> (String, LinearRgba, Option<AgentPaneState>) {
         let pane = self.sidebar_primary_pane_for_tab_idx(tab_idx);
         let agent = if self.config.agent_ui.enabled && self.config.agent_ui.show_sidebar_badges {
             pane.as_ref().and_then(|pane| self.detect_agent_pane(pane))
@@ -5517,7 +5870,7 @@ impl crate::TermWindow {
             command.as_deref(),
             pane_title.as_deref(),
         );
-        (symbol, color)
+        (symbol, color, agent)
     }
 
     fn sidebar_agent_metadata(&self, agent: &AgentPaneState) -> Vec<String> {
@@ -6201,6 +6554,26 @@ impl crate::TermWindow {
             if resume_expanded {
                 rows.extend(self.agent_resume_session_rows());
             }
+        }
+
+        // Reopen everything the last window had. Top level rather than inside
+        // the submenu above: it should not need discovering, and it stays useful
+        // when `resume_menu_sessions` is 0. Reads only the snapshot loaded at
+        // window creation — paint must not touch the filesystem.
+        if let Some(candidates) = self.agent_restore_candidates() {
+            let count = candidates.len();
+            rows.push(SidebarDropdownRow {
+                label: format!(
+                    "Reopen last window ({count} agent{})",
+                    if count == 1 { "" } else { "s" }
+                ),
+                dot_color: None,
+                checkbox: None,
+                divider_above: false,
+                indent: false,
+                trailing_chevron: false,
+                item_type: UIItemType::SidebarAgentMenuRestoreLastWindow,
+            });
         }
 
         // The session labels are prose, not one-word commands, so the submenu
@@ -7170,7 +7543,8 @@ impl crate::TermWindow {
                 let tab_hovered = hovered_item.as_ref() == Some(&tab_type);
                 let tab_pressed =
                     left_pressed && tab_hovered && self.pressed_ui_item.as_ref() == Some(&tab_type);
-                let (symbol, icon_color) = self.sidebar_compact_tab_icon(tab_idx, &title);
+                let (symbol, icon_color, rail_agent) =
+                    self.sidebar_compact_tab_icon(tab_idx, &title);
                 let tab_bg = if active {
                     lerp_rgba(icon_color, surface, 0.16)
                 } else if tab_pressed {
@@ -7234,6 +7608,31 @@ impl crate::TermWindow {
                     label_fg,
                     tab_bg,
                 )?;
+                // Agent status dot, tucked into the icon box's top corner on the
+                // side away from the active-tab rail so the two never collide.
+                // Follows `tab_offset` so it stays put when the tab is pressed.
+                if let Some(agent) = &rail_agent {
+                    let dot_size = sidebar_status_dot_size(cell_height as f32);
+                    let inset = 1.5;
+                    let dot_x = match self.config.sidebar_position {
+                        SidebarPosition::Left => rail_x + rail_side - dot_size - inset,
+                        SidebarPosition::Right => rail_x + inset,
+                    };
+                    let dot_color = agent_status_dot_accent(
+                        &agent.status,
+                        if active { accent } else { icon_color },
+                        tab_bg,
+                        self.agent_dot_pulse(agent),
+                    );
+                    self.sidebar_pill_fill(
+                        layers,
+                        2,
+                        euclid::rect(dot_x, rail_y + tab_offset + inset, dot_size, dot_size),
+                        dot_size * 0.5,
+                        dot_color,
+                    )?;
+                }
+
                 self.ui_items.push(UIItem {
                     x: left as usize,
                     y: rail_y as usize,
@@ -8441,82 +8840,152 @@ impl crate::TermWindow {
         let Some(window) = mux.get_window(self.mux_window_id) else {
             return;
         };
-        let mut agents = Vec::new();
-        let mut session_ids = HashSet::new();
+        let mut panes: Vec<PaneAgentRow> = Vec::new();
 
-        for tab_idx in 0..window.len() {
-            let agent = match self.sidebar_agent_for_tab_idx(tab_idx) {
-                Some(a) => a,
-                None => continue,
-            };
-            let pane_id = self
-                .sidebar_primary_pane_for_tab_idx(tab_idx)
-                .map(|pane| pane.pane_id());
+        let tab_count = window.len();
+        // The mux borrow has to go before `detect_agent_pane`, which reaches
+        // back into the mux for each pane.
+        drop(window);
 
-            let vendor = match agent.kind {
-                AgentKind::Claude => AgentVendor::Claude,
-                AgentKind::Codex => AgentVendor::Codex,
-                AgentKind::Gemini => AgentVendor::Gemini,
-                AgentKind::OpenCode => AgentVendor::OpenCode,
-                AgentKind::Copilot => AgentVendor::Copilot,
-                AgentKind::Cursor => AgentVendor::Cursor,
-                AgentKind::Amp => AgentVendor::Amp,
-                AgentKind::Unknown(_) => {
-                    AgentVendor::Custom(agent.adapter_id.clone().unwrap_or_default())
-                }
-            };
+        for tab_idx in 0..tab_count {
+            for (pane, agent) in self.sidebar_agent_panes_for_tab_idx(tab_idx) {
+                let pane_id = pane.pane_id();
 
-            let status = herd_status_from_agent(agent.status);
+                let vendor = match agent.kind {
+                    AgentKind::Claude => AgentVendor::Claude,
+                    AgentKind::Codex => AgentVendor::Codex,
+                    AgentKind::Gemini => AgentVendor::Gemini,
+                    AgentKind::OpenCode => AgentVendor::OpenCode,
+                    AgentKind::Copilot => AgentVendor::Copilot,
+                    AgentKind::Cursor => AgentVendor::Cursor,
+                    AgentKind::Amp => AgentVendor::Amp,
+                    AgentKind::Unknown(_) => {
+                        AgentVendor::Custom(agent.adapter_id.clone().unwrap_or_default())
+                    }
+                };
 
-            let name = agent.model.as_deref().unwrap_or(vendor.label()).to_string();
+                // The repo root, not the cwd's parent: `belongs_to_project`
+                // compares roots exactly, so a parent directory made the pane row
+                // fail project scoping whenever the pane sat at the repo root.
+                let project_root = agent
+                    .cwd
+                    .as_deref()
+                    .and_then(crate::agent_herd::project_root_for);
 
-            let project_root = agent
-                .cwd
-                .as_ref()
-                .and_then(|p| p.parent())
-                .map(|p| p.to_path_buf());
-
-            agents.push(HerdAgent {
-                provider: agent.adapter_id.clone().unwrap_or_default(),
-                vendor,
-                name,
-                status,
-                model: agent.model,
-                cwd: agent.cwd,
-                project_root,
-                pane_id,
-                session_id: agent.session_id,
-                blocked_reason: None,
-                git_branch: None,
-                pid: None,
-                started_at: None,
-                status_changed_at: None,
-                activity: None,
-                subagents: Vec::new(),
-            });
-            if let Some(session_id) = agents.last().and_then(|agent| agent.session_id.clone()) {
-                session_ids.insert(session_id);
+                panes.push(PaneAgentRow {
+                    pane_id,
+                    provider: agent.adapter_id.clone().or_else(|| {
+                        // The join matches a session's vendor against this string,
+                        // so fall back to the detected vendor's own id.
+                        Some(vendor.adapter_id().to_string())
+                    }),
+                    title: agent.model.as_deref().unwrap_or(vendor.label()).to_string(),
+                    status: herd_status_from_agent(agent.status),
+                    model: agent.model,
+                    session_id: agent.session_id,
+                    cwd: agent.cwd,
+                    project_root,
+                    git_branch: None,
+                    pids: foreground_process_pids(&pane),
+                });
             }
         }
 
-        if let Some((_, sessions)) = self.agent_herd_session_cache.as_ref() {
-            for session in sessions.iter() {
-                if !session.session_id.is_empty() && session_ids.contains(&session.session_id) {
-                    continue;
-                }
-                if !vendor_session_adapter_enabled(&self.config.agent_ui.adapters, &session.vendor)
-                {
-                    continue;
-                }
-                agents.push(herd_agent_from_vendor_session(session));
-            }
-        }
+        // Sessions read off disk. Each one is bound to a pane by the join
+        // below, so a session and the pane running it collapse into one row
+        // instead of appearing twice.
+        let sessions = self
+            .agent_herd_session_cache
+            .as_ref()
+            .map(|(_, cached)| {
+                herd_sessions_for_display(
+                    cached,
+                    &self.config.agent_ui.adapters,
+                    self.config.agent_ui.section.show_non_interactive,
+                )
+            })
+            .unwrap_or_default();
+
+        let agents = crate::agent_herd::join_sessions_with_panes(sessions, panes);
+        // Before project scoping: the snapshot is about this window, not about
+        // whatever project the active pane happens to sit in.
+        self.record_agent_window_sessions(&agents);
 
         let current_project = self.current_project_root();
         let agents = scope_herd_agents_to_project(agents, current_project.as_deref());
 
         let mut state = self.agent_herd_state.borrow_mut();
         state.agents = agents;
+    }
+
+    /// Note which agent sessions this window is running, and persist the list
+    /// when it changes.
+    ///
+    /// Runs on the paint path, so the per-frame cost is a filter plus one
+    /// comparison against the last thing written; identity excludes status, so a
+    /// working→idle flip writes nothing. The write itself is a worker-thread job.
+    fn record_agent_window_sessions(&mut self, agents: &[HerdAgent]) {
+        if self.config.agent_ui.launcher.restore_last_window_sessions == 0 {
+            return;
+        }
+        // Before the first disk scan lands the live set is trivially empty, and
+        // recording that would look like "this window had no agents".
+        if self.agent_herd_session_cache.is_none() {
+            return;
+        }
+
+        let sessions = window_agent_sessions(agents);
+        self.agent_window_sessions = sessions.clone();
+
+        if let Some((_, previous)) = &self.agent_snapshot_written {
+            if *previous == sessions {
+                self.agent_snapshot_dirty = false;
+                return;
+            }
+        } else if sessions.is_empty() {
+            // Nothing has ever been written for this window and there is nothing
+            // to write; don't create an entry for a shell-only window.
+            return;
+        }
+
+        if let Some((written_at, _)) = &self.agent_snapshot_written {
+            if written_at.elapsed() < SNAPSHOT_WRITE_INTERVAL {
+                // Schedule a frame so a deferred write is not lost when the
+                // window goes quiet immediately after the change.
+                self.agent_snapshot_dirty = true;
+                self.update_next_frame_time(Some(Instant::now() + SNAPSHOT_WRITE_INTERVAL));
+                return;
+            }
+        }
+
+        self.agent_snapshot_written = Some((Instant::now(), sessions.clone()));
+        self.agent_snapshot_dirty = false;
+
+        let key = tgz_last_session::window_key(self.mux_window_id as usize);
+        promise::spawn::spawn_into_new_thread(move || {
+            tgz_last_session::record_window_sessions(key, sessions, false);
+            Ok::<(), anyhow::Error>(())
+        })
+        .detach();
+    }
+
+    /// Persist this window's agent sessions as it closes.
+    ///
+    /// Synchronous on purpose: the process may exit moments from now and a worker
+    /// thread would be killed with it. Reuses the list the paint path already
+    /// computed, so there is no mux walk here either.
+    pub(crate) fn persist_agent_window_sessions_on_close(&self) {
+        if self.config.agent_ui.launcher.restore_last_window_sessions == 0 {
+            return;
+        }
+        if self.agent_window_sessions.is_empty() {
+            return;
+        }
+        tgz_last_session::record_window_sessions(
+            tgz_last_session::window_key(self.mux_window_id as usize),
+            self.agent_window_sessions.clone(),
+            true,
+        );
     }
 
     /// Repo root of the active pane, used to scope the herd to this project.
@@ -8573,29 +9042,27 @@ impl crate::TermWindow {
         bg: LinearRgba,
         bold: bool,
     ) -> anyhow::Result<()> {
-        let cell_width = self.render_metrics.cell_size.width as f32;
         let cell_height = self.render_metrics.cell_size.height as f32;
-        let cols = (pixel_width / cell_width).floor().max(0.0) as usize;
+        // Whole cells only: `render_screen_line` does not clip, so a partly
+        // visible cell overhangs the region it was told to paint into.
+        let cols = sidebar_text_cols(
+            pixel_width,
+            self.render_metrics.cell_size.width.max(0) as usize,
+        );
         if cols == 0 || text.is_empty() {
             return Ok(());
         }
-        let text: String = text
-            .chars()
-            .take_while(|c| {
-                let w = unicode_column_width(&c.to_string(), None);
-                if w > cols {
-                    return false;
-                }
-                true
-            })
-            .collect();
+        let text = truncate_to_cols(text, cols);
         let mut attrs = CellAttributes::default();
         attrs.set_foreground(ColorAttribute::TrueColorWithDefaultFallback(fg.to_srgb()));
         attrs.set_background(ColorAttribute::TrueColorWithDefaultFallback(bg.to_srgb()));
         if bold {
             attrs.set_intensity(Intensity::Bold);
         }
-        let line = Line::from_text(&text, &attrs, 1, None);
+        let mut line = Line::from_text(text, &attrs, 1, None);
+        // Pad/clip the cell vector to the region so a shorter string cannot
+        // leave stale cells and a longer one cannot spill past `pixel_width`.
+        line.resize(cols, SEQ_ZERO);
         let palette = self.palette().clone();
         let white_space = self
             .render_state
@@ -8674,11 +9141,15 @@ impl crate::TermWindow {
         let state = self.agent_herd_state.borrow();
         let collapsed = state.collapsed;
         let agents = state.agents.clone();
-        let expanded = state.expanded;
+        let expanded = state.expanded.clone();
         drop(state);
 
         let dpi = (self.dimensions.dpi as f32 / 96.0).clamp(1.0, 2.5);
         let cell_h = self.render_metrics.cell_size.height as f32;
+        // Text advance comes from the cell's own width; deriving it from
+        // `cell_h` (as this section used to) over-estimates it by ~30%.
+        let cell_w = self.render_metrics.cell_size.width as f32;
+        let cell_w_cols = self.render_metrics.cell_size.width.max(0) as usize;
         let base_row_h = metrics.base_row_h;
         let header_h = metrics.header_h;
         let pad = metrics.pad;
@@ -8722,14 +9193,16 @@ impl crate::TermWindow {
             false,
         )?;
 
-        // "Agents · N" label.
+        // "Agents · N" label. The budget is measured from the label's own
+        // origin, not from `section_x`, or the region overruns the sidebar.
         let label = format!("Agents · {agent_count}");
+        let label_x = section_x + pad + cell_h + 4.0 * dpi;
         self.paint_text(
             layers,
             &label,
-            section_x + pad + cell_h + 4.0 * dpi,
+            label_x,
             header_y + (header_h - cell_h) * 0.5,
-            section_w - 2.0 * pad - cell_h,
+            (section_x + section_w - pad - label_x).max(0.),
             fg,
             bg,
             true,
@@ -8749,9 +9222,16 @@ impl crate::TermWindow {
             return Ok(());
         }
 
+        let hovered_item = self
+            .last_ui_item
+            .as_ref()
+            .map(|item| item.item_type.clone());
+        let hover_fill = lerp_rgba(bg, fg, 0.12);
+
         let mut y = header_y + header_h;
-        for (idx, agent) in agents.iter().enumerate() {
-            let is_expanded = expanded == Some(idx);
+        for agent in agents.iter() {
+            let key = agent.key();
+            let is_expanded = expanded.as_ref() == Some(&key);
             let row_h = base_row_h;
             let detail_h = if is_expanded { metrics.detail_h } else { 0.0 };
 
@@ -8759,12 +9239,45 @@ impl crate::TermWindow {
                 break;
             }
 
+            // A detached agent (no pane bound) cannot be focused, so the row
+            // reads dimmer and its click offers Resume instead.
+            let detached = agent.is_detached();
+            let row_fg = if detached { dim } else { fg };
+            let row_type = UIItemType::SidebarAgentRow { key: key.clone() };
+            let row_hovered = hovered_item.as_ref() == Some(&row_type);
+
             // Row background.
             let row_rect = euclid::rect(section_x, y, section_w, row_h);
-            self.filled_rectangle(layers, 0, row_rect, bg)?;
+            self.filled_rectangle(
+                layers,
+                0,
+                row_rect,
+                if row_hovered { hover_fill } else { bg },
+            )?;
+            let row_bg = if row_hovered { hover_fill } else { bg };
+            let text_y = y + (row_h - cell_h) * 0.5;
+
+            // Per-row chevron. Expanding is its own target so that clicking
+            // the row itself can do the useful thing (focus the agent).
+            let chevron_w = cell_w.max(8.0 * dpi);
+            let chevron_type = UIItemType::SidebarAgentRowChevron { key: key.clone() };
+            self.paint_text(
+                layers,
+                if is_expanded { "▾" } else { "▸" },
+                section_x + pad,
+                text_y,
+                chevron_w,
+                if hovered_item.as_ref() == Some(&chevron_type) {
+                    fg
+                } else {
+                    dim
+                },
+                row_bg,
+                false,
+            )?;
 
             // Status dot.
-            let dot_x = section_x + pad + 8.0 * dpi;
+            let dot_x = section_x + pad + chevron_w + 6.0 * dpi;
             let dot_y = y + row_h * 0.5;
             let dot_color = agent.vendor_dot_color();
             let dot_rect = euclid::rect(dot_x - 4.0 * dpi, dot_y - 4.0 * dpi, 8.0 * dpi, 8.0 * dpi);
@@ -8775,81 +9288,116 @@ impl crate::TermWindow {
                 srgb8_to_linear(dot_color.0, dot_color.1, dot_color.2),
             )?;
 
-            // Vendor glyph + name.
-            let name_x = section_x + pad + 20.0 * dpi;
+            // Name on the left, project on the right, in disjoint column
+            // budgets: both are painted into the same row, and glyphs
+            // composite instead of erasing, so overlapping regions double-strike.
+            let name_x = dot_x + 10.0 * dpi;
+            let content_right = section_x + section_w - pad;
+            let content_cols = sidebar_text_cols((content_right - name_x).max(0.), cell_w_cols);
+            let project = agent.project_label();
+            let (name_cols, project_cols) =
+                herd_row_columns(content_cols, unicode_column_width(&project, None));
+
             let name = format!("{} {}", agent.vendor_glyph(), agent.name);
             self.paint_text(
                 layers,
-                &name,
+                &truncate_with_ellipsis(&name, name_cols),
                 name_x,
-                y + (row_h - cell_h) * 0.5,
-                section_w - 2.0 * pad - 40.0 * dpi,
-                fg,
-                bg,
+                text_y,
+                name_cols as f32 * cell_w,
+                row_fg,
+                row_bg,
                 true,
             )?;
 
-            // Project label (right-aligned, dim).
-            let project = agent.project_label();
-            let project_w = (project.len() as f32) * cell_h * 0.6;
-            self.paint_text(
-                layers,
-                &project,
-                section_x + section_w - pad - project_w,
-                y + (row_h - cell_h) * 0.5,
-                project_w,
-                dim,
-                bg,
-                false,
-            )?;
+            if project_cols > 0 {
+                let project_w = project_cols as f32 * cell_w;
+                self.paint_text(
+                    layers,
+                    &truncate_with_ellipsis(&project, project_cols),
+                    content_right - project_w,
+                    text_y,
+                    project_w,
+                    dim,
+                    row_bg,
+                    false,
+                )?;
+            }
 
-            // Push UIItem for the row click.
+            // The row activates the agent; pushed before the chevron so the
+            // reverse hit-test walk gives the chevron its own pixels.
             self.ui_items.push(UIItem {
                 x: hit_x as usize,
                 y: y as usize,
                 width: hit_w as usize,
                 height: row_h as usize,
-                item_type: UIItemType::SidebarAgentRow { index: idx },
+                item_type: row_type,
+            });
+            let chevron_hit_x = (section_x + pad).clamp(hit_x, hit_x + hit_w);
+            self.ui_items.push(UIItem {
+                x: chevron_hit_x as usize,
+                y: y as usize,
+                width: (chevron_w + 4.0 * dpi).min((hit_x + hit_w - chevron_hit_x).max(0.))
+                    as usize,
+                height: row_h as usize,
+                item_type: chevron_type,
             });
 
-            // Expanded detail view.
-            if is_expanded {
+            // Expanded detail view. A zero-height detail (the section ran out
+            // of room) must not register hit regions: `y` advances by
+            // `row_h + detail_h`, so they would land on the *next* row and,
+            // being pushed later, win the reverse hit-test walk.
+            if is_expanded && detail_h > 0.0 {
                 let detail_y = y + row_h;
                 let detail_rect = euclid::rect(section_x, detail_y, section_w, detail_h);
                 self.filled_rectangle(layers, 0, detail_rect, bg)?;
 
-                let detail_x = section_x + pad + 20.0 * dpi;
+                let detail_x = name_x;
+                let detail_w = (section_x + section_w - pad - detail_x).max(0.);
+                let detail_cols = sidebar_text_cols(detail_w, cell_w_cols);
                 let mut detail_line_y = detail_y + pad;
 
-                // Status + model line.
+                // Status + model line. "detached" is part of the status because
+                // it is what explains why Focus is missing.
                 let status_label = agent.status.label();
                 let model_text = agent.model.as_deref().unwrap_or("");
-                let status_line = if model_text.is_empty() {
-                    status_label.to_string()
-                } else {
-                    format!("{} · {}", status_label, model_text)
-                };
+                let mut status_line = status_label.to_string();
+                if !model_text.is_empty() {
+                    status_line = format!("{status_line} \u{b7} {model_text}");
+                }
+                if detached {
+                    status_line = format!("{status_line} \u{b7} detached");
+                }
                 self.paint_text(
                     layers,
-                    &status_line,
+                    &truncate_with_ellipsis(&status_line, detail_cols),
                     detail_x,
                     detail_line_y,
-                    section_w - 2.0 * pad - 40.0 * dpi,
+                    detail_w,
                     fg,
                     bg,
                     false,
                 )?;
                 detail_line_y += cell_h + 2.0 * dpi;
 
-                // Project root line.
+                // Project root line. The tail of a path is the informative
+                // part, so elide from the head: "\u{2026}/Documents/tgzterminal".
                 if let Some(ref root) = agent.project_root {
-                    let root_text = format!("📁 {}", root.display());
+                    const FOLDER_PREFIX: &str = "\u{1f4c1} ";
+                    let prefix_cols = unicode_column_width(FOLDER_PREFIX, None);
+                    let root_text = format!(
+                        "{FOLDER_PREFIX}{}",
+                        elide_path_head(
+                            &root.display().to_string(),
+                            detail_cols.saturating_sub(prefix_cols)
+                        )
+                    );
                     self.paint_text(
                         layers,
                         &root_text,
                         detail_x,
                         detail_line_y,
-                        section_w - 2.0 * pad - 40.0 * dpi,
+                        detail_w,
                         dim,
                         bg,
                         false,
@@ -8867,37 +9415,71 @@ impl crate::TermWindow {
                     if !activity_text.is_empty() {
                         self.paint_text(
                             layers,
-                            &activity_text,
+                            &truncate_with_ellipsis(&activity_text, detail_cols),
                             detail_x,
                             detail_line_y,
-                            section_w - 2.0 * pad - 40.0 * dpi,
+                            detail_w,
                             dim,
                             bg,
                             false,
                         )?;
+                        detail_line_y += cell_h + 2.0 * dpi;
                     }
                 }
 
-                // Push UIItem for the detail expand click.
-                self.ui_items.push(UIItem {
-                    x: hit_x as usize,
-                    y: detail_y as usize,
-                    width: hit_w as usize,
-                    height: detail_h as usize,
-                    item_type: UIItemType::SidebarAgentDetailExpand { index: idx },
-                });
-
-                // Push UIItem for the focus pane click.
-                let focus_x =
-                    (section_x + section_w - pad - 40.0 * dpi).clamp(hit_x, hit_x + hit_w);
-                let focus_w = (40.0_f32).min((hit_x + hit_w - focus_x).max(0.));
-                self.ui_items.push(UIItem {
-                    x: focus_x as usize,
-                    y: (detail_y + pad) as usize,
-                    width: focus_w as usize,
-                    height: cell_h as usize,
-                    item_type: UIItemType::SidebarAgentFocusPane { index: idx },
-                });
+                // Action buttons, left to right along the last detail line.
+                // These replace an unlabelled, invisible hit box that only the
+                // code knew about.
+                let mut button_x = detail_x;
+                let button_h = cell_h + 4.0 * dpi;
+                let button_y = (detail_y + detail_h - pad - button_h)
+                    .max(detail_line_y.min(detail_y + detail_h - button_h));
+                for action in agent_row_actions(agent) {
+                    let label = action.label();
+                    let label_cols = unicode_column_width(label, None);
+                    let button_w = label_cols as f32 * cell_w + 8.0 * dpi;
+                    if button_x + button_w > section_x + section_w - pad {
+                        break;
+                    }
+                    let button_type = UIItemType::SidebarAgentAction {
+                        key: key.clone(),
+                        action,
+                    };
+                    let hovered = hovered_item.as_ref() == Some(&button_type);
+                    self.filled_rectangle(
+                        layers,
+                        0,
+                        euclid::rect(button_x, button_y, button_w, button_h),
+                        if hovered {
+                            hover_fill
+                        } else {
+                            lerp_rgba(bg, fg, 0.06)
+                        },
+                    )?;
+                    self.paint_text(
+                        layers,
+                        label,
+                        button_x + 4.0 * dpi,
+                        button_y + (button_h - cell_h) * 0.5,
+                        label_cols as f32 * cell_w,
+                        if hovered { fg } else { dim },
+                        if hovered {
+                            hover_fill
+                        } else {
+                            lerp_rgba(bg, fg, 0.06)
+                        },
+                        false,
+                    )?;
+                    let button_hit_x = button_x.clamp(hit_x, hit_x + hit_w);
+                    self.ui_items.push(UIItem {
+                        x: button_hit_x as usize,
+                        y: button_y as usize,
+                        width: button_w.min((hit_x + hit_w - button_hit_x).max(0.)) as usize,
+                        height: button_h as usize,
+                        item_type: button_type,
+                    });
+                    button_x += button_w + 4.0 * dpi;
+                }
             }
 
             y += row_h + detail_h + 2.0 * dpi;
@@ -9163,13 +9745,13 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn vendor_session_conversion_preserves_identity_and_project() {
-        let session = VendorSession {
-            pid: 42,
+    fn vendor_session(pid: u32, session_id: &str, cwd: &str, interactive: bool) -> VendorSession {
+        VendorSession {
+            pid,
+            interactive,
             vendor: AgentVendor::Codex,
-            session_id: "session-42".to_string(),
-            cwd: PathBuf::from("/tmp/project/src"),
+            session_id: session_id.to_string(),
+            cwd: PathBuf::from(cwd),
             project_root: Some(PathBuf::from("/tmp/project")),
             name: Some("build agent".to_string()),
             status: HerdStatus::Blocked,
@@ -9177,15 +9759,122 @@ mod tests {
             started_at: None,
             status_changed_at: None,
             subagents: Vec::new(),
-        };
+        }
+    }
 
-        let agent = herd_agent_from_vendor_session(&session);
+    #[test]
+    fn vendor_session_conversion_preserves_identity_and_project() {
+        // A session with no pane to bind to still becomes exactly one row,
+        // carrying its own identity rather than a pane's.
+        let agents = crate::agent_herd::join_sessions_with_panes(
+            vec![vendor_session(42, "session-42", "/tmp/project/src", true)],
+            Vec::new(),
+        );
+
+        assert_eq!(agents.len(), 1);
+        let agent = &agents[0];
         assert_eq!(agent.name, "build agent");
         assert_eq!(agent.provider, "codex");
         assert_eq!(agent.vendor, AgentVendor::Codex);
         assert_eq!(agent.status, HerdStatus::Blocked);
         assert_eq!(agent.session_id.as_deref(), Some("session-42"));
         assert_eq!(agent.project_root, Some(PathBuf::from("/tmp/project")));
+        // Nothing to focus: the row must advertise that, not pretend.
+        assert_eq!(agent.pane_id, None);
+        assert_eq!(agent.pid, Some(42));
+    }
+
+    #[test]
+    fn one_agent_yields_one_row_when_its_pane_is_detected() {
+        // The pane scan and the disk scan both see the same agent. Before the
+        // join was wired, the dedup key was a session id that Claude never
+        // sets, so the agent appeared twice — once named by its model, once by
+        // its session name.
+        let pane = PaneAgentRow {
+            pane_id: 7,
+            provider: Some("codex".to_string()),
+            title: "codex-model".to_string(),
+            status: HerdStatus::Working,
+            model: Some("gpt-5".to_string()),
+            session_id: None,
+            cwd: Some(PathBuf::from("/tmp/project/src")),
+            project_root: Some(PathBuf::from("/tmp/project")),
+            git_branch: None,
+            pids: std::iter::once(4242u32).collect(),
+        };
+
+        let agents = crate::agent_herd::join_sessions_with_panes(
+            vec![vendor_session(4242, "session-42", "/tmp/project/src", true)],
+            vec![pane],
+        );
+
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].pane_id, Some(7));
+        // The pane contributes the model; the session contributes the name.
+        assert_eq!(agents[0].name, "build agent");
+        assert_eq!(agents[0].model.as_deref(), Some("gpt-5"));
+    }
+
+    #[test]
+    fn harness_sessions_are_hidden_unless_asked_for() {
+        // A claude-mem hook process writes a session file just like the agent
+        // the user is talking to, and used to show up as a second agent.
+        let adapters = default_agent_adapters();
+        let sessions = vec![
+            vendor_session(1, "human", "/tmp/project", true),
+            vendor_session(2, "harness", "/tmp/project", false),
+        ];
+
+        let shown = herd_sessions_for_display(&sessions, &adapters, false);
+        assert_eq!(shown.len(), 1);
+        assert_eq!(shown[0].session_id, "human");
+
+        let shown = herd_sessions_for_display(&sessions, &adapters, true);
+        assert_eq!(shown.len(), 2);
+    }
+
+    #[test]
+    fn repeated_session_files_collapse_but_distinct_pids_survive() {
+        let adapters = default_agent_adapters();
+        let session = vendor_session(1, "shared", "/tmp/project", true);
+        let sessions = vec![
+            session.clone(),
+            session,
+            vendor_session(2, "shared", "/tmp/project", true),
+        ];
+
+        let shown = herd_sessions_for_display(&sessions, &adapters, false);
+        assert_eq!(
+            shown.iter().map(|s| s.pid).collect::<Vec<_>>(),
+            vec![1, 2],
+            "same (vendor, session id, pid) is one agent; a different pid is not"
+        );
+    }
+
+    #[test]
+    fn disabled_adapters_do_not_come_back_through_the_disk_scan() {
+        let mut adapters = default_agent_adapters();
+        adapters
+            .get_mut("codex")
+            .expect("codex is a built-in adapter")
+            .enabled = false;
+
+        let sessions = vec![vendor_session(1, "human", "/tmp/project", true)];
+        assert!(herd_sessions_for_display(&sessions, &adapters, true).is_empty());
+    }
+
+    #[test]
+    fn sessions_sharing_a_session_id_are_distinct_rows_but_never_duplicated() {
+        // Observed with SDK harnesses: sibling processes write one sessionId
+        // across several files, so identity has to include the pid.
+        let sessions = vec![
+            vendor_session(1, "shared", "/tmp/project/a", true),
+            vendor_session(2, "shared", "/tmp/project/b", true),
+        ];
+        let agents = crate::agent_herd::join_sessions_with_panes(sessions, Vec::new());
+        assert_eq!(agents.len(), 2);
+        assert_eq!(agents[0].pid, Some(1));
+        assert_eq!(agents[1].pid, Some(2));
     }
 
     fn herd_agent(name: &str, cwd: &str, project_root: Option<&str>) -> HerdAgent {
@@ -9211,6 +9900,172 @@ mod tests {
 
     fn herd_names(agents: &[HerdAgent]) -> Vec<&str> {
         agents.iter().map(|agent| agent.name.as_str()).collect()
+    }
+
+    fn snapshot(adapter: &str, id: &str, cwd: &str) -> SnapshotSession {
+        SnapshotSession {
+            adapter_id: adapter.to_string(),
+            session_id: id.to_string(),
+            cwd: PathBuf::from(cwd),
+            label: None,
+        }
+    }
+
+    fn adapter_set(ids: &[&str]) -> HashSet<String> {
+        ids.iter().map(|id| id.to_string()).collect()
+    }
+
+    #[test]
+    fn window_agent_sessions_records_only_what_can_be_restored() {
+        let mut bound = herd_agent("bound", "/repos/mine/src", Some("/repos/mine"));
+        bound.pane_id = Some(4);
+        bound.session_id = Some("session-a".to_string());
+
+        // No pane: came from the machine-wide disk scan, so it may be another
+        // window's agent and is not this window's state to record.
+        let mut detached = herd_agent("detached", "/repos/mine/src", Some("/repos/mine"));
+        detached.session_id = Some("session-b".to_string());
+
+        // A pane-bound agent with no session id cannot be resumed at all.
+        let mut idless = herd_agent("idless", "/repos/mine/src", Some("/repos/mine"));
+        idless.pane_id = Some(5);
+
+        // Nor one with no directory to resume into.
+        let mut cwdless = herd_agent("cwdless", "/repos/mine/src", Some("/repos/mine"));
+        cwdless.pane_id = Some(6);
+        cwdless.session_id = Some("session-c".to_string());
+        cwdless.cwd = None;
+
+        let recorded = window_agent_sessions(&[bound, detached, idless, cwdless]);
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].session_id, "session-a");
+        assert_eq!(recorded[0].cwd, PathBuf::from("/repos/mine/src"));
+    }
+
+    #[test]
+    fn window_agent_sessions_dedupes_and_preserves_tab_order() {
+        let mut make = |name: &str, id: &str, pane: PaneId| {
+            let mut agent = herd_agent(name, "/repos/mine/src", Some("/repos/mine"));
+            agent.pane_id = Some(pane);
+            agent.session_id = Some(id.to_string());
+            agent
+        };
+        // The same session bound twice (the cwd fallback in the join can do this)
+        // must not become two restored tabs.
+        let recorded = window_agent_sessions(&[
+            make("first", "one", 1),
+            make("second", "two", 2),
+            make("dupe", "one", 3),
+        ]);
+        assert_eq!(
+            recorded
+                .iter()
+                .map(|s| s.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["one", "two"]
+        );
+    }
+
+    #[test]
+    fn plan_session_restore_skips_what_must_not_be_respawned() {
+        let entries = vec![
+            snapshot("claude", "live-one", "/repo"),
+            snapshot("codex", "disabled-vendor", "/repo"),
+            snapshot("claude", "--dangerously-skip-permissions", "/repo"),
+            snapshot("claude", "good-one", "/repo"),
+            snapshot("claude", "good-one", "/repo"),
+        ];
+        let live: HashSet<(String, String)> =
+            std::iter::once(("claude".to_string(), "live-one".to_string())).collect();
+
+        let plan = plan_session_restore(&entries, &live, &adapter_set(&["claude"]), 10);
+
+        assert_eq!(
+            plan.spawn
+                .iter()
+                .map(|s| s.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["good-one"],
+            "already-live, disabled-adapter, hostile-id and duplicate entries all drop"
+        );
+        // Every rejection is counted so the toast can be honest.
+        assert_eq!(plan.skipped, 4);
+    }
+
+    #[test]
+    fn plan_session_restore_enforces_the_cap_and_counts_the_remainder() {
+        let entries: Vec<_> = (0..6)
+            .map(|i| snapshot("claude", &format!("id-{i}"), "/repo"))
+            .collect();
+        let plan = plan_session_restore(&entries, &HashSet::new(), &adapter_set(&["claude"]), 2);
+        assert_eq!(
+            plan.spawn
+                .iter()
+                .map(|s| s.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["id-0", "id-1"],
+            "capture order is preserved, and the cap takes the first N"
+        );
+        assert_eq!(plan.skipped, 4);
+    }
+
+    #[test]
+    fn plan_session_restore_is_empty_at_cap_zero() {
+        let entries = vec![snapshot("claude", "one", "/repo")];
+        let plan = plan_session_restore(&entries, &HashSet::new(), &adapter_set(&["claude"]), 0);
+        assert!(plan.spawn.is_empty());
+        assert_eq!(plan.skipped, 1);
+    }
+
+    #[test]
+    fn detached_agents_are_offered_resume_and_nothing_that_needs_a_pane() {
+        // Focus/Attach/Logs/Stop all reach through a pane id. Offering them on
+        // a row that has none is how the old focus box came to silently no-op.
+        let mut agent = herd_agent("orphan", "/repos/mine/src", Some("/repos/mine"));
+        agent.pane_id = None;
+        assert_eq!(agent_row_actions(&agent), vec![AgentRowAction::Resume]);
+
+        agent.pane_id = Some(3);
+        agent.status = HerdStatus::Idle;
+        assert_eq!(
+            agent_row_actions(&agent),
+            vec![
+                AgentRowAction::Focus,
+                AgentRowAction::Attach,
+                AgentRowAction::Logs
+            ],
+            "an idle agent has nothing to interrupt"
+        );
+
+        agent.status = HerdStatus::Working;
+        assert_eq!(
+            agent_row_actions(&agent).last(),
+            Some(&AgentRowAction::Stop)
+        );
+    }
+
+    #[test]
+    fn row_identity_survives_the_list_being_reordered() {
+        // The list is rebuilt every paint and sorted by status, so the row the
+        // user expanded moves. Keys must follow the agent, not the position.
+        let mut first = herd_agent("first", "/repos/mine/a", Some("/repos/mine"));
+        first.session_id = Some("session-a".to_string());
+        let mut second = herd_agent("second", "/repos/mine/b", Some("/repos/mine"));
+        second.pane_id = Some(9);
+
+        let key = first.key();
+        assert_eq!(
+            key,
+            crate::agent_herd::AgentKey::Session("session-a".into())
+        );
+        // Pane-only agents fall back to the pane, which is still stable.
+        assert_eq!(second.key(), crate::agent_herd::AgentKey::Pane(9));
+
+        let reordered = vec![second, first];
+        assert_eq!(
+            reordered.iter().position(|agent| agent.key() == key),
+            Some(1)
+        );
     }
 
     #[test]
@@ -9598,6 +10453,62 @@ mod tests {
     }
 
     #[test]
+    fn ellipsis_marks_elision_and_still_respects_the_budget() {
+        // Fits: borrowed unchanged, no ellipsis noise.
+        assert_eq!(truncate_with_ellipsis("idle", 8), "idle");
+        assert_eq!(truncate_with_ellipsis("idle", 4), "idle");
+        // Doesn't fit: the result is never wider than the budget, and the cut
+        // is visible rather than reading as data.
+        let elided = truncate_with_ellipsis("claude-sonnet-4-5", 8);
+        assert_eq!(elided, "claude-…");
+        assert_eq!(unicode_column_width(&elided, None), 8);
+        assert_eq!(truncate_with_ellipsis("abc", 1), "…");
+        assert_eq!(truncate_with_ellipsis("abc", 0), "");
+    }
+
+    #[test]
+    fn path_elision_keeps_the_tail_and_honors_the_budget() {
+        // The old renderer cut the head-most columns off the *end*, leaving
+        // "/Users/tim.gro"; the tail is what identifies the project.
+        let path = "/Users/tim.grossinger/Documents/tgzterminal";
+        let elided = elide_path_head(path, 20);
+        assert_eq!(elided, "…cuments/tgzterminal");
+        assert!(elided.ends_with("tgzterminal"));
+        assert!(elided.starts_with('…'));
+        assert!(unicode_column_width(&elided, None) <= 20);
+        // Fits: untouched.
+        assert_eq!(elide_path_head("/tmp", 10), "/tmp");
+        assert_eq!(elide_path_head("/tmp", 0), "");
+    }
+
+    #[test]
+    fn herd_row_columns_never_overlap() {
+        // The name and project labels are painted at opposite ends of one row.
+        // Overlapping budgets double-strike glyphs, because sidebar text
+        // composites on the glyph layer and never erases what is beneath.
+        for content_cols in 0..80usize {
+            for wanted in [0usize, 1, 4, 11, 40, 200] {
+                let (name, project) = herd_row_columns(content_cols, wanted);
+                assert!(
+                    name + project <= content_cols,
+                    "content={content_cols} wanted={wanted} -> name={name} project={project}"
+                );
+                if project > 0 {
+                    // A gap column keeps the two regions off each other.
+                    assert!(name + project < content_cols);
+                    assert!(project <= wanted);
+                }
+            }
+        }
+        // A long project label never starves the name out of the row.
+        let (name, project) = herd_row_columns(24, 40);
+        assert_eq!((name, project), (15, 8));
+        // Too narrow to show both: the name keeps the whole row.
+        assert_eq!(herd_row_columns(9, 11), (9, 0));
+        assert_eq!(herd_row_columns(0, 5), (0, 0));
+    }
+
+    #[test]
     fn fit_label_picks_the_widest_variant_that_fits() {
         assert_eq!(fit_label(&WORKTREE_LABELS, 9), Some("Worktree"));
         assert_eq!(fit_label(&WORKTREE_LABELS, 8), Some("Worktree"));
@@ -9940,6 +10851,52 @@ mod tests {
             agent_pulse_phase(Duration::from_millis(5), Duration::ZERO),
             0.
         );
+    }
+
+    #[test]
+    fn every_working_dot_shares_one_phase() {
+        // The whole point of the pulse is that N working agents read as working
+        // at the same instant. Phase is a pure function of (elapsed, period), so
+        // any two dots sampling the same epoch agree — including dots in
+        // different windows, which is why the epoch is process-global and not
+        // `TermWindow::created`.
+        let period = Duration::from_millis(1600);
+        for step in 0..16 {
+            let elapsed = Duration::from_millis(step * 137);
+            let first = agent_pulse_phase(elapsed, period);
+            for _ in 0..7 {
+                assert_eq!(
+                    agent_pulse_phase(elapsed, period),
+                    first,
+                    "seven dots at {elapsed:?} must share one phase"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pulse_frame_deadline_is_snapped_to_the_grid_and_in_the_future() {
+        // `now + interval` would drift by however long each repaint took, so
+        // dots asking on different frames would slowly spread apart.
+        let interval = AGENT_PULSE_FRAME_INTERVAL.as_nanos();
+        let first = next_agent_pulse_frame_due();
+        assert!(first > *AGENT_PULSE_EPOCH);
+        // Landing on a grid boundary is what makes repeated asks agree.
+        let offset = first.duration_since(*AGENT_PULSE_EPOCH).as_nanos();
+        assert_eq!(offset % interval, 0, "deadline is not on a frame boundary");
+        // Callers within one frame get the same answer, and a later caller can
+        // only ever move forward. Asserting equality of two live calls would
+        // flake whenever the test straddles a frame boundary, so assert the
+        // property that makes them agree: both land on the same grid, and the
+        // sequence is monotonic.
+        let second = next_agent_pulse_frame_due();
+        assert!(second >= first);
+        assert_eq!(
+            second.duration_since(*AGENT_PULSE_EPOCH).as_nanos() % interval,
+            0
+        );
+        // Never in the past, or the frame scheduler would spin.
+        assert!(first >= *AGENT_PULSE_EPOCH + AGENT_PULSE_FRAME_INTERVAL);
     }
 
     #[test]

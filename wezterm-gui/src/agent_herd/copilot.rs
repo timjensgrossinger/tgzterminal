@@ -68,6 +68,9 @@ impl SessionSource for CopilotDetector {
                         .unwrap_or(HerdStatus::Unknown);
                     sessions.push(VendorSession {
                         pid,
+                        // This store does not distinguish harness-spawned
+                        // sessions from interactive ones.
+                        interactive: true,
                         vendor: AgentVendor::Copilot,
                         session_id,
                         cwd,

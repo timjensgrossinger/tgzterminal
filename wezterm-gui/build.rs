@@ -94,6 +94,15 @@ fn main() {
             ci_tag
         };
 
+        for var in [
+            "BRAND_COMPANY_NAME",
+            "BRAND_FILE_DESCRIPTION",
+            "BRAND_LEGAL_COPYRIGHT",
+            "BRAND_PRODUCT_NAME",
+        ] {
+            println!("cargo:rerun-if-env-changed={var}");
+        }
+
         let rcfile_name = Path::new(&std::env::var_os("OUT_DIR").unwrap()).join("resource.rc");
         let mut rcfile = std::fs::File::create(&rcfile_name).unwrap();
         println!("cargo:rerun-if-changed=../assets/windows/terminal.ico");
@@ -118,13 +127,13 @@ BEGIN
     BEGIN
         BLOCK "040904E4"
         BEGIN
-            VALUE "CompanyName",      "Wez Furlong\0"
-            VALUE "FileDescription",  "WezTerm - Wez's Terminal Emulator\0"
+            VALUE "CompanyName",      "{company}\0"
+            VALUE "FileDescription",  "{description}\0"
             VALUE "FileVersion",      "{version}\0"
-            VALUE "LegalCopyright",   "Wez Furlong, MIT licensed\0"
+            VALUE "LegalCopyright",   "{copyright}\0"
             VALUE "InternalName",     "\0"
             VALUE "OriginalFilename", "\0"
-            VALUE "ProductName",      "WezTerm\0"
+            VALUE "ProductName",      "{product}\0"
             VALUE "ProductVersion",   "{version}\0"
         END
     END
@@ -136,6 +145,20 @@ END
 "#,
             win = windows_dir.display().to_string().replace("\\", "\\\\"),
             version = version,
+            // Windows shows FileDescription in Task Manager and ProductName in
+            // Explorer's Properties dialog, so leaving upstream's strings here
+            // made an installed TGZTerminal introduce itself as WezTerm. These
+            // read from the same BRAND_* env vars as wezterm-gui/src/brand.rs so
+            // a rebranded build stays consistent; note this only changes
+            // metadata, never a file name.
+            company = std::env::var("BRAND_COMPANY_NAME")
+                .unwrap_or_else(|_| "Tim Grossinger".to_string()),
+            description = std::env::var("BRAND_FILE_DESCRIPTION")
+                .unwrap_or_else(|_| "TGZTerminal - agent-aware terminal".to_string()),
+            copyright = std::env::var("BRAND_LEGAL_COPYRIGHT")
+                .unwrap_or_else(|_| { "Tim Grossinger and Wez Furlong, MIT licensed".to_string() }),
+            product =
+                std::env::var("BRAND_PRODUCT_NAME").unwrap_or_else(|_| "TGZTerminal".to_string()),
         )
         .unwrap();
         drop(rcfile);

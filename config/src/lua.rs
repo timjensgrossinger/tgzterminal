@@ -245,12 +245,14 @@ pub fn make_lua_context(config_file: &Path) -> anyhow::Result<Lua> {
                             .ok_or_else(|| anyhow!("current_exe path is not UTF-8"))?,
                     )
                     .context("set wezterm.executable_dir")?;
-                if cfg!(windows) {
-                    // For a portable windows install, force in this path ahead
-                    // of the rest
-                    prefix_path(&mut path_array, &path.join("wezterm_modules"));
-                }
             }
+        }
+        // Portable mode only: an installed build's program directory is not the
+        // user's to put modules in, and letting it win would mean a file dropped
+        // there outranked every user's own modules. `executable_dir` above stays
+        // unconditional — it is informational.
+        if let Some(dir) = crate::portable_exe_dir() {
+            prefix_path(&mut path_array, &dir.join("wezterm_modules"));
         }
         let config_file_str = config_file
             .to_str()

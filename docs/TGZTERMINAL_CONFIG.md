@@ -227,6 +227,7 @@ config.agent_ui = {
     domain = nil,
     prefer_wsl = true, -- Windows default; false elsewhere
     resume_menu_sessions = 10,
+    restore_last_window_sessions = 8, -- 0 hides the "Reopen last window" button
   },
 }
 
@@ -524,6 +525,8 @@ asked, trimmed to ten words.
 
 - `resume_menu_sessions` (default `10`, max `25`, `0` hides the row) caps how
   many sessions are offered.
+- `restore_last_window_sessions` (default `8`, max `25`, `0` hides the button)
+  caps how many sessions one "Reopen last window" click may bring back.
 
 Only Claude Code and Codex are listed. The other adapters declare resume
 commands, but none of them documents a session store this terminal could
@@ -588,11 +591,22 @@ The sidebar has a collapsible **Agents** section listing agents TGZTerminal
 can see, headed `Agents · N`. It merges two sources: agents detected live in
 this window's own tabs/panes, and agents found by scanning each vendor's
 on-disk session files (so an agent in a pane outside the current window can
-still show up). Both sources are filtered before display:
+still show up). The two sources are **joined**, not concatenated: a session is
+bound to the pane running it by process tree (falling back to a *unique* cwd
+match), so an agent visible both ways is one row, not two. A session that binds
+to no pane is still listed, but it cannot be focused.
+
+Both sources are filtered before display:
 
 - **Liveness**: a vendor session file is only shown while its process is
   still alive. A session whose process has exited is a stale leftover and is
   dropped silently — it does not linger as a phantom row.
+- **Interactive only**: vendors write the same session files for processes no
+  human is typing into — SDK harnesses, one-shot `-p` runs, hook children.
+  These are hidden unless `show_non_interactive = true`. For Claude the
+  discriminator is the session's `entrypoint` (`cli` is interactive, `sdk-cli`
+  is not); vendors whose store does not record this are always treated as
+  interactive.
 - **Project scope**: only agents belonging to the active pane's project (the
   repo root of its working directory, or a directory nested under it) are
   shown. If the active pane's project can't be determined, the section falls
@@ -606,6 +620,7 @@ agent_ui = {
   section = {
     enabled = true,      -- show the Agents section in the sidebar at all
     refresh_ms = 500,     -- how often the disk-scanned source re-reads, clamped 100..=10000
+    show_non_interactive = false, -- also list SDK/headless/hook agent processes
   },
 }
 ```
@@ -894,6 +909,35 @@ rebrand without patching source.
 `CFBundleExecutable` stays `wezterm-gui`, and the internal namespaces
 (`tgzterminal.worktree` user var, `TGZTERMINAL_BIN`, `.cache/tgzterminal`) are
 unaffected by branding.
+
+## Portable mode (Windows)
+
+On Windows only, configuration precedence depends on a file rather than a config
+key. When a file named `.portable` sits next to the executables, these three
+locations take precedence over their counterparts in your user profile:
+
+| In the program folder | Instead of |
+|---|---|
+| `wezterm.lua` | `%USERPROFILE%\.wezterm.lua`, `%USERPROFILE%\.config\wezterm\wezterm.lua` |
+| `colors\` | the `colors` directory of each config dir |
+| `wezterm_modules\` | later entries on the Lua `package.path` |
+
+The portable `.zip` ships that marker; the installer never does, and actively
+deletes one it finds. So an extracted zip behaves like a self-contained tool on a
+thumb drive, while an installed build reads only your own configuration — which
+matters because the program folder belongs to the installer, and a file dropped
+there would otherwise outrank every user's config on the machine.
+
+- `TGZTERMINAL_PORTABLE=1` forces portable mode on, `=0` forces it off, for a
+  layout the marker does not describe.
+- `--config-file` and `WEZTERM_CONFIG_FILE` outrank all of the above in both
+  modes.
+- A `wezterm.lua` found next to the executable without a marker is ignored, and
+  logs a warning once saying so.
+
+Nothing is portable about *state*: UI state, caches and sockets always live under
+the user profile (`%APPDATA%\wezterm`, `%LOCALAPPDATA%\wezterm`,
+`%USERPROFILE%\.local\share\wezterm`), in either mode.
 
 ## What is not configurable
 

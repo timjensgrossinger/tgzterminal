@@ -1,6 +1,7 @@
+use crate::agent_herd::AgentKey;
 use crate::tabbar::TabBarItem;
 use crate::termwindow::{
-    AgentCopyAction, AgentCopyMenuState, AgentLaunchMenuState, AgentToolbeltAction,
+    AgentCopyAction, AgentCopyMenuState, AgentLaunchMenuState, AgentRowAction, AgentToolbeltAction,
     CloseTabMenuAction, CloseTabMenuState, CloseTabSource, ExpandedMenuRow, GuiWin, MouseCapture,
     PositionedSplit, ScrollHit, SshLaunchMenuState, TermWindowNotif, UIItem, UIItemType, TMB,
 };
@@ -64,10 +65,11 @@ impl super::TermWindow {
             | UIItemType::SidebarAgentMenuTarget { .. }
             | UIItemType::SidebarAgentMenuResume
             | UIItemType::SidebarAgentMenuResumeSession { .. }
+            | UIItemType::SidebarAgentMenuRestoreLastWindow
             | UIItemType::SidebarAgentSectionHeader
             | UIItemType::SidebarAgentRow { .. }
-            | UIItemType::SidebarAgentDetailExpand { .. }
-            | UIItemType::SidebarAgentFocusPane { .. }
+            | UIItemType::SidebarAgentRowChevron { .. }
+            | UIItemType::SidebarAgentAction { .. }
             | UIItemType::SidebarNewTabMenuButton
             | UIItemType::SidebarNewTabMenuItem { .. }
             | UIItemType::SidebarSshLaunchButton
@@ -105,10 +107,11 @@ impl super::TermWindow {
             | UIItemType::SidebarAgentMenuTarget { .. }
             | UIItemType::SidebarAgentMenuResume
             | UIItemType::SidebarAgentMenuResumeSession { .. }
+            | UIItemType::SidebarAgentMenuRestoreLastWindow
             | UIItemType::SidebarAgentSectionHeader
             | UIItemType::SidebarAgentRow { .. }
-            | UIItemType::SidebarAgentDetailExpand { .. }
-            | UIItemType::SidebarAgentFocusPane { .. }
+            | UIItemType::SidebarAgentRowChevron { .. }
+            | UIItemType::SidebarAgentAction { .. }
             | UIItemType::SidebarNewTabMenuButton
             | UIItemType::SidebarNewTabMenuItem { .. }
             | UIItemType::SidebarSshLaunchButton
@@ -365,10 +368,11 @@ impl super::TermWindow {
                             | UIItemType::SidebarAgentMenuTarget { .. }
                             | UIItemType::SidebarAgentMenuResume
                             | UIItemType::SidebarAgentMenuResumeSession { .. }
-             | UIItemType::SidebarAgentSectionHeader
-             | UIItemType::SidebarAgentRow { .. }
-             | UIItemType::SidebarAgentDetailExpand { .. }
-             | UIItemType::SidebarAgentFocusPane { .. }
+                            | UIItemType::SidebarAgentMenuRestoreLastWindow
+                            | UIItemType::SidebarAgentSectionHeader
+                            | UIItemType::SidebarAgentRow { .. }
+                            | UIItemType::SidebarAgentRowChevron { .. }
+                            | UIItemType::SidebarAgentAction { .. }
                     )
             );
             if !on_launch_menu {
@@ -672,17 +676,23 @@ impl super::TermWindow {
             UIItemType::SidebarAgentMenuResumeSession { index } => {
                 self.mouse_event_sidebar_agent_menu_resume_session(index, event, context);
             }
+            UIItemType::SidebarAgentMenuRestoreLastWindow => {
+                self.mouse_event_sidebar_agent_menu_restore_last_window(event, context);
+            }
             UIItemType::SidebarAgentSectionHeader => {
                 self.mouse_event_sidebar_agent_section_header(event, context);
             }
-            UIItemType::SidebarAgentRow { index } => {
-                self.mouse_event_sidebar_agent_row(index, event, context);
+            UIItemType::SidebarAgentRow { ref key } => {
+                let key = key.clone();
+                self.mouse_event_sidebar_agent_row(&key, event, context);
             }
-            UIItemType::SidebarAgentDetailExpand { index } => {
-                self.mouse_event_sidebar_agent_detail_expand(index, event, context);
+            UIItemType::SidebarAgentRowChevron { ref key } => {
+                let key = key.clone();
+                self.mouse_event_sidebar_agent_row_chevron(&key, event, context);
             }
-            UIItemType::SidebarAgentFocusPane { index } => {
-                self.mouse_event_sidebar_agent_focus_pane(index, event, context);
+            UIItemType::SidebarAgentAction { ref key, action } => {
+                let key = key.clone();
+                self.mouse_event_sidebar_agent_action(&key, action, event, context);
             }
             UIItemType::SidebarNewTabMenuButton => {
                 self.mouse_event_sidebar_new_tab_menu_button(item, event, context);
@@ -794,7 +804,7 @@ impl super::TermWindow {
     ) {
         if event.kind == WMEK::Release(MousePress::Left) {
             self.pressed_ui_item = None;
-            self.activate_sidebar_pane(pane_id);
+            let _ = self.activate_sidebar_pane(pane_id);
         }
         context.invalidate();
     }
@@ -1046,6 +1056,21 @@ impl super::TermWindow {
             self.agent_launch_menu = None;
             self.pressed_ui_item = None;
             self.resume_agent_session(index, None);
+        }
+        context.invalidate();
+    }
+
+    /// Reopen every agent session the previous run's last window had open.
+    fn mouse_event_sidebar_agent_menu_restore_last_window(
+        &mut self,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        if event.kind == WMEK::Release(MousePress::Left) {
+            // Acts on the tab layout, so the menu has no reason to stay open.
+            self.agent_launch_menu = None;
+            self.pressed_ui_item = None;
+            self.restore_last_window_agent_sessions();
         }
         context.invalidate();
     }
@@ -2120,51 +2145,152 @@ impl super::TermWindow {
         }
     }
 
+    /// Clicking a row brings that agent on screen. Expanding is the chevron's
+    /// job — the row used to only toggle its own detail, which meant there was
+    /// no way to reach the agent from the sidebar at all.
     fn mouse_event_sidebar_agent_row(
         &mut self,
-        index: usize,
-        event: MouseEvent,
-        context: &dyn WindowOps,
-    ) {
-        if event.kind == WMEK::Release(MousePress::Left) {
-            let mut state = self.agent_herd_state.borrow_mut();
-            state.expanded = if state.expanded == Some(index) {
-                None
-            } else {
-                Some(index)
-            };
-            drop(state);
-            context.invalidate();
-        }
-    }
-
-    fn mouse_event_sidebar_agent_detail_expand(
-        &mut self,
-        index: usize,
-        event: MouseEvent,
-        context: &dyn WindowOps,
-    ) {
-        self.mouse_event_sidebar_agent_row(index, event, context);
-    }
-
-    fn mouse_event_sidebar_agent_focus_pane(
-        &mut self,
-        index: usize,
+        key: &AgentKey,
         event: MouseEvent,
         context: &dyn WindowOps,
     ) {
         if event.kind != WMEK::Release(MousePress::Left) {
             return;
         }
-        let pane_id = {
-            let state = self.agent_herd_state.borrow();
-            state.agents.get(index).and_then(|a| a.pane_id)
-        };
-        if let Some(pane_id) = pane_id {
-            let mux = Mux::get();
-            mux.focus_pane_and_containing_tab(pane_id).ok();
+        self.pressed_ui_item = None;
+        match self.herd_agent_by_key(key) {
+            Some(agent) if !agent.is_detached() => {
+                self.focus_herd_agent(&agent);
+            }
+            // Detached: there is no pane to show. Say so instead of doing
+            // nothing, and point at the action that does work.
+            Some(_) => {
+                self.toggle_herd_row_expansion(key);
+                wezterm_toast_notification::show(wezterm_toast_notification::ToastNotification {
+                    title: "Agent".to_string(),
+                    message: "This agent is not attached to a pane here. Use Resume to reopen it."
+                        .to_string(),
+                    url: None,
+                    timeout: Some(std::time::Duration::from_millis(2600)),
+                });
+            }
+            None => {}
+        }
+        context.invalidate();
+    }
+
+    fn mouse_event_sidebar_agent_row_chevron(
+        &mut self,
+        key: &AgentKey,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        if event.kind == WMEK::Release(MousePress::Left) {
+            self.pressed_ui_item = None;
+            self.toggle_herd_row_expansion(key);
             context.invalidate();
         }
+    }
+
+    fn toggle_herd_row_expansion(&mut self, key: &AgentKey) {
+        let mut state = self.agent_herd_state.borrow_mut();
+        state.expanded = if state.expanded.as_ref() == Some(key) {
+            None
+        } else {
+            Some(key.clone())
+        };
+    }
+
+    /// Look up a row by identity: the list is rebuilt every paint, so the
+    /// agent that was under the cursor may have moved by now.
+    fn herd_agent_by_key(&self, key: &AgentKey) -> Option<crate::agent_herd::HerdAgent> {
+        self.agent_herd_state
+            .borrow()
+            .agents
+            .iter()
+            .find(|agent| &agent.key() == key)
+            .cloned()
+    }
+
+    fn focus_herd_agent(&mut self, agent: &crate::agent_herd::HerdAgent) {
+        let Some(pane_id) = agent.pane_id else {
+            return;
+        };
+        // The sidebar path also activates the containing tab and refreshes the
+        // title; fall back to the mux for a pane in another window.
+        if self.activate_sidebar_pane(pane_id) {
+            return;
+        }
+        if let Err(err) = Mux::get().focus_pane_and_containing_tab(pane_id) {
+            log::warn!("could not focus agent pane {pane_id}: {err:#}");
+        }
+    }
+
+    fn mouse_event_sidebar_agent_action(
+        &mut self,
+        key: &AgentKey,
+        action: AgentRowAction,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        if event.kind != WMEK::Release(MousePress::Left) {
+            return;
+        }
+        self.pressed_ui_item = None;
+        let Some(agent) = self.herd_agent_by_key(key) else {
+            return;
+        };
+
+        match action {
+            AgentRowAction::Focus => self.focus_herd_agent(&agent),
+            AgentRowAction::Resume => {
+                let session_id = agent.session_id.clone().unwrap_or_default();
+                let cwd = agent.cwd.clone();
+                match (session_id.is_empty(), cwd) {
+                    (false, Some(cwd)) => {
+                        self.resume_agent_session_by_id(&agent.provider, &session_id, cwd, None);
+                    }
+                    // Without both an id and a directory the resume command
+                    // cannot be built; saying so beats spawning something wrong.
+                    _ => {
+                        wezterm_toast_notification::show(
+                            wezterm_toast_notification::ToastNotification {
+                                title: "Agent resume".to_string(),
+                                message: "This agent did not report a session id and directory"
+                                    .to_string(),
+                                url: None,
+                                timeout: Some(std::time::Duration::from_millis(2600)),
+                            },
+                        );
+                    }
+                }
+            }
+            AgentRowAction::Attach | AgentRowAction::Logs | AgentRowAction::Stop => {
+                let Some(pane) = agent.pane_id.and_then(|id| Mux::get().get_pane(id)) else {
+                    wezterm_toast_notification::show(
+                        wezterm_toast_notification::ToastNotification {
+                            title: "Agent".to_string(),
+                            message: format!(
+                                "{} needs a live pane; this agent is detached",
+                                action.label()
+                            ),
+                            url: None,
+                            timeout: Some(std::time::Duration::from_millis(2600)),
+                        },
+                    );
+                    return;
+                };
+                match action {
+                    AgentRowAction::Attach => self.agent_attach_pane(&pane),
+                    AgentRowAction::Logs => self.agent_open_logs_for_pane(&pane),
+                    AgentRowAction::Stop => {
+                        pane.key_down(KeyCode::Char('c'), KeyModifiers::CTRL).ok();
+                    }
+                    _ => unreachable!("outer match limits this to attach/logs/stop"),
+                }
+            }
+        }
+        context.invalidate();
     }
 }
 

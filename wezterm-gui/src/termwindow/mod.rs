@@ -2,6 +2,7 @@
 use super::renderstate::*;
 use super::utilsprites::RenderMetrics;
 use crate::agent_herd::sessions::AgentSession;
+use crate::agent_herd::AgentKey;
 use crate::colorease::ColorEase;
 use crate::frontend::{front_end, try_front_end};
 use crate::inputmap::InputMap;
@@ -126,6 +127,7 @@ pub mod render;
 pub mod resize;
 mod selection;
 pub mod spawn;
+pub mod tgz_last_session;
 pub mod tgz_ui_state;
 pub mod webgpu;
 pub mod wsl_paths;
@@ -147,6 +149,40 @@ pub fn set_window_position(pos: GuiPosition) {
 
 pub fn set_window_class(cls: &str) {
     *WINDOW_CLASS.lock().unwrap() = cls.to_owned();
+}
+
+/// Path handed to the worktree script as `$TGZTERMINAL_BIN`.
+///
+/// The CLI binary is `tgzterminal[.exe]` (see `wezterm/Cargo.toml`'s `[[bin]]
+/// name`). The previous code probed for an extension-less name, so on Windows it
+/// never matched and silently handed the script `wezterm-gui.exe` instead — a
+/// GUI binary where a CLI was expected. Falling back to the bare name is the
+/// honest alternative: it works when the executable's directory is on PATH and
+/// fails visibly when it is not.
+fn cli_bin_for_script(exe: Option<&Path>, windows: bool, exists: &dyn Fn(&Path) -> bool) -> String {
+    const CLI: &str = "tgzterminal";
+    let name = if windows { "tgzterminal.exe" } else { CLI };
+    match exe
+        .and_then(|exe| exe.parent())
+        .map(|dir| dir.join(name))
+        .filter(|candidate| exists(candidate))
+    {
+        Some(path) => shell_path(&path, windows),
+        None => CLI.to_string(),
+    }
+}
+
+/// Render a path for the POSIX shell script the worktree picker runs.
+///
+/// That script goes through msys/git-bash on Windows, where a backslash is an
+/// escape character, so a native path has to be emitted with forward slashes.
+fn shell_path(path: &Path, windows: bool) -> String {
+    let path = path.to_string_lossy().to_string();
+    if windows {
+        path.replace('\\', "/")
+    } else {
+        path
+    }
 }
 
 pub fn get_window_class() -> String {
@@ -281,6 +317,9 @@ pub enum UIItemType {
     SidebarAgentMenuResumeSession {
         index: usize,
     },
+    /// The "Reopen last window" button: restores the previous run's agent
+    /// sessions into new tabs of this window.
+    SidebarAgentMenuRestoreLastWindow,
     /// Chevron beside the sidebar new-tab button.
     SidebarNewTabMenuButton,
     /// A shell/domain row in the new-tab dropdown.
@@ -307,18 +346,48 @@ pub enum UIItemType {
     Split(PositionedSplit),
     /// Agent section header in the sidebar: toggle expand/collapse.
     SidebarAgentSectionHeader,
-    /// A single agent row in the sidebar agent section.
+    /// A single agent row in the sidebar agent section: focuses the agent.
     SidebarAgentRow {
-        index: usize,
+        key: AgentKey,
     },
-    /// Clicking expands the detail view for this agent.
-    SidebarAgentDetailExpand {
-        index: usize,
+    /// The per-row chevron: expands/collapses that row's detail. Separate from
+    /// the row itself so clicking the row can do the useful thing instead.
+    SidebarAgentRowChevron {
+        key: AgentKey,
     },
-    /// Focus button: jump to the agent's pane.
-    SidebarAgentFocusPane {
-        index: usize,
+    /// A labelled action button inside an expanded agent's detail.
+    SidebarAgentAction {
+        key: AgentKey,
+        action: AgentRowAction,
     },
+}
+
+/// What a button in an expanded agent row does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentRowAction {
+    /// Bring the agent's pane on screen.
+    Focus,
+    /// Re-launch a detached session through its adapter's resume command.
+    Resume,
+    /// Adapter-defined attach (e.g. reconnect to a remote session).
+    Attach,
+    /// Open the agent's log directory.
+    Logs,
+    /// Interrupt the agent with Ctrl-C.
+    Stop,
+}
+
+impl AgentRowAction {
+    /// Button label. Short: the row is as wide as the sidebar.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Focus => "Focus",
+            Self::Resume => "Resume",
+            Self::Attach => "Attach",
+            Self::Logs => "Logs",
+            Self::Stop => "Stop",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -486,8 +555,9 @@ pub struct SshQuickLaunchEntry {
 pub struct AgentHerdState {
     /// Flattened agent list in display order.
     pub agents: Vec<crate::agent_herd::HerdAgent>,
-    /// Which agent row is expanded inline (index into `agents`).
-    pub expanded: Option<usize>,
+    /// Which agent row is expanded inline, by identity rather than position:
+    /// the list is rebuilt and re-sorted every paint.
+    pub expanded: Option<crate::agent_herd::AgentKey>,
     /// Whether the section is collapsed (hidden).
     pub collapsed: bool,
 }
@@ -762,6 +832,23 @@ pub struct TermWindow {
     /// A scan is in flight. Keeps a held-open submenu from queueing a new scan
     /// per frame, and tells the renderer to show progress instead of "none".
     agent_session_scan_pending: bool,
+    /// Agent sessions running in *this* window right now, in tab order.
+    ///
+    /// Recomputed from the herd join every paint, which is why it must stay a
+    /// plain filter with no filesystem work. Also what the close handler
+    /// persists, so it must be current rather than recomputed on the way out.
+    agent_window_sessions: Vec<tgz_last_session::SnapshotSession>,
+    /// What was last persisted for this window, and when. The list is the change
+    /// detector (so an unchanged set writes nothing) and the instant is the rate
+    /// limiter.
+    agent_snapshot_written: Option<(Instant, Vec<tgz_last_session::SnapshotSession>)>,
+    /// The set changed but the rate limit had not elapsed. A frame is scheduled
+    /// so the write is not lost when the window then goes quiet.
+    agent_snapshot_dirty: bool,
+    /// Agent sessions from the last window of the previous run, loaded once at
+    /// window creation. `None` means there is nothing to offer, so the launcher's
+    /// restore row stays hidden.
+    last_window_sessions: Option<Arc<Vec<tgz_last_session::SnapshotSession>>>,
     sidebar_scroll_offset: usize,
     sidebar_drop_flash: Option<(usize, Instant)>,
     /// Tabs whose pane children are shown in the sidebar. Persisted via
@@ -865,6 +952,10 @@ impl TermWindow {
 
     fn close_requested(&mut self, window: &Window) {
         let mux = Mux::get();
+        // Record the agents while the panes still exist. One line here covers
+        // all three exit paths below, including the confirmation overlay, which
+        // closes the window later from somewhere with no access to this state.
+        self.persist_agent_window_sessions_on_close();
         match self.config.window_close_confirmation {
             WindowCloseConfirmation::NeverPrompt => {
                 // Immediately kill the tabs and allow the window to close
@@ -1140,6 +1231,15 @@ impl TermWindow {
             ssh_launcher_cache: RefCell::new(None),
             agent_session_cache: None,
             agent_session_scan_pending: false,
+            agent_window_sessions: Vec::new(),
+            agent_snapshot_written: None,
+            agent_snapshot_dirty: false,
+            // Read once here, never from paint: the launcher's restore row only
+            // ever consults this copy.
+            last_window_sessions: (config.agent_ui.launcher.restore_last_window_sessions > 0)
+                .then(tgz_last_session::load_last_window)
+                .flatten()
+                .map(Arc::new),
             composer_history: RefCell::new(Vec::new()),
             docked_input: crate::termwindow::composer::DockedInput::new(),
             sidebar_scroll_offset: 0,
@@ -4094,17 +4194,11 @@ done
             "TGZTERMINAL_TARGET_PANE".to_string(),
             target_pane.pane_id().to_string(),
         );
-        let bin = std::env::current_exe()
-            .ok()
-            .map(|path| {
-                let cli_path = path
-                    .parent()
-                    .map(|parent| parent.join("tgzterminal"))
-                    .filter(|path| path.exists())
-                    .unwrap_or(path);
-                cli_path.to_string_lossy().to_string()
-            })
-            .unwrap_or_else(|| "tgzterminal".to_string());
+        let bin = cli_bin_for_script(
+            std::env::current_exe().ok().as_deref(),
+            cfg!(windows),
+            &|path| path.exists(),
+        );
         set_environment_variables.insert("TGZTERMINAL_BIN".to_string(), bin);
         // Prefer the fzf binary vendored alongside the app (see
         // ci/fetch-fzf.sh + ci/build-macos-bundle.sh / the Windows release
@@ -4117,7 +4211,8 @@ done
         }) {
             set_environment_variables.insert(
                 "TGZTERMINAL_FZF_BIN".to_string(),
-                fzf_bin.to_string_lossy().to_string(),
+                // Same POSIX-script quoting concern as TGZTERMINAL_BIN.
+                shell_path(&fzf_bin, cfg!(windows)),
             );
         }
         if let Some(editor_command) = self
@@ -4833,10 +4928,12 @@ done
     }
 
     /// Focus the pane a sidebar pane row refers to, switching tabs if needed.
-    pub fn activate_sidebar_pane(&mut self, pane_id: PaneId) {
+    /// Returns false when the pane does not live in this window, so callers
+    /// that can reach other windows know to fall back instead of doing nothing.
+    pub fn activate_sidebar_pane(&mut self, pane_id: PaneId) -> bool {
         let mux = Mux::get();
         let Some(window) = mux.get_window(self.mux_window_id) else {
-            return;
+            return false;
         };
         let Some((tab_idx, tab, pane)) = window.iter().enumerate().find_map(|(idx, tab)| {
             tab.iter_panes_ignoring_zoom()
@@ -4844,7 +4941,7 @@ done
                 .find(|pos| pos.pane.pane_id() == pane_id)
                 .map(|pos| (idx, tab.clone(), pos.pane.clone()))
         }) else {
-            return;
+            return false;
         };
         // Drop the borrow before activate_tab, which reaches back into the mux.
         drop(window);
@@ -4854,6 +4951,7 @@ done
         // above still stands, so there is nothing to recover from.
         let _ = self.activate_tab(tab_idx as isize);
         self.update_title();
+        true
     }
 
     /// Close one specific pane, chosen from the sidebar rather than by focus.
@@ -5510,5 +5608,55 @@ mod tests {
     #[test]
     fn host_looks_remote_true_when_no_local_label() {
         assert!(TermWindow::host_looks_remote("build01", None));
+    }
+
+    #[test]
+    fn windows_cli_bin_has_the_exe_suffix() {
+        // The regression: probing for an extension-less `tgzterminal` never
+        // matched on Windows, so the script silently got wezterm-gui.exe.
+        // A backslash path cannot be exercised here — `Path` only splits on the
+        // host's separator, so on a unix test host `C:\a\b` is a single
+        // component. `shell_path` covers the separator rewrite instead.
+        let exe = PathBuf::from("/programs/TGZTerminal/wezterm-gui.exe");
+        let bin = cli_bin_for_script(Some(&exe), true, &|_| true);
+        assert_eq!(bin, "/programs/TGZTerminal/tgzterminal.exe");
+    }
+
+    #[test]
+    fn shell_path_rewrites_windows_separators() {
+        // The worktree script is POSIX sh run through msys/git-bash, where a
+        // backslash is an escape character.
+        let path = PathBuf::from(r"C:\Program Files\TGZTerminal\tgzterminal.exe");
+        assert_eq!(
+            shell_path(&path, true),
+            "C:/Program Files/TGZTerminal/tgzterminal.exe"
+        );
+        // Untouched off Windows, where a backslash is a legal filename byte.
+        assert_eq!(
+            shell_path(&PathBuf::from("/opt/a b/c"), false),
+            "/opt/a b/c"
+        );
+    }
+
+    #[test]
+    fn unix_cli_bin_keeps_the_native_path() {
+        let exe = PathBuf::from("/Applications/TGZTerminal.app/Contents/MacOS/wezterm-gui");
+        let bin = cli_bin_for_script(Some(&exe), false, &|_| true);
+        assert_eq!(
+            bin,
+            "/Applications/TGZTerminal.app/Contents/MacOS/tgzterminal"
+        );
+    }
+
+    #[test]
+    fn missing_cli_falls_back_to_the_bare_name_not_the_gui() {
+        // Handing the script the GUI binary is worse than handing it a name that
+        // PATH can resolve: the GUI is not a CLI and fails obscurely.
+        let exe = PathBuf::from("/opt/tgz/wezterm-gui");
+        assert_eq!(
+            cli_bin_for_script(Some(&exe), false, &|_| false),
+            "tgzterminal"
+        );
+        assert_eq!(cli_bin_for_script(None, false, &|_| true), "tgzterminal");
     }
 }

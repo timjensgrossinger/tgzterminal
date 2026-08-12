@@ -2,16 +2,21 @@ name: TGZTerminal Windows Release
 
 # Windows counterpart to tgzterminal-release.yml. Triggered by the same
 # `tgz-v*` tags so a single release carries both the macOS .dmg and the Windows
-# build. Produces:
-#   * TGZTerminal-windows-portable-<tag>.zip  (guaranteed) — unzip and run
-#     wezterm-gui.exe, no install required. Uses the ANGLE GL backend bundled in
-#     assets/windows.
-#   * TGZTerminal-Setup.exe (best-effort) — Inno Setup installer, only if the
-#     toolchain and all files the installer script requires are present.
+# build. Both artifacts are required; a missing one fails the run. Produces:
+#   * TGZTerminal-Setup-<tag>.exe — Inno Setup installer
+#     (ci/tgzterminal-windows-installer.iss). Per-user by default, no admin
+#     prompt; an elevated run can choose an all-users install instead.
+#   * TGZTerminal-windows-portable-<tag>.zip — unzip and run TGZTerminal.cmd, no
+#     install required. Ships a `.portable` marker, which is what makes a
+#     wezterm.lua next to the binaries outrank the user's own config; the
+#     installed build deliberately has no marker and so ignores that directory.
+#   * A .sha256 sidecar for each.
+# Both use the ANGLE GL backend bundled in assets/windows. x64 only: the
+# vendored ANGLE/conpty/OpenConsole/mesa/fzf payload is x64, so arm64 machines
+# run the x64 build under emulation.
 #
-# NOTE: this is the first Windows build of the fork. If the fork's additive code
-# does not yet compile on windows-msvc, the build step is where that surfaces —
-# fix compile errors and re-tag.
+# NOTE: if the fork's additive code does not compile on windows-msvc, the build
+# step is where that surfaces — fix compile errors and re-tag.
 #
 # Manual runs (workflow_dispatch) build and upload the portable zip as a CI
 # artifact only; they do not publish a Release.
@@ -50,15 +55,27 @@ jobs:
           if [[ "${GITHUB_REF}" == refs/tags/tgz-v* ]]; then
             VERSION="${GITHUB_REF_NAME}"
             IS_RELEASE=1
+            # Bake the version only for a real release, so the in-app updater
+            # compares against releases/latest. A manual run must NOT bake
+            # "dev-..." into the binary: is_release_build() in update.rs keys off
+            # the tgz- prefix, and a baked dev string would misreport the build.
+            printf '%s' "${VERSION}" > .tag
+            echo "Baked version: ${VERSION}"
           else
             VERSION="dev-$(git -c core.abbrev=8 show -s --format=%cd-%h --date=format:%Y%m%d-%H%M%S)"
             IS_RELEASE=0
+            echo "Not a release ref; leaving .tag alone (version: ${VERSION})"
+          fi
+          # A dotted numeric version for VERSIONINFO, which cannot take the
+          # tgz-vYYYY.MM.PATCH form: tgz-v2026.08.5 -> 2026.8.5.0.
+          if [[ "${VERSION}" =~ ^tgz-v([0-9]+)\.0*([0-9]+)\.0*([0-9]+)$ ]]; then
+            VINFO="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}.0"
+          else
+            VINFO="0.0.0.0"
           fi
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "is_release=${IS_RELEASE}" >> "$GITHUB_OUTPUT"
-          # Bake the version so the in-app updater compares against releases/latest.
-          printf '%s' "${VERSION}" > .tag
-          echo "Baked version: ${VERSION}"
+          echo "vinfo=${VINFO}" >> "$GITHUB_OUTPUT"
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -110,35 +127,71 @@ jobs:
           fi
           # Friendly launcher so coworkers don't have to hunt for wezterm-gui.exe.
           printf '@echo off\r\nstart "" "%%~dp0wezterm-gui.exe" %%*\r\n' > "$pkg/TGZTerminal.cmd"
+          # Portable mode marker: with this present, a wezterm.lua, colors/ and
+          # wezterm_modules/ sitting next to these binaries take precedence over
+          # the user's own (config::PORTABLE_MARKER). The installer never ships
+          # one, so an installed build reads only the user's config.
+          printf 'This file enables portable mode: configuration, colors and wezterm_modules next to these binaries take precedence over your user configuration. Delete it to use only your user configuration.\r\n' > "$pkg/.portable"
           7z a -tzip "${pkg}.zip" "$pkg" >/dev/null
           echo "PKG_ZIP=${pkg}.zip" >> "$GITHUB_ENV"
 
-      - name: Build installer (best-effort)
+      # Pinned rather than relying on whatever the runner image happens to
+      # carry: ci/tgzterminal-windows-installer.iss uses ArchitecturesAllowed=
+      # x64compatible, which needs Inno Setup 6.3 or newer.
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          choco install innosetup --version=6.3.3 --no-progress -y
+          "ISCC=C:\Program Files (x86)\Inno Setup 6\ISCC.exe" >> $env:GITHUB_ENV
+
+      - name: Build installer
         id: installer
-        continue-on-error: true
         shell: bash
         run: |
-          set -uo pipefail
+          set -euo pipefail
           VERSION="${{ steps.ver.outputs.version }}"
+          VINFO="${{ steps.ver.outputs.vinfo }}"
           # The Inno script reads files from target/release; stage the runtime
-          # DLLs the .rs build does not place there itself.
+          # DLLs the build script does not place there itself.
           cp assets/windows/conhost/conpty.dll \
              assets/windows/conhost/OpenConsole.exe \
              assets/windows/angle/libEGL.dll \
              assets/windows/angle/libGLESv2.dll \
-             target/release/ || true
+             target/release/
           chmod +x ci/fetch-fzf.sh
-          ci/fetch-fzf.sh windows amd64 target/release/fzf.exe || true
-          if [ ! -f target/release/mesa/opengl32.dll ]; then
-            echo "mesa/opengl32.dll missing — the stock installer script requires it; skipping installer."
+          ci/fetch-fzf.sh windows amd64 target/release/fzf.exe
+          # An installed tree must never carry the portable marker.
+          rm -f target/release/.portable
+          # The .iss lists every payload file explicitly with no
+          # skipifsourcedoesntexist, so report all of them at once rather than
+          # letting iscc fail on whichever it reaches first.
+          missing=()
+          for f in tgzterminal.exe wezterm-gui.exe wezterm-mux-server.exe \
+                   strip-ansi-escapes.exe libEGL.dll libGLESv2.dll conpty.dll \
+                   OpenConsole.exe fzf.exe mesa/opengl32.dll ; do
+            [ -f "target/release/$f" ] || missing+=("$f")
+          done
+          if [ ${#missing[@]} -ne 0 ]; then
+            printf 'missing installer payload: %s\n' "${missing[@]}"
             exit 1
           fi
-          iscc.exe //DMyAppName=TGZTerminal //DMyAppVersion="${VERSION}" //FTGZTerminal-Setup ci/windows-installer.iss
-          # ci/windows-installer.iss has OutputDir=.. (relative to the .iss file
-          # in ci/), so iscc writes the installer to the repo root, not ci/.
-          if [ -f TGZTerminal-Setup.exe ]; then
-            echo "SETUP_EXE=TGZTerminal-Setup.exe" >> "$GITHUB_ENV"
-          fi
+          setup="TGZTerminal-Setup-${VERSION}"
+          "$ISCC" //DMyAppName=TGZTerminal //DMyAppVersion="${VERSION}" \
+                  //DMyVersionInfoVersion="${VINFO}" \
+                  //F"${setup}" ci/tgzterminal-windows-installer.iss
+          # OutputDir=.. is relative to the .iss in ci/, so iscc writes to the
+          # repo root.
+          test -f "${setup}.exe"
+          echo "SETUP_EXE=${setup}.exe" >> "$GITHUB_ENV"
+
+      - name: Checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          for f in TGZTerminal-windows-portable-*.zip TGZTerminal-Setup-*.exe; do
+            sha256sum "$f" > "$f.sha256"
+          done
+          cat ./*.sha256
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -146,8 +199,9 @@ jobs:
           name: TGZTerminal-windows
           path: |
             TGZTerminal-windows-portable-*.zip
-            TGZTerminal-Setup.exe
-          if-no-files-found: warn
+            TGZTerminal-Setup-*.exe
+            *.sha256
+          if-no-files-found: error
 
       - name: Publish to GitHub Release
         if: steps.ver.outputs.is_release == '1'
@@ -155,5 +209,6 @@ jobs:
         with:
           files: |
             TGZTerminal-windows-portable-*.zip
-            TGZTerminal-Setup.exe
-          fail_on_unmatched_files: false
+            TGZTerminal-Setup-*.exe
+            *.sha256
+          fail_on_unmatched_files: true

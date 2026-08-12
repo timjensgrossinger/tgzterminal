@@ -82,12 +82,14 @@ impl Platform {
 /// The release artifact a user on `platform` should download.
 ///
 /// Asset names are produced by the release workflows and are stable:
-/// `<Product>.dmg` on macOS, `<Product>-Setup.exe` on Windows with the
-/// portable `<Product>-windows-portable-<tag>.zip` as the fallback (the
-/// installer step is best-effort and can legitimately be missing from a
-/// release). Returns `None` on platforms we publish nothing for, in which
-/// case callers fall back to the release page.
-fn pick_asset_for(release: &Release, platform: Platform) -> Option<&Asset> {
+/// `<Product>.dmg` on macOS, and on Windows `<Product>-Setup-<tag>.exe` next to
+/// the portable `<Product>-windows-portable-<tag>.zip`. Both Windows artifacts
+/// are always published, so `portable` decides which one this build should be
+/// pointed at: replacing a portable extraction with an installer (or the reverse)
+/// is not what the user asked for. `.sha256` sidecars never match, since the
+/// extension check excludes them. Returns `None` on platforms we publish nothing
+/// for, in which case callers fall back to the release page.
+fn pick_asset_for(release: &Release, platform: Platform, portable: bool) -> Option<&Asset> {
     let product = crate::brand::PRODUCT_NAME;
     match platform {
         Platform::MacOS => {
@@ -96,23 +98,32 @@ fn pick_asset_for(release: &Release, platform: Platform) -> Option<&Asset> {
         }
         Platform::Windows => {
             let setup = format!("{}-Setup", product);
-            let portable = format!("{}-windows-portable", product);
-            release
-                .assets
-                .iter()
-                .find(|asset| asset.name.starts_with(&setup) && asset.name.ends_with(".exe"))
-                .or_else(|| {
-                    release.assets.iter().find(|asset| {
-                        asset.name.starts_with(&portable) && asset.name.ends_with(".zip")
-                    })
+            let portable_prefix = format!("{}-windows-portable", product);
+            let find_setup = || {
+                release
+                    .assets
+                    .iter()
+                    .find(|asset| asset.name.starts_with(&setup) && asset.name.ends_with(".exe"))
+            };
+            let find_zip = || {
+                release.assets.iter().find(|asset| {
+                    asset.name.starts_with(&portable_prefix) && asset.name.ends_with(".zip")
                 })
+            };
+            // Either way, fall back to the other kind rather than sending the
+            // user to a release page with no download.
+            if portable {
+                find_zip().or_else(find_setup)
+            } else {
+                find_setup().or_else(find_zip)
+            }
         }
         Platform::Other => None,
     }
 }
 
 fn pick_asset(release: &Release) -> Option<&Asset> {
-    pick_asset_for(release, Platform::current())
+    pick_asset_for(release, Platform::current(), config::portable_mode())
 }
 
 pub fn get_latest_release_info() -> anyhow::Result<Release> {
@@ -472,54 +483,77 @@ mod tests {
     /// The default branding; tests assert against the shipped asset names.
     const PRODUCT: &str = crate::brand::PRODUCT_NAME;
 
+    /// A release as the workflows publish it today: versioned installer,
+    /// versioned portable zip, the dmg, and a checksum beside each.
+    fn full_release() -> Release {
+        release_with(&[
+            &format!("{}-windows-portable-tgz-v2026.08.5.zip", PRODUCT),
+            &format!("{}-windows-portable-tgz-v2026.08.5.zip.sha256", PRODUCT),
+            &format!("{}-Setup-tgz-v2026.08.5.exe", PRODUCT),
+            &format!("{}-Setup-tgz-v2026.08.5.exe.sha256", PRODUCT),
+            &format!("{}.dmg", PRODUCT),
+        ])
+    }
+
     #[test]
     fn macos_picks_the_dmg() {
-        let release = release_with(&[
-            &format!("{}-windows-portable-tgz-v2026.07.2.zip", PRODUCT),
-            &format!("{}.dmg", PRODUCT),
-        ]);
-        let asset = pick_asset_for(&release, Platform::MacOS).expect("dmg should be picked");
+        let release = full_release();
+        let asset = pick_asset_for(&release, Platform::MacOS, false).expect("dmg should be picked");
         assert_eq!(asset.name, format!("{}.dmg", PRODUCT));
     }
 
     #[test]
-    fn windows_prefers_the_installer_over_the_portable_zip() {
-        let release = release_with(&[
-            &format!("{}-windows-portable-tgz-v2026.07.2.zip", PRODUCT),
-            &format!("{}-Setup.exe", PRODUCT),
-            &format!("{}.dmg", PRODUCT),
-        ]);
+    fn installed_windows_build_picks_the_versioned_installer() {
+        let release = full_release();
         let asset =
-            pick_asset_for(&release, Platform::Windows).expect("installer should be picked");
-        assert_eq!(asset.name, format!("{}-Setup.exe", PRODUCT));
+            pick_asset_for(&release, Platform::Windows, false).expect("installer should be picked");
+        assert_eq!(asset.name, format!("{}-Setup-tgz-v2026.08.5.exe", PRODUCT));
     }
 
-    /// The Inno Setup step is `continue-on-error`, so a release can ship the
-    /// portable zip alone.
     #[test]
-    fn windows_falls_back_to_the_portable_zip() {
-        let release = release_with(&[
-            &format!("{}.dmg", PRODUCT),
-            &format!("{}-windows-portable-tgz-v2026.07.2.zip", PRODUCT),
-        ]);
-        let asset = pick_asset_for(&release, Platform::Windows).expect("zip should be picked");
+    fn portable_windows_build_picks_the_zip() {
+        // Handing a portable user an installer would replace their extracted
+        // folder with an installed app, which is not what they asked for.
+        let release = full_release();
+        let asset =
+            pick_asset_for(&release, Platform::Windows, true).expect("zip should be picked");
         assert_eq!(
             asset.name,
-            format!("{}-windows-portable-tgz-v2026.07.2.zip", PRODUCT)
+            format!("{}-windows-portable-tgz-v2026.08.5.zip", PRODUCT)
         );
     }
 
     #[test]
+    fn each_windows_kind_falls_back_to_the_other() {
+        let installer_only = release_with(&[&format!("{}-Setup-tgz-v2026.08.5.exe", PRODUCT)]);
+        assert!(pick_asset_for(&installer_only, Platform::Windows, true).is_some());
+
+        let zip_only = release_with(&[&format!("{}-windows-portable-tgz-v2026.08.5.zip", PRODUCT)]);
+        assert!(pick_asset_for(&zip_only, Platform::Windows, false).is_some());
+    }
+
+    #[test]
+    fn checksum_sidecars_are_never_offered_as_downloads() {
+        let sidecars_only = release_with(&[
+            &format!("{}-Setup-tgz-v2026.08.5.exe.sha256", PRODUCT),
+            &format!("{}-windows-portable-tgz-v2026.08.5.zip.sha256", PRODUCT),
+            &format!("{}.dmg.sha256", PRODUCT),
+        ]);
+        assert!(pick_asset_for(&sidecars_only, Platform::Windows, false).is_none());
+        assert!(pick_asset_for(&sidecars_only, Platform::Windows, true).is_none());
+        assert!(pick_asset_for(&sidecars_only, Platform::MacOS, false).is_none());
+    }
+
+    #[test]
     fn no_asset_for_unpublished_platforms() {
-        let release = release_with(&[&format!("{}.dmg", PRODUCT)]);
-        assert!(pick_asset_for(&release, Platform::Other).is_none());
+        assert!(pick_asset_for(&full_release(), Platform::Other, false).is_none());
     }
 
     #[test]
     fn no_asset_when_the_release_has_none() {
         let release = release_with(&[]);
-        assert!(pick_asset_for(&release, Platform::MacOS).is_none());
-        assert!(pick_asset_for(&release, Platform::Windows).is_none());
+        assert!(pick_asset_for(&release, Platform::MacOS, false).is_none());
+        assert!(pick_asset_for(&release, Platform::Windows, false).is_none());
     }
 
     /// Guards against matching an unrelated asset that merely starts with the
@@ -530,8 +564,8 @@ mod tests {
             &format!("{}-debug-symbols.zip", PRODUCT),
             &format!("{}.dmg.sha256", PRODUCT),
         ]);
-        assert!(pick_asset_for(&release, Platform::MacOS).is_none());
-        assert!(pick_asset_for(&release, Platform::Windows).is_none());
+        assert!(pick_asset_for(&release, Platform::MacOS, false).is_none());
+        assert!(pick_asset_for(&release, Platform::Windows, false).is_none());
     }
 
     #[test]

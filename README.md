@@ -112,10 +112,31 @@ Universal binary — runs natively on Apple Silicon and Intel, no Rosetta tax.
 
 ### Windows (beta)
 
-Download `TGZTerminal-windows-portable-<version>.zip` from the latest release, extract
-anywhere, run **`TGZTerminal.cmd`** (or `wezterm-gui.exe` directly if you enjoy typing
-extensions). No installer, no registry entries you'll regret later. SmartScreen will warn
-you once because the build is unsigned — **More info → Run anyway**.
+Two artifacts, both published with every release plus a `.sha256` beside each. SmartScreen
+will warn you once either way, because the build is unsigned — **More info → Run anyway**.
+
+**Installed** — `TGZTerminal-Setup-<version>.exe`. Installs **for your user only**, into
+`%LOCALAPPDATA%\Programs\TGZTerminal`, with **no admin prompt**. You get a Start Menu
+entry and *Open TGZTerminal here* on right-click in Explorer. Adding `tgzterminal` to your
+PATH is an unchecked box in the installer — tick it if you want the CLI from other shells.
+Upgrades replace the previous install in place.
+
+**Portable** — `TGZTerminal-windows-portable-<version>.zip`. Extract anywhere and run
+**`TGZTerminal.cmd`**. The zip contains a `.portable` marker file, which is what makes a
+`wezterm.lua`, `colors\` or `wezterm_modules\` sitting next to the binaries take
+precedence over your user config — handy on a thumb drive. Delete the marker to use only
+your own config. The installed build deliberately has no marker and ignores its program
+directory, so a file dropped there can't override anybody's config.
+
+> **Upgrading from tgz-v2026.08.4 or earlier?** Those builds installed for *all users* and
+> shared upstream WezTerm's application id, so Windows treated the two as one app. The new
+> installer offers, once, to remove that old all-users copy (that step does need admin
+> approval). If you had a `wezterm.lua` inside the old install folder it offers to copy it
+> into your user profile first, since an installed build no longer reads that folder.
+
+> **On a managed/corporate machine**, policy often only allows programs to run from
+> `Program Files`, which can block a per-user install outright. Launch the setup as
+> administrator and it offers an all-users install instead.
 
 > Windows support is new and comes from the exact same additive fork. If it does
 > something weird, open an issue with the release version — not a screenshot of your
@@ -125,15 +146,17 @@ you once because the build is unsigned — **More info → Run anyway**.
 
 TGZTerminal reuses WezTerm's built-in update check, pointed at this repo instead. When a
 newer release ships you get a notification naming the version; **clicking it downloads
-the artifact for your platform** — `TGZTerminal.dmg` on macOS, `TGZTerminal-Setup.exe`
-(or the portable `.zip`, when a release didn't produce an installer) on Windows. The
-banner in the first pane links the release page, for when you want the notes first.
+the artifact for your platform** — `TGZTerminal.dmg` on macOS, and on Windows whichever
+kind you are already running: the installer for an installed copy, the portable `.zip`
+for a portable one. The banner in the first pane links the release page, for when you
+want the notes first.
 
 Install it the same way you installed the last one:
 
 - **macOS** — open the dmg, drag onto **Applications**, replace the old copy.
-- **Windows** — run `TGZTerminal-Setup.exe`; it upgrades in place and closes a running
-  instance for you. On the portable zip, extract over the old folder.
+- **Windows** — run `TGZTerminal-Setup-<version>.exe`; it upgrades in place and closes a
+  running instance for you. On the portable zip, extract over the old folder (keeping the
+  `.portable` marker).
 
 Then **fully quit and relaunch** — an already-running window will not pick up a new
 binary, no matter how hard you believe in it.
@@ -302,7 +325,8 @@ git push origin tgz-v2026.07.2
 - [`tgzterminal-release.yml`](.github/workflows/tgzterminal-release.yml) builds the
   macOS universal `.dmg`.
 - [`tgzterminal-windows-release.yml`](.github/workflows/tgzterminal-windows-release.yml)
-  builds the Windows portable `.zip` (and a best-effort installer).
+  builds the Windows per-user installer and the portable `.zip`, with a `.sha256` for
+  each. Both are required: the run fails rather than publishing a partial release.
 
 The macOS release signs with a real certificate when three repository secrets are set,
 and falls back to ad-hoc signing when they aren't:

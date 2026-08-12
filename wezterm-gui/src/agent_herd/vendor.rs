@@ -53,6 +53,21 @@ impl AgentVendor {
         }
     }
 
+    /// Adapter id this vendor is configured and detected under, i.e. the key
+    /// used in `agent_ui.adapters` and in `PaneAgentRow::provider`.
+    pub fn adapter_id(&self) -> &str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::Copilot => "copilot",
+            Self::OpenCode => "opencode",
+            Self::Gemini => "gemini",
+            Self::Cursor => "cursor",
+            Self::Amp => "amp",
+            Self::Custom(id) => id.as_str(),
+        }
+    }
+
     /// Unicode glyph used in the sidebar row.
     pub fn glyph(&self) -> &'static str {
         match self {
@@ -83,6 +98,14 @@ pub struct VendorSession {
     pub started_at: Option<SystemTime>,
     pub status_changed_at: Option<SystemTime>,
     pub subagents: Vec<HerdSubagent>,
+    /// Is this a session a human is typing into?
+    ///
+    /// Vendors spawn agent processes that write the same session files as an
+    /// interactive one: SDK harnesses, `-p` one-shots, hook children. They are
+    /// not something the user can focus or resume, so the herd hides them
+    /// unless `agent_ui.section.show_non_interactive` says otherwise. Vendors
+    /// whose store does not distinguish the two report `true`.
+    pub interactive: bool,
 }
 
 /// Reads session files from a vendor's on-disk store.

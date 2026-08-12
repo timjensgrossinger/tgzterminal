@@ -263,7 +263,11 @@ struct SessionDetails {
 /// flag where it expected a value. Anyone who can write into the projects
 /// directory picks the filename, so the id must not be able to look like an
 /// option.
-fn session_id_is_sane(id: &str) -> bool {
+///
+/// Also called by the last-session restore path: a snapshot file is untrusted
+/// input like any other file under `$HOME`, and this is the last place before
+/// argv that can still say no.
+pub(crate) fn session_id_is_sane(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= MAX_SESSION_ID_LEN
         && !id.starts_with('-')

@@ -63,8 +63,51 @@ jobs:
       - name: Test config agent UI
         run: cargo test -p config agent_ui_tests
 
+      - name: Test config portable mode
+        run: cargo test -p config portable_tests
+
       - name: Test GUI sidebar agent module
         run: cargo test -p wezterm-gui termwindow::render::sidebar::tests
 
+      - name: Test last-session snapshot
+        run: cargo test -p wezterm-gui termwindow::tgz_last_session
+
+      - name: Test updater asset matching
+        run: cargo test -p wezterm-gui update::tests
+
       - name: Test escape parser
         run: cargo test -p wezterm-escape-parser
+
+  windows-installer-script:
+    name: Windows installer script
+    # Compiles ci/tgzterminal-windows-installer.iss without a cargo build. Inno
+    # never inspects file contents, so empty placeholders satisfy [Files] and the
+    # whole script — including the Pascal [Code] block — gets syntax checked.
+    # Worth a job of its own: iscc cannot run on the macOS dev machine, so
+    # without this a typo in the installer only surfaces at release time.
+    runs-on: windows-latest
+    if: github.repository != 'wezterm/wezterm'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          choco install innosetup --version=6.3.3 --no-progress -y
+          "ISCC=C:\Program Files (x86)\Inno Setup 6\ISCC.exe" >> $env:GITHUB_ENV
+
+      - name: Compile the installer script
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/release/mesa
+          for f in tgzterminal.exe wezterm-gui.exe wezterm-mux-server.exe \
+                   strip-ansi-escapes.exe libEGL.dll libGLESv2.dll conpty.dll \
+                   OpenConsole.exe fzf.exe mesa/opengl32.dll ; do
+            : > "target/release/$f"
+          done
+          "$ISCC" //DMyAppName=TGZTerminal //DMyAppVersion=0.0.0 \
+                  //DMyVersionInfoVersion=0.0.0.0 \
+                  //FTGZTerminal-Setup-lint ci/tgzterminal-windows-installer.iss
+          test -f TGZTerminal-Setup-lint.exe
