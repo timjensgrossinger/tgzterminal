@@ -1,11 +1,11 @@
-use anyhow::{anyhow, bail, Context};
-use config::keyassignment::SpawnCommand;
+use anyhow::{Context, anyhow, bail};
 use config::TermConfig;
+use config::keyassignment::SpawnCommand;
+use mux::Mux;
 use mux::activity::Activity;
 use mux::domain::SplitSource;
 use mux::tab::SplitRequest;
 use mux::window::WindowId as MuxWindowId;
-use mux::Mux;
 use portable_pty::CommandBuilder;
 use std::sync::Arc;
 use wezterm_term::TerminalSize;
@@ -31,6 +31,12 @@ pub fn spawn_command_impl(
             spawn_command_internal(spawn, spawn_where, size, src_window_id, term_config).await
         {
             log::error!("Failed to spawn: {:#}", err);
+            wezterm_toast_notification::show(wezterm_toast_notification::ToastNotification {
+                title: "Spawn failed".to_string(),
+                message: format!("{:#}", err),
+                url: None,
+                timeout: Some(std::time::Duration::from_millis(4000)),
+            });
         }
     })
     .detach();

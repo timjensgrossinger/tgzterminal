@@ -3496,6 +3496,28 @@ is_remote() {
   [ -n "$remote_dest" ]
 }
 
+# Local-open command line: honors TGZTERMINAL_EDITOR_COMMAND/$VISUAL/$EDITOR
+# when the user configured one, otherwise hands off to the platform's default
+# file handler instead of assuming `vim` is installed (it usually isn't on a
+# native Windows shell or a bare WSL image). $1 = already shell-quoted path,
+# $2 = raw path.
+local_editor_invocation() {
+  if [ -n "${TGZTERMINAL_EDITOR_COMMAND:-}" ] || [ -n "${VISUAL:-}" ] || [ -n "${EDITOR:-}" ]; then
+    printf '%s %s' "$editor_cmd" "$1"
+    return 0
+  fi
+  if [ -n "${WSL_DISTRO_NAME:-}" ] || grep -qi microsoft /proc/version 2>/dev/null; then
+    winpath=$(wslpath -w "$2" 2>/dev/null) || winpath="$2"
+    printf 'explorer.exe %s' "$(quote_path "$winpath")"
+    return 0
+  fi
+  if [ -n "${MSYSTEM:-}" ]; then
+    printf 'cmd.exe /c start "" %s' "$1"
+    return 0
+  fi
+  printf '%s %s' "$editor_cmd" "$1"
+}
+
 # --- SSH connection strategy -------------------------------------------------
 # The worktree browser must never force a second interactive login when the
 # terminal already has a working connection to the host. The strategy is
@@ -3982,8 +4004,9 @@ open_file() {
     fi
   else
     dir=$(dirname "$selection")
+    cmdline=$(local_editor_invocation "$quoted" "$selection")
     "$wezterm_bin" cli split-pane --pane-id "$target_pane" --right --percent 50 --cwd "$dir" -- \
-      sh -lc "printf '\033]0;Editor\007'; $editor_cmd $quoted" >/dev/null 2>&1 || return 0
+      sh -lc "printf '\033]0;Editor\007'; $cmdline || { printf '\\nFailed to launch editor\\n'; sleep 4; }" >/dev/null 2>&1 || return 0
   fi
 }
 

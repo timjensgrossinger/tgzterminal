@@ -2113,6 +2113,35 @@ fn command_exists_on_path(command: &str) -> bool {
     resolve_command_path(command).is_some()
 }
 
+/// Name of the WSL distro `command` resolves in, or `None`.
+///
+/// On Windows, an agent CLI (e.g. `claude`) is often installed only inside a
+/// WSL Ubuntu distro's own `$PATH`, which `resolve_command_path`'s native
+/// `PATH`/`fallback_command_dirs` scan can never see — a native Windows
+/// process has no visibility into a WSL guest's filesystem/env. This probes
+/// each registered distro's own `which` as a fallback so those agents still
+/// show up in the launcher. No-op (always `None`) off Windows or when `wsl`
+/// is unavailable.
+fn resolve_command_via_wsl(command: &str) -> Option<String> {
+    if !cfg!(windows) {
+        return None;
+    }
+    let command = command.trim();
+    if command.is_empty() {
+        return None;
+    }
+    for distro in config::WslDistro::load_distro_list().ok()? {
+        let found = std::process::Command::new("wsl.exe")
+            .args(["-d", &distro.name, "--", "which", command])
+            .output()
+            .is_ok_and(|output| output.status.success() && !output.stdout.is_empty());
+        if found {
+            return Some(distro.name);
+        }
+    }
+    None
+}
+
 fn resolve_agent_command(
     command: Option<&Vec<String>>,
     values: &AgentActionTemplateValues,
@@ -3655,12 +3684,24 @@ impl crate::TermWindow {
                 // Availability is the whole discovery mechanism: an agent the
                 // user has not installed simply never appears in the UI. The
                 // resolved absolute path is what gets spawned — see
-                // `resolve_command_path`.
-                let Some(resolved) = resolve_command_path(program) else {
-                    continue;
-                };
+                // `resolve_command_path`. On Windows, a CLI installed only
+                // inside a WSL distro (see `resolve_command_via_wsl`) is
+                // wrapped through `wsl.exe` instead of resolved to a path.
                 let mut argv = argv.clone();
-                argv[0] = resolved.to_string_lossy().into_owned();
+                if let Some(resolved) = resolve_command_path(program) {
+                    argv[0] = resolved.to_string_lossy().into_owned();
+                } else if let Some(distro) = resolve_command_via_wsl(program) {
+                    let mut wrapped = vec![
+                        "wsl.exe".to_string(),
+                        "-d".to_string(),
+                        distro,
+                        "--".to_string(),
+                    ];
+                    wrapped.extend(argv);
+                    argv = wrapped;
+                } else {
+                    continue;
+                }
                 let kind = adapter_kind_from_id(id, adapter);
                 entries.push(AgentLauncherEntry {
                     adapter_id: id.clone(),
