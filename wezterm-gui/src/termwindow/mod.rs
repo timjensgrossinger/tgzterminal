@@ -5063,9 +5063,7 @@ done
             None => return,
         };
 
-        if mux_window.len() <= 1 {
-            return;
-        }
+        let is_last_tab = mux_window.len() <= 1;
 
         let tab = match mux_window.get_by_idx(tab_idx) {
             Some(tab) => Arc::clone(tab),
@@ -5074,7 +5072,13 @@ done
         drop(mux_window);
 
         let tab_id = tab.tab_id();
-        if confirm && !tab.can_close_without_prompting(CloseReason::Tab) {
+        // Closing the last tab in a window also closes the window, so always
+        // confirm in that case even if the tab itself would otherwise skip
+        // prompting — a stray sidebar click should never silently take the
+        // whole window (and, if it's the last window, the app) down. This
+        // must never be a silent no-op: that used to leave a stuck pane with
+        // no way to close it from the sidebar at all.
+        if confirm && (is_last_tab || !tab.can_close_without_prompting(CloseReason::Tab)) {
             if self.activate_tab(tab_idx as isize).is_err() {
                 return;
             }
