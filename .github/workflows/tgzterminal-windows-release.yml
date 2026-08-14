@@ -135,20 +135,19 @@ jobs:
           7z a -tzip "${pkg}.zip" "$pkg" >/dev/null
           echo "PKG_ZIP=${pkg}.zip" >> "$GITHUB_ENV"
 
-      # ci/tgzterminal-windows-installer.iss uses ArchitecturesAllowed=
-      # x64compatible, which needs Inno Setup 6.3 or newer. Only install the
-      # pinned version when the runner image doesn't already carry a
-      # sufficient one - choco refuses to "install" over a newer preinstalled
-      # version without --allow-downgrade, which previously hard-failed CI on
-      # runner images that ship a newer Inno Setup than our pin.
+      # Pinned rather than relying on whatever the runner image happens to
+      # carry: newer Inno Setup releases have changed preprocessor behavior
+      # enough to break ci/tgzterminal-windows-installer.iss ("Unknown
+      # preprocessor directive" compiling against a 6.7.1 preinstalled on a
+      # newer runner image), and the .iss's ArchitecturesAllowed=
+      # x64compatible needs at least 6.3. --allow-downgrade is required
+      # because recent runner images ship a newer Inno Setup than this pin,
+      # and choco otherwise refuses to "install" over it.
       - name: Install Inno Setup
         shell: pwsh
         run: |
-          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
-          if (-not (Test-Path $iscc)) {
-            choco install innosetup --version=6.3.3 --no-progress -y
-          }
-          "ISCC=$iscc" >> $env:GITHUB_ENV
+          choco install innosetup --version=6.3.3 --no-progress -y --allow-downgrade --force
+          "ISCC=C:\Program Files (x86)\Inno Setup 6\ISCC.exe" >> $env:GITHUB_ENV
 
       - name: Build installer
         id: installer
