@@ -55,6 +55,21 @@ jobs:
           printf '%s' "${GITHUB_REF_NAME}" > .tag
           echo "Baked version: $(cat .tag)"
 
+      # A universal (x86_64 + aarch64) release build doubles compiled
+      # artifact size on top of an already large workspace; combined with the
+      # runner's stock preinstalled SDKs this has been enough to exhaust the
+      # macos-latest runner's disk mid-build (`hdiutil: create failed - No
+      # space left on device` building the .dmg). None of this is needed for
+      # a Rust/macOS build.
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf /Users/runner/Library/Android/sdk
+          sudo rm -rf /Applications/Xcode_15*.app /Applications/Xcode_16.0.app /Applications/Xcode_16.1.app /Applications/Xcode_16.2.app
+          rm -rf ~/Library/Developer/CoreSimulator/Caches
+          rm -rf ~/.cocoapods
+          df -h /
+
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:

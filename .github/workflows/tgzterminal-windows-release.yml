@@ -135,14 +135,20 @@ jobs:
           7z a -tzip "${pkg}.zip" "$pkg" >/dev/null
           echo "PKG_ZIP=${pkg}.zip" >> "$GITHUB_ENV"
 
-      # Pinned rather than relying on whatever the runner image happens to
-      # carry: ci/tgzterminal-windows-installer.iss uses ArchitecturesAllowed=
-      # x64compatible, which needs Inno Setup 6.3 or newer.
+      # ci/tgzterminal-windows-installer.iss uses ArchitecturesAllowed=
+      # x64compatible, which needs Inno Setup 6.3 or newer. Only install the
+      # pinned version when the runner image doesn't already carry a
+      # sufficient one - choco refuses to "install" over a newer preinstalled
+      # version without --allow-downgrade, which previously hard-failed CI on
+      # runner images that ship a newer Inno Setup than our pin.
       - name: Install Inno Setup
         shell: pwsh
         run: |
-          choco install innosetup --version=6.3.3 --no-progress -y
-          "ISCC=C:\Program Files (x86)\Inno Setup 6\ISCC.exe" >> $env:GITHUB_ENV
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup --version=6.3.3 --no-progress -y
+          }
+          "ISCC=$iscc" >> $env:GITHUB_ENV
 
       - name: Build installer
         id: installer
