@@ -366,8 +366,8 @@ begin
     Extras := Extras + #13#10 + AddBackslash(InstallLocation) + 'wezterm_modules';
   if Extras <> '' then
     SuppressibleMsgBox(
-      'These folders in the old install location will also stop being read:' +
-      #13#10 + Extras + #13#10#13#10 +
+      'These folders in the old install location will also stop being read:' + #13#10 +
+      Extras + #13#10#13#10 +
       'Copy anything you want to keep before removing the old install.',
       mbInformation, MB_OK, IDOK);
 end;
