@@ -228,7 +228,12 @@ impl crate::TermWindow {
         // do a per-pane scrollbar.  That will require more extensive
         // changes to ScrollHit, mouse positioning, PositionedPane
         // and tab size calculation.
-        if pos.is_active && self.show_scroll_bar {
+        // Nothing beyond the current viewport to scroll to (a fresh pane, or
+        // one pinned to the alternate/managed screen some full-screen TUIs
+        // use): a thumb spanning the whole track reads as "stuck", so skip
+        // drawing and hit-testing it entirely rather than show a misleading
+        // permanently-full bar.
+        if pos.is_active && self.show_scroll_bar && dims.scrollback_rows > dims.viewport_rows {
             let thumb_y_offset = top_bar_height as usize + border.top.get();
 
             let min_height = self.min_scroll_bar_height();

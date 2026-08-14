@@ -375,6 +375,16 @@ impl crate::TermWindow {
             return Ok(());
         }
 
+        // Nothing beyond the current viewport to scroll to (a fresh pane, or
+        // one pinned to the alternate/managed screen some full-screen TUIs
+        // use): a thumb spanning the whole track reads as "stuck", so skip
+        // drawing it entirely rather than show a misleading permanently-full
+        // bar. Mirrored in render/pane.rs's hit-test registration.
+        let render_dims = pane.get_dimensions();
+        if render_dims.scrollback_rows <= render_dims.viewport_rows {
+            return Ok(());
+        }
+
         let info = ScrollHit::thumb(
             &*pane,
             current_viewport,
