@@ -560,6 +560,8 @@ pub struct AgentHerdState {
     pub expanded: Option<crate::agent_herd::AgentKey>,
     /// Whether the section is collapsed (hidden).
     pub collapsed: bool,
+    /// Short-lived feedback for control actions. OS notifications may be denied.
+    pub feedback: Option<(String, std::time::Instant)>,
 }
 
 impl Default for AgentHerdState {
@@ -568,6 +570,7 @@ impl Default for AgentHerdState {
             agents: Vec::new(),
             expanded: None,
             collapsed: false,
+            feedback: None,
         }
     }
 }

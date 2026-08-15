@@ -6,7 +6,7 @@
 //! normalises them into a common `VendorSession` shape so the rest of
 //! the agent herd logic stays vendor-agnostic.
 
-use crate::agent_herd::{HerdStatus, HerdSubagent};
+use crate::agent_herd::{HerdActivity, HerdStatus, HerdSubagent};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -20,6 +20,7 @@ pub enum AgentVendor {
     Gemini,
     Cursor,
     Amp,
+    Antigravity,
     /// Vendor not in the built-in list; carries the raw adapter id.
     Custom(String),
 }
@@ -35,6 +36,7 @@ impl AgentVendor {
             Self::Gemini => "Gemini",
             Self::Cursor => "Cursor",
             Self::Amp => "Amp",
+            Self::Antigravity => "Antigravity",
             Self::Custom(id) => id.as_str(),
         }
     }
@@ -49,6 +51,7 @@ impl AgentVendor {
             Self::Gemini => (255, 180, 0),
             Self::Cursor => (88, 166, 255),
             Self::Amp => (255, 100, 100),
+            Self::Antigravity => (155, 124, 255),
             Self::Custom(_) => (180, 180, 180),
         }
     }
@@ -64,6 +67,7 @@ impl AgentVendor {
             Self::Gemini => "gemini",
             Self::Cursor => "cursor",
             Self::Amp => "amp",
+            Self::Antigravity => "antigravity",
             Self::Custom(id) => id.as_str(),
         }
     }
@@ -78,6 +82,7 @@ impl AgentVendor {
             Self::Gemini => "◆",
             Self::Cursor => "▸",
             Self::Amp => "▶",
+            Self::Antigravity => "◇",
             Self::Custom(_) => "●",
         }
     }
@@ -93,11 +98,17 @@ pub struct VendorSession {
     pub cwd: PathBuf,
     pub project_root: Option<PathBuf>,
     pub name: Option<String>,
+    pub model: Option<String>,
     pub status: HerdStatus,
     pub blocked_reason: Option<String>,
     pub started_at: Option<SystemTime>,
     pub status_changed_at: Option<SystemTime>,
     pub subagents: Vec<HerdSubagent>,
+    /// Recent transcript activity, when this vendor exposes a readable log.
+    pub activity: Option<HerdActivity>,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub cost: Option<String>,
     /// Is this a session a human is typing into?
     ///
     /// Vendors spawn agent processes that write the same session files as an

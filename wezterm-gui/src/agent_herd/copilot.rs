@@ -76,11 +76,16 @@ impl SessionSource for CopilotDetector {
                         cwd,
                         project_root: None,
                         name,
+                        model: None,
                         status,
                         blocked_reason: None,
                         started_at: None,
                         status_changed_at: None,
                         subagents: Vec::new(),
+                        activity: None,
+                        input_tokens: None,
+                        output_tokens: None,
+                        cost: None,
                     });
                 }
             }

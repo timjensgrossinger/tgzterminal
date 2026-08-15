@@ -537,9 +537,20 @@ pub fn default_agent_adapters() -> AgentAdaptersConfig {
         "Copilot",
         "Cp",
         "#57a85f",
-        &["copilot", "gh-copilot", "github-copilot"],
-        &["copilot"],
-        &["github copilot", "copilot cli", "gh copilot"],
+        &[
+            "copilot",
+            "copilot-cli",
+            "gh-copilot",
+            "github-copilot",
+            "github-copilot-cli",
+        ],
+        &["copilot", "copilot cli", "github copilot"],
+        &[
+            "github copilot",
+            "github copilot cli",
+            "copilot cli",
+            "gh copilot",
+        ],
         &["tokens", "context"],
         &["gpt", "claude"],
     );
@@ -553,8 +564,38 @@ pub fn default_agent_adapters() -> AgentAdaptersConfig {
         "{home}/.copilot/session-state".to_string(),
     ]);
     copilot.launch_command = Some(vec!["copilot".to_string()]);
-    copilot.running_patterns = vec!["esc to interrupt".to_string()];
+    copilot.running_patterns = vec![
+        "esc to interrupt".to_string(),
+        "esc to stop".to_string(),
+        "ctrl+c to interrupt".to_string(),
+    ];
     adapters.insert("copilot".to_string(), copilot);
+
+    let mut antigravity = AgentAdapterConfig::with_defaults(
+        "Antigravity",
+        "Ag",
+        "#9b7cff",
+        &["antigravity", "antigravity-cli", "agy"],
+        &["antigravity", "antigravity cli", "agy"],
+        &[
+            "antigravity cli",
+            "antigravity agent",
+            "welcome to antigravity",
+        ],
+        &["tokens", "context", "approval", "sandbox"],
+        &["gemini", "claude", "gpt"],
+    );
+    antigravity.launch_command = Some(vec!["antigravity".to_string()]);
+    antigravity.running_patterns = vec![
+        "esc to interrupt".to_string(),
+        "esc to stop".to_string(),
+        "ctrl+c to interrupt".to_string(),
+    ];
+    antigravity.chrome_patterns = vec![
+        "antigravity cli".to_string(),
+        "antigravity agent".to_string(),
+    ];
+    adapters.insert("antigravity".to_string(), antigravity);
     adapters.insert(
         "cursor".to_string(),
         AgentAdapterConfig::with_defaults(
@@ -840,6 +881,14 @@ pub struct AgentSectionConfig {
     /// stores report.
     #[dynamic(default)]
     pub show_non_interactive: bool,
+
+    /// Show transcript activity and subagent summaries in expanded rows.
+    #[dynamic(default = "default_true")]
+    pub show_activity: bool,
+
+    /// Show pane-reported token and cost telemetry in expanded rows.
+    #[dynamic(default = "default_true")]
+    pub show_tokens: bool,
 }
 
 impl Default for AgentSectionConfig {
@@ -848,6 +897,8 @@ impl Default for AgentSectionConfig {
             enabled: true,
             refresh_ms: default_agent_section_refresh_ms(),
             show_non_interactive: false,
+            show_activity: true,
+            show_tokens: true,
         }
     }
 }
@@ -901,6 +952,10 @@ pub struct AgentUiConfig {
     /// Allow agent UI actions that spawn processes or open local files.
     #[dynamic(default)]
     pub enable_control_actions: bool,
+
+    /// Show Stop in expanded herd rows when the agent can be interrupted.
+    #[dynamic(default = "default_true")]
+    pub show_stop: bool,
 
     /// Detect known agent process and title names in addition to user vars.
     #[dynamic(default = "default_true")]
@@ -971,6 +1026,7 @@ impl Default for AgentUiConfig {
             show_sidebar_badges: true,
             show_pane_toolbelt: true,
             enable_control_actions: false,
+            show_stop: true,
             detect_processes: true,
             copy_scrollback_lines: default_agent_copy_scrollback_lines(),
             waiting_notification: true,
@@ -3135,6 +3191,8 @@ mod agent_ui_tests {
 
         assert!(section.enabled);
         assert_eq!(section.refresh_ms, 500);
+        assert!(section.show_activity);
+        assert!(section.show_tokens);
     }
 
     #[test]
@@ -3145,6 +3203,7 @@ mod agent_ui_tests {
         assert!(config.agent_ui.show_sidebar_badges);
         assert!(config.agent_ui.show_pane_toolbelt);
         assert!(!config.agent_ui.enable_control_actions);
+        assert!(config.agent_ui.show_stop);
         assert!(config.agent_ui.detect_processes);
         assert_eq!(config.agent_ui.copy_scrollback_lines, 20_000);
         assert!(config.agent_ui.waiting_notification);
@@ -3153,7 +3212,14 @@ mod agent_ui_tests {
             AgentToolbeltPosition::Top
         );
         for adapter in [
-            "claude", "codex", "gemini", "opencode", "copilot", "cursor", "amp",
+            "claude",
+            "codex",
+            "gemini",
+            "opencode",
+            "copilot",
+            "cursor",
+            "amp",
+            "antigravity",
         ] {
             assert!(config.agent_ui.adapters[adapter].enabled);
         }
@@ -3272,7 +3338,14 @@ mod agent_ui_tests {
         let adapters = default_agent_adapters();
 
         for id in [
-            "claude", "codex", "gemini", "opencode", "copilot", "cursor", "amp",
+            "claude",
+            "codex",
+            "gemini",
+            "opencode",
+            "copilot",
+            "cursor",
+            "amp",
+            "antigravity",
         ] {
             let argv = adapters[id]
                 .launch_command
@@ -3579,6 +3652,20 @@ mod agent_ui_tests {
                 "{home}/.copilot/session-state",
             ]))
         );
+        assert!(copilot
+            .process_names
+            .iter()
+            .any(|name| name == "copilot-cli"));
+
+        let antigravity = adapters.get("antigravity").unwrap();
+        assert_eq!(
+            antigravity.launch_command.as_ref(),
+            Some(&strings(&["antigravity"]))
+        );
+        assert!(antigravity
+            .process_names
+            .iter()
+            .any(|name| name == "antigravity-cli"));
 
         let opencode = adapters.get("opencode").unwrap();
         assert_eq!(

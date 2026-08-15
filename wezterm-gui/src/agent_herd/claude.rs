@@ -310,6 +310,7 @@ pub fn session_transcript_path(home: &Path, cwd: &Path, session_id: &str) -> Opt
 #[cfg(test)]
 mod tests {
     use super::super::transcript::{MAX_TAIL_WINDOW, TAIL_WINDOW};
+    use super::super::vendor::SessionSource;
     use super::super::HerdStatus;
     use super::*;
     use std::time::Duration;
@@ -382,6 +383,38 @@ mod tests {
         );
         assert_eq!(sessions[0].cwd, PathBuf::from("/repo"));
         assert!(sessions[0].started_at.is_some());
+    }
+
+    #[test]
+    fn detector_attaches_transcript_activity_to_live_sessions() {
+        let temp = tempfile::tempdir().unwrap();
+        let me = std::process::id();
+        let cwd = Path::new("/repo");
+        write(
+            &temp
+                .path()
+                .join(".claude/sessions")
+                .join(format!("{me}.json")),
+            &session_json(me, "busy", None, "/repo"),
+        );
+        let project = temp
+            .path()
+            .join(".claude/projects")
+            .join(encode_project_path(cwd));
+        write(
+            &project.join(format!("sess-{me}.jsonl")),
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","id":"tool-1","input":{"command":"cargo check"}}]}}"#,
+        );
+
+        let sessions = ClaudeDetector.collect_sessions(temp.path());
+        let activity = sessions[0].activity.as_ref().expect("activity");
+        assert!(activity.current.is_some());
+        assert!(activity
+            .current
+            .as_ref()
+            .unwrap()
+            .display_text()
+            .contains("Bash"));
     }
 
     #[test]
@@ -682,20 +715,41 @@ impl crate::agent_herd::vendor::SessionSource for ClaudeDetector {
         let claude_sessions = collect_sessions(home, true);
         claude_sessions
             .into_iter()
-            .map(|s| crate::agent_herd::vendor::VendorSession {
-                pid: s.pid,
-                interactive: s.interactive,
-                vendor: crate::agent_herd::vendor::AgentVendor::Claude,
-                session_id: s.session_id,
-                cwd: s.cwd,
-                project_root: s.project_root,
-                name: s.name,
-                status: s.status,
-                blocked_reason: s.blocked_reason,
-                started_at: s.started_at,
-                status_changed_at: s.status_changed_at,
-                subagents: s.subagents,
+            .map(|s| {
+                let activity = activity_for_session(home, &s);
+                crate::agent_herd::vendor::VendorSession {
+                    pid: s.pid,
+                    interactive: s.interactive,
+                    vendor: crate::agent_herd::vendor::AgentVendor::Claude,
+                    session_id: s.session_id,
+                    cwd: s.cwd,
+                    project_root: s.project_root,
+                    name: s.name,
+                    model: None,
+                    status: s.status,
+                    blocked_reason: s.blocked_reason,
+                    started_at: s.started_at,
+                    status_changed_at: s.status_changed_at,
+                    subagents: s.subagents,
+                    activity,
+                    input_tokens: None,
+                    output_tokens: None,
+                    cost: None,
+                }
             })
             .collect()
     }
+}
+
+fn activity_for_session(home: &Path, session: &ClaudeSession) -> Option<super::HerdActivity> {
+    let transcript = session_transcript_path(home, &session.cwd, &session.session_id)?;
+    let project_dir = transcript.parent()?.to_path_buf();
+    let mut activity = super::transcript::read_activity(&transcript, 8);
+    super::sessions::populate_subagent_tree(
+        &mut activity,
+        &project_dir,
+        &session.session_id,
+        &session.subagents,
+    );
+    Some(activity)
 }

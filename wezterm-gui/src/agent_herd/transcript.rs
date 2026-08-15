@@ -295,6 +295,140 @@ pub fn read_activity(path: &Path, max_events: usize) -> HerdActivity {
     }
 }
 
+/// Read common agent transcript shapes when no vendor-specific parser exists.
+///
+/// Codex rollouts and OpenCode message files use different envelopes, but both
+/// commonly expose `function_call`, `tool_use`, `parts`, `text`, or `content`.
+/// This deliberately extracts only short display events; unknown records stay
+/// invisible instead of polluting the insight row with raw protocol data.
+pub fn read_generic_activity(path: &Path, max_events: usize) -> HerdActivity {
+    if max_events == 0 {
+        return HerdActivity::default();
+    }
+    let mut events = Vec::new();
+    for line in tail_lines(path, max_events.saturating_mul(4)) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        collect_generic_events(&value, &mut events);
+    }
+    if events.len() > max_events {
+        events.drain(..events.len() - max_events);
+    }
+    let current = events
+        .last()
+        .filter(|event| event.kind == HerdEventKind::Tool)
+        .cloned();
+    HerdActivity {
+        current,
+        recent: events,
+        subagent_tree: Vec::new(),
+    }
+}
+
+fn collect_generic_events(value: &serde_json::Value, events: &mut Vec<HerdEvent>) {
+    let Some(object) = value.as_object() else {
+        return;
+    };
+    let at = object
+        .get("timestamp")
+        .or_else(|| object.get("created_at"))
+        .and_then(|value| value.as_str())
+        .and_then(parse_timestamp);
+    let record_type = object.get("type").and_then(|value| value.as_str());
+    let tool_name = object
+        .get("name")
+        .or_else(|| object.get("tool_name"))
+        .or_else(|| object.get("tool"))
+        .and_then(|value| value.as_str());
+    let arguments = object
+        .get("input")
+        .or_else(|| object.get("arguments"))
+        .or_else(|| object.get("args"))
+        .or_else(|| object.get("state").and_then(|state| state.get("input")));
+
+    if matches!(
+        record_type,
+        Some("function_call" | "custom_tool_call" | "tool_use" | "tool")
+    ) || (tool_name.is_some() && arguments.is_some())
+    {
+        events.push(HerdEvent {
+            at,
+            kind: HerdEventKind::Tool,
+            content: HerdContent::ToolArgs {
+                name: tool_name.unwrap_or("tool").to_string(),
+                args: arguments.cloned().unwrap_or(serde_json::Value::Null),
+            },
+            tool_use_id: object
+                .get("id")
+                .or_else(|| object.get("call_id"))
+                .and_then(|value| value.as_str())
+                .map(str::to_string),
+            parent_id: None,
+        });
+        return;
+    }
+
+    if let Some(command) = object.get("command").and_then(|value| value.as_str()) {
+        events.push(HerdEvent {
+            at,
+            kind: HerdEventKind::Tool,
+            content: HerdContent::ToolArgs {
+                name: "shell".to_string(),
+                args: serde_json::json!({ "command": command }),
+            },
+            tool_use_id: None,
+            parent_id: None,
+        });
+        return;
+    }
+
+    if let Some(text) = generic_text(object) {
+        events.push(HerdEvent {
+            at,
+            kind: HerdEventKind::Assistant,
+            content: HerdContent::SingleLine(trim_to_event_text(&text)),
+            tool_use_id: None,
+            parent_id: None,
+        });
+        return;
+    }
+
+    for key in [
+        "item", "items", "parts", "content", "message", "msg", "event", "payload",
+    ] {
+        match object.get(key) {
+            Some(value) if value.is_array() => {
+                for child in value.as_array().into_iter().flatten() {
+                    collect_generic_events(child, events);
+                }
+            }
+            Some(value) if value.is_object() => collect_generic_events(value, events),
+            _ => {}
+        }
+    }
+}
+
+fn generic_text(object: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+    for key in ["text", "message", "preview", "summary", "description"] {
+        if let Some(text) = object.get(key).and_then(|value| value.as_str()) {
+            if !text.trim().is_empty() {
+                return Some(text.to_string());
+            }
+        }
+    }
+    object
+        .get("content")
+        .and_then(|value| value.as_str())
+        .filter(|text| !text.trim().is_empty())
+        .map(str::to_string)
+}
+
+fn trim_to_event_text(text: &str) -> String {
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    text.chars().take(MAX_EVENT_TEXT).collect()
+}
+
 /// Turn one JSONL line into the events it describes, if any.
 fn parse_line(line: &str) -> Vec<HerdEvent> {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
@@ -329,6 +463,11 @@ fn parse_assistant_line(value: &serde_json::Value) -> Vec<HerdEvent> {
         match block.get("type").and_then(|v| v.as_str()) {
             Some("tool_use") => {
                 let tool_use_id = block.get("id").and_then(|v| v.as_str()).map(str::to_string);
+                let name = block
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("tool")
+                    .to_string();
                 let input = block
                     .get("input")
                     .cloned()
@@ -337,7 +476,7 @@ fn parse_assistant_line(value: &serde_json::Value) -> Vec<HerdEvent> {
                 events.push(HerdEvent {
                     at,
                     kind: HerdEventKind::Tool,
-                    content: HerdContent::ToolArgs { args: input },
+                    content: HerdContent::ToolArgs { name, args: input },
                     tool_use_id,
                     parent_id: None,
                 });
@@ -786,7 +925,7 @@ mod tests {
         let activity = read_activity(&path, 3);
         assert_eq!(activity.recent.len(), 3);
         // Last event should be f19
-        if let HerdContent::ToolArgs { args } = &activity.recent[2].content {
+        if let HerdContent::ToolArgs { args, .. } = &activity.recent[2].content {
             assert_eq!(
                 args.get("file_path").and_then(|v| v.as_str()),
                 Some("f19.rs")

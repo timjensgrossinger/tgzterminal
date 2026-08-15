@@ -56,6 +56,11 @@ impl SessionSource for CodexDetector {
                         .get("name")
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string());
+                    let activity = crate::agent_herd::sessions::activity_from_session_files(
+                        &file,
+                        &dir.join("sessions"),
+                        &session_id,
+                    );
                     let status = json
                         .get("status")
                         .and_then(|v| v.as_str())
@@ -76,11 +81,16 @@ impl SessionSource for CodexDetector {
                         cwd,
                         project_root: None,
                         name,
+                        model: None,
                         status,
                         blocked_reason: None,
                         started_at: None,
                         status_changed_at: None,
                         subagents: Vec::new(),
+                        activity,
+                        input_tokens: None,
+                        output_tokens: None,
+                        cost: None,
                     });
                 }
             }
@@ -127,5 +137,29 @@ mod tests {
         let sessions = CodexDetector.collect_sessions(temp.path());
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].pid, me);
+    }
+
+    #[test]
+    fn activity_is_read_from_codex_rollout_artifact() {
+        let temp = tempfile::tempdir().unwrap();
+        let me = std::process::id();
+        write(
+            &temp.path().join(".codex").join("live.json"),
+            &session_json(me),
+        );
+        write(
+            &temp
+                .path()
+                .join(".codex/sessions")
+                .join(format!("rollout-sess-{me}.jsonl")),
+            r#"{"type":"function_call","name":"shell","arguments":{"command":"cargo check"}}"#,
+        );
+
+        let sessions = CodexDetector.collect_sessions(temp.path());
+        assert!(sessions[0]
+            .activity
+            .as_ref()
+            .and_then(|activity| activity.current.as_ref())
+            .is_some());
     }
 }

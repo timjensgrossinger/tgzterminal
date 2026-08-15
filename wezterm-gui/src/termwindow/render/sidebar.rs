@@ -1,6 +1,9 @@
 use crate::agent_herd::claude::{self, ProjectDirError as ClaudeLogsPathError};
 use crate::agent_herd::vendor::{AgentVendor, VendorSession};
-use crate::agent_herd::{group_by_project, HerdAgent, HerdStatus, HerdView, PaneAgentRow};
+use crate::agent_herd::{
+    group_by_project, HerdActivity, HerdAgent, HerdContent, HerdEvent, HerdEventKind, HerdStatus,
+    HerdView, PaneAgentRow,
+};
 use crate::quad::TripleLayerQuadAllocator;
 use crate::spawn::SpawnWhere;
 use crate::tabbar::TabBarItem;
@@ -33,7 +36,7 @@ use std::collections::{HashMap, HashSet};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use std::{env, fs};
 use termwiz::cell::{grapheme_column_width, unicode_column_width, CellAttributes, Intensity};
 use termwiz::color::ColorAttribute;
@@ -105,8 +108,15 @@ const AGENT_TRANSCRIPT_MAX_ROWS: usize = 100_000;
 /// window, so a partial copy is never presented as a whole conversation.
 const AGENT_TRANSCRIPT_CLIPPED_MARKER: &str = "[… earlier scrollback not included …]";
 const WAITING_NOTIFICATION_THROTTLE: Duration = Duration::from_secs(60);
-const DEFAULT_AGENT_ADAPTER_IDS: [&str; 7] = [
-    "claude", "codex", "gemini", "opencode", "copilot", "cursor", "amp",
+const DEFAULT_AGENT_ADAPTER_IDS: [&str; 8] = [
+    "claude",
+    "codex",
+    "gemini",
+    "opencode",
+    "copilot",
+    "cursor",
+    "amp",
+    "antigravity",
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1333,10 +1343,9 @@ fn sidebar_agent_herd_metrics(
     let header_h = cell_h + 8.0 * dpi;
     let pad = 8.0 * dpi;
     let full_detail_h = if !collapsed && expanded.is_some_and(|index| index < agent_count) {
-        // Detail can contain status, project root and activity lines, plus the
-        // action button row. Keep room for all four, including the top padding,
-        // the line gaps and the padding under the buttons.
-        pad + 4.0 * cell_h + 10.0 * dpi
+        // Detail can contain status, root, activity, attention, branch,
+        // telemetry, subagent summary, and the action row.
+        pad + 8.0 * cell_h + 20.0 * dpi
     } else {
         0.0
     };
@@ -2259,6 +2268,7 @@ enum AgentKind {
     Copilot,
     Cursor,
     Amp,
+    Antigravity,
     Unknown(String),
 }
 
@@ -2272,6 +2282,7 @@ impl AgentKind {
             "copilot" => Some(Self::Copilot),
             "cursor" => Some(Self::Cursor),
             "amp" => Some(Self::Amp),
+            "antigravity" => Some(Self::Antigravity),
             _ => None,
         }
     }
@@ -2322,6 +2333,7 @@ impl AgentKind {
             Self::Copilot => "Copilot",
             Self::Cursor => "Cursor",
             Self::Amp => "Amp",
+            Self::Antigravity => "Antigravity",
             Self::Unknown(value) => value.as_str(),
         }
     }
@@ -2335,6 +2347,7 @@ impl AgentKind {
             Self::Copilot => Some("copilot"),
             Self::Cursor => Some("cursor"),
             Self::Amp => Some("amp"),
+            Self::Antigravity => Some("antigravity"),
             Self::Unknown(_) => None,
         }
     }
@@ -2362,6 +2375,7 @@ fn adapter_short_label(adapter: Option<&AgentAdapterConfig>, kind: &AgentKind) -
             AgentKind::Copilot => "Cp".to_string(),
             AgentKind::Cursor => "Cu".to_string(),
             AgentKind::Amp => "A".to_string(),
+            AgentKind::Antigravity => "Ag".to_string(),
             AgentKind::Unknown(value) => compact_label(value, "Ag"),
         })
 }
@@ -2392,6 +2406,7 @@ fn adapter_color(adapter: Option<&AgentAdapterConfig>, kind: &AgentKind) -> Line
         AgentKind::Copilot => LinearRgba(0.34, 0.66, 0.38, 1.0),
         AgentKind::Cursor => LinearRgba(0.44, 0.42, 0.82, 1.0),
         AgentKind::Amp => LinearRgba(0.74, 0.36, 0.68, 1.0),
+        AgentKind::Antigravity => LinearRgba(0.61, 0.49, 1.0, 1.0),
         AgentKind::Unknown(_) => LinearRgba(0.58, 0.50, 0.82, 1.0),
     }
 }
@@ -2645,6 +2660,7 @@ pub(crate) struct AgentPaneState {
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
     cost: Option<String>,
+    activity: Option<HerdActivity>,
     actions: AgentActions,
 }
 
@@ -2749,16 +2765,18 @@ fn plan_session_restore(
 /// A detached agent has no pane to focus, attach to, read logs from or signal,
 /// so it is offered the one thing that can work: relaunching it through its
 /// adapter's resume command.
-fn agent_row_actions(agent: &HerdAgent) -> Vec<AgentRowAction> {
+fn agent_row_actions(agent: &HerdAgent, show_stop: bool) -> Vec<AgentRowAction> {
     if agent.is_detached() {
         return vec![AgentRowAction::Resume];
     }
-    let mut actions = vec![
-        AgentRowAction::Focus,
-        AgentRowAction::Attach,
-        AgentRowAction::Logs,
-    ];
-    if agent.can_stop() {
+    let mut actions = vec![AgentRowAction::Focus];
+    if agent.can_attach {
+        actions.push(AgentRowAction::Attach);
+    }
+    if agent.can_open_logs {
+        actions.push(AgentRowAction::Logs);
+    }
+    if show_stop && agent.can_stop() {
         actions.push(AgentRowAction::Stop);
     }
     actions
@@ -3317,6 +3335,36 @@ fn infer_agent_status_from_visible_text(
         }
     }
     AgentStatus::Unknown
+}
+
+/// Last useful visible line fallback for vendors without a readable transcript.
+/// This keeps Codex/OpenCode/Gemini/Copilot insight useful without pretending
+/// that terminal text is structured tool telemetry.
+fn visible_agent_activity(text: &str) -> Option<HerdActivity> {
+    let line = text
+        .lines()
+        .rev()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .find(|line| {
+            !matches!(*line, "❯" | ">" | "›")
+                && !line.starts_with("Esc to ")
+                && !line.starts_with("Press Esc")
+                && !line.starts_with("? for ")
+                && line.chars().count() > 2
+        })?;
+    let text = line.chars().take(160).collect::<String>();
+    Some(HerdActivity {
+        current: None,
+        recent: vec![HerdEvent {
+            at: Some(SystemTime::now()),
+            kind: HerdEventKind::Assistant,
+            content: HerdContent::SingleLine(text),
+            tool_use_id: None,
+            parent_id: None,
+        }],
+        subagent_tree: Vec::new(),
+    })
 }
 
 /// Hold `Running` for a short grace period after its marker vanishes.
@@ -4956,6 +5004,9 @@ impl crate::TermWindow {
             cost: user_var(&vars, "agent.cost")
                 .or_else(|| user_var(&vars, "agent.estimated_cost"))
                 .map(ToString::to_string),
+            activity: visible_text_loaded
+                .then(|| visible_agent_activity(&visible_text))
+                .flatten(),
             actions,
         });
         let previous_status = previous_entry
@@ -5132,11 +5183,17 @@ impl crate::TermWindow {
         agent_copy_toast_message(action, payload)
     }
 
+    fn set_agent_feedback(&self, message: impl Into<String>) {
+        self.agent_herd_state.borrow_mut().feedback = Some((message.into(), Instant::now()));
+    }
+
     pub(crate) fn agent_resume_pane(&self, pane: &Arc<dyn Pane>) {
         let Some(agent) = self.detect_agent_pane(pane) else {
+            self.set_agent_feedback("Agent no longer detected");
             return;
         };
         let Some(adapter_id) = agent.adapter_id.as_deref() else {
+            self.set_agent_feedback("Resume unavailable: agent vendor unknown");
             wezterm_toast_notification::show(wezterm_toast_notification::ToastNotification {
                 title: "Agent control".to_string(),
                 message: "Resume is not configured for this agent".to_string(),
@@ -5146,9 +5203,11 @@ impl crate::TermWindow {
             return;
         };
         let Some(adapter) = self.agent_adapter_config_by_id(Some(adapter_id)) else {
+            self.set_agent_feedback("Resume unavailable: adapter missing");
             return;
         };
         if !agent.trusted_controls {
+            self.set_agent_feedback("Resume blocked: enable trusted agent controls");
             wezterm_toast_notification::show(wezterm_toast_notification::ToastNotification {
                 title: "Agent control".to_string(),
                 message:
@@ -5160,6 +5219,7 @@ impl crate::TermWindow {
             return;
         }
         if !agent.actions.resume {
+            self.set_agent_feedback("Resume unavailable: command missing");
             wezterm_toast_notification::show(wezterm_toast_notification::ToastNotification {
                 title: "Agent control".to_string(),
                 message: "Resume is not configured or its command is not on PATH".to_string(),
@@ -5170,6 +5230,7 @@ impl crate::TermWindow {
         }
         let values = AgentActionTemplateValues::from_agent(&agent);
         let Some(argv) = resolve_agent_resume_command(&adapter, &values) else {
+            self.set_agent_feedback("Resume unavailable: command cannot be resolved");
             return;
         };
         let label = adapter_label(&adapter, adapter_id);
@@ -5182,6 +5243,10 @@ impl crate::TermWindow {
             },
             SpawnWhere::NewTab,
         );
+        self.set_agent_feedback(format!(
+            "Started {} resume",
+            adapter_label(&adapter, adapter_id)
+        ));
         wezterm_toast_notification::show(wezterm_toast_notification::ToastNotification {
             title: "Agent control".to_string(),
             message: format!("Started {label} resume in a new tab"),
@@ -5192,15 +5257,19 @@ impl crate::TermWindow {
 
     pub(crate) fn agent_attach_pane(&self, pane: &Arc<dyn Pane>) {
         let Some(agent) = self.detect_agent_pane(pane) else {
+            self.set_agent_feedback("Attach unavailable: agent no longer detected");
             return;
         };
         let Some(adapter_id) = agent.adapter_id.as_deref() else {
+            self.set_agent_feedback("Attach unavailable: agent vendor unknown");
             return;
         };
         let Some(adapter) = self.agent_adapter_config_by_id(Some(adapter_id)) else {
+            self.set_agent_feedback("Attach unavailable: adapter missing");
             return;
         };
         if !agent.trusted_controls {
+            self.set_agent_feedback("Attach blocked: enable trusted agent controls");
             wezterm_toast_notification::show(wezterm_toast_notification::ToastNotification {
                 title: "Agent control".to_string(),
                 message:
@@ -5212,6 +5281,7 @@ impl crate::TermWindow {
             return;
         }
         if !agent.actions.attach {
+            self.set_agent_feedback("Attach unavailable: no attach URL or command");
             wezterm_toast_notification::show(wezterm_toast_notification::ToastNotification {
                 title: "Agent control".to_string(),
                 message:
@@ -5224,6 +5294,7 @@ impl crate::TermWindow {
         }
         let values = AgentActionTemplateValues::from_agent(&agent);
         let Some(argv) = resolve_agent_attach_command(&adapter, &values) else {
+            self.set_agent_feedback("Attach unavailable: command cannot be resolved");
             return;
         };
         let label = adapter_label(&adapter, adapter_id);
@@ -5236,6 +5307,10 @@ impl crate::TermWindow {
             },
             SpawnWhere::NewTab,
         );
+        self.set_agent_feedback(format!(
+            "Started {} attach",
+            adapter_label(&adapter, adapter_id)
+        ));
         wezterm_toast_notification::show(wezterm_toast_notification::ToastNotification {
             title: "Agent control".to_string(),
             message: format!("Started {label} attach in a new tab"),
@@ -5246,9 +5321,11 @@ impl crate::TermWindow {
 
     pub(crate) fn agent_open_logs_for_pane(&self, pane: &Arc<dyn Pane>) {
         let Some(agent) = self.detect_agent_pane(pane) else {
+            self.set_agent_feedback("Logs unavailable: agent no longer detected");
             return;
         };
         let Some(adapter_id) = agent.adapter_id.as_deref() else {
+            self.set_agent_feedback("Logs unavailable: agent vendor unknown");
             wezterm_toast_notification::show(wezterm_toast_notification::ToastNotification {
                 title: "Agent details".to_string(),
                 message: "Details are not configured for this agent".to_string(),
@@ -5258,6 +5335,7 @@ impl crate::TermWindow {
             return;
         };
         let Some(adapter) = self.agent_adapter_config_by_id(Some(adapter_id)) else {
+            self.set_agent_feedback("Logs unavailable: adapter missing");
             return;
         };
         let detail_label = agent_detail_button_label(Some(adapter_id), Some(&adapter));
@@ -5267,6 +5345,9 @@ impl crate::TermWindow {
             "Agent details"
         };
         if !agent.trusted_controls {
+            self.set_agent_feedback(format!(
+                "Opening {detail_label} blocked: enable trusted controls"
+            ));
             wezterm_toast_notification::show(wezterm_toast_notification::ToastNotification {
                 title: title.to_string(),
                 message: format!(
@@ -5278,6 +5359,7 @@ impl crate::TermWindow {
             return;
         }
         if !agent.actions.open_logs {
+            self.set_agent_feedback(format!("{detail_label} unavailable: path not found"));
             wezterm_toast_notification::show(wezterm_toast_notification::ToastNotification {
                 title: title.to_string(),
                 message: format!("{detail_label} are not configured or no details path exists"),
@@ -5288,6 +5370,7 @@ impl crate::TermWindow {
         }
         let values = AgentActionTemplateValues::from_agent(&agent);
         let Some(path) = resolve_agent_detail_path(Some(adapter_id), &adapter, &values) else {
+            self.set_agent_feedback(format!("{detail_label} unavailable: path not found"));
             return;
         };
         let url = if path.is_dir() {
@@ -5298,6 +5381,7 @@ impl crate::TermWindow {
         match url {
             Ok(url) => {
                 wezterm_open_url::open_url(url.as_str());
+                self.set_agent_feedback(format!("Opening {}", path.display()));
                 wezterm_toast_notification::show(wezterm_toast_notification::ToastNotification {
                     title: title.to_string(),
                     message: format!("Opening {}", path.display()),
@@ -5306,6 +5390,7 @@ impl crate::TermWindow {
                 });
             }
             Err(()) => {
+                self.set_agent_feedback("Agent details path could not be opened");
                 wezterm_toast_notification::show(wezterm_toast_notification::ToastNotification {
                     title: title.to_string(),
                     message: "Agent details path could not be opened".to_string(),
@@ -8900,6 +8985,7 @@ impl crate::TermWindow {
                     AgentKind::Copilot => AgentVendor::Copilot,
                     AgentKind::Cursor => AgentVendor::Cursor,
                     AgentKind::Amp => AgentVendor::Amp,
+                    AgentKind::Antigravity => AgentVendor::Antigravity,
                     AgentKind::Unknown(_) => {
                         AgentVendor::Custom(agent.adapter_id.clone().unwrap_or_default())
                     }
@@ -8916,9 +9002,10 @@ impl crate::TermWindow {
                 panes.push(PaneAgentRow {
                     pane_id,
                     provider: agent.adapter_id.clone().or_else(|| {
-                        // The join matches a session's vendor against this string,
-                        // so fall back to the detected vendor's own id.
-                        Some(vendor.adapter_id().to_string())
+                        // Unknown panes remain eligible for a disk session's cwd
+                        // binding. An empty custom id would reject that match.
+                        (!matches!(&vendor, AgentVendor::Custom(id) if id.is_empty()))
+                            .then(|| vendor.adapter_id().to_string())
                     }),
                     title: agent.model.as_deref().unwrap_or(vendor.label()).to_string(),
                     status: herd_status_from_agent(agent.status),
@@ -8928,6 +9015,12 @@ impl crate::TermWindow {
                     project_root,
                     git_branch: None,
                     pids: foreground_process_pids(&pane),
+                    input_tokens: agent.input_tokens,
+                    output_tokens: agent.output_tokens,
+                    cost: agent.cost,
+                    activity: agent.activity,
+                    can_attach: agent.actions.attach,
+                    can_open_logs: agent.actions.open_logs,
                 });
             }
         }
@@ -9183,6 +9276,11 @@ impl crate::TermWindow {
         let collapsed = state.collapsed;
         let agents = state.agents.clone();
         let expanded = state.expanded.clone();
+        let feedback = state
+            .feedback
+            .as_ref()
+            .filter(|(_, at)| at.elapsed() < Duration::from_secs(5))
+            .map(|(message, _)| message.clone());
         drop(state);
 
         let dpi = (self.dimensions.dpi as f32 / 96.0).clamp(1.0, 2.5);
@@ -9236,7 +9334,9 @@ impl crate::TermWindow {
 
         // "Agents · N" label. The budget is measured from the label's own
         // origin, not from `section_x`, or the region overruns the sidebar.
-        let label = format!("Agents · {agent_count}");
+        let label = feedback
+            .map(|message| format!("Agents · {agent_count} · {message}"))
+            .unwrap_or_else(|| format!("Agents · {agent_count}"));
         let label_x = section_x + pad + cell_h + 4.0 * dpi;
         self.paint_text(
             layers,
@@ -9320,7 +9420,12 @@ impl crate::TermWindow {
             // Status dot.
             let dot_x = section_x + pad + chevron_w + 6.0 * dpi;
             let dot_y = y + row_h * 0.5;
-            let dot_color = agent.vendor_dot_color();
+            let display_status = agent.display_status(SystemTime::now());
+            let dot_color = if display_status.is_attention() {
+                crate::agent_herd::ATTENTION_RGB
+            } else {
+                agent.vendor_dot_color()
+            };
             let dot_rect = euclid::rect(dot_x - 4.0 * dpi, dot_y - 4.0 * dpi, 8.0 * dpi, 8.0 * dpi);
             self.filled_rectangle(
                 layers,
@@ -9328,6 +9433,11 @@ impl crate::TermWindow {
                 dot_rect,
                 srgb8_to_linear(dot_color.0, dot_color.1, dot_color.2),
             )?;
+            if display_status.is_attention() {
+                let attention_rect =
+                    euclid::rect(dot_x + 3.0 * dpi, dot_y - 2.0 * dpi, 4.0 * dpi, 4.0 * dpi);
+                self.filled_rectangle(layers, 1, attention_rect, srgb8_to_linear(255, 230, 120))?;
+            }
 
             // Name on the left, project on the right, in disjoint column
             // budgets: both are painted into the same row, and glyphs
@@ -9400,11 +9510,16 @@ impl crate::TermWindow {
 
                 // Status + model line. "detached" is part of the status because
                 // it is what explains why Focus is missing.
-                let status_label = agent.status.label();
+                let status_label = display_status.label();
                 let model_text = agent.model.as_deref().unwrap_or("");
                 let mut status_line = status_label.to_string();
                 if !model_text.is_empty() {
                     status_line = format!("{status_line} \u{b7} {model_text}");
+                }
+                if let Some(started_at) = agent.started_at {
+                    if let Ok(age) = SystemTime::now().duration_since(started_at) {
+                        status_line = format!("{status_line} \u{b7} {}", format_elapsed(age));
+                    }
                 }
                 if detached {
                     status_line = format!("{status_line} \u{b7} detached");
@@ -9446,17 +9561,52 @@ impl crate::TermWindow {
                     detail_line_y += cell_h + 2.0 * dpi;
                 }
 
-                // Activity hint.
-                if let Some(ref activity) = agent.activity {
-                    let activity_text = activity
-                        .current
-                        .as_ref()
-                        .map(|e| e.display_text())
-                        .unwrap_or_default();
-                    if !activity_text.is_empty() {
+                // Activity headline: the transcript parser already removes
+                // prompts and keeps only useful tool/prose events.
+                if self.config.agent_ui.section.show_activity {
+                    if let Some(ref activity) = agent.activity {
+                        if let Some((when, text)) =
+                            activity.headline(agent.status, SystemTime::now())
+                        {
+                            let activity_text = format!("{when}: {text}");
+                            self.paint_text(
+                                layers,
+                                &truncate_with_ellipsis(&activity_text, detail_cols),
+                                detail_x,
+                                detail_line_y,
+                                detail_w,
+                                dim,
+                                bg,
+                                false,
+                            )?;
+                            detail_line_y += cell_h + 2.0 * dpi;
+                        }
+                    }
+                }
+
+                if self.config.agent_ui.section.show_activity {
+                    if let Some(reason) = agent.blocked_reason.as_deref() {
+                        let text = format!("attention: {reason}");
                         self.paint_text(
                             layers,
-                            &truncate_with_ellipsis(&activity_text, detail_cols),
+                            &truncate_with_ellipsis(&text, detail_cols),
+                            detail_x,
+                            detail_line_y,
+                            detail_w,
+                            srgb8_to_linear(240, 184, 66),
+                            bg,
+                            false,
+                        )?;
+                        detail_line_y += cell_h + 2.0 * dpi;
+                    }
+                }
+
+                if self.config.agent_ui.section.show_activity {
+                    if let Some(branch) = agent.git_branch.as_deref().filter(|b| !b.is_empty()) {
+                        let text = format!("branch: {branch}");
+                        self.paint_text(
+                            layers,
+                            &truncate_with_ellipsis(&text, detail_cols),
                             detail_x,
                             detail_line_y,
                             detail_w,
@@ -9468,6 +9618,69 @@ impl crate::TermWindow {
                     }
                 }
 
+                if self.config.agent_ui.section.show_tokens
+                    && (agent.input_tokens.is_some()
+                        || agent.output_tokens.is_some()
+                        || agent.cost.is_some())
+                {
+                    let mut parts = Vec::new();
+                    if let Some(value) = agent.input_tokens {
+                        parts.push(format!("in {}", compact_count(value)));
+                    }
+                    if let Some(value) = agent.output_tokens {
+                        parts.push(format!("out {}", compact_count(value)));
+                    }
+                    if let Some(cost) = agent.cost.as_deref() {
+                        parts.push(cost.to_string());
+                    }
+                    let text = format!("tokens: {}", parts.join(" · "));
+                    self.paint_text(
+                        layers,
+                        &truncate_with_ellipsis(&text, detail_cols),
+                        detail_x,
+                        detail_line_y,
+                        detail_w,
+                        dim,
+                        bg,
+                        false,
+                    )?;
+                    detail_line_y += cell_h + 2.0 * dpi;
+                }
+
+                if self.config.agent_ui.section.show_activity && !agent.subagents.is_empty() {
+                    let working = agent
+                        .subagents
+                        .iter()
+                        .filter(|sub| sub.status == HerdStatus::Working)
+                        .count();
+                    let blocked = agent
+                        .subagents
+                        .iter()
+                        .filter(|sub| sub.status == HerdStatus::Blocked)
+                        .count();
+                    let text = if blocked > 0 {
+                        format!(
+                            "subagents: {} · {} working · {} need attention",
+                            agent.subagents.len(),
+                            working,
+                            blocked
+                        )
+                    } else {
+                        format!("subagents: {} · {} working", agent.subagents.len(), working)
+                    };
+                    self.paint_text(
+                        layers,
+                        &truncate_with_ellipsis(&text, detail_cols),
+                        detail_x,
+                        detail_line_y,
+                        detail_w,
+                        dim,
+                        bg,
+                        false,
+                    )?;
+                    detail_line_y += cell_h + 2.0 * dpi;
+                }
+
                 // Action buttons, left to right along the last detail line.
                 // These replace an unlabelled, invisible hit box that only the
                 // code knew about.
@@ -9475,7 +9688,7 @@ impl crate::TermWindow {
                 let button_h = cell_h + 4.0 * dpi;
                 let button_y = (detail_y + detail_h - pad - button_h)
                     .max(detail_line_y.min(detail_y + detail_h - button_h));
-                for action in agent_row_actions(agent) {
+                for action in agent_row_actions(agent, self.config.agent_ui.show_stop) {
                     let label = action.label();
                     let label_cols = unicode_column_width(label, None);
                     let button_w = label_cols as f32 * cell_w + 8.0 * dpi;
@@ -9731,6 +9944,23 @@ impl crate::TermWindow {
     }
 }
 
+fn compact_count(value: u64) -> String {
+    match value {
+        value if value >= 1_000_000 => format!("{:.1}m", value as f64 / 1_000_000.0),
+        value if value >= 1_000 => format!("{:.1}k", value as f64 / 1_000.0),
+        value => value.to_string(),
+    }
+}
+
+fn format_elapsed(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    match seconds {
+        0..=59 => format!("{seconds}s"),
+        60..=3599 => format!("{}m", seconds / 60),
+        _ => format!("{}h {}m", seconds / 3600, (seconds / 60) % 60),
+    }
+}
+
 fn sidebar_rounded_corner_radius(rect: RectF, radius: f32) -> f32 {
     if !radius.is_finite() || !rect.size.width.is_finite() || !rect.size.height.is_finite() {
         return 0.0;
@@ -9795,11 +10025,16 @@ mod tests {
             cwd: PathBuf::from(cwd),
             project_root: Some(PathBuf::from("/tmp/project")),
             name: Some("build agent".to_string()),
+            model: None,
             status: HerdStatus::Blocked,
             blocked_reason: Some("permission".to_string()),
             started_at: None,
             status_changed_at: None,
             subagents: Vec::new(),
+            activity: None,
+            input_tokens: None,
+            output_tokens: None,
+            cost: None,
         }
     }
 
@@ -9842,6 +10077,12 @@ mod tests {
             project_root: Some(PathBuf::from("/tmp/project")),
             git_branch: None,
             pids: std::iter::once(4242u32).collect(),
+            input_tokens: None,
+            output_tokens: None,
+            cost: None,
+            activity: None,
+            can_attach: true,
+            can_open_logs: true,
         };
 
         let agents = crate::agent_herd::join_sessions_with_panes(
@@ -9936,6 +10177,11 @@ mod tests {
             status_changed_at: None,
             subagents: Vec::new(),
             activity: None,
+            input_tokens: None,
+            output_tokens: None,
+            cost: None,
+            can_attach: true,
+            can_open_logs: true,
         }
     }
 
@@ -10064,12 +10310,15 @@ mod tests {
         // a row that has none is how the old focus box came to silently no-op.
         let mut agent = herd_agent("orphan", "/repos/mine/src", Some("/repos/mine"));
         agent.pane_id = None;
-        assert_eq!(agent_row_actions(&agent), vec![AgentRowAction::Resume]);
+        assert_eq!(
+            agent_row_actions(&agent, true),
+            vec![AgentRowAction::Resume]
+        );
 
         agent.pane_id = Some(3);
         agent.status = HerdStatus::Idle;
         assert_eq!(
-            agent_row_actions(&agent),
+            agent_row_actions(&agent, true),
             vec![
                 AgentRowAction::Focus,
                 AgentRowAction::Attach,
@@ -10080,9 +10329,28 @@ mod tests {
 
         agent.status = HerdStatus::Working;
         assert_eq!(
-            agent_row_actions(&agent).last(),
+            agent_row_actions(&agent, true).last(),
             Some(&AgentRowAction::Stop)
         );
+        assert_eq!(
+            agent_row_actions(&agent, false).last(),
+            Some(&AgentRowAction::Logs)
+        );
+
+        agent.can_attach = false;
+        agent.can_open_logs = false;
+        assert_eq!(
+            agent_row_actions(&agent, false),
+            vec![AgentRowAction::Focus],
+            "unavailable actions must not render as dead buttons"
+        );
+    }
+
+    #[test]
+    fn elapsed_format_is_compact() {
+        assert_eq!(format_elapsed(Duration::from_secs(8)), "8s");
+        assert_eq!(format_elapsed(Duration::from_secs(125)), "2m");
+        assert_eq!(format_elapsed(Duration::from_secs(3720)), "1h 2m");
     }
 
     #[test]
@@ -11261,6 +11529,7 @@ mod tests {
             input_tokens: None,
             output_tokens: None,
             cost: None,
+            activity: None,
             actions: AgentActions {
                 interrupt: true,
                 copy_summary: true,
@@ -11797,6 +12066,7 @@ mod tests {
             input_tokens: None,
             output_tokens: None,
             cost: None,
+            activity: None,
             actions: AgentActions::default(),
         }
     }

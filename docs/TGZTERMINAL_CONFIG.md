@@ -157,6 +157,7 @@ config.agent_ui = {
   trust_visible_evidence = true,
   pulse_working_dot = true,
   pulse_period_ms = 1600,
+  show_stop = true,
   adapters = {
     claude = {
       enabled = true,
@@ -209,6 +210,12 @@ config.agent_ui = {
         "{home}/.copilot/session-state/{session_id}",
         "{home}/.copilot/session-state",
       },
+    },
+    antigravity = {
+      enabled = true,
+      launch_command = { "antigravity" },
+      process_names = { "antigravity", "antigravity-cli", "agy" },
+      title_patterns = { "antigravity", "antigravity cli", "agy" },
     },
     cursor = { enabled = true },
     amp = { enabled = true },
@@ -267,6 +274,7 @@ vendor-neutral agent.
 | `show_sidebar_badges` | bool | `true` | |
 | `show_pane_toolbelt` | bool | `true` | |
 | `enable_control_actions` | bool | `false` | Opt-in half of the control-action gate; see below. |
+| `show_stop` | bool | `true` | Show Stop in expanded herd rows when agent can be interrupted. |
 | `detect_processes` | bool | `true` | When off, only user vars identify an agent — no process, title or visible-text detection, and therefore no inferred status. |
 | `copy_scrollback_lines` | int | `20000` | Maximum **physical** rows a copy action reads, counted from the bottom of the pane buffer. Wrapped output costs several rows per logical line, which is why the previous `500` truncated real sessions. Clamped to 100000 rows per action. Lower it to capture less. |
 | `waiting_notification` | bool | `true` | |
@@ -285,8 +293,8 @@ Each adapter accepts `enabled`, `label`, `short_label`, `color`,
 are literal case-insensitive fragments by default. Entries prefixed with `re:`
 are treated as regexes, but long or invalid regexes are ignored to keep passive
 detection bounded. Built-in detection defaults cover Claude, Codex, Gemini,
-OpenCode, Copilot, Cursor, and Amp; partial adapter configs merge with those
-defaults.
+OpenCode, Copilot CLI, Antigravity CLI, Cursor, and Amp; partial adapter configs
+merge with those defaults.
 
 Action templates are argv/path arrays expanded only when the user clicks a
 toolbelt action. Supported variables are `{session_id}`, `{cwd}`, `{home}`,
@@ -621,6 +629,8 @@ agent_ui = {
     enabled = true,      -- show the Agents section in the sidebar at all
     refresh_ms = 500,     -- how often the disk-scanned source re-reads, clamped 100..=10000
     show_non_interactive = false, -- also list SDK/headless/hook agent processes
+    show_activity = true, -- transcript headline, attention, branch, subagent summary
+    show_tokens = true, -- pane-reported token/cost telemetry
   },
 }
 ```
@@ -952,7 +962,7 @@ you are not left hunting for one.
 | `+ New Tab` button and label | Always drawn. `new_tab_menu.enabled` controls only the chevron beside it, not the button. |
 | Collapsed icon-rail composition | Derived from the auto-hide state and whether an agent CLI was discovered. Two-character badges come from an adapter's `short_label`. |
 | Toolbelt button labels, sizes and drop order | Hardcoded. When the strip is too narrow buttons are dropped in a fixed order (Input/Compose, then Details, Attach, Resume), and Stop and Copy are the last two standing. |
-| Per-toolbelt-button visibility | **Derived, not configured — there is no `show_stop` / `show_resume`.** `Stop` appears while the agent looks Running/Streaming; `Copy` whenever an agent is detected; `Attach` / `Resume` / `Details` need their action templates *and* the control-action gate; `Input` / `Compose` follow `rich_input.enabled` and `rich_input.docked`. If a button is missing, it is a detection or a gate question — see *How an agent is identified*. |
+| Per-toolbelt-button visibility | Toolbelt visibility is derived. Herd-row `Stop` is governed by `agent_ui.show_stop`; it appears when the agent can be interrupted. `Copy` whenever an agent is detected; `Attach` / `Resume` / `Details` need their action templates *and* the control-action gate; `Input` / `Compose` follow `rich_input.enabled` and `rich_input.docked`. If a button is missing, it is a detection or a gate question — see *How an agent is identified*. |
 | Sidebar spacing, radii and row geometry | Compile-time constants. |
 | Sidebar colors | Derived from the active color scheme. |
 | Worktree picker behavior | No config surface. |

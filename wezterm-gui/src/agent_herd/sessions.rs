@@ -948,6 +948,70 @@ pub fn populate_subagent_tree(
     activity.subagent_tree = tree;
 }
 
+/// Read a vendor's primary session file, then its bounded on-disk artifact
+/// search path. Vendor stores disagree on whether activity lives beside the
+/// session record, in JSONL rollouts, or in per-message JSON files.
+pub fn activity_from_session_files(
+    primary: &Path,
+    search_root: &Path,
+    session_id: &str,
+) -> Option<HerdActivity> {
+    let direct = transcript::read_generic_activity(primary, 8);
+    if !direct.is_empty() {
+        return Some(direct);
+    }
+    if session_id.is_empty() {
+        return None;
+    }
+    let artifact = find_session_artifact(search_root, session_id)?;
+    let activity = transcript::read_generic_activity(&artifact, 8);
+    (!activity.is_empty()).then_some(activity)
+}
+
+fn find_session_artifact(root: &Path, session_id: &str) -> Option<PathBuf> {
+    const MAX_FILES: usize = 2048;
+    let mut stack = vec![root.to_path_buf()];
+    let mut newest: Option<(SystemTime, PathBuf)> = None;
+    let mut visited = 0;
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            visited += 1;
+            if visited > MAX_FILES {
+                break;
+            }
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let is_json = matches!(
+                path.extension().and_then(|ext| ext.to_str()),
+                Some("json" | "jsonl")
+            );
+            let has_id = path
+                .file_name()
+                .map(|name| name.to_string_lossy().contains(session_id))
+                .unwrap_or(false);
+            if !is_json || !has_id {
+                continue;
+            }
+            let modified = std::fs::metadata(&path)
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            if newest
+                .as_ref()
+                .is_none_or(|(previous, _)| modified > *previous)
+            {
+                newest = Some((modified, path));
+            }
+        }
+    }
+    newest.map(|(_, path)| path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

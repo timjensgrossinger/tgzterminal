@@ -72,6 +72,34 @@ pub enum HerdStatus {
     Unknown,
 }
 
+/// User-facing status derived from source status plus transcript freshness.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HerdDisplayStatus {
+    NeedsApproval,
+    Working,
+    WaitingForInput,
+    Idle,
+    Done,
+    Unknown,
+}
+
+impl HerdDisplayStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NeedsApproval => "needs approval",
+            Self::Working => "working",
+            Self::WaitingForInput => "waiting for input",
+            Self::Idle => "idle",
+            Self::Done => "done",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    pub fn is_attention(self) -> bool {
+        matches!(self, Self::NeedsApproval)
+    }
+}
+
 impl HerdStatus {
     pub fn label(self) -> &'static str {
         match self {
@@ -198,7 +226,10 @@ pub enum HerdContent {
     /// A fenced code block with optional language tag.
     CodeBlock { lang: String, code: String },
     /// Structured tool arguments as JSON.
-    ToolArgs { args: serde_json::Value },
+    ToolArgs {
+        name: String,
+        args: serde_json::Value,
+    },
     /// Tool execution output, possibly truncated.
     ToolResult { output: String, truncated: bool },
 }
@@ -240,13 +271,14 @@ impl HerdEvent {
                     format!("```{lang} {}", code.lines().next().unwrap_or(""))
                 }
             }
-            HerdContent::ToolArgs { args } => {
+            HerdContent::ToolArgs { name, args } => {
                 let s = args.to_string();
-                if s.len() > 80 {
-                    format!("{}…", &s[..77])
+                let summary = if s.chars().count() > 80 {
+                    format!("{}…", s.chars().take(77).collect::<String>())
                 } else {
                     s
-                }
+                };
+                format!("{name} {summary}")
             }
             HerdContent::ToolResult { output, truncated } => {
                 let first = output.lines().next().unwrap_or("");
@@ -311,7 +343,9 @@ impl HerdActivity {
         self.current
             .as_ref()
             .and_then(|event| event.at)
-            .or_else(|| self.recent.last().and_then(|event| event.at))
+            .into_iter()
+            .chain(self.recent.iter().filter_map(|event| event.at))
+            .max()
     }
 
     /// Headline for the agent row.
@@ -363,6 +397,12 @@ pub struct HerdAgent {
     pub subagents: Vec<HerdSubagent>,
     /// What this agent is doing, when a source could read its transcript.
     pub activity: Option<HerdActivity>,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub cost: Option<String>,
+    /// Whether row actions resolved successfully for its bound pane.
+    pub can_attach: bool,
+    pub can_open_logs: bool,
 }
 
 impl HerdAgent {
@@ -380,6 +420,45 @@ impl HerdAgent {
     /// there is something to interrupt.
     pub fn can_stop(&self) -> bool {
         self.pane_id.is_some() && self.status.is_interruptible()
+    }
+
+    /// Source status is authoritative while active; stale transcript activity
+    /// turns a nominally working row into a useful waiting/idle hint.
+    pub fn display_status(&self, now: SystemTime) -> HerdDisplayStatus {
+        if self.blocked_reason.is_some() || self.status == HerdStatus::Blocked {
+            return HerdDisplayStatus::NeedsApproval;
+        }
+        match self.status {
+            HerdStatus::Blocked => HerdDisplayStatus::NeedsApproval,
+            HerdStatus::Working => {
+                let stale = self
+                    .activity
+                    .as_ref()
+                    .and_then(HerdActivity::last_activity)
+                    .and_then(|at| now.duration_since(at).ok())
+                    .is_some_and(|age| age >= Duration::from_secs(300));
+                if stale {
+                    HerdDisplayStatus::WaitingForInput
+                } else {
+                    HerdDisplayStatus::Working
+                }
+            }
+            HerdStatus::Idle => HerdDisplayStatus::WaitingForInput,
+            HerdStatus::Done => HerdDisplayStatus::Done,
+            HerdStatus::Unknown => {
+                let fresh = self
+                    .activity
+                    .as_ref()
+                    .and_then(HerdActivity::last_activity)
+                    .and_then(|at| now.duration_since(at).ok())
+                    .is_some_and(|age| age < ACTIVITY_FRESH_WINDOW);
+                if fresh {
+                    HerdDisplayStatus::Working
+                } else {
+                    HerdDisplayStatus::Unknown
+                }
+            }
+        }
     }
 
     /// Identity that survives the list being rebuilt and re-sorted.
@@ -462,6 +541,12 @@ pub struct PaneAgentRow {
     /// Every pid in this pane's foreground process tree, used to bind a
     /// filesystem-discovered session to this pane.
     pub pids: HashSet<u32>,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub cost: Option<String>,
+    pub activity: Option<HerdActivity>,
+    pub can_attach: bool,
+    pub can_open_logs: bool,
 }
 
 /// Join filesystem-discovered Claude sessions to detected panes.
@@ -503,8 +588,10 @@ pub fn join_sessions_with_panes(
             vendor: session.vendor.clone(),
             status: session.status,
             blocked_reason: session.blocked_reason.clone(),
-            // The session file carries no model; pane detection sometimes does.
-            model: pane.and_then(|p| p.model.clone()),
+            model: session
+                .model
+                .clone()
+                .or_else(|| pane.and_then(|p| p.model.clone())),
             project_root: session
                 .project_root
                 .clone()
@@ -521,9 +608,21 @@ pub fn join_sessions_with_panes(
             started_at: session.started_at,
             status_changed_at: session.status_changed_at,
             subagents: session.subagents,
-            // Filled in afterwards by whoever owns the transcript cache; the
-            // join stays pure so it can be tested without a filesystem.
-            activity: None,
+            activity: session
+                .activity
+                .or_else(|| pane.and_then(|p| p.activity.clone())),
+            input_tokens: session
+                .input_tokens
+                .or_else(|| pane.and_then(|p| p.input_tokens)),
+            output_tokens: session
+                .output_tokens
+                .or_else(|| pane.and_then(|p| p.output_tokens)),
+            cost: session
+                .cost
+                .clone()
+                .or_else(|| pane.and_then(|p| p.cost.clone())),
+            can_attach: pane.is_some_and(|p| p.can_attach),
+            can_open_logs: pane.is_some_and(|p| p.can_open_logs),
         });
     }
 
@@ -544,6 +643,7 @@ pub fn join_sessions_with_panes(
                 "gemini" => Some(AgentVendor::Gemini),
                 "cursor" => Some(AgentVendor::Cursor),
                 "amp" => Some(AgentVendor::Amp),
+                "antigravity" => Some(AgentVendor::Antigravity),
                 _ => None,
             })
             .unwrap_or_else(|| AgentVendor::Custom(row.provider.clone().unwrap_or_default()));
@@ -563,7 +663,12 @@ pub fn join_sessions_with_panes(
             started_at: None,
             status_changed_at: None,
             subagents: Vec::new(),
-            activity: None,
+            activity: row.activity,
+            input_tokens: row.input_tokens,
+            output_tokens: row.output_tokens,
+            cost: row.cost,
+            can_attach: row.can_attach,
+            can_open_logs: row.can_open_logs,
         });
     }
 
@@ -754,6 +859,12 @@ mod tests {
             project_root: Some(PathBuf::from("/repo")),
             git_branch: None,
             pids: pids.iter().copied().collect(),
+            input_tokens: None,
+            output_tokens: None,
+            cost: None,
+            activity: None,
+            can_attach: true,
+            can_open_logs: true,
         }
     }
 
@@ -766,11 +877,16 @@ mod tests {
             cwd: PathBuf::from(cwd),
             project_root: Some(PathBuf::from(cwd)),
             name: Some(name.to_string()),
+            model: None,
             status: HerdStatus::Working,
             blocked_reason: None,
             started_at: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(pid as u64)),
             status_changed_at: None,
             subagents: Vec::new(),
+            activity: None,
+            input_tokens: None,
+            output_tokens: None,
+            cost: None,
         }
     }
 
@@ -792,6 +908,11 @@ mod tests {
             status_changed_at: None,
             subagents: Vec::new(),
             activity: None,
+            input_tokens: None,
+            output_tokens: None,
+            cost: None,
+            can_attach: true,
+            can_open_logs: true,
         }
     }
 
@@ -1015,6 +1136,38 @@ mod tests {
         assert!(!idle.can_stop());
         idle.status = HerdStatus::Blocked;
         assert!(idle.can_stop());
+    }
+
+    #[test]
+    fn display_status_surfaces_attention_and_stale_work() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
+        let mut blocked = agent("blocked", HerdStatus::Blocked, "/repo");
+        assert_eq!(
+            blocked.display_status(now),
+            HerdDisplayStatus::NeedsApproval
+        );
+
+        let mut working = agent("working", HerdStatus::Working, "/repo");
+        working.activity = Some(HerdActivity {
+            current: None,
+            recent: vec![HerdEvent {
+                at: Some(now - Duration::from_secs(301)),
+                kind: HerdEventKind::Assistant,
+                content: HerdContent::SingleLine("finished".to_string()),
+                tool_use_id: None,
+                parent_id: None,
+            }],
+            subagent_tree: Vec::new(),
+        });
+        assert_eq!(
+            working.display_status(now),
+            HerdDisplayStatus::WaitingForInput
+        );
+        blocked.blocked_reason = Some("permission".to_string());
+        assert_eq!(
+            blocked.display_status(now),
+            HerdDisplayStatus::NeedsApproval
+        );
     }
 
     #[test]
