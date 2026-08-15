@@ -17,6 +17,7 @@
 
 #![allow(dead_code)]
 
+pub mod antigravity;
 pub mod claude;
 pub mod codex;
 pub mod copilot;
@@ -1220,5 +1221,6 @@ pub fn default_registry() -> vendor::VendorRegistry {
     registry.register(Box::new(copilot::CopilotDetector));
     registry.register(Box::new(opencode::OpenCodeDetector));
     registry.register(Box::new(gemini::GeminiDetector));
+    registry.register(Box::new(antigravity::AntigravityDetector));
     registry
 }
