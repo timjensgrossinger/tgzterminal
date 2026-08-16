@@ -1,0 +1,71 @@
+name: TGZTerminal Debian Release
+
+on:
+  push:
+    tags: ["tgz-v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: tgzterminal-debian-release-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  deb:
+    name: Build Debian package
+    runs-on: ubuntu-22.04
+    if: github.repository != 'wezterm/wezterm'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Bake release version
+        if: startsWith(github.ref, 'refs/tags/tgz-v')
+        run: printf '%s' "${GITHUB_REF_NAME}" > .tag
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build outputs
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Install system dependencies
+        run: |
+          chmod +x get-deps ci/build-tgz-deb.sh
+          CI=yes ./get-deps
+
+      - name: Build release binaries
+        run: cargo build --release -p wezterm -p wezterm-gui -p wezterm-mux-server -p strip-ansi-escapes
+
+      - name: Build .deb
+        run: |
+          version="${GITHUB_REF_NAME}"
+          if [[ ! "$version" =~ ^tgz-v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            version=tgz-v0.0.0
+          fi
+          ci/build-tgz-deb.sh --version "$version" --output dist
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TGZTerminal-debian
+          path: dist/*
+
+      - name: Publish GitHub Release assets
+        if: startsWith(github.ref, 'refs/tags/tgz-v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.deb
+            dist/*.deb.sha256
+          fail_on_unmatched_files: true

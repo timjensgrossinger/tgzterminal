@@ -142,6 +142,19 @@ directory, so a file dropped there can't override anybody's config.
 > something weird, open an issue with the release version — not a screenshot of your
 > desktop wallpaper, the actual version.
 
+### Ubuntu and Debian
+
+Download `tgzterminal_<version>_amd64.deb` from the latest release, then install it
+with:
+
+```sh
+sudo apt install ./tgzterminal_<version>_amd64.deb
+```
+
+Package targets Ubuntu 22.04+ and Debian 12+ on amd64. It installs `tgzterminal`,
+keeps `wezterm` as a compatibility command, registers a desktop entry, and replaces
+upstream `wezterm` packages when present.
+
 ## Staying up to date
 
 TGZTerminal reuses WezTerm's built-in update check, pointed at this repo instead. When a
@@ -157,6 +170,8 @@ Install it the same way you installed the last one:
 - **Windows** — run `TGZTerminal-Setup-<version>.exe`; it upgrades in place and closes a
   running instance for you. On the portable zip, extract over the old folder (keeping the
   `.portable` marker).
+- **Ubuntu/Debian** — run `sudo apt install ./tgzterminal_<version>_amd64.deb`; apt upgrades
+  the installed package in place.
 
 Then **fully quit and relaunch** — an already-running window will not pick up a new
 binary, no matter how hard you believe in it.
