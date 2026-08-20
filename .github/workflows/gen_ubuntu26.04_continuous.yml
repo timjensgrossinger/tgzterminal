@@ -30,6 +30,7 @@ on:
 
 jobs:
   build:
+    if: github.repository == 'wezterm/wezterm'
     runs-on: "ubuntu-latest"
     container:
       image: "ubuntu:26.04"
