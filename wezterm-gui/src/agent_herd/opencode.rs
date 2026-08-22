@@ -1,6 +1,6 @@
 use crate::agent_herd::claude::process_is_alive;
 use crate::agent_herd::vendor::{AgentVendor, SessionSource, VendorSession};
-use crate::agent_herd::HerdStatus;
+use crate::agent_herd::{HerdActivity, HerdContent, HerdEvent, HerdEventKind, HerdStatus};
 use rusqlite::{Connection, OpenFlags};
 use std::convert::TryFrom;
 use std::path::{Path, PathBuf};
@@ -200,6 +200,7 @@ fn collect_database_sessions(home: &Path) -> Vec<VendorSession> {
         let model = model.and_then(|raw| model_label(&raw));
         let started_at = epoch_millis(created);
         let cost = (cost > 0.0).then(|| format!("${cost:.4}"));
+        let activity = opencode_activity(&conn, &session_id);
         Some(VendorSession {
             // OpenCode's current database has no process id. Binding falls back
             // to the unique cwd match, while pane detection still handles live
@@ -217,7 +218,7 @@ fn collect_database_sessions(home: &Path) -> Vec<VendorSession> {
             started_at,
             status_changed_at: Some(updated_at),
             subagents: Vec::new(),
-            activity: None,
+            activity,
             input_tokens: u64_count(input_tokens),
             output_tokens: u64_count(output_tokens),
             cost,
@@ -243,6 +244,90 @@ fn model_label(raw: &str) -> Option<String> {
         .and_then(serde_json::Value::as_str)
         .filter(|value| !value.trim().is_empty())
         .map(ToString::to_string)
+}
+
+fn opencode_activity(conn: &Connection, session_id: &str) -> Option<HerdActivity> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT data, time_created FROM part \
+             WHERE session_id = ?1 ORDER BY time_created DESC, id DESC LIMIT 64",
+        )
+        .ok()?;
+    let rows = stmt
+        .query_map([session_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .ok()?;
+    let mut events = Vec::new();
+    for row in rows.flatten() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&row.0) else {
+            continue;
+        };
+        let Some(kind) = value.get("type").and_then(|kind| kind.as_str()) else {
+            continue;
+        };
+        let Some(at) = epoch_millis(row.1) else {
+            continue;
+        };
+        match kind {
+            "tool" => {
+                let name = value
+                    .get("tool")
+                    .and_then(|tool| tool.as_str())
+                    .unwrap_or("tool")
+                    .to_string();
+                let args = value
+                    .get("state")
+                    .and_then(|state| state.get("input"))
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                events.push(HerdEvent {
+                    at: Some(at),
+                    kind: HerdEventKind::Tool,
+                    content: HerdContent::ToolArgs { name, args },
+                    tool_use_id: value
+                        .get("callID")
+                        .and_then(|id| id.as_str())
+                        .map(str::to_string),
+                    parent_id: None,
+                });
+            }
+            "text" => {
+                let Some(text) = value.get("text").and_then(|text| text.as_str()) else {
+                    continue;
+                };
+                if text.trim().is_empty() {
+                    continue;
+                }
+                events.push(HerdEvent {
+                    at: Some(at),
+                    kind: HerdEventKind::Assistant,
+                    content: HerdContent::SingleLine(
+                        text.split_whitespace().collect::<Vec<_>>().join(" "),
+                    ),
+                    tool_use_id: None,
+                    parent_id: None,
+                });
+            }
+            _ => {}
+        }
+    }
+    events.reverse();
+    if events.len() > 8 {
+        events.drain(..events.len() - 8);
+    }
+    if events.is_empty() {
+        return None;
+    }
+    let current = events
+        .last()
+        .filter(|event| event.kind == HerdEventKind::Tool)
+        .cloned();
+    Some(HerdActivity {
+        current,
+        recent: events,
+        subagent_tree: Vec::new(),
+    })
 }
 
 fn clean_title(title: &str) -> Option<String> {
@@ -289,6 +374,14 @@ mod tests {
                 time_created INTEGER NOT NULL,
                 time_updated INTEGER NOT NULL,
                 time_archived INTEGER
+            );
+            CREATE TABLE part (
+                id TEXT PRIMARY KEY,
+                message_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL,
+                data TEXT NOT NULL
             );",
         )
         .unwrap();
@@ -305,6 +398,14 @@ mod tests {
             rusqlite::params!["session-1", now],
         )
         .unwrap();
+        conn.execute(
+            "INSERT INTO part
+             (id, message_id, session_id, time_created, time_updated, data)
+             VALUES ('part-1', 'message-1', 'session-1', ?1, ?1,
+                     '{\"type\":\"tool\",\"tool\":\"opencode-mem\",\"state\":{\"input\":{\"query\":\"sidebar fixes\"}}}')",
+            rusqlite::params![now],
+        )
+        .unwrap();
         drop(conn);
 
         let sessions = OpenCodeDetector.collect_sessions(temp.path());
@@ -316,6 +417,14 @@ mod tests {
         assert_eq!(sessions[0].input_tokens, Some(12));
         assert_eq!(sessions[0].output_tokens, Some(34));
         assert_eq!(sessions[0].cost.as_deref(), Some("$0.1250"));
+        assert_eq!(
+            sessions[0]
+                .activity
+                .as_ref()
+                .and_then(|activity| activity.current.as_ref())
+                .map(|event| event.display_text()),
+            Some("opencode-mem {\"query\":\"sidebar fixes\"}".to_string())
+        );
     }
 
     #[test]
