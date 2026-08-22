@@ -217,6 +217,20 @@ pub enum HerdEventKind {
     SubagentSpawn,
 }
 
+impl HerdEventKind {
+    /// Short tag shown in the agent log overlay.
+    pub fn label(self) -> &'static str {
+        match self {
+            HerdEventKind::Tool => "tool",
+            HerdEventKind::Assistant => "msg",
+            HerdEventKind::Notice => "note",
+            HerdEventKind::Thinking => "think",
+            HerdEventKind::ToolResult => "result",
+            HerdEventKind::SubagentSpawn => "spawn",
+        }
+    }
+}
+
 /// Rich content payload for a herd event.
 #[derive(Clone, Debug, PartialEq)]
 pub enum HerdContent {

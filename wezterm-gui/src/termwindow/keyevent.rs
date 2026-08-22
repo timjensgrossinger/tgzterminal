@@ -285,6 +285,13 @@ impl super::TermWindow {
                 }
             }
 
+            // Agent section keyboard navigation captures arrows/enter/space/esc
+            // while active, before they reach the terminal or other bindings.
+            if self.agent_section_nav_key(keycode) {
+                context.invalidate();
+                return true;
+            }
+
             if let Some((entry, table_name)) = self.lookup_key(
                 pane,
                 &keycode,

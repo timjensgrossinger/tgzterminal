@@ -798,6 +798,14 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             menubar: &["Help"],
             icon: Some("cod_debug"),
         },
+        ActivateAgentSection => CommandDef {
+            brief: "Focus agent section".into(),
+            doc: "Enters keyboard navigation of the sidebar agent section".into(),
+            keys: vec![(Modifiers::CTRL.union(Modifiers::SHIFT), "a".into())],
+            args: &[ArgType::ActiveWindow],
+            menubar: &["View"],
+            icon: Some("cod_terminal"),
+        },
         CheckForUpdates => CommandDef {
             brief: "Check for updates".into(),
             doc: "Asks GitHub for the latest release and offers a download link \

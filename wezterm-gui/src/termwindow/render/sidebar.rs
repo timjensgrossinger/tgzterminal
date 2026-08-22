@@ -1424,22 +1424,98 @@ impl SidebarAgentHerdMetrics {
     }
 }
 
+/// How many detail lines a given agent's expanded view will paint, so the
+/// section can size its detail block exactly instead of guessing.
+fn agent_detail_line_count(
+    agent: &crate::agent_herd::HerdAgent,
+    show_activity: bool,
+    show_tokens: bool,
+) -> usize {
+    let mut lines = 1; // status · model · elapsed (always present)
+    if agent.project_root.is_some() {
+        lines += 1;
+    }
+    if show_activity {
+        if agent.activity.is_some() {
+            lines += 1;
+        }
+        if agent.blocked_reason.is_some() {
+            lines += 1;
+        }
+        if agent
+            .git_branch
+            .as_deref()
+            .filter(|b| !b.is_empty())
+            .is_some()
+        {
+            lines += 1;
+        }
+        if !agent.subagents.is_empty() {
+            // The summary line plus the rendered (capped) subagent tree.
+            lines += 1 + subagent_tree_line_count(agent);
+        }
+    }
+    if show_tokens
+        && (agent.input_tokens.is_some() || agent.output_tokens.is_some() || agent.cost.is_some())
+    {
+        lines += 1;
+    }
+    lines
+}
+
+/// Most subagent trees are a handful of nodes; cap the rendered depth so a
+/// runaway spawn does not push the action buttons off the section.
+const SUBAGENT_TREE_MAX_VISIBLE: usize = 12;
+
+/// Depth-first, parent-before-child walk of the subagent tree for rendering.
+fn flatten_subagent_nodes<'a>(
+    nodes: &'a [crate::agent_herd::SubagentNode],
+    out: &mut Vec<&'a crate::agent_herd::SubagentNode>,
+) {
+    for node in nodes {
+        out.push(node);
+        flatten_subagent_nodes(&node.children, out);
+    }
+}
+
+/// How many subagent tree lines an agent's detail will show (capped), plus
+/// the trailing "… N more" overflow line when the cap kicks in.
+fn subagent_tree_line_count(agent: &crate::agent_herd::HerdAgent) -> usize {
+    let mut flat = Vec::new();
+    if let Some(activity) = agent.activity.as_ref() {
+        flatten_subagent_nodes(&activity.subagent_tree, &mut flat);
+    }
+    let mut lines = flat.len().min(SUBAGENT_TREE_MAX_VISIBLE);
+    if flat.len() > SUBAGENT_TREE_MAX_VISIBLE {
+        lines += 1;
+    }
+    lines
+}
+
 fn sidebar_agent_herd_metrics(
     cell_h: f32,
     dpi: f32,
     collapsed: bool,
     agent_count: usize,
-    expanded: Option<usize>,
+    detail_agent: Option<&crate::agent_herd::HerdAgent>,
+    show_activity: bool,
+    show_tokens: bool,
     max_content_h: Option<f32>,
 ) -> SidebarAgentHerdMetrics {
     let dpi = dpi.clamp(1.0, 2.5);
     let base_row_h = cell_h + 4.0 * dpi;
     let header_h = cell_h + 8.0 * dpi;
     let pad = 8.0 * dpi;
-    let full_detail_h = if !collapsed && expanded.is_some_and(|index| index < agent_count) {
-        // Detail can contain status, root, activity, attention, branch,
-        // telemetry, subagent summary, and the action row.
-        pad + 8.0 * cell_h + 20.0 * dpi
+    let full_detail_h = if !collapsed {
+        if let Some(agent) = detail_agent {
+            // One line per detail row, plus the action button strip at the
+            // bottom. Detail text advances `cell_h + 2*dpi` per line; the
+            // button row is `cell_h + 4*dpi`.
+            let lines = agent_detail_line_count(agent, show_activity, show_tokens);
+            pad + (lines as f32) * (cell_h + 2.0 * dpi) + (cell_h + 4.0 * dpi) + pad
+        } else {
+            0.0
+        }
     } else {
         0.0
     };
@@ -1450,14 +1526,15 @@ fn sidebar_agent_herd_metrics(
     let max_rows_with_detail = max_content_h
         .map(|height| ((height - full_detail_h).max(0.) / row_h).floor() as usize)
         .unwrap_or(agent_count);
-    let expanded_can_be_visible = !collapsed
-        && expanded.is_some_and(|index| index < agent_count && index < max_rows_without_detail);
-    let detail_h =
-        if expanded_can_be_visible && expanded.is_some_and(|index| index < max_rows_with_detail) {
-            full_detail_h
-        } else {
-            0.0
-        };
+    // The detail block is only present when a specific agent was supplied to
+    // measure (the expanded one). The first metrics probe passes `None`, so it
+    // sizes the plain list; the second call passes the agent and gets the
+    // detail height folded into the row budget.
+    let detail_h = if detail_agent.is_some() {
+        full_detail_h
+    } else {
+        0.0
+    };
     let max_rows = if detail_h > 0.0 {
         max_rows_with_detail
     } else {
@@ -2878,6 +2955,21 @@ fn agent_row_actions(agent: &HerdAgent, show_stop: bool) -> Vec<AgentRowAction> 
     }
     if show_stop && agent.can_stop() {
         actions.push(AgentRowAction::Stop);
+    }
+    // The log overlay is only meaningful when we actually read a transcript.
+    if agent.activity.is_some() {
+        actions.push(AgentRowAction::Log);
+    }
+    if agent
+        .session_id
+        .as_deref()
+        .map(|s| !s.is_empty())
+        .unwrap_or(false)
+    {
+        actions.push(AgentRowAction::CopyId);
+    }
+    if agent.cwd.is_some() {
+        actions.push(AgentRowAction::Transcript);
     }
     actions
 }
@@ -5222,9 +5314,7 @@ impl crate::TermWindow {
             let cache = self.agent_detection_cache.borrow();
             cache
                 .iter()
-                .map(|(pane_id, entry)| {
-                    (*pane_id, entry.waiting_since, entry.unseen_exited_since)
-                })
+                .map(|(pane_id, entry)| (*pane_id, entry.waiting_since, entry.unseen_exited_since))
                 .collect()
         };
         build_waiting_queue(entries, focused_active)
@@ -5234,7 +5324,10 @@ impl crate::TermWindow {
     /// `(waiting, unseen_exited)` — does not apply the lazy-ack exclusion.
     pub(crate) fn pane_queue_state(&self, pane_id: PaneId) -> (bool, bool) {
         if let Some(entry) = self.agent_detection_cache.borrow().get(&pane_id) {
-            (entry.waiting_since.is_some(), entry.unseen_exited_since.is_some())
+            (
+                entry.waiting_since.is_some(),
+                entry.unseen_exited_since.is_some(),
+            )
         } else {
             (false, false)
         }
@@ -5715,12 +5808,17 @@ impl crate::TermWindow {
             .expanded
             .as_ref()
             .and_then(|key| state.agents.iter().position(|agent| &agent.key() == key));
+        let expanded_agent = expanded_idx.and_then(|idx| state.agents.get(idx));
+        let show_activity = self.config.agent_ui.section.show_activity;
+        let show_tokens = self.config.agent_ui.section.show_tokens;
         let metrics = sidebar_agent_herd_metrics(
             self.render_metrics.cell_size.height as f32,
             self.dimensions.dpi as f32 / 96.0,
             state.collapsed,
             state.agents.len(),
-            expanded_idx,
+            None,
+            show_activity,
+            show_tokens,
             None,
         );
         let section_bottom = self.sidebar_bottom_controls_top(top, height, row_height);
@@ -5736,7 +5834,9 @@ impl crate::TermWindow {
             self.dimensions.dpi as f32 / 96.0,
             state.collapsed,
             state.agents.len(),
-            expanded_idx,
+            expanded_agent,
+            show_activity,
+            show_tokens,
             Some(available_h - metrics.header_h),
         ))
     }
@@ -8154,8 +8254,7 @@ impl crate::TermWindow {
                     let counter_h = (top + height) - counter_y - 2.;
                     if counter_h > 4. {
                         let counter_type = UIItemType::SidebarWaitingCounter;
-                        let counter_hovered =
-                            hovered_item.as_ref() == Some(&counter_type);
+                        let counter_hovered = hovered_item.as_ref() == Some(&counter_type);
                         let label = format!("● {}", waiting.len());
                         let mut counter_attrs = CellAttributes::default();
                         counter_attrs.set_intensity(Intensity::Bold);
@@ -9341,11 +9440,33 @@ impl crate::TermWindow {
         // whatever project the active pane happens to sit in.
         self.record_agent_window_sessions(&agents);
 
+        let view = self.agent_herd_state.borrow().view;
         let current_project = self.current_project_root();
-        let agents = scope_herd_agents_to_project(agents, current_project.as_deref());
+        let mut agents = if view == crate::agent_herd::HerdView::AllGrouped {
+            // All projects: skip per-project scoping so every agent shows.
+            agents
+        } else {
+            scope_herd_agents_to_project(agents, current_project.as_deref())
+        };
+
+        // Surface attention-needing agents first so they are not buried.
+        if self.config.agent_ui.section.sort_attention_first {
+            let now = SystemTime::now();
+            agents.sort_by_key(|agent| {
+                (
+                    !agent.display_status(now).is_attention(),
+                    agent.name.clone(),
+                )
+            });
+        }
 
         let mut state = self.agent_herd_state.borrow_mut();
         state.agents = agents;
+        // The list is rebuilt every refresh; keep a now-too-large scroll offset
+        // from stranding the view past the end.
+        if state.scroll_offset > state.agents.len() {
+            state.scroll_offset = state.agents.len();
+        }
     }
 
     /// Note which agent sessions this window is running, and persist the list
@@ -9570,8 +9691,12 @@ impl crate::TermWindow {
     ) -> anyhow::Result<()> {
         let state = self.agent_herd_state.borrow();
         let collapsed = state.collapsed;
+        let state_scroll_offset = state.scroll_offset;
         let agents = state.agents.clone();
         let expanded = state.expanded.clone();
+        let selection = state.selection.clone();
+        let nav_active = state.nav_active;
+        let view_all = state.view == crate::agent_herd::HerdView::AllGrouped;
         let feedback = state
             .feedback
             .as_ref()
@@ -9609,6 +9734,11 @@ impl crate::TermWindow {
 
         // Count agents.
         let agent_count = agents.len();
+        let now = SystemTime::now();
+        let attention_count = agents
+            .iter()
+            .filter(|agent| agent.display_status(now).is_attention())
+            .count();
 
         let content_h = metrics.content_h;
         let header_y = (section_bottom - header_h - content_h).max(sidebar_top);
@@ -9632,7 +9762,18 @@ impl crate::TermWindow {
         // origin, not from `section_x`, or the region overruns the sidebar.
         let label = feedback
             .map(|message| format!("Agents · {agent_count} · {message}"))
-            .unwrap_or_else(|| format!("Agents · {agent_count}"));
+            .unwrap_or_else(|| {
+                let base = if attention_count > 0 {
+                    format!("Agents · {agent_count} · {attention_count}⚠")
+                } else {
+                    format!("Agents · {agent_count}")
+                };
+                if view_all {
+                    format!("{base} · all")
+                } else {
+                    base
+                }
+            });
         let label_x = section_x + pad + cell_h + 4.0 * dpi;
         self.paint_text(
             layers,
@@ -9666,7 +9807,8 @@ impl crate::TermWindow {
         let hover_fill = lerp_rgba(bg, fg, 0.12);
 
         let mut y = header_y + header_h;
-        for agent in agents.iter() {
+        let mut visible_row_count = 0usize;
+        for agent in agents.iter().skip(state_scroll_offset) {
             let key = agent.key();
             let is_expanded = expanded.as_ref() == Some(&key);
             let row_h = base_row_h;
@@ -9675,23 +9817,41 @@ impl crate::TermWindow {
             if y + row_h + detail_h > section_bottom {
                 break;
             }
+            visible_row_count += 1;
 
             // A detached agent (no pane bound) cannot be focused, so the row
             // reads dimmer and its click offers Resume instead.
             let detached = agent.is_detached();
+            let display_status = agent.display_status(SystemTime::now());
             let row_fg = if detached { dim } else { fg };
             let row_type = UIItemType::SidebarAgentRow { key: key.clone() };
             let row_hovered = hovered_item.as_ref() == Some(&row_type);
+            let selected = nav_active && selection.as_ref() == Some(&key);
 
             // Row background.
+            let row_bg = if selected {
+                lerp_rgba(bg, fg, 0.18)
+            } else if row_hovered {
+                hover_fill
+            } else {
+                bg
+            };
             let row_rect = euclid::rect(section_x, y, section_w, row_h);
-            self.filled_rectangle(
-                layers,
-                0,
-                row_rect,
-                if row_hovered { hover_fill } else { bg },
-            )?;
-            let row_bg = if row_hovered { hover_fill } else { bg };
+            self.filled_rectangle(layers, 0, row_rect, row_bg)?;
+            // Keyboard cursor: a solid accent bar on the row's leading edge.
+            if selected {
+                let accent = if display_status.is_attention() {
+                    crate::agent_herd::ATTENTION_RGB
+                } else {
+                    agent.vendor_dot_color()
+                };
+                self.filled_rectangle(
+                    layers,
+                    1,
+                    euclid::rect(section_x, y + 2.0 * dpi, 3.0 * dpi, row_h - 4.0 * dpi),
+                    srgb8_to_linear(accent.0, accent.1, accent.2),
+                )?;
+            }
             let text_y = y + (row_h - cell_h) * 0.5;
 
             // Per-row chevron. Expanding is its own target so that clicking
@@ -9716,7 +9876,6 @@ impl crate::TermWindow {
             // Status dot.
             let dot_x = section_x + pad + chevron_w + 6.0 * dpi;
             let dot_y = y + row_h * 0.5;
-            let display_status = agent.display_status(SystemTime::now());
             let dot_color = if display_status.is_attention() {
                 crate::agent_herd::ATTENTION_RGB
             } else {
@@ -9977,6 +10136,69 @@ impl crate::TermWindow {
                     detail_line_y += cell_h + 2.0 * dpi;
                 }
 
+                // Subagent tree: a flat, depth-indented walk. Clipped to a sane
+                // cap; an over-long tree gets a trailing "… N more" line.
+                if self.config.agent_ui.section.show_activity && !agent.subagents.is_empty() {
+                    if let Some(activity) = agent.activity.as_ref() {
+                        let mut flat = Vec::new();
+                        flatten_subagent_nodes(&activity.subagent_tree, &mut flat);
+                        let visible: &[_] = if flat.len() > SUBAGENT_TREE_MAX_VISIBLE {
+                            &flat[..SUBAGENT_TREE_MAX_VISIBLE]
+                        } else {
+                            &flat[..]
+                        };
+                        for node in visible {
+                            let indent_cols = (node.depth as usize).min(4) * 2;
+                            let indent_w = indent_cols as f32 * cell_w;
+                            let dot_color = subagent_status_color(node.status);
+                            let dot_x = detail_x + indent_w + 3.0 * dpi;
+                            let dot_y = detail_line_y + cell_h * 0.5;
+                            self.filled_rectangle(
+                                layers,
+                                1,
+                                euclid::rect(
+                                    dot_x - 3.0 * dpi,
+                                    dot_y - 3.0 * dpi,
+                                    6.0 * dpi,
+                                    6.0 * dpi,
+                                ),
+                                srgb8_to_linear(dot_color.0, dot_color.1, dot_color.2),
+                            )?;
+                            let mut label = format!("{} {}", node.agent_type, node.description);
+                            if let Some(last) = node.events.last() {
+                                label.push_str(&format!(" — {}", last.display_text()));
+                            }
+                            let budget = (detail_w - indent_w - 8.0 * dpi).max(0.);
+                            let budget_cols = sidebar_text_cols(budget, cell_w_cols);
+                            self.paint_text(
+                                layers,
+                                &truncate_with_ellipsis(&label, budget_cols),
+                                detail_x + indent_w + 8.0 * dpi,
+                                detail_line_y,
+                                budget,
+                                dim,
+                                bg,
+                                false,
+                            )?;
+                            detail_line_y += cell_h + 2.0 * dpi;
+                        }
+                        if flat.len() > SUBAGENT_TREE_MAX_VISIBLE {
+                            let more = flat.len() - SUBAGENT_TREE_MAX_VISIBLE;
+                            self.paint_text(
+                                layers,
+                                &format!("… {more} more subagents"),
+                                detail_x + 8.0 * dpi,
+                                detail_line_y,
+                                detail_w - 8.0 * dpi,
+                                dim,
+                                bg,
+                                false,
+                            )?;
+                            detail_line_y += cell_h + 2.0 * dpi;
+                        }
+                    }
+                }
+
                 // Action buttons, left to right along the last detail line.
                 // These replace an unlabelled, invisible hit box that only the
                 // code knew about.
@@ -10034,6 +10256,66 @@ impl crate::TermWindow {
 
             y += row_h + detail_h + 2.0 * dpi;
         }
+
+        // Right-click action menu: a floating panel of the row's actions,
+        // painted last so its UIItems win the hit-test over the rows beneath.
+        {
+            let menu_key = self.agent_herd_state.borrow().context_menu.clone();
+            if let Some(menu_key) = menu_key {
+                if let Some(agent) = agents.iter().find(|a| a.key() == menu_key) {
+                    let actions = agent_row_actions(agent, self.config.agent_ui.show_stop);
+                    if !actions.is_empty() {
+                        let menu_w = (section_w - pad * 2.0).max(0.);
+                        let row_h = cell_h + 4.0 * dpi;
+                        let menu_h = actions.len() as f32 * row_h + pad * 2.0;
+                        let menu_x = section_x + pad;
+                        let menu_y = (header_y + header_h + pad).min(section_bottom - menu_h);
+                        self.filled_rectangle(
+                            layers,
+                            1,
+                            euclid::rect(menu_x, menu_y, menu_w, menu_h),
+                            lerp_rgba(bg, fg, 0.10),
+                        )?;
+                        let mut by = menu_y + pad;
+                        for action in actions {
+                            let label = action.label();
+                            let label_cols = unicode_column_width(label, None);
+                            self.filled_rectangle(
+                                layers,
+                                1,
+                                euclid::rect(menu_x, by, menu_w, row_h),
+                                lerp_rgba(bg, fg, 0.06),
+                            )?;
+                            self.paint_text(
+                                layers,
+                                label,
+                                menu_x + 8.0 * dpi,
+                                by + (row_h - cell_h) * 0.5,
+                                label_cols as f32 * cell_w,
+                                fg,
+                                lerp_rgba(bg, fg, 0.06),
+                                false,
+                            )?;
+                            self.ui_items.push(UIItem {
+                                x: menu_x as usize,
+                                y: by as usize,
+                                width: menu_w as usize,
+                                height: row_h as usize,
+                                item_type: UIItemType::SidebarAgentAction {
+                                    key: menu_key.clone(),
+                                    action,
+                                },
+                            });
+                            by += row_h;
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut state = self.agent_herd_state.borrow_mut();
+        state.visible_rows = visible_row_count;
+        drop(state);
 
         Ok(())
     }
@@ -10237,6 +10519,16 @@ impl crate::TermWindow {
         }
 
         Ok(())
+    }
+}
+
+fn subagent_status_color(status: crate::agent_herd::HerdStatus) -> (u8, u8, u8) {
+    match status {
+        crate::agent_herd::HerdStatus::Blocked => (240, 184, 66),
+        crate::agent_herd::HerdStatus::Working => (120, 200, 120),
+        crate::agent_herd::HerdStatus::Idle => (150, 150, 150),
+        crate::agent_herd::HerdStatus::Done => (110, 110, 110),
+        crate::agent_herd::HerdStatus::Unknown => (130, 130, 130),
     }
 }
 
@@ -10618,26 +10910,25 @@ mod tests {
             vec![
                 AgentRowAction::Focus,
                 AgentRowAction::Attach,
-                AgentRowAction::Logs
+                AgentRowAction::Logs,
+                AgentRowAction::Transcript
             ],
             "an idle agent has nothing to interrupt"
         );
 
         agent.status = HerdStatus::Working;
-        assert_eq!(
-            agent_row_actions(&agent, true).last(),
-            Some(&AgentRowAction::Stop)
-        );
-        assert_eq!(
-            agent_row_actions(&agent, false).last(),
-            Some(&AgentRowAction::Logs)
-        );
+        let with_stop = agent_row_actions(&agent, true);
+        assert!(with_stop.contains(&AgentRowAction::Stop));
+        assert_eq!(with_stop.last(), Some(&AgentRowAction::Transcript));
+        let without_stop = agent_row_actions(&agent, false);
+        assert!(without_stop.contains(&AgentRowAction::Logs));
+        assert_eq!(without_stop.last(), Some(&AgentRowAction::Transcript));
 
         agent.can_attach = false;
         agent.can_open_logs = false;
         assert_eq!(
             agent_row_actions(&agent, false),
-            vec![AgentRowAction::Focus],
+            vec![AgentRowAction::Focus, AgentRowAction::Transcript],
             "unavailable actions must not render as dead buttons"
         );
     }
@@ -11240,8 +11531,16 @@ mod tests {
             for (collapsed, expanded, bottom_button_rows) in
                 [(true, None, 2.), (false, None, 2.), (false, Some(0), 3.)]
             {
-                let metrics =
-                    sidebar_agent_herd_metrics(cell_height, dpi, collapsed, 2, expanded, None);
+                let metrics = sidebar_agent_herd_metrics(
+                    cell_height,
+                    dpi,
+                    collapsed,
+                    2,
+                    None,
+                    true,
+                    true,
+                    None,
+                );
                 let controls_top =
                     sidebar_bottom_controls_top(top, height, row_height, bottom_button_rows);
                 let section_top = controls_top - metrics.reserved_h();
@@ -11278,7 +11577,8 @@ mod tests {
     #[test]
     fn collapsed_agent_herd_reserves_only_its_header() {
         for (dpi, cell_height) in [(-1.0, 16.), (1.0, 16.), (2.5, 32.), (10.0, 32.)] {
-            let metrics = sidebar_agent_herd_metrics(cell_height, dpi, true, 100, Some(0), None);
+            let metrics =
+                sidebar_agent_herd_metrics(cell_height, dpi, true, 100, None, true, true, None);
             assert!(metrics.header_h > 0.);
             assert!((metrics.content_h - 0.).abs() < f32::EPSILON);
             assert!((metrics.detail_h - 0.).abs() < f32::EPSILON);
@@ -11288,11 +11588,95 @@ mod tests {
 
     #[test]
     fn expanded_agent_detail_fits_status_project_and_activity_lines() {
-        let metrics = sidebar_agent_herd_metrics(32., 2., false, 1, Some(0), None);
-        let expected_detail_h = 8. * 2. + 3. * 32. + 4. * 2.;
+        // Detail height is now derived from the agent's actual lines: status +
+        // project root + activity headline, plus the action button strip.
+        let mut agent = herd_agent("x", "/repo/src", Some("/repo"));
+        agent.activity = Some(crate::agent_herd::HerdActivity::default());
+        let metrics = sidebar_agent_herd_metrics(32., 2., false, 1, Some(&agent), true, true, None);
+        let expected_detail_h = 8. * 2. + 3. * (32. + 2. * 2.) + (32. + 4. * 2.) + 8. * 2.;
 
         assert!(metrics.detail_h >= expected_detail_h);
         assert!(metrics.content_h >= metrics.base_row_h + metrics.detail_h);
+    }
+
+    #[test]
+    fn detail_height_tracks_agent_data() {
+        // A minimal agent (status line only) reserves less detail room than
+        // one carrying project, activity, attention, branch, tokens and
+        // subagents — the old fixed 8-line guess made both the same.
+        let minimal = herd_agent("min", "/repo/src", None);
+        let mut full = herd_agent("full", "/repo/src", Some("/repo"));
+        full.activity = Some(crate::agent_herd::HerdActivity {
+            subagent_tree: vec![crate::agent_herd::SubagentNode {
+                agent_id: "sub-1".to_string(),
+                agent_type: "Explore".to_string(),
+                description: "scanning".to_string(),
+                status: HerdStatus::Working,
+                depth: 1,
+                children: Vec::new(),
+                events: Vec::new(),
+            }],
+            ..Default::default()
+        });
+        full.blocked_reason = Some("needs approval".to_string());
+        full.git_branch = Some("main".to_string());
+        full.input_tokens = Some(1000);
+        full.output_tokens = Some(2000);
+        full.subagents = vec![crate::agent_herd::HerdSubagent {
+            agent_id: "sub-1".to_string(),
+            agent_type: "Explore".to_string(),
+            description: "scanning".to_string(),
+            status: HerdStatus::Working,
+            depth: 1,
+            last_activity: None,
+        }];
+
+        let min_h = sidebar_agent_herd_metrics(32., 2., false, 1, Some(&minimal), true, true, None)
+            .detail_h;
+        let full_h =
+            sidebar_agent_herd_metrics(32., 2., false, 1, Some(&full), true, true, None).detail_h;
+        assert!(
+            full_h > min_h,
+            "full agent detail ({full_h}) must exceed minimal ({min_h})"
+        );
+        // status + root + activity + attention + branch + tokens + (summary + 1 node)
+        let expected_full_lines = 6 + 2;
+        let expected_full_h =
+            8. * 2. + expected_full_lines as f32 * (32. + 2. * 2.) + (32. + 4. * 2.) + 8. * 2.;
+        assert!((full_h - expected_full_h).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn subagent_tree_overflow_reserves_its_more_line() {
+        let mut agent = herd_agent("spawner", "/repo/src", Some("/repo"));
+        let make_node = |i: usize| crate::agent_herd::SubagentNode {
+            agent_id: format!("sub-{i}"),
+            agent_type: "Task".to_string(),
+            description: format!("job {i}"),
+            status: HerdStatus::Working,
+            depth: 0,
+            children: Vec::new(),
+            events: Vec::new(),
+        };
+        let nodes: Vec<_> = (0..SUBAGENT_TREE_MAX_VISIBLE + 3).map(make_node).collect();
+        agent.activity = Some(crate::agent_herd::HerdActivity {
+            subagent_tree: nodes,
+            ..Default::default()
+        });
+        agent.subagents = vec![crate::agent_herd::HerdSubagent {
+            agent_id: "sub-0".to_string(),
+            agent_type: "Task".to_string(),
+            description: "root job".to_string(),
+            status: HerdStatus::Working,
+            depth: 1,
+            last_activity: None,
+        }];
+
+        // Cap + the "… N more" line.
+        assert_eq!(
+            subagent_tree_line_count(&agent),
+            SUBAGENT_TREE_MAX_VISIBLE + 1
+        );
     }
 
     #[test]
@@ -11300,8 +11684,16 @@ mod tests {
         let cell_height = 32.;
         let dpi = 2.;
         let row_height = cell_height + 4. * dpi + 2. * dpi;
-        let metrics =
-            sidebar_agent_herd_metrics(cell_height, dpi, false, 2, Some(1), Some(row_height * 2.));
+        let metrics = sidebar_agent_herd_metrics(
+            cell_height,
+            dpi,
+            false,
+            2,
+            None,
+            true,
+            true,
+            Some(row_height * 2.),
+        );
 
         assert!((metrics.detail_h - 0.).abs() < f32::EPSILON);
         assert!((metrics.content_h - row_height * 2.).abs() < f32::EPSILON);
@@ -11309,7 +11701,8 @@ mod tests {
 
     #[test]
     fn large_agent_lists_are_bounded_by_available_sidebar_height() {
-        let metrics = sidebar_agent_herd_metrics(16., 1., false, usize::MAX, None, Some(200.));
+        let metrics =
+            sidebar_agent_herd_metrics(16., 1., false, usize::MAX, None, true, true, Some(200.));
 
         assert!((metrics.content_h - 198.).abs() < f32::EPSILON);
     }
@@ -11317,7 +11710,7 @@ mod tests {
     #[test]
     fn stale_expansion_indexes_do_not_reserve_detail_space() {
         for expanded in [Some(2), Some(usize::MAX)] {
-            let metrics = sidebar_agent_herd_metrics(16., 1., false, 2, expanded, None);
+            let metrics = sidebar_agent_herd_metrics(16., 1., false, 2, None, true, true, None);
             assert!((metrics.detail_h - 0.).abs() < f32::EPSILON);
         }
     }
@@ -11325,7 +11718,8 @@ mod tests {
     #[test]
     fn tiny_available_height_renders_no_agent_rows_or_detail() {
         for available_h in [-1., 0., 1.] {
-            let metrics = sidebar_agent_herd_metrics(16., 1., false, 4, Some(0), Some(available_h));
+            let metrics =
+                sidebar_agent_herd_metrics(16., 1., false, 4, None, true, true, Some(available_h));
             assert!((metrics.content_h - 0.).abs() < f32::EPSILON);
             assert!((metrics.detail_h - 0.).abs() < f32::EPSILON);
         }
@@ -12194,12 +12588,12 @@ mod tests {
     fn unseen_exited_requires_agent_loss_while_unfocused() {
         let t0 = Instant::now();
         // Agent identity lost while unfocused: flagged.
-        assert_eq!(next_unseen_exited_since(None, true, false, true, t0), Some(t0));
-        // Same, but window focused: never flagged.
         assert_eq!(
-            next_unseen_exited_since(None, true, false, false, t0),
-            None
+            next_unseen_exited_since(None, true, false, true, t0),
+            Some(t0)
         );
+        // Same, but window focused: never flagged.
+        assert_eq!(next_unseen_exited_since(None, true, false, false, t0), None);
         // Still an agent: cleared.
         assert_eq!(
             next_unseen_exited_since(Some(t0), true, true, true, t0),
@@ -12257,7 +12651,11 @@ mod tests {
         // Nothing queued: empty output — the rail chip hides and the dock
         // badge clears.
         assert!(build_waiting_queue(vec![(idle, None, None)], Some(99)).is_empty());
-        assert!(build_waiting_queue(Vec::<(PaneId, Option<Instant>, Option<Instant>)>::new(), None).is_empty());
+        assert!(build_waiting_queue(
+            Vec::<(PaneId, Option<Instant>, Option<Instant>)>::new(),
+            None
+        )
+        .is_empty());
     }
 
     #[test]

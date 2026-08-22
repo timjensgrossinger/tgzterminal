@@ -378,6 +378,12 @@ pub enum AgentRowAction {
     Logs,
     /// Interrupt the agent with Ctrl-C.
     Stop,
+    /// Open a full-screen activity log overlay for this agent.
+    Log,
+    /// Copy the agent's session id to the clipboard.
+    CopyId,
+    /// Reveal the agent's transcript/log directory in the file manager.
+    Transcript,
 }
 
 impl AgentRowAction {
@@ -389,6 +395,9 @@ impl AgentRowAction {
             Self::Attach => "Attach",
             Self::Logs => "Logs",
             Self::Stop => "Stop",
+            Self::Log => "Log",
+            Self::CopyId => "Copy Id",
+            Self::Transcript => "Transcript",
         }
     }
 }
@@ -563,6 +572,18 @@ pub struct AgentHerdState {
     pub expanded: Option<crate::agent_herd::AgentKey>,
     /// Whether the section is collapsed (hidden).
     pub collapsed: bool,
+    /// First agent row scrolled into view, for lists longer than the section.
+    pub scroll_offset: usize,
+    /// How many agent rows the current section layout fits (for scroll clamp).
+    pub visible_rows: usize,
+    /// Keyboard navigation: the row with the cursor, if nav mode is active.
+    pub selection: Option<crate::agent_herd::AgentKey>,
+    /// Whether arrow-key navigation of the section is capturing keys.
+    pub nav_active: bool,
+    /// Right-clicked row whose action menu is open, if any.
+    pub context_menu: Option<crate::agent_herd::AgentKey>,
+    /// Whether the list is scoped to the current project or shows all projects.
+    pub view: crate::agent_herd::HerdView,
     /// Short-lived feedback for control actions. OS notifications may be denied.
     pub feedback: Option<(String, std::time::Instant)>,
 }
@@ -573,6 +594,12 @@ impl Default for AgentHerdState {
             agents: Vec::new(),
             expanded: None,
             collapsed: false,
+            scroll_offset: 0,
+            visible_rows: 0,
+            selection: None,
+            nav_active: false,
+            context_menu: None,
+            view: crate::agent_herd::HerdView::CurrentProject,
             feedback: None,
         }
     }
@@ -1034,7 +1061,11 @@ impl TermWindow {
         // macOS dock badge: surface the waiting-agent count while the app is
         // unfocused. Other platforms ignore it. Only meaningful when enabled.
         if self.config.agent_ui.dock_badge {
-            let count = if focused { 0 } else { self.waiting_queue().len() };
+            let count = if focused {
+                0
+            } else {
+                self.waiting_queue().len()
+            };
             crate::macos_dock_badge::set_waiting_count(count);
         }
 
@@ -1235,6 +1266,8 @@ impl TermWindow {
             agent_detection_cache: RefCell::new(HashMap::new()),
             agent_herd_state: RefCell::new(AgentHerdState {
                 collapsed: tgz_ui_state::load_agent_section_collapsed().unwrap_or(false),
+                view: tgz_ui_state::load_agent_section_view()
+                    .unwrap_or(crate::agent_herd::HerdView::CurrentProject),
                 ..AgentHerdState::default()
             }),
             agent_herd_session_cache: None,
@@ -2954,6 +2987,141 @@ impl TermWindow {
         promise::spawn::spawn(future).detach();
     }
 
+    /// Open the activity-log overlay for a single agent. The snapshot is cloned
+    /// into the overlay closure; the overlay re-reads the transcript live.
+    fn show_agent_log(&mut self, agent: crate::agent_herd::HerdAgent) {
+        let mux = Mux::get();
+        let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
+            Some(tab) => tab,
+            None => return,
+        };
+        let (overlay, future) = start_overlay(self, &tab, move |_tab_id, term| {
+            crate::overlay::show_agent_log_overlay(term, agent)
+        });
+        self.assign_overlay(tab.tab_id(), overlay);
+        promise::spawn::spawn(future).detach();
+    }
+
+    /// Enter keyboard navigation of the agent section: pick the first
+    /// attention-needing agent (else the first agent) and put the cursor there.
+    fn activate_agent_section_nav(&mut self) {
+        let mut state = self.agent_herd_state.borrow_mut();
+        if state.agents.is_empty() {
+            return;
+        }
+        let first_attention = state
+            .agents
+            .iter()
+            .find(|agent| {
+                agent
+                    .display_status(std::time::SystemTime::now())
+                    .is_attention()
+            })
+            .or_else(|| state.agents.first());
+        state.selection = first_attention.map(|agent| agent.key());
+        state.nav_active = true;
+        state.scroll_offset = state
+            .scroll_offset
+            .min(state.agents.len().saturating_sub(state.visible_rows));
+        let sel = state.selection.clone();
+        drop(state);
+        if let Some(sel) = sel {
+            self.scroll_agent_selection_into_view(&sel);
+        }
+    }
+
+    /// Keep the keyboard-selected agent row on screen.
+    pub(crate) fn scroll_agent_selection_into_view(&mut self, key: &crate::agent_herd::AgentKey) {
+        let mut state = self.agent_herd_state.borrow_mut();
+        if let Some(idx) = state.agents.iter().position(|agent| &agent.key() == key) {
+            if idx < state.scroll_offset {
+                state.scroll_offset = idx;
+            } else if idx >= state.scroll_offset + state.visible_rows.max(1) {
+                state.scroll_offset = idx + 1 - state.visible_rows.max(1);
+            }
+        }
+    }
+
+    /// Handle a navigation key while `nav_active`. Returns true if consumed.
+    pub(crate) fn agent_section_nav_key(&mut self, keycode: &KeyCode) -> bool {
+        let nav_active = self.agent_herd_state.borrow().nav_active;
+        if !nav_active {
+            return false;
+        }
+        // Every agent vanished (closed or rescoped): leave nav mode rather
+        // than swallowing keys with nothing to navigate.
+        if self.agent_herd_state.borrow().agents.is_empty() {
+            self.agent_herd_state.borrow_mut().nav_active = false;
+            return false;
+        }
+        match keycode {
+            KeyCode::UpArrow => {
+                self.agent_section_nav_move(-1);
+                true
+            }
+            KeyCode::DownArrow => {
+                self.agent_section_nav_move(1);
+                true
+            }
+            KeyCode::Char(' ') | KeyCode::RightArrow => {
+                let key = self.agent_herd_state.borrow().selection.clone();
+                if let Some(key) = key {
+                    self.toggle_herd_row_expansion(&key);
+                }
+                true
+            }
+            KeyCode::Char('\r') | KeyCode::LeftArrow => {
+                let key = self.agent_herd_state.borrow().selection.clone();
+                if let Some(key) = key {
+                    self.agent_section_nav_activate(&key);
+                }
+                true
+            }
+            KeyCode::Char('\u{1b}') => {
+                self.agent_herd_state.borrow_mut().nav_active = false;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn agent_section_nav_move(&mut self, delta: isize) {
+        let mut state = self.agent_herd_state.borrow_mut();
+        if state.agents.is_empty() {
+            return;
+        }
+        let current = state
+            .selection
+            .as_ref()
+            .and_then(|key| state.agents.iter().position(|agent| &agent.key() == key));
+        let next = match current {
+            Some(idx) => {
+                let len = state.agents.len() as isize;
+                let raw = idx as isize + delta;
+                (((raw % len) + len) % len) as usize
+            }
+            None => 0,
+        };
+        state.selection = Some(state.agents[next].key());
+        let key = state.agents[next].key();
+        drop(state);
+        self.scroll_agent_selection_into_view(&key);
+    }
+
+    fn agent_section_nav_activate(&mut self, key: &crate::agent_herd::AgentKey) {
+        let agent = self.herd_agent_by_key(key);
+        match agent {
+            Some(agent) if !agent.is_detached() => {
+                self.focus_herd_agent(&agent);
+                self.agent_herd_state.borrow_mut().nav_active = false;
+            }
+            Some(_) => {
+                self.toggle_herd_row_expansion(key);
+            }
+            None => {}
+        }
+    }
+
     fn show_tab_navigator(&mut self) {
         let mux = Mux::get();
         let active_tab_idx = match mux.get_window(self.mux_window_id) {
@@ -4549,6 +4717,7 @@ done
             ScrollToBottom => self.scroll_to_bottom(pane),
             ShowTabNavigator => self.show_tab_navigator(),
             ShowDebugOverlay => self.show_debug_overlay(),
+            ActivateAgentSection => self.activate_agent_section_nav(),
             CheckForUpdates => crate::update::check_for_updates_now(),
             ShowLauncher => self.show_launcher(),
             ShowLauncherArgs(args) => {
@@ -4949,8 +5118,7 @@ done
             CycleWaitingAgent => {
                 let queue: Vec<PaneId> =
                     self.waiting_queue().into_iter().map(|(id, _)| id).collect();
-                if let Some(target) =
-                    render::sidebar::cycle_waiting_target(&queue, pane.pane_id())
+                if let Some(target) = render::sidebar::cycle_waiting_target(&queue, pane.pane_id())
                 {
                     self.activate_pane_by_id(target)?;
                 }

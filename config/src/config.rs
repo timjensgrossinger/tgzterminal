@@ -889,6 +889,11 @@ pub struct AgentSectionConfig {
     /// Show pane-reported token and cost telemetry in expanded rows.
     #[dynamic(default = "default_true")]
     pub show_tokens: bool,
+
+    /// Sort attention-needing agents (blocked / waiting) to the top of the
+    /// list so they are not buried under healthy rows.
+    #[dynamic(default = "default_true")]
+    pub sort_attention_first: bool,
 }
 
 impl Default for AgentSectionConfig {
@@ -899,6 +904,7 @@ impl Default for AgentSectionConfig {
             show_non_interactive: false,
             show_activity: true,
             show_tokens: true,
+            sort_attention_first: true,
         }
     }
 }

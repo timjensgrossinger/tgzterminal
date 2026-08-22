@@ -25,6 +25,7 @@ use std::time::{Duration, Instant};
 use termwiz::hyperlink::Hyperlink;
 use termwiz::surface::Line;
 use wezterm_dynamic::ToDynamic;
+use wezterm_open_url::open_url;
 use wezterm_term::input::{MouseButton, MouseEventKind as TMEK};
 use wezterm_term::{ClickPosition, KeyCode, KeyModifiers, LastMouseClick, StableRowIndex};
 
@@ -595,6 +596,24 @@ impl super::TermWindow {
     ) {
         let is_left_press = event.kind == WMEK::Press(MousePress::Left);
         self.last_ui_item.replace(item.clone());
+        if matches!(event.kind, WMEK::VertWheel(_) | WMEK::HorzWheel(_))
+            && matches!(
+                item.item_type,
+                UIItemType::SidebarAgentSectionHeader
+                    | UIItemType::SidebarAgentRow { .. }
+                    | UIItemType::SidebarAgentRowChevron { .. }
+                    | UIItemType::SidebarAgentAction { .. }
+            )
+        {
+            self.mouse_event_sidebar_agent_section_wheel(event, context);
+            return;
+        }
+        // A press anywhere that is not an agent action closes an open row menu.
+        if matches!(event.kind, WMEK::Press(_))
+            && !matches!(item.item_type, UIItemType::SidebarAgentAction { .. })
+        {
+            self.agent_herd_state.borrow_mut().context_menu = None;
+        }
         if is_left_press {
             self.pressed_ui_item.replace(item.item_type.clone());
             context.invalidate();
@@ -1009,11 +1028,7 @@ impl super::TermWindow {
     /// Waiting-queue footer chip: a left-click jumps to the oldest waiting
     /// agent pane, exactly like `CycleWaitingAgent` does. Focusing it acts as
     /// the acknowledge that drops it from the queue.
-    fn mouse_event_sidebar_waiting_counter(
-        &mut self,
-        event: MouseEvent,
-        context: &dyn WindowOps,
-    ) {
+    fn mouse_event_sidebar_waiting_counter(&mut self, event: MouseEvent, context: &dyn WindowOps) {
         if event.kind == WMEK::Release(MousePress::Left) {
             self.pressed_ui_item = None;
             let oldest = self.waiting_queue().into_iter().next().map(|(id, _)| id);
@@ -2157,6 +2172,16 @@ impl super::TermWindow {
         event: MouseEvent,
         context: &dyn WindowOps,
     ) {
+        if event.kind == WMEK::Release(MousePress::Right) {
+            let view = {
+                let mut state = self.agent_herd_state.borrow_mut();
+                state.view = state.view.toggled();
+                state.view
+            };
+            crate::termwindow::tgz_ui_state::save_agent_section_view(view);
+            context.invalidate();
+            return;
+        }
         if event.kind == WMEK::Release(MousePress::Left) {
             let collapsed = {
                 let mut state = self.agent_herd_state.borrow_mut();
@@ -2164,6 +2189,37 @@ impl super::TermWindow {
                 state.collapsed
             };
             crate::termwindow::tgz_ui_state::save_agent_section_collapsed(collapsed);
+            context.invalidate();
+        }
+    }
+
+    /// Scroll the agent list when it is taller than the section. Wheel notches
+    /// move one row; the per-frame `visible_rows` and `agents.len()` bound it.
+    fn mouse_event_sidebar_agent_section_wheel(
+        &mut self,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        let amount = match event.kind {
+            WMEK::VertWheel(n) => n,
+            WMEK::HorzWheel(n) => n,
+            _ => return,
+        };
+        // `amount` is the lines-per-notch the OS reported; sign is wheel
+        // direction. Delta in rows = the notch count, one row per notch.
+        let delta = if amount > 0 { 1 } else { -1 };
+        let clamped = {
+            let state = self.agent_herd_state.borrow();
+            let max = state.agents.len().saturating_sub(state.visible_rows);
+            state.scroll_offset.saturating_add_signed(delta).min(max)
+        };
+        let changed = {
+            let mut state = self.agent_herd_state.borrow_mut();
+            let changed = state.scroll_offset != clamped;
+            state.scroll_offset = clamped;
+            changed
+        };
+        if changed {
             context.invalidate();
         }
     }
@@ -2177,25 +2233,37 @@ impl super::TermWindow {
         event: MouseEvent,
         context: &dyn WindowOps,
     ) {
+        // Right-click opens/closes this row's action menu.
+        if event.kind == WMEK::Release(MousePress::Right) {
+            let mut state = self.agent_herd_state.borrow_mut();
+            state.context_menu = if state.context_menu.as_ref() == Some(key) {
+                None
+            } else {
+                Some(key.clone())
+            };
+            context.invalidate();
+            return;
+        }
         if event.kind != WMEK::Release(MousePress::Left) {
             return;
         }
         self.pressed_ui_item = None;
+        // A left click anywhere while a row menu is open closes it (the menu's
+        // own actions are separate UIItems that win the hit-test).
+        self.agent_herd_state.borrow_mut().context_menu = None;
         match self.herd_agent_by_key(key) {
             Some(agent) if !agent.is_detached() => {
                 self.focus_herd_agent(&agent);
             }
-            // Detached: there is no pane to show. Say so instead of doing
-            // nothing, and point at the action that does work.
+            // Detached: there is no pane to show. Say so in the section header
+            // (deduped by the 5s feedback window) instead of an OS toast on
+            // every click, and expand so the Resume button is visible.
             Some(_) => {
                 self.toggle_herd_row_expansion(key);
-                wezterm_toast_notification::show(wezterm_toast_notification::ToastNotification {
-                    title: "Agent".to_string(),
-                    message: "This agent is not attached to a pane here. Use Resume to reopen it."
-                        .to_string(),
-                    url: None,
-                    timeout: Some(std::time::Duration::from_millis(2600)),
-                });
+                self.agent_herd_state.borrow_mut().feedback = Some((
+                    "not attached here — use Resume".to_string(),
+                    std::time::Instant::now(),
+                ));
             }
             None => {}
         }
@@ -2215,18 +2283,24 @@ impl super::TermWindow {
         }
     }
 
-    fn toggle_herd_row_expansion(&mut self, key: &AgentKey) {
+    pub(crate) fn toggle_herd_row_expansion(&mut self, key: &AgentKey) {
         let mut state = self.agent_herd_state.borrow_mut();
         state.expanded = if state.expanded.as_ref() == Some(key) {
             None
         } else {
             Some(key.clone())
         };
+        let expanded_now = state.expanded.is_some();
+        drop(state);
+        // An expanded row is taller than a plain one; keep it on screen.
+        if expanded_now {
+            self.scroll_agent_selection_into_view(key);
+        }
     }
 
     /// Look up a row by identity: the list is rebuilt every paint, so the
     /// agent that was under the cursor may have moved by now.
-    fn herd_agent_by_key(&self, key: &AgentKey) -> Option<crate::agent_herd::HerdAgent> {
+    pub(crate) fn herd_agent_by_key(&self, key: &AgentKey) -> Option<crate::agent_herd::HerdAgent> {
         self.agent_herd_state
             .borrow()
             .agents
@@ -2235,7 +2309,7 @@ impl super::TermWindow {
             .cloned()
     }
 
-    fn focus_herd_agent(&mut self, agent: &crate::agent_herd::HerdAgent) {
+    pub(crate) fn focus_herd_agent(&mut self, agent: &crate::agent_herd::HerdAgent) {
         let Some(pane_id) = agent.pane_id else {
             return;
         };
@@ -2265,6 +2339,19 @@ impl super::TermWindow {
         };
 
         match action {
+            AgentRowAction::Log => self.show_agent_log(agent.clone()),
+            AgentRowAction::CopyId => {
+                if let Some(id) = agent.session_id.as_deref() {
+                    self.copy_to_clipboard(ClipboardCopyDestination::Clipboard, id.to_string());
+                    self.agent_herd_state.borrow_mut().feedback =
+                        Some(("session id copied".to_string(), Instant::now()));
+                }
+            }
+            AgentRowAction::Transcript => {
+                if let Some(cwd) = agent.cwd.as_ref() {
+                    let _ = open_url(&format!("file://{}", cwd.display()));
+                }
+            }
             AgentRowAction::Focus => self.focus_herd_agent(&agent),
             AgentRowAction::Resume => {
                 let session_id = agent.session_id.clone().unwrap_or_default();
@@ -2313,6 +2400,7 @@ impl super::TermWindow {
                 }
             }
         }
+        self.agent_herd_state.borrow_mut().context_menu = None;
         context.invalidate();
     }
 }

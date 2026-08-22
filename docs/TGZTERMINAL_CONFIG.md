@@ -660,16 +660,33 @@ Both sources are filtered before display:
   already gated by the same adapter config).
 
 ```lua
-agent_ui = {
-  section = {
-    enabled = true,      -- show the Agents section in the sidebar at all
-    refresh_ms = 500,     -- how often the disk-scanned source re-reads, clamped 100..=10000
-    show_non_interactive = false, -- also list SDK/headless/hook agent processes
-    show_activity = true, -- transcript headline, attention, branch, subagent summary
-    show_tokens = true, -- pane-reported token/cost telemetry
-  },
-}
-```
+ agent_ui = {
+   section = {
+     enabled = true,      -- show the Agents section in the sidebar at all
+     refresh_ms = 500,     -- how often the disk-scanned source re-reads, clamped 100..=10000
+     show_non_interactive = false, -- also list SDK/headless/hook agent processes
+     show_activity = true, -- transcript headline, attention, branch, subagent summary + tree
+     show_tokens = true, -- pane-reported token/cost telemetry
+     sort_attention_first = true, -- surface blocked/waiting agents at the top of the list
+   },
+ }
+ ```
+
+The section header reads `Agents · N` (or `Agents · N · M⚠` when `M` agents
+need attention). Scroll the list with the mouse wheel when it is taller than
+the section. **Left-click** the header collapses it; **right-click** toggles
+between the current-project view and `· all` (every project's agents). Click a
+row to focus its pane, or the chevron to expand it.
+
+Expanded rows show status, project root, the latest activity headline, a flat
+indented **subagent tree**, and action buttons. Available actions: `Focus`,
+`Resume` (detached sessions), `Attach`, `Logs`, `Stop`, `Log` (full-screen
+activity log overlay — press `r` to refresh, `q`/Esc to close), `Copy Id`, and
+`Transcript` (reveal the session directory in the file manager).
+
+**Keyboard navigation:** bind `ActivateAgentSection` (e.g.
+`CTRL|SHIFT|a`) to enter navigation mode; `↑`/`↓` move the cursor,
+`Enter`/`←` focus the selected agent, `Space`/`→` expand it, `Esc` exits.
 
 ### New-tab dropdown
 

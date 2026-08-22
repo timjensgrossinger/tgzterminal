@@ -30,6 +30,11 @@ struct TgzUiState {
     /// Whether the agent section in the sidebar is collapsed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     agent_section_collapsed: Option<bool>,
+
+    /// Agent section scope: `"current"` (current project only) or `"all"`
+    /// (every project's agents). `None` falls back to the current-project view.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    agent_section_view: Option<String>,
 }
 
 fn state_path() -> PathBuf {
@@ -93,6 +98,25 @@ pub fn load_agent_section_collapsed() -> Option<bool> {
 pub fn save_agent_section_collapsed(value: bool) {
     let mut state = read_state();
     state.agent_section_collapsed = Some(value);
+    write_state(&state);
+}
+
+/// Persisted agent section view scope, or `None` when unset.
+pub fn load_agent_section_view() -> Option<crate::agent_herd::HerdView> {
+    match read_state().agent_section_view.as_deref() {
+        Some("all") => Some(crate::agent_herd::HerdView::AllGrouped),
+        Some("current") => Some(crate::agent_herd::HerdView::CurrentProject),
+        _ => None,
+    }
+}
+
+/// Persist the agent section view scope. Best-effort.
+pub fn save_agent_section_view(value: crate::agent_herd::HerdView) {
+    let mut state = read_state();
+    state.agent_section_view = Some(match value {
+        crate::agent_herd::HerdView::CurrentProject => "current".to_string(),
+        crate::agent_herd::HerdView::AllGrouped => "all".to_string(),
+    });
     write_state(&state);
 }
 
@@ -198,6 +222,7 @@ mod tests {
             agent_launcher_project_root: Some(true),
             sidebar_expanded_tabs: Some(vec![0, 2]),
             agent_section_collapsed: None,
+            agent_section_view: None,
         };
         let json = serde_json::to_string_pretty(&state).unwrap();
         let parsed: TgzUiState = serde_json::from_str(&json).unwrap();
@@ -234,6 +259,7 @@ mod tests {
             agent_launcher_project_root: Some(true),
             sidebar_expanded_tabs: Some(vec![0]),
             agent_section_collapsed: None,
+            agent_section_view: None,
         });
         assert_eq!(overrides, Value::Null);
     }
