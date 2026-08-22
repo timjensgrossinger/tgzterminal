@@ -10,9 +10,7 @@ pub fn set_waiting_count(count: usize) {
     use cocoa::appkit::NSApplication;
     use cocoa::base::{id, nil};
     use cocoa::foundation::NSString;
-    use objc::msg_send;
-    use objc::sel;
-    use objc::sel_impl;
+    use objc::{msg_send, sel, sel_impl};
 
     unsafe {
         let app: id = NSApplication::sharedApplication(nil);

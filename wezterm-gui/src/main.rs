@@ -43,9 +43,9 @@ mod download;
 mod frontend;
 mod glyphcache;
 mod inputmap;
+mod macos_dock_badge;
 #[cfg(target_os = "macos")]
 mod macos_permissions;
-mod macos_dock_badge;
 mod overlay;
 mod quad;
 mod renderstate;
