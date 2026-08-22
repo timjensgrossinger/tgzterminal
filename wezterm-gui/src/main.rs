@@ -45,6 +45,7 @@ mod glyphcache;
 mod inputmap;
 #[cfg(target_os = "macos")]
 mod macos_permissions;
+mod macos_dock_badge;
 mod overlay;
 mod quad;
 mod renderstate;

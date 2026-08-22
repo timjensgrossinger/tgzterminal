@@ -1017,6 +1017,18 @@ pub struct AgentUiConfig {
     /// Duration of one pulse cycle, in milliseconds. Clamped to 400..=6000.
     #[dynamic(default = "default_agent_pulse_period_ms")]
     pub pulse_period_ms: u64,
+
+    /// Show a count badge on the macOS dock icon for the number of agents
+    /// waiting for input while the app is unfocused. Ignored on non-macOS
+    /// platforms. Default on; set false to disable.
+    #[dynamic(default = "default_true")]
+    pub dock_badge: bool,
+
+    /// Track agents that finished while the window was unfocused and never got
+    /// focus since ("exited behind your back"), keeping them in the waiting
+    /// queue with a dimmed badge until seen. Experimental.
+    #[dynamic(default = "default_true")]
+    pub track_exited_unseen: bool,
 }
 
 impl Default for AgentUiConfig {
@@ -1038,6 +1050,8 @@ impl Default for AgentUiConfig {
             trust_visible_evidence: true,
             pulse_working_dot: true,
             pulse_period_ms: default_agent_pulse_period_ms(),
+            dock_badge: true,
+            track_exited_unseen: true,
         }
     }
 }

@@ -565,6 +565,100 @@ fn agent_strip_pattern_matches(trimmed: &str, pattern: &str) -> bool {
     haystack.starts_with(&needle) && word_boundary_after(haystack.as_bytes(), needle.len())
 }
 
+/// Oldest-wait-first ordering for the waiting queue. `None` (degenerate
+/// sort key) sorts first, then by earliest entered-at instant.
+pub(crate) fn sort_waiting_queue(
+    mut queue: Vec<(PaneId, Option<Instant>)>,
+) -> Vec<(PaneId, Option<Instant>)> {
+    queue.sort_by_key(|(_, entered)| *entered);
+    queue
+}
+
+/// Waiting-queue membership from raw detection-cache entries. The active pane
+/// of a focused window is excluded (lazy acknowledge); a pane belongs when it
+/// is either waiting or exited-unseen. Empty in, empty out — which is what
+/// hides the rail chip and clears the dock badge at zero.
+pub(crate) fn build_waiting_queue<I>(
+    entries: I,
+    focused_active: Option<PaneId>,
+) -> Vec<(PaneId, Option<Instant>)>
+where
+    I: IntoIterator<Item = (PaneId, Option<Instant>, Option<Instant>)>,
+{
+    let queue: Vec<(PaneId, Option<Instant>)> = entries
+        .into_iter()
+        .filter_map(|(pane_id, waiting, unseen)| {
+            if focused_active == Some(pane_id) {
+                return None;
+            }
+            waiting.or(unseen).map(|at| (pane_id, Some(at)))
+        })
+        .collect();
+    sort_waiting_queue(queue)
+}
+
+/// Queue entry timestamp for a waiting pane: set on the first frame it shows
+/// `WaitingForInput`, kept while it stays waiting, cleared when the status
+/// moves on. A later re-prompt therefore re-enters the queue with a fresh
+/// timestamp rather than inheriting the old one. Deliberately NOT throttled —
+/// throttling applies to notification surfaces only, never to queue truth.
+pub(crate) fn next_waiting_since(
+    previous: Option<Instant>,
+    is_waiting: bool,
+    now: Instant,
+) -> Option<Instant> {
+    if is_waiting {
+        previous.or(Some(now))
+    } else {
+        None
+    }
+}
+
+/// Exited-unseen timestamp: set when a real agent identity is lost while the
+/// window is unfocused, cleared when the pane is (still) an agent or the
+/// window has focus.
+pub(crate) fn next_unseen_exited_since(
+    previous: Option<Instant>,
+    prev_was_agent: bool,
+    now_is_agent: bool,
+    window_unfocused: bool,
+    now: Instant,
+) -> Option<Instant> {
+    if prev_was_agent && !now_is_agent && window_unfocused {
+        previous.or(Some(now))
+    } else if now_is_agent || !window_unfocused {
+        None
+    } else {
+        previous
+    }
+}
+
+/// Pick the next pane for `CycleWaitingAgent` from an oldest-first queue:
+/// the entry after `current`, wrapping around; the oldest entry when
+/// `current` is not itself waiting; `None` when the queue is empty.
+pub(crate) fn cycle_waiting_target(queue: &[PaneId], current: PaneId) -> Option<PaneId> {
+    if queue.is_empty() {
+        return None;
+    }
+    match queue.iter().position(|&id| id == current) {
+        Some(pos) => Some(queue[(pos + 1) % queue.len()]),
+        None => queue.first().copied(),
+    }
+}
+
+/// Compact human-readable token count, e.g. `340K`, `1.2M`, `12.4B`.
+fn format_tokens(n: u64) -> String {
+    if n >= 1_000_000_000 {
+        format!("{:.1}B", n as f64 / 1_000_000_000.)
+    } else if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.)
+    } else if n >= 1_000 {
+        format!("{:.0}K", n as f64 / 1_000.)
+    } else {
+        n.to_string()
+    }
+}
+
 fn is_agent_transcript_chrome_line(line: &str, adapter: Option<&AgentAdapterConfig>) -> bool {
     let trimmed = line.trim();
     if trimmed.is_empty() || is_agent_separator_line(trimmed) {
@@ -2273,6 +2367,12 @@ enum AgentKind {
 }
 
 impl AgentKind {
+    /// Whether this is the catch-all `Unknown` variant (a real detected agent
+    /// kind is anything else).
+    fn is_unknown(&self) -> bool {
+        matches!(self, AgentKind::Unknown(_))
+    }
+
     fn from_adapter_id(id: &str) -> Option<Self> {
         match id {
             "claude" => Some(Self::Claude),
@@ -2877,6 +2977,15 @@ pub(crate) struct AgentDetectionCacheEntry {
     /// Consecutive detections agreeing on an adapter that is not the
     /// established one, for the identity switch hysteresis.
     pending_switch: Option<(String, u32)>,
+    /// When this pane entered the waiting queue (a `WaitingForInput`
+    /// transition). `None` otherwise. Drives the waiting-queue UX; the active
+    /// pane of a focused window is treated as acknowledged at query time, so we
+    /// never need to clear this on focus (lazy acknowledge).
+    waiting_since: Option<Instant>,
+    /// The agent identity was lost (became non-agent) while the window was
+    /// unfocused, so the user probably never saw it finish. Experimental; only
+    /// consulted when `agent_ui.track_exited_unseen` is on.
+    unseen_exited_since: Option<Instant>,
 }
 
 /// Agent identity carried over from this pane's previous detection.
@@ -4904,6 +5013,8 @@ impl crate::TermWindow {
                     detected_at: Instant::now(),
                     status_at: Instant::now(),
                     pending_switch: None,
+                    waiting_since: None,
+                    unseen_exited_since: None,
                 },
             );
             return None;
@@ -4924,6 +5035,8 @@ impl crate::TermWindow {
                     detected_at: Instant::now(),
                     status_at: Instant::now(),
                     pending_switch: None,
+                    waiting_since: None,
+                    unseen_exited_since: None,
                 },
             );
             return None;
@@ -4938,6 +5051,8 @@ impl crate::TermWindow {
                     detected_at: Instant::now(),
                     status_at: Instant::now(),
                     pending_switch: None,
+                    waiting_since: None,
+                    unseen_exited_since: None,
                 },
             );
             return None;
@@ -5032,6 +5147,44 @@ impl crate::TermWindow {
             })
             .detach();
         }
+
+        // Waiting-queue bookkeeping. `waiting_since` is set on the first frame
+        // a pane shows `WaitingForInput` and kept until the status moves on, so
+        // re-prompts after the user already looked restart the timer cleanly.
+        let is_waiting = state
+            .as_ref()
+            .map(|s| s.status == AgentStatus::WaitingForInput)
+            .unwrap_or(false);
+        let now = Instant::now();
+        let waiting_since = next_waiting_since(
+            previous_entry.as_ref().and_then(|e| e.waiting_since),
+            is_waiting,
+            now,
+        );
+        // Exited-unseen: the pane was an agent last time, is not anymore, and
+        // the window was not focused when we noticed. Experimental; off unless
+        // the user opts in.
+        let prev_was_agent = previous_entry
+            .as_ref()
+            .and_then(|e| e.state.as_ref())
+            .map(|s| !s.kind.is_unknown())
+            .unwrap_or(false);
+        let now_is_agent = state
+            .as_ref()
+            .map(|s| !s.kind.is_unknown())
+            .unwrap_or(false);
+        let unseen_exited_since = if !self.config.agent_ui.track_exited_unseen {
+            None
+        } else {
+            next_unseen_exited_since(
+                previous_entry.as_ref().and_then(|e| e.unseen_exited_since),
+                prev_was_agent,
+                now_is_agent,
+                self.focused.is_none(),
+                now,
+            )
+        };
+
         self.agent_detection_cache.borrow_mut().insert(
             pane.pane_id(),
             AgentDetectionCacheEntry {
@@ -5041,9 +5194,62 @@ impl crate::TermWindow {
                 detected_at: Instant::now(),
                 status_at,
                 pending_switch,
+                waiting_since,
+                unseen_exited_since,
             },
         );
+        // Keep the macOS dock badge live while the app is unfocused: waiting
+        // transitions can happen at any time, not just around focus changes
+        // (which is the only other place the badge is refreshed).
+        if self.config.agent_ui.dock_badge && self.focused.is_none() {
+            crate::macos_dock_badge::set_waiting_count(self.waiting_queue().len());
+        }
         state
+    }
+
+    /// Panes in the waiting queue, oldest entry first. The active pane of a
+    /// focused window is excluded: looking at it is treated as having handled
+    /// it (lazy acknowledge), so no hook is needed to clear the queue.
+    /// Returns `(pane_id, entered_at)` pairs, `entered_at` `None` only for the
+    /// degenerate sort key.
+    pub(crate) fn waiting_queue(&self) -> Vec<(PaneId, Option<Instant>)> {
+        let focused_active = if self.focused.is_some() {
+            self.get_active_pane_or_overlay().map(|p| p.pane_id())
+        } else {
+            None
+        };
+        let entries: Vec<(PaneId, Option<Instant>, Option<Instant>)> = {
+            let cache = self.agent_detection_cache.borrow();
+            cache
+                .iter()
+                .map(|(pane_id, entry)| {
+                    (*pane_id, entry.waiting_since, entry.unseen_exited_since)
+                })
+                .collect()
+        };
+        build_waiting_queue(entries, focused_active)
+    }
+
+    /// Raw queue flags for a single pane, used by the rail badge rendering.
+    /// `(waiting, unseen_exited)` — does not apply the lazy-ack exclusion.
+    pub(crate) fn pane_queue_state(&self, pane_id: PaneId) -> (bool, bool) {
+        if let Some(entry) = self.agent_detection_cache.borrow().get(&pane_id) {
+            (entry.waiting_since.is_some(), entry.unseen_exited_since.is_some())
+        } else {
+            (false, false)
+        }
+    }
+
+    /// Total agent tokens (input + output) observed across this window's panes,
+    /// for the collapsed-rail footer summary. `cost` is a free-form string and
+    /// is intentionally not summed here.
+    pub(crate) fn agent_token_total(&self) -> u64 {
+        self.agent_detection_cache
+            .borrow()
+            .values()
+            .filter_map(|entry| entry.state.as_ref())
+            .map(|state| state.input_tokens.unwrap_or(0) + state.output_tokens.unwrap_or(0))
+            .sum()
     }
 
     fn prune_agent_detection_cache(&self) {
@@ -7671,6 +7877,21 @@ impl crate::TermWindow {
                     left_pressed && tab_hovered && self.pressed_ui_item.as_ref() == Some(&tab_type);
                 let (symbol, icon_color, rail_agent) =
                     self.sidebar_compact_tab_icon(tab_idx, &title);
+                // Exited-unseen: the agent finished while this window was
+                // unfocused and was never seen. Dim the tile so it reads as
+                // "needs attention, but already done". Experimental.
+                let unseen_exited = {
+                    let mux = Mux::get();
+                    let mut unseen = false;
+                    if let Some(window) = mux.get_window(self.mux_window_id) {
+                        if let Some(tab) = window.get_by_idx(tab_idx) {
+                            if let Some(pane) = tab.get_active_pane() {
+                                unseen = self.pane_queue_state(pane.pane_id()).1;
+                            }
+                        }
+                    }
+                    unseen
+                };
                 let tab_bg = if active {
                     lerp_rgba(icon_color, surface, 0.16)
                 } else if tab_pressed {
@@ -7679,6 +7900,11 @@ impl crate::TermWindow {
                     lerp_rgba(icon_color, surface, 0.42)
                 } else {
                     lerp_rgba(icon_color, surface, 0.58)
+                };
+                let tab_bg = if unseen_exited {
+                    tab_bg.mul_alpha(0.5)
+                } else {
+                    tab_bg
                 };
                 let tab_offset = if tab_pressed { 1. } else { 0. };
                 self.sidebar_rounded_fill(
@@ -7917,6 +8143,76 @@ impl crate::TermWindow {
                 height: rail_side as usize,
                 item_type: new_tab_type,
             });
+
+            // Waiting-queue footer: a compact "● N" chip at the very bottom of
+            // the collapsed rail. Hidden when nothing waits. Clicking jumps to
+            // the oldest waiting pane (same target CycleWaitingAgent reaches).
+            if self.config.agent_ui.enabled {
+                let waiting = self.waiting_queue();
+                if !waiting.is_empty() {
+                    let counter_y = new_tab_y + rail_side + 2.;
+                    let counter_h = (top + height) - counter_y - 2.;
+                    if counter_h > 4. {
+                        let counter_type = UIItemType::SidebarWaitingCounter;
+                        let counter_hovered =
+                            hovered_item.as_ref() == Some(&counter_type);
+                        let label = format!("● {}", waiting.len());
+                        let mut counter_attrs = CellAttributes::default();
+                        counter_attrs.set_intensity(Intensity::Bold);
+                        let counter_fg = if counter_hovered {
+                            accent
+                        } else {
+                            inactive_fg.mul_alpha(0.92)
+                        };
+                        let counter_label_y =
+                            counter_y + ((counter_h - cell_height as f32).max(0.)) * 0.5;
+                        render_text(
+                            self,
+                            layers,
+                            &label,
+                            &counter_attrs,
+                            left + 4.,
+                            counter_label_y,
+                            (width as f32 - 8.).max(0.),
+                            counter_fg,
+                            surface,
+                        )?;
+                        self.ui_items.push(UIItem {
+                            x: left as usize,
+                            y: counter_y as usize,
+                            width,
+                            height: counter_h as usize,
+                            item_type: counter_type,
+                        });
+                    }
+                } else {
+                    // Nothing waiting: show a compact token total across this
+                    // window's agent panes instead, so the rail still surfaces
+                    // aggregate activity at a glance.
+                    let tokens = self.agent_token_total();
+                    if tokens > 0 {
+                        let counter_y = new_tab_y + rail_side + 2.;
+                        let counter_h = (top + height) - counter_y - 2.;
+                        if counter_h > 4. {
+                            let label = format!("Σ {}", format_tokens(tokens));
+                            let counter_label_y =
+                                counter_y + ((counter_h - cell_height as f32).max(0.)) * 0.5;
+                            let counter_fg = inactive_fg.mul_alpha(0.7);
+                            render_text(
+                                self,
+                                layers,
+                                &label,
+                                &CellAttributes::default(),
+                                left + 4.,
+                                counter_label_y,
+                                (width as f32 - 8.).max(0.),
+                                counter_fg,
+                                surface,
+                            )?;
+                        }
+                    }
+                }
+            }
 
             // No room for a side-by-side chevron on the rail, so it takes the
             // icon's bottom-right corner. Pushed after the "+" item because
@@ -11844,6 +12140,127 @@ mod tests {
     }
 
     #[test]
+    fn agent_kind_is_unknown_distinguishes_real_adapters() {
+        assert!(AgentKind::Unknown("claude".into()).is_unknown());
+        assert!(!AgentKind::Claude.is_unknown());
+        assert!(!AgentKind::OpenCode.is_unknown());
+    }
+
+    #[test]
+    fn waiting_queue_token_total_formats_units() {
+        assert_eq!(format_tokens(0), "0");
+        assert_eq!(format_tokens(999), "999");
+        assert_eq!(format_tokens(1000), "1K");
+        assert_eq!(format_tokens(1_500_000), "1.5M");
+        assert_eq!(format_tokens(2_400_000_000), "2.4B");
+    }
+
+    #[test]
+    fn waiting_queue_sorts_oldest_wait_first() {
+        let now = Instant::now();
+        let a: PaneId = 1;
+        let b: PaneId = 2;
+        let c: PaneId = 3;
+        // Deliberately out of order; the counter (c) entered most recently.
+        let queue = vec![
+            (c, Some(now)),
+            (a, Some(now - Duration::from_secs(30))),
+            (b, Some(now - Duration::from_secs(10))),
+        ];
+        let sorted = sort_waiting_queue(queue);
+        assert_eq!(sorted[0].0, a);
+        assert_eq!(sorted[1].0, b);
+        assert_eq!(sorted[2].0, c);
+    }
+
+    #[test]
+    fn waiting_since_sets_on_transition_keeps_and_restarts() {
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_secs(5);
+        // Not waiting: never a queue entry, whatever the history.
+        assert_eq!(next_waiting_since(None, false, t0), None);
+        assert_eq!(next_waiting_since(Some(t0), false, t1), None);
+        // Transition into waiting: entry stamped now.
+        assert_eq!(next_waiting_since(None, true, t0), Some(t0));
+        // Still waiting on the next frame: timestamp kept, not restamped
+        // (ordering stays stable across frames).
+        assert_eq!(next_waiting_since(Some(t0), true, t1), Some(t0));
+        // Re-prompt after the user already looked (entry cleared in between):
+        // re-enters with a fresh timestamp.
+        assert_eq!(next_waiting_since(None, true, t1), Some(t1));
+    }
+
+    #[test]
+    fn unseen_exited_requires_agent_loss_while_unfocused() {
+        let t0 = Instant::now();
+        // Agent identity lost while unfocused: flagged.
+        assert_eq!(next_unseen_exited_since(None, true, false, true, t0), Some(t0));
+        // Same, but window focused: never flagged.
+        assert_eq!(
+            next_unseen_exited_since(None, true, false, false, t0),
+            None
+        );
+        // Still an agent: cleared.
+        assert_eq!(
+            next_unseen_exited_since(Some(t0), true, true, true, t0),
+            None
+        );
+        // Focus regained before it was seen: cleared.
+        assert_eq!(
+            next_unseen_exited_since(Some(t0), true, false, false, t0),
+            None
+        );
+        // Was never an agent: no flag even while unfocused.
+        assert_eq!(next_unseen_exited_since(None, false, false, true, t0), None);
+        // Sticky while it stays a non-agent behind an unfocused window.
+        assert_eq!(
+            next_unseen_exited_since(Some(t0), false, false, true, t0),
+            Some(t0)
+        );
+    }
+
+    #[test]
+    fn cycle_waiting_target_wraps_and_falls_back_to_oldest() {
+        let a: PaneId = 1;
+        let b: PaneId = 2;
+        let c: PaneId = 3;
+        let queue = vec![a, b, c]; // oldest-first
+        assert_eq!(cycle_waiting_target(&queue, a), Some(b));
+        assert_eq!(cycle_waiting_target(&queue, b), Some(c));
+        // Wraps from the newest entry back to the oldest.
+        assert_eq!(cycle_waiting_target(&queue, c), Some(a));
+        // Current pane not itself waiting: jump to the oldest.
+        assert_eq!(cycle_waiting_target(&queue, 99), Some(a));
+        // Empty queue: nothing to do.
+        assert_eq!(cycle_waiting_target(&[], a), None);
+    }
+
+    #[test]
+    fn build_waiting_queue_lazy_ack_and_membership() {
+        let now = Instant::now();
+        let waiting: PaneId = 1;
+        let waiting_viewed: PaneId = 2;
+        let exited_unseen: PaneId = 3;
+        let idle: PaneId = 4;
+        let entries = vec![
+            (waiting, Some(now - Duration::from_secs(20)), None),
+            (waiting_viewed, Some(now - Duration::from_secs(10)), None),
+            (exited_unseen, None, Some(now - Duration::from_secs(5))),
+            (idle, None, None),
+        ];
+        // Window focused and the user is looking at `waiting_viewed`: it is
+        // acknowledged (excluded) even though it is still waiting.
+        let queue = build_waiting_queue(entries.clone(), Some(waiting_viewed));
+        assert_eq!(queue.len(), 2);
+        assert_eq!(queue[0].0, waiting); // oldest wait first
+        assert_eq!(queue[1].0, exited_unseen);
+        // Nothing queued: empty output — the rail chip hides and the dock
+        // badge clears.
+        assert!(build_waiting_queue(vec![(idle, None, None)], Some(99)).is_empty());
+        assert!(build_waiting_queue(Vec::<(PaneId, Option<Instant>, Option<Instant>)>::new(), None).is_empty());
+    }
+
+    #[test]
     fn agent_copy_payload_marks_a_clipped_window() {
         let clipped = AgentRawTranscript {
             text: "❯ hi\nthere".to_string(),
@@ -12029,6 +12446,8 @@ mod tests {
             detected_at: Instant::now(),
             status_at: Instant::now(),
             pending_switch: None,
+            waiting_since: None,
+            unseen_exited_since: None,
         }
     }
 
@@ -12045,6 +12464,8 @@ mod tests {
             detected_at,
             status_at: detected_at,
             pending_switch: None,
+            waiting_since: None,
+            unseen_exited_since: None,
         }
     }
 

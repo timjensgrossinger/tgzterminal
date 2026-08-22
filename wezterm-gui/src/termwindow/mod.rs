@@ -261,6 +261,9 @@ pub enum UIItemType {
     /// tell the vertical sidebar apart from the horizontal top tab bar and
     /// emit surface-appropriate menu labels (Above/Below vs Left/Right).
     SidebarCloseTab(usize),
+    /// Footer chip in the collapsed sidebar rail showing the waiting-agent
+    /// count; clicking it jumps to the oldest waiting pane.
+    SidebarWaitingCounter,
     /// A row in the right-click close-tab submenu.
     CloseTabMenuItem {
         source: CloseTabSource,
@@ -1026,6 +1029,13 @@ impl TermWindow {
 
         if let Some(pane) = self.get_active_pane_or_overlay() {
             pane.focus_changed(focused);
+        }
+
+        // macOS dock badge: surface the waiting-agent count while the app is
+        // unfocused. Other platforms ignore it. Only meaningful when enabled.
+        if self.config.agent_ui.dock_badge {
+            let count = if focused { 0 } else { self.waiting_queue().len() };
+            crate::macos_dock_badge::set_waiting_count(count);
         }
 
         self.update_title();
@@ -2713,6 +2723,44 @@ impl TermWindow {
         }
 
         Ok(())
+    }
+
+    fn activate_pane_by_id(&mut self, pane_id: PaneId) -> anyhow::Result<bool> {
+        let target_tab = {
+            let mux = Mux::get();
+            let window = mux
+                .get_window(self.mux_window_id)
+                .ok_or_else(|| anyhow!("no such window"))?;
+            let mut found = None;
+            for tab_idx in 0..window.len() {
+                if let Some(tab) = window.get_by_idx(tab_idx) {
+                    if let Some(pane) = tab.get_active_pane() {
+                        if pane.pane_id() == pane_id {
+                            found = Some(tab_idx);
+                            break;
+                        }
+                    }
+                }
+            }
+            found
+        };
+        let Some(tab_idx) = target_tab else {
+            return Ok(false);
+        };
+        let mux = Mux::get();
+        let mut window = mux
+            .get_window_mut(self.mux_window_id)
+            .ok_or_else(|| anyhow!("no such window"))?;
+        if tab_idx != window.get_active_idx() {
+            window.save_and_then_set_active(tab_idx);
+        }
+        drop(window);
+        if let Some(pane) = self.get_active_pane_or_overlay() {
+            pane.focus_changed(true);
+        }
+        self.update_title();
+        self.update_scrollbar();
+        Ok(true)
     }
 
     fn activate_tab(&mut self, tab_idx: isize) -> anyhow::Result<()> {
@@ -4898,6 +4946,15 @@ done
             PromptInputLine(args) => self.show_prompt_input_line(args),
             InputSelector(args) => self.show_input_selector(args),
             Confirmation(args) => self.show_confirmation(args),
+            CycleWaitingAgent => {
+                let queue: Vec<PaneId> =
+                    self.waiting_queue().into_iter().map(|(id, _)| id).collect();
+                if let Some(target) =
+                    render::sidebar::cycle_waiting_target(&queue, pane.pane_id())
+                {
+                    self.activate_pane_by_id(target)?;
+                }
+            }
         };
         Ok(PerformAssignmentResult::Handled)
     }

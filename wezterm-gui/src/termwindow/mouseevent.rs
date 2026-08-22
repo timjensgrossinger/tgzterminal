@@ -76,6 +76,7 @@ impl super::TermWindow {
             | UIItemType::SidebarSshMenuItem { .. }
             | UIItemType::AgentToolbeltButton { .. }
             | UIItemType::AgentCopyMenuItem { .. }
+            | UIItemType::SidebarWaitingCounter
             | UIItemType::AboveScrollThumb
             | UIItemType::BelowScrollThumb
             | UIItemType::ScrollThumb
@@ -118,6 +119,7 @@ impl super::TermWindow {
             | UIItemType::SidebarSshMenuItem { .. }
             | UIItemType::AgentToolbeltButton { .. }
             | UIItemType::AgentCopyMenuItem { .. }
+            | UIItemType::SidebarWaitingCounter
             | UIItemType::AboveScrollThumb
             | UIItemType::BelowScrollThumb
             | UIItemType::ScrollThumb
@@ -706,6 +708,9 @@ impl super::TermWindow {
             UIItemType::SidebarSshMenuItem { domain_name } => {
                 self.mouse_event_sidebar_ssh_menu_item(domain_name, event, context);
             }
+            UIItemType::SidebarWaitingCounter => {
+                self.mouse_event_sidebar_waiting_counter(event, context);
+            }
             UIItemType::AgentToolbeltButton { pane_id, action } => {
                 self.mouse_event_agent_toolbelt_button(pane_id, action, event, context);
             }
@@ -997,6 +1002,24 @@ impl super::TermWindow {
             self.ssh_launch_menu = None;
             self.pressed_ui_item = None;
             self.spawn_ssh_quick_launch_entry(&domain_name);
+        }
+        context.invalidate();
+    }
+
+    /// Waiting-queue footer chip: a left-click jumps to the oldest waiting
+    /// agent pane, exactly like `CycleWaitingAgent` does. Focusing it acts as
+    /// the acknowledge that drops it from the queue.
+    fn mouse_event_sidebar_waiting_counter(
+        &mut self,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        if event.kind == WMEK::Release(MousePress::Left) {
+            self.pressed_ui_item = None;
+            let oldest = self.waiting_queue().into_iter().next().map(|(id, _)| id);
+            if let Some(target) = oldest {
+                let _ = self.activate_pane_by_id(target);
+            }
         }
         context.invalidate();
     }

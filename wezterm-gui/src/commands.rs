@@ -824,6 +824,16 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             menubar: &[],
             icon: None,
         },
+        CycleWaitingAgent => CommandDef {
+            brief: "Cycle to next waiting agent".into(),
+            doc: "Jumps to the oldest agent pane waiting for input in this window, \
+                  wrapping around. Focusing a waiting pane acknowledges it."
+                .into(),
+            keys: vec![(Modifiers::SUPER.union(Modifiers::SHIFT), "j".into())],
+            args: &[ArgType::ActivePane],
+            menubar: &[],
+            icon: Some("md_notifications_active"),
+        },
         PromptInputLine(_) => CommandDef {
             brief: "Prompt the user for a line of text".into(),
             doc: "Activates the prompt overlay and wait for input".into(),

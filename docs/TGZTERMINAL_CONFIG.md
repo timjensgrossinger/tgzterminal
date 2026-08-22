@@ -283,6 +283,8 @@ vendor-neutral agent.
 | `trust_visible_evidence` | bool | `true` | Whether multi-signal visible-text evidence counts as trusted for control actions. |
 | `pulse_working_dot` | bool | `true` | Pulse the status dot while an agent is Running/Streaming. |
 | `pulse_period_ms` | int | `1600` | One pulse cycle. Clamped to `400..=6000`. |
+| `dock_badge` | bool | `true` | Show a count badge on the macOS dock icon for agents waiting for input while the app is unfocused. Ignored on non-macOS platforms. |
+| `track_exited_unseen` | bool | `true` | Keep agents that finished while the window was unfocused in the waiting queue with a dimmed badge until seen. **Experimental**: relies on detecting the loss of agent identity, which is less reliable than the `WaitingForInput` signal. |
 
 Each adapter accepts `enabled`, `label`, `short_label`, `color`,
 `process_names`, `title_patterns`, `visible_patterns`, `running_patterns`,
@@ -324,6 +326,40 @@ Non-Claude local session or state paths are shown as `Details` in the toolbelt.
 
 `waiting_notification` enables a throttled local toast when an agent appears to
 be waiting for input.
+
+### Waiting-queue UX
+
+Turning "which agent needs me?" into an inbox workflow. When a pane's inferred
+status becomes `WaitingForInput`, it joins the waiting queue; an agent that
+finished while the window was unfocused and never regained focus also joins
+(with a dimmed badge) when `track_exited_unseen` is on.
+
+Surfaces:
+
+- **Collapsed rail chip** — a `● N` footer at the bottom of the sidebar rail
+  while anything waits. Clicking it jumps to the oldest waiting pane. When
+  nothing waits, the same chip shows a compact token total (`Σ 1.2M`) across
+  this window's agent panes instead.
+- **macOS dock badge** — `agent_ui.dock_badge` shows the waiting count on the
+  dock icon while the app is unfocused. No-op elsewhere.
+- **Rail badges** — waiting panes keep the amber attention dot; exited-unseen
+  panes render dimmed.
+
+Acknowledge is lazy: focusing a waiting pane (or clicking its rail row) drops it
+from the queue immediately, even before the agent's status changes. Re-prompts
+after you have looked restart the timer cleanly.
+
+The default key assignment is:
+
+```lua
+config.keys = {
+  { key = "j", mods = "CMD|SHIFT", action = "CycleWaitingAgent" },
+}
+```
+
+`CycleWaitingAgent` jumps to the next waiting pane in the **current window**,
+ordered oldest-wait-first and wrapping around. The command palette exposes the
+same action under "Cycle to next waiting agent".
 
 ### How an agent is identified
 

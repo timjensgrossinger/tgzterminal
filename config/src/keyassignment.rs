@@ -652,6 +652,10 @@ pub enum KeyAssignment {
     PromptInputLine(PromptInputLine),
     InputSelector(InputSelector),
     Confirmation(Confirmation),
+    /// Cycle to the next agent pane waiting for input, oldest wait first.
+    /// Scoped to the current window; focusing a waiting pane acknowledges it
+    /// and removes it from the queue.
+    CycleWaitingAgent,
 }
 impl_lua_conversion_dynamic!(KeyAssignment);
 
