@@ -27,6 +27,11 @@ use termwiz::surface::Line;
 use wezterm_dynamic::ToDynamic;
 use wezterm_open_url::open_url;
 use wezterm_term::input::{MouseButton, MouseEventKind as TMEK};
+
+/// Resolve the user's home directory for vendor path helpers.
+fn dirs_home() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME").map(std::path::PathBuf::from)
+}
 use wezterm_term::{ClickPosition, KeyCode, KeyModifiers, LastMouseClick, StableRowIndex};
 
 impl super::TermWindow {
@@ -2311,6 +2316,7 @@ impl super::TermWindow {
 
     pub(crate) fn focus_herd_agent(&mut self, agent: &crate::agent_herd::HerdAgent) {
         let Some(pane_id) = agent.pane_id else {
+            self.set_agent_feedback("Agent pane not found");
             return;
         };
         // The sidebar path also activates the containing tab and refreshes the
@@ -2319,6 +2325,7 @@ impl super::TermWindow {
             return;
         }
         if let Err(err) = Mux::get().focus_pane_and_containing_tab(pane_id) {
+            self.set_agent_feedback(format!("Could not focus agent: {err}"));
             log::warn!("could not focus agent pane {pane_id}: {err:#}");
         }
     }
@@ -2348,8 +2355,32 @@ impl super::TermWindow {
                 }
             }
             AgentRowAction::Transcript => {
-                if let Some(cwd) = agent.cwd.as_ref() {
-                    let _ = open_url(&format!("file://{}", cwd.display()));
+                match agent.provider.as_str() {
+                    // OpenCode keeps every session in one opencode.db with no
+                    // per-session file; the Log overlay reads it live instead.
+                    "opencode" => self.show_agent_log(agent.clone()),
+                    // Claude has a real per-session transcript file: reveal it.
+                    "claude" => {
+                        if let (Some(cwd), Some(session_id)) =
+                            (agent.cwd.as_ref(), agent.session_id.as_deref())
+                        {
+                            if let Some(home) = dirs_home() {
+                                if let Some(path) = crate::agent_herd::claude::session_transcript_path(
+                                    &home, cwd, session_id,
+                                ) {
+                                    let _ = open_url(&format!("file://{}", path.display()));
+                                } else {
+                                    self.set_agent_feedback("Transcript not found");
+                                }
+                            }
+                        }
+                    }
+                    // Anything else: fall back to the working directory.
+                    _ => {
+                        if let Some(cwd) = agent.cwd.as_ref() {
+                            let _ = open_url(&format!("file://{}", cwd.display()));
+                        }
+                    }
                 }
             }
             AgentRowAction::Focus => self.focus_herd_agent(&agent),
@@ -2358,7 +2389,25 @@ impl super::TermWindow {
                 let cwd = agent.cwd.clone();
                 match (session_id.is_empty(), cwd) {
                     (false, Some(cwd)) => {
+                        // Capture the highest pane id in existence now, so the
+                        // bind we record targets only the pane the resume spawns
+                        // (OpenCode reports no cwd, so the cwd bind can't fire).
+                        let floor = Mux::get()
+                            .iter_panes()
+                            .iter()
+                            .map(|p| p.pane_id())
+                            .max()
+                            .unwrap_or(0) as u64;
+                        self.agent_resume_binds.borrow_mut().push((
+                            session_id.clone(),
+                            agent.provider.clone(),
+                            floor,
+                            Instant::now() + Duration::from_secs(30),
+                        ));
                         self.resume_agent_session_by_id(&agent.provider, &session_id, cwd, None);
+                        // Force a re-scan so the new pane binds to the agent
+                        // and the Resume button flips to Focus.
+                        self.agent_herd_scan_pending = true;
                     }
                     // Without both an id and a directory the resume command
                     // cannot be built; saying so beats spawning something wrong.

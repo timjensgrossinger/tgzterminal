@@ -5482,7 +5482,7 @@ impl crate::TermWindow {
         agent_copy_toast_message(action, payload)
     }
 
-    fn set_agent_feedback(&self, message: impl Into<String>) {
+    pub(crate) fn set_agent_feedback(&self, message: impl Into<String>) {
         self.agent_herd_state.borrow_mut().feedback = Some((message.into(), Instant::now()));
     }
 
@@ -7009,12 +7009,23 @@ impl crate::TermWindow {
         }
 
         // The session labels are prose, not one-word commands, so the submenu
-        // needs a wider panel than the launch rows do.
+        // needs a wider panel than the launch rows do. Fit the panel to the
+        // longest label so nothing is truncated.
+        let cell_w = self.render_metrics.cell_size.width as f32;
+        let dpi = (self.dimensions.dpi as f32 / 96.0).clamp(1.0, 2.5);
+        let longest_cols = rows
+            .iter()
+            .map(|row| unicode_column_width(&row.label, None))
+            .max()
+            .unwrap_or(0);
+        // insets from paint_sidebar_dropdown: row_text_inset (12) + chevron + pad.
+        let needed_cols = (longest_cols as f32 * cell_w + 64.0 * dpi) / dpi;
         let menu_w = if resume_expanded {
             AGENT_RESUME_MENU_W
         } else {
             AGENT_LAUNCH_MENU_W
-        };
+        }
+        .max(needed_cols);
         self.paint_sidebar_dropdown(layers, menu.x as f32, menu.y as f32, menu_w, false, &rows)
     }
 
@@ -9435,7 +9446,12 @@ impl crate::TermWindow {
             })
             .unwrap_or_default();
 
-        let agents = crate::agent_herd::join_sessions_with_panes(sessions, panes);
+        let mut agents = crate::agent_herd::join_sessions_with_panes(sessions, panes);
+        // Apply pending resume bindings. OpenCode panes report no cwd, so the
+        // join above leaves resumed sessions detached; match each to the first
+        // still-unclaimed pane whose provider matches and whose id is above the
+        // floor captured when resume was clicked.
+        self.apply_resume_binds(&mut agents);
         // Before project scoping: the snapshot is about this window, not about
         // whatever project the active pane happens to sit in.
         self.record_agent_window_sessions(&agents);
@@ -9466,6 +9482,62 @@ impl crate::TermWindow {
         // from stranding the view past the end.
         if state.scroll_offset > state.agents.len() {
             state.scroll_offset = state.agents.len();
+        }
+    }
+
+    /// Match still-detached resumed sessions to the panes they spawned.
+    ///
+    /// See `agent_resume_binds`. A bind is spent once it claims a pane; stale
+    /// binds (older than their 30s expiry) are dropped so a long-dead resume
+    /// click cannot later kidnap an unrelated pane.
+    fn apply_resume_binds(&self, agents: &mut [crate::agent_herd::HerdAgent]) {
+        let mut binds = self.agent_resume_binds.borrow_mut();
+        binds.retain(|(_, _, _, expiry)| *expiry > Instant::now());
+        if binds.is_empty() {
+            return;
+        }
+        let mux = Mux::get();
+        let claimed: Vec<PaneId> = agents
+            .iter()
+            .filter_map(|agent| agent.pane_id)
+            .collect();
+        for (session_id, provider, floor, _) in binds.iter() {
+            // The resumed agent is detached and carries this session id.
+            let Some(agent) = agents
+                .iter_mut()
+                .find(|a| a.session_id.as_deref() == Some(session_id) && a.pane_id.is_none())
+            else {
+                continue;
+            };
+            // First pane with a matching provider and an id above the floor
+            // that is not already bound to some other agent.
+            let target = mux
+                .iter_panes()
+                .into_iter()
+                .find(|pane| {
+                    let id = pane.pane_id();
+                    if id <= *floor as usize {
+                        return false;
+                    }
+                    if claimed.contains(&id) {
+                        return false;
+                    }
+                    let pane_provider = pane
+                        .copy_user_vars()
+                        .get("agent.adapter")
+                        .cloned()
+                        .or_else(|| {
+                            pane.get_foreground_process_name(CachePolicy::AllowStale)
+                        });
+                    match pane_provider.as_deref() {
+                        None => false,
+                        Some(p) => p == provider,
+                    }
+                });
+            if let Some(pane) = target {
+                agent.pane_id = Some(pane.pane_id());
+                agent.status = crate::agent_herd::HerdStatus::Working;
+            }
         }
     }
 
@@ -10265,35 +10337,75 @@ impl crate::TermWindow {
                 if let Some(agent) = agents.iter().find(|a| a.key() == menu_key) {
                     let actions = agent_row_actions(agent, self.config.agent_ui.show_stop);
                     if !actions.is_empty() {
-                        let menu_w = (section_w - pad * 2.0).max(0.);
+                        // Widen the menu to fit the longest label so nothing is
+                        // silently truncated; cap at the section width.
+                        let max_label_cols = actions
+                            .iter()
+                            .map(|a| unicode_column_width(a.label(), None))
+                            .max()
+                            .unwrap_or(0);
+                        let min_menu_w =
+                            max_label_cols as f32 * cell_w + 24.0 * dpi;
+                        let menu_w = (section_w - pad * 2.0)
+                            .max(min_menu_w)
+                            .min(section_w);
                         let row_h = cell_h + 4.0 * dpi;
                         let menu_h = actions.len() as f32 * row_h + pad * 2.0;
                         let menu_x = section_x + pad;
                         let menu_y = (header_y + header_h + pad).min(section_bottom - menu_h);
+                        // Single panel colour (no per-row stripe), so the menu
+                        // reads as one unit rather than alternating shades.
+                        let menu_bg = lerp_rgba(bg, fg, 0.10);
+                        let hover_bg = lerp_rgba(bg, fg, 0.20);
+                        let pressed_bg = lerp_rgba(bg, fg, 0.28);
+                        let left_pressed = self.current_mouse_buttons.contains(&MousePress::Left);
+                        let hovered_item = self
+                            .last_ui_item
+                            .as_ref()
+                            .map(|item| item.item_type.clone());
                         self.filled_rectangle(
                             layers,
                             1,
                             euclid::rect(menu_x, menu_y, menu_w, menu_h),
-                            lerp_rgba(bg, fg, 0.10),
+                            menu_bg,
                         )?;
                         let mut by = menu_y + pad;
                         for action in actions {
+                            let action_type = UIItemType::SidebarAgentAction {
+                                key: menu_key.clone(),
+                                action,
+                            };
+                            let hovered = hovered_item.as_ref() == Some(&action_type);
+                            let pressed = hovered
+                                && left_pressed
+                                && self.pressed_ui_item.as_ref() == Some(&action_type);
+                            let row_bg = if pressed {
+                                pressed_bg
+                            } else if hovered {
+                                hover_bg
+                            } else {
+                                menu_bg
+                            };
                             let label = action.label();
                             let label_cols = unicode_column_width(label, None);
+                            let available_cols =
+                                ((menu_w - 24.0 * dpi) / cell_w).max(0.0) as usize;
+                            let display_label =
+                                truncate_with_ellipsis(label, available_cols);
                             self.filled_rectangle(
                                 layers,
                                 1,
                                 euclid::rect(menu_x, by, menu_w, row_h),
-                                lerp_rgba(bg, fg, 0.06),
+                                row_bg,
                             )?;
                             self.paint_text(
                                 layers,
-                                label,
+                                &display_label,
                                 menu_x + 8.0 * dpi,
                                 by + (row_h - cell_h) * 0.5,
                                 label_cols as f32 * cell_w,
                                 fg,
-                                lerp_rgba(bg, fg, 0.06),
+                                row_bg,
                                 false,
                             )?;
                             self.ui_items.push(UIItem {
@@ -10301,10 +10413,7 @@ impl crate::TermWindow {
                                 y: by as usize,
                                 width: menu_w as usize,
                                 height: row_h as usize,
-                                item_type: UIItemType::SidebarAgentAction {
-                                    key: menu_key.clone(),
-                                    action,
-                                },
+                                item_type: action_type,
                             });
                             by += row_h;
                         }

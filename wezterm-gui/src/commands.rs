@@ -2193,6 +2193,7 @@ fn compute_default_actions() -> Vec<KeyAssignment> {
         ActivateLastTab,
         ShowLauncher,
         ShowTabNavigator,
+        ActivateAgentSection,
         // ----------------- Help
         OpenUri("https://wezterm.org/".to_string()),
         OpenUri("https://github.com/wezterm/wezterm/discussions/".to_string()),

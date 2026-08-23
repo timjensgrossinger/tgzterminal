@@ -191,10 +191,27 @@ fn collect_database_sessions(home: &Path) -> Vec<VendorSession> {
         }
         let updated_at = epoch_millis(updated)?;
         let age = now.duration_since(updated_at).ok()?;
-        let status = if age <= OPENCODE_WORKING_WINDOW {
-            HerdStatus::Working
-        } else {
-            HerdStatus::Idle
+        // Derive status from the most recent part the session actually wrote,
+        // not from the row's `time_updated` (which the UI touches on open):
+        //   - newest part is a tool call  -> the agent is mid-action
+        //   - newest part is text/reasoning/step-finish -> it has stopped
+        // A session with no parts at all is just the start screen: idle.
+        let last_part_type = conn
+            .query_row(
+                "SELECT json_extract(data, '$.type') \
+                 FROM part WHERE session_id = ?1 \
+                 ORDER BY time_created DESC LIMIT 1",
+                [&session_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .flatten();
+        let status = match last_part_type.as_deref() {
+            None => HerdStatus::Idle,
+            Some("tool") | Some("reasoning") if age <= OPENCODE_WORKING_WINDOW => {
+                HerdStatus::Working
+            }
+            _ => HerdStatus::Idle,
         };
         let name = title.as_deref().and_then(clean_title);
         let model = model.and_then(|raw| model_label(&raw));
@@ -309,6 +326,23 @@ fn opencode_activity(conn: &Connection, session_id: &str) -> Option<HerdActivity
                     parent_id: None,
                 });
             }
+            "reasoning" => {
+                let Some(text) = value.get("text").and_then(|text| text.as_str()) else {
+                    continue;
+                };
+                if text.trim().is_empty() {
+                    continue;
+                }
+                events.push(HerdEvent {
+                    at: Some(at),
+                    kind: HerdEventKind::Thinking,
+                    content: HerdContent::SingleLine(
+                        text.split_whitespace().collect::<Vec<_>>().join(" "),
+                    ),
+                    tool_use_id: None,
+                    parent_id: None,
+                });
+            }
             _ => {}
         }
     }
@@ -329,6 +363,101 @@ fn opencode_activity(conn: &Connection, session_id: &str) -> Option<HerdActivity
         subagent_tree: Vec::new(),
     })
 }
+
+/// Re-read a live OpenCode session's activity for the agent log overlay.
+pub fn read_session_activity(session_id: &str, max_events: usize) -> Option<HerdActivity> {
+    let home = dirs_home()?;
+    let db = opencode_db(&home);
+    if !db.is_file() {
+        return None;
+    }
+    let Ok(conn) = Connection::open_with_flags(
+        db,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_URI,
+    ) else {
+        return None;
+    };
+    let mut activity = opencode_activity(&conn, session_id)?;
+    // The overlay wants a deep history; the detection path keeps a shallow 8.
+    if max_events > activity.recent.len() {
+        if let Some(ev) = opencode_all_events(&conn, session_id, max_events) {
+            activity.recent = ev;
+            activity.current = activity
+                .recent
+                .last()
+                .filter(|e| e.kind == HerdEventKind::Tool)
+                .cloned();
+        }
+    }
+    Some(activity)
+}
+
+fn opencode_all_events(conn: &Connection, session_id: &str, max_events: usize) -> Option<Vec<HerdEvent>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT data, time_created FROM part \
+             WHERE session_id = ?1 ORDER BY time_created DESC, id DESC LIMIT 256",
+        )
+        .ok()?;
+    let rows = stmt
+        .query_map([session_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .ok()?;
+    let mut events = Vec::new();
+    for row in rows.flatten() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&row.0) else {
+            continue;
+        };
+        let Some(kind) = value.get("type").and_then(|kind| kind.as_str()) else {
+            continue;
+        };
+        let Some(at) = epoch_millis(row.1) else {
+            continue;
+        };
+        let mapped = match kind {
+            "tool" => Some(HerdEvent {
+                at: Some(at),
+                kind: HerdEventKind::Tool,
+                content: HerdContent::SingleLine(
+                    value
+                        .get("tool")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("tool")
+                        .to_string(),
+                ),
+                tool_use_id: None,
+                parent_id: None,
+            }),
+            "text" if !value.get("text").and_then(|t| t.as_str()).unwrap_or("").trim().is_empty() => {
+                Some(HerdEvent {
+                    at: Some(at),
+                    kind: HerdEventKind::Assistant,
+                    content: HerdContent::SingleLine(
+                        value
+                            .get("text")
+                            .and_then(|t| t.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                    ),
+                    tool_use_id: None,
+                    parent_id: None,
+                })
+            }
+            _ => None,
+        };
+        if let Some(ev) = mapped {
+            events.push(ev);
+        }
+    }
+    events.reverse();
+    Some(events.into_iter().take(max_events).collect())
+}
+
+fn dirs_home() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
 
 fn clean_title(title: &str) -> Option<String> {
     let title = title.trim();
@@ -425,6 +554,56 @@ mod tests {
                 .map(|event| event.display_text()),
             Some("opencode-mem {\"query\":\"sidebar fixes\"}".to_string())
         );
+    }
+
+    #[test]
+    fn a_start_screen_session_is_idle_not_working() {
+        // A session that was opened but only wrote a step-finish (no tool/text
+        // activity) must not read as Working — that is what made the OpenCode
+        // start screen show a fake Stop button.
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join(".local/share/opencode/opencode.db");
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session (
+                id TEXT PRIMARY KEY, project_id TEXT NOT NULL,
+                parent_id TEXT, directory TEXT NOT NULL, title TEXT NOT NULL,
+                model TEXT, cost REAL NOT NULL, tokens_input INTEGER NOT NULL,
+                tokens_output INTEGER NOT NULL, time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL, time_archived INTEGER
+            );
+            CREATE TABLE part (
+                id TEXT PRIMARY KEY, message_id TEXT NOT NULL,
+                session_id TEXT NOT NULL, time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL, data TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        conn.execute(
+            "INSERT INTO session (id, project_id, directory, title, model, cost,
+                 tokens_input, tokens_output, time_created, time_updated)
+             VALUES (?1, 'project', '/repo', 'New session - x', NULL, 0, 0, 0, ?2, ?2)",
+            rusqlite::params!["session-start", now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO part (id, message_id, session_id, time_created,
+             time_updated, data)
+             VALUES ('p1', 'm1', 'session-start', ?1, ?1,
+                     '{\"type\":\"step-finish\",\"reason\":\"stop\"}')",
+            rusqlite::params![now],
+        )
+        .unwrap();
+        drop(conn);
+
+        let sessions = OpenCodeDetector.collect_sessions(temp.path());
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].status, HerdStatus::Idle);
     }
 
     #[test]

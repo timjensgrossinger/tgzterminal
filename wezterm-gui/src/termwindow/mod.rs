@@ -845,6 +845,12 @@ pub struct TermWindow {
     /// Vendor session scan result. Filesystem work runs off the GUI thread.
     agent_herd_session_cache: Option<(Instant, Arc<Vec<crate::agent_herd::vendor::VendorSession>>)>,
     agent_herd_scan_pending: bool,
+    /// Pending resume bindings: (session_id, adapter_id, pane_id_floor, expiry).
+    /// When a resume command spawns a new pane, OpenCode does not emit OSC 7 so
+    /// its cwd is unknown and the cwd-based bind cannot fire; instead we bind the
+    /// resumed session to the first still-unclaimed pane whose provider matches
+    /// and whose id is higher than the floor captured at click time.
+    agent_resume_binds: RefCell<Vec<(String, String, u64, Instant)>>,
     adapter_cache: RefCell<Option<(usize, Arc<Vec<(String, AgentAdapterConfig)>>)>>,
     /// Installed-agent launcher entries, rebuilt only when the config
     /// generation changes. Building probes `$PATH`, so this must never be
@@ -1272,6 +1278,7 @@ impl TermWindow {
             }),
             agent_herd_session_cache: None,
             agent_herd_scan_pending: false,
+            agent_resume_binds: RefCell::new(Vec::new()),
             adapter_cache: RefCell::new(None),
             launcher_cache: RefCell::new(None),
             ssh_launcher_cache: RefCell::new(None),

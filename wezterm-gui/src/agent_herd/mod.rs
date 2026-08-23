@@ -715,6 +715,10 @@ fn bind_by_cwd(
                 None => true,
                 Some(provider) => provider == session.vendor.adapter_id(),
             }
+            // Only bind when cwd is non-empty — an empty cwd is a sentinel,
+            // not a real match, and would wrongly collapse every session onto
+            // the first pane with no cwd.
+            && !session.cwd.as_os_str().is_empty()
     });
     let first = candidates.next()?;
     // Ambiguous: refuse to guess rather than aim Stop at the wrong pane.
