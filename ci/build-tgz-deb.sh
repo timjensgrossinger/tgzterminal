@@ -45,6 +45,7 @@ ln -s tgzterminal "$root/usr/bin/wezterm"
 
 cat > "$root/usr/bin/open-tgzterminal-here" <<'EOF'
 #!/bin/sh
+set -euo pipefail
 exec tgzterminal start --cwd "$PWD" -- "$@"
 EOF
 chmod 0755 "$root/usr/bin/open-tgzterminal-here"
@@ -85,6 +86,7 @@ EOF
 chmod 0755 "$root/DEBIAN/prerm"
 
 desktop="$root/usr/share/applications/org.tgzterminal.TGZTerminal.desktop"
+mkdir -p "$(dirname "$desktop")"
 sed \
     -e 's/^Name=WezTerm$/Name=TGZTerminal/' \
     -e 's/org\.wezfurlong\.wezterm/org.tgzterminal.TGZTerminal/g' \
