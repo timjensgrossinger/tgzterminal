@@ -4,6 +4,7 @@ use crate::agent_herd::{
     group_by_project, HerdActivity, HerdAgent, HerdContent, HerdEvent, HerdEventKind, HerdStatus,
     HerdView, PaneAgentRow,
 };
+use crate::colorease::ColorEase;
 use crate::quad::TripleLayerQuadAllocator;
 use crate::spawn::SpawnWhere;
 use crate::tabbar::TabBarItem;
@@ -20,8 +21,9 @@ use crate::termwindow::{
 };
 use config::keyassignment::{SpawnCommand, SpawnTabDomain};
 use config::{
-    default_agent_adapters, AgentAdapterConfig, AgentLaunchTarget, AgentRemoteBehavior,
-    AgentSplitDirection, AgentTelemetryField, AgentToolbeltPosition, ConfigHandle, SidebarPosition,
+    default_agent_adapters, dim_srgb, AgentAdapterConfig, AgentAnimationColors, AgentLaunchTarget,
+    AgentRemoteBehavior, AgentRingColors, AgentSplitDirection, AgentTelemetryField,
+    AgentToolbeltPosition, AgentUiConfig, ConfigHandle, EasingFunction, SidebarPosition,
     SidebarTabDensity, SidebarTabMetadata, SidebarTabTitleSource, TabBarColors,
 };
 use finl_unicode::grapheme_clusters::Graphemes;
@@ -56,7 +58,10 @@ const PANE_ROW_INDENT: f32 = 14.;
 const CHEVRON_GAP: f32 = 4.;
 const ACTION_ICON_W: f32 = 16.;
 const ACTION_ICON_GAP: f32 = 8.;
-const RADIUS: f32 = 7.;
+const RADIUS: f32 = 10.;
+/// Corner radius of the working-agent throbber ring. One step outside
+/// [`RADIUS`] so the ring reads as sitting around the row rather than on it.
+const RING_RADIUS: f32 = 11.;
 const CLOSE_ZONE_W: f32 = 34.;
 /// Gap between the close `×` glyph and the right edge of its zone. The text
 /// reserve is derived from it in `sidebar_close_text_reserve`.
@@ -193,6 +198,194 @@ fn lerp_rgba(a: LinearRgba, b: LinearRgba, t: f32) -> LinearRgba {
     )
 }
 
+/// The two rotating stops of the agent ring plus the hairline it settles into,
+/// resolved from `agent_ui.ring_colors` and `agent_ui.animations.colors`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct RingColors {
+    /// Warm end of the pair.
+    a: LinearRgba,
+    /// Cool end of the pair.
+    b: LinearRgba,
+    /// Settled/resolved hairline: `b` at 55% brightness.
+    done: LinearRgba,
+    /// Standing outline on a row whose agent is blocked on the user.
+    waiting: LinearRgba,
+    /// Colour a working status dot breathes in.
+    pulse: LinearRgba,
+}
+
+impl RingColors {
+    /// Preset stops with `agent_ui.animations.colors` layered over them.
+    ///
+    /// An unset `resolve` stays *derived*: 55% of whatever the cool end ended
+    /// up being, in sRGB bytes, so overriding `ring_b` alone moves the settled
+    /// hairline with it instead of leaving it on the old preset's hue — and so
+    /// an untouched config lands on exactly `preset.settled_stop()`.
+    fn resolve(preset: AgentRingColors, overrides: &AgentAnimationColors) -> Self {
+        let ((ar, ag, ab), (br, bg, bb)) = preset.stops();
+        let (br, bg, bb) = match overrides.ring_b {
+            Some(color) => {
+                let (r, g, b, _) = color.to_srgb_u8();
+                (r, g, b)
+            }
+            None => (br, bg, bb),
+        };
+        let a = match overrides.ring_a {
+            Some(color) => color.to_linear(),
+            None => srgb8_to_linear(ar, ag, ab),
+        };
+        Self {
+            a,
+            b: srgb8_to_linear(br, bg, bb),
+            done: match overrides.resolve {
+                Some(color) => color.to_linear(),
+                None => srgb8_to_linear(dim_srgb(br), dim_srgb(bg), dim_srgb(bb)),
+            },
+            waiting: overrides
+                .waiting_glow
+                .map(|color| color.to_linear())
+                .unwrap_or(a),
+            pulse: overrides
+                .dot_pulse
+                .map(|color| color.to_linear())
+                .unwrap_or(a),
+        }
+    }
+}
+
+/// Which sidebar animations may run, resolved from `agent_ui`.
+///
+/// Kept as a plain value rather than a set of `TermWindow` predicates so the
+/// whole gating surface — including the `pulse_working_dot` back-compat rule —
+/// can be tested without a window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SidebarAnimationGates {
+    working_ring: bool,
+    resolve_ripple: bool,
+    waiting_glow: bool,
+    agent_enter: bool,
+    rail_breathe: bool,
+    dot_pulse: bool,
+    /// Keep asking for frames while the window is unfocused.
+    unfocused: bool,
+}
+
+impl SidebarAnimationGates {
+    fn from_config(agent_ui: &AgentUiConfig) -> Self {
+        let anim = agent_ui.resolved_animations();
+        let master = anim.enabled && !agent_ui.legacy_animation_kill_switch();
+        Self {
+            working_ring: master && anim.working_ring,
+            resolve_ripple: master && anim.resolve_ripple,
+            // Not under `master`: the glow is static state, drawn with no phase
+            // and no scheduled frame, and it is the only mark left saying which
+            // agent is still blocked on the user.
+            waiting_glow: anim.waiting_glow,
+            agent_enter: master && anim.agent_enter,
+            rail_breathe: master && anim.rail_breathe,
+            dot_pulse: master && anim.dot_pulse && agent_ui.pulse_working_dot,
+            unfocused: master && anim.unfocused,
+        }
+    }
+
+    /// Whether anything on this sidebar moves. The waiting glow is excluded
+    /// deliberately — it never asks for a frame.
+    fn any_motion(&self) -> bool {
+        self.working_ring
+            || self.resolve_ripple
+            || self.agent_enter
+            || self.rail_breathe
+            || self.dot_pulse
+    }
+}
+
+/// Which of the three mutually exclusive ring treatments a tab row draws.
+///
+/// Two treatments on one row read as a rendering fault, so the choice is made
+/// once, here, rather than by the order of the paint calls.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum AgentRowRing {
+    None,
+    Spin(f32),
+    Waiting,
+    Resolve(Option<f32>),
+}
+
+/// The sidebar's own colour scheme.
+///
+/// Kept separate from [`TabBarColors`] deliberately. That struct backs the
+/// upstream `tab_bar_colors` key and still drives the classic and fancy top tab
+/// bars, so neither its defaults nor its field meanings may change here. When
+/// the user (or a colour scheme) has actually set `tab_bar_colors` the sidebar
+/// keeps deriving from it exactly as it did before; only the unconfigured case
+/// picks up the fork's near-black scheme.
+#[derive(Clone, Copy, Debug)]
+struct SidebarPalette {
+    surface: LinearRgba,
+    row_fill: LinearRgba,
+    row_border: LinearRgba,
+    active_fill: LinearRgba,
+    hover_fill: LinearRgba,
+    pressed_fill: LinearRgba,
+    search_fill: LinearRgba,
+    focused_search_fill: LinearRgba,
+    divider: LinearRgba,
+    menu_border: LinearRgba,
+    text_active: LinearRgba,
+    text_idle: LinearRgba,
+    text_meta: LinearRgba,
+    /// Fill behind a row whose agent is working, one shade under `row_fill` so
+    /// the throbber ring has something to sit on.
+    working_fill: LinearRgba,
+    ring: RingColors,
+}
+
+impl SidebarPalette {
+    fn modern(ring: RingColors) -> Self {
+        Self {
+            ring,
+            surface: srgb8_to_linear(0x0c, 0x0c, 0x0e),
+            row_fill: srgb8_to_linear(0x14, 0x14, 0x17),
+            row_border: srgb8_to_linear(0x21, 0x21, 0x27),
+            active_fill: srgb8_to_linear(0x1c, 0x1c, 0x21),
+            hover_fill: srgb8_to_linear(0x17, 0x17, 0x1a),
+            pressed_fill: srgb8_to_linear(0x22, 0x22, 0x2a),
+            search_fill: srgb8_to_linear(0x14, 0x14, 0x17),
+            focused_search_fill: srgb8_to_linear(0x1c, 0x1c, 0x21),
+            divider: srgb8_to_linear(0x1a, 0x1a, 0x1f),
+            menu_border: srgb8_to_linear(0x26, 0x26, 0x2e),
+            text_active: srgb8_to_linear(0xe8, 0xe8, 0xee),
+            text_idle: srgb8_to_linear(0x8a, 0x8a, 0x94),
+            text_meta: srgb8_to_linear(0x5a, 0x5a, 0x63),
+            working_fill: srgb8_to_linear(0x13, 0x13, 0x17),
+        }
+    }
+
+    fn from_tab_bar(colors: &TabBarColors, ring: RingColors) -> Self {
+        let surface = opaque(colors.background().to_linear());
+        let text_active = colors.active_tab().fg_color.to_linear();
+        let text_idle = colors.inactive_tab().fg_color.to_linear();
+        let row_fill = opaque(colors.inactive_tab().bg_color.to_linear());
+        Self {
+            surface,
+            row_fill,
+            row_border: lerp_rgba(surface, text_idle, 0.12),
+            active_fill: lerp_rgba(surface, text_idle, 0.18),
+            hover_fill: lerp_rgba(surface, text_idle, 0.10),
+            pressed_fill: lerp_rgba(surface, text_idle, 0.15),
+            search_fill: lerp_rgba(surface, text_idle, 0.07),
+            focused_search_fill: lerp_rgba(surface, text_idle, 0.13),
+            divider: colors.inactive_tab().bg_color.to_linear().mul_alpha(0.8),
+            menu_border: lerp_rgba(row_fill, text_active, 0.12),
+            text_active,
+            text_idle,
+            text_meta: text_idle.mul_alpha(0.60),
+            working_fill: row_fill,
+            ring,
+        }
+    }
+}
+
 /// How long a window waits before writing its agent-session snapshot again.
 ///
 /// The set is checked every paint but changes rarely; this bounds a burst of
@@ -240,20 +433,317 @@ fn agent_pulse_phase(elapsed: Duration, period: Duration) -> f32 {
     triangle * triangle * (3. - 2. * triangle)
 }
 
+/// One full turn of the working-agent throbber ring.
+const THROBBER_SPIN: Duration = Duration::from_millis(9000);
+/// Period of the active tab rail's opacity breathe.
+const RAIL_BREATHE_PERIOD: Duration = Duration::from_millis(6000);
+/// Dimmest point of that breathe.
+const RAIL_BREATHE_FLOOR: f32 = 0.85;
+/// Vertical bands the rail's two-colour ramp is quantised into. The renderer
+/// has no gradient primitive, so the ramp is a stack of adjacent flat quads;
+/// at 3px wide and ~24px tall the banding is not resolvable.
+const RAIL_GRADIENT_BANDS: usize = 5;
+/// Tile pitch along the ring, as a fraction of the stroke.
+///
+/// The ring is a gradient drawn as flat tiles, so this is the difference
+/// between reading as a gradient and reading as bars: a fixed handful of
+/// segments per edge left ~48px of one flat colour on a full-width row. Below
+/// 1.0 the tiles overlap, which also closes the seams between them.
+const THROBBER_TILE_PITCH: f32 = 0.6;
+const DONE_RING_IN_MS: u64 = 260;
+const DONE_RING_OUT_MS: u64 = 1100;
+/// How far the resolve ring expands past the row as it fades out.
+/// How far the finished ring swells past the row as it departs. Small values
+/// read as the border thickening rather than as a ripple leaving.
+const DONE_RING_GROW_PX: f32 = 6.;
+/// What the finished row keeps once the pulse is gone. Enough to mark it as
+/// resolved, faint enough not to compete with the active row's own outline.
+const DONE_RING_SETTLED_STRENGTH: f32 = 0.2;
+/// How strongly a row whose agent is blocked on the user is outlined. Well
+/// above [`DONE_RING_SETTLED_STRENGTH`], because this one has to be findable at
+/// a glance in a list of finished rows — it is the only thing left saying which
+/// agent still needs you.
+const WAITING_GLOW_STRENGTH: f32 = 0.8;
+/// A new agent's row slides in over this long. Short enough not to delay the
+/// list, long enough to be seen as movement rather than a jump.
+const AGENT_ENTER_MS: u64 = 340;
+const AGENT_ENTER_SLIDE_PX: f32 = 12.;
+
+/// Linear `0.0..1.0` sawtooth.
+///
+/// The throbber rotates at a constant rate — the mockup's `linear` spin — so it
+/// cannot reuse the smoothstep triangle the status dot breathes on. Same shared
+/// epoch though, so every working row points the same way at the same instant.
+fn spin_phase(elapsed: Duration, period: Duration) -> f32 {
+    let period_ms = period.as_millis() as f32;
+    if period_ms <= 1. {
+        return 0.;
+    }
+    (elapsed.as_millis() as f32 % period_ms) / period_ms
+}
+
+/// Fraction of a full turn, clockwise from 12 o'clock, of the point
+/// `(px, py)` seen from `(cx, cy)`.
+fn ring_turn_at(cx: f32, cy: f32, px: f32, py: f32) -> f32 {
+    let angle = (px - cx).atan2(cy - py);
+    (angle / std::f32::consts::TAU).rem_euclid(1.0)
+}
+
+/// Colour of the throbber ring at `turn_t`, with the whole ring rotated by
+/// `phase` turns.
+///
+/// Mirrors the mockup's conic-gradient stops: a warm arc across 52°–128°, a
+/// cool arc across 232°–308°, and a ramp to nothing on either side of both. The
+/// returned alpha is coverage against whatever the caller is drawing over, not
+/// something to hand the blender; `None` is a full gap.
+fn throbber_ring_color(ring: RingColors, turn_t: f32, phase: f32) -> Option<LinearRgba> {
+    let deg = (turn_t - phase).rem_euclid(1.0) * 360.;
+    let (color, coverage) = if deg < 52. {
+        (ring.a, deg / 52.)
+    } else if deg < 128. {
+        (ring.a, 1.)
+    } else if deg < 180. {
+        (ring.a, 1. - (deg - 128.) / 52.)
+    } else if deg < 232. {
+        (ring.b, (deg - 180.) / 52.)
+    } else if deg < 308. {
+        (ring.b, 1.)
+    } else {
+        (ring.b, 1. - (deg - 308.) / 52.)
+    };
+    (coverage > 0.01).then(|| color.mul_alpha(coverage))
+}
+
+/// Colour of one throbber tile, over the continuous under-ring.
+///
+/// A gap in the ramp still paints, in `under`. Skipping it left a tile's worth
+/// of outline undrawn, and since the tiles are a stroke wide but advance by
+/// less than that, the miss opened a sub-pixel sliver of the row's own dark
+/// interior right where the two arcs hand over.
+fn throbber_tile_color(ring: RingColors, under: LinearRgba, turn_t: f32, phase: f32) -> LinearRgba {
+    match throbber_ring_color(ring, turn_t, phase) {
+        Some(color) => lerp_rgba(under, color, color.3),
+        None => under,
+    }
+}
+
+/// The throbber's tile centres, as one closed outline walked clockwise from the
+/// top-left corner, so consecutive points are neighbours on the perimeter.
+///
+/// Points advance by less than `stroke`, which is the tile's own width, so
+/// consecutive tiles overlap and no sliver of the row can show between them.
+fn throbber_outline(rect: RectF, radius: f32, stroke: f32) -> Vec<(f32, f32)> {
+    let x = rect.min_x();
+    let y = rect.min_y();
+    let w = rect.size.width;
+    let h = rect.size.height;
+    // The ring is a gradient sampled as flat tiles, so tile pitch is what
+    // decides whether it reads as a gradient or as bars. Advancing by a
+    // fraction of the stroke keeps each colour step under a pixel or two
+    // and overlaps neighbours, which also hides the seams between them.
+    let advance = (stroke * THROBBER_TILE_PITCH).max(1.);
+    let mid = (radius - stroke * 0.5).max(0.);
+    let inset = stroke * 0.5;
+    let quarter = std::f32::consts::FRAC_PI_2;
+    let corner_steps = if mid > 0. {
+        ((mid * quarter) / advance).ceil().max(1.) as usize
+    } else {
+        0
+    };
+
+    let mut outline: Vec<(f32, f32)> = Vec::new();
+    let arc = |outline: &mut Vec<(f32, f32)>, ox: f32, oy: f32, start: f32| {
+        for i in 0..=corner_steps {
+            let theta = start + quarter * (i as f32 / corner_steps.max(1) as f32);
+            outline.push((ox + mid * theta.cos(), oy + mid * theta.sin()));
+        }
+    };
+    let span = |outline: &mut Vec<(f32, f32)>, from: f32, to: f32, horiz: bool, fixed: f32| {
+        let len = to - from;
+        if len.abs() <= f32::EPSILON {
+            return;
+        }
+        let steps = (len.abs() / advance).ceil().max(1.) as usize;
+        for i in 0..=steps {
+            let p = from + len * (i as f32 / steps as f32);
+            outline.push(if horiz { (p, fixed) } else { (fixed, p) });
+        }
+    };
+
+    arc(&mut outline, x + radius, y + radius, std::f32::consts::PI);
+    span(&mut outline, x + radius, x + w - radius, true, y + inset);
+    arc(
+        &mut outline,
+        x + w - radius,
+        y + radius,
+        1.5 * std::f32::consts::PI,
+    );
+    span(
+        &mut outline,
+        y + radius,
+        y + h - radius,
+        false,
+        x + w - inset,
+    );
+    arc(&mut outline, x + w - radius, y + h - radius, 0.);
+    span(
+        &mut outline,
+        x + w - radius,
+        x + radius,
+        true,
+        y + h - inset,
+    );
+    arc(&mut outline, x + radius, y + h - radius, quarter);
+    span(&mut outline, y + h - radius, y + radius, false, x + inset);
+    outline
+}
+
+/// Each outline point's position in the sweep, as a fraction of the *arc
+/// length* travelled — never the angle to the row's centre.
+///
+/// On a 264x44 row the angle is violently non-uniform: each long edge covers
+/// ~160 degrees while each short edge covers ~20, so a whole short edge shared
+/// one colour and blinked on and off as an arc crossed it, a lit blob detaching
+/// from the smooth motion on the long edges. Arc length gives every pixel of the
+/// outline the same share of the sweep.
+///
+/// `None` when the outline is degenerate and nothing should be drawn.
+fn throbber_outline_turns(outline: &[(f32, f32)]) -> Option<Vec<f32>> {
+    if outline.len() < 2 {
+        return None;
+    }
+    let mut travelled = Vec::with_capacity(outline.len());
+    let mut total = 0f32;
+    let mut previous = *outline.last().unwrap();
+    for point in outline {
+        total += (point.0 - previous.0).hypot(point.1 - previous.1);
+        travelled.push(total);
+        previous = *point;
+    }
+    if total <= 0. {
+        return None;
+    }
+    Some(travelled.into_iter().map(|at| at / total).collect())
+}
+
+/// Per-row agent animation, derived entirely from the shared pulse epoch plus
+/// two timestamps on the pane's detection cache entry. No row owns an animator.
+#[derive(Clone, Copy, Debug)]
+struct AgentRowAnimation {
+    /// `1.0` once the row has finished sliding in.
+    enter: f32,
+    /// Throbber rotation while the agent is working.
+    spin: Option<f32>,
+    /// One-shot resolve ring intensity while it plays.
+    resolve: Option<f32>,
+    /// The resolve ring has finished; leave the quiet hairline behind.
+    settled: bool,
+    /// The agent is in the waiting queue: mark the row until the user looks at
+    /// it. Not a phase — this glow never animates.
+    waiting: bool,
+}
+
+impl AgentRowAnimation {
+    fn still() -> Self {
+        Self {
+            enter: 1.,
+            spin: None,
+            resolve: None,
+            settled: false,
+            waiting: false,
+        }
+    }
+
+    fn slide_x(&self) -> f32 {
+        -(1. - self.enter) * AGENT_ENTER_SLIDE_PX
+    }
+
+    /// The single ring treatment this row draws, in precedence order: the
+    /// throbber outranks the standing waiting glow, which outranks the
+    /// departing ripple and the hairline it settles into.
+    fn ring_treatment(&self) -> AgentRowRing {
+        if let Some(phase) = self.spin {
+            AgentRowRing::Spin(phase)
+        } else if self.waiting {
+            AgentRowRing::Waiting
+        } else if self.resolve.is_some() || self.settled {
+            AgentRowRing::Resolve(self.resolve)
+        } else {
+            AgentRowRing::None
+        }
+    }
+
+    /// While the ring is turning it already says everything the dot says,
+    /// louder. Drawing both left a static pip inside a moving outline, reading
+    /// as a piece that had come off it.
+    fn shows_status_dot(&self) -> bool {
+        self.spin.is_none()
+    }
+}
+
+fn agent_is_working(status: &AgentStatus) -> bool {
+    matches!(status, AgentStatus::Running | AgentStatus::Streaming)
+}
+
+/// Which of a tab's agent panes the tab row speaks for, given
+/// `(pane_id, status, is_primary)` in pane order.
+///
+/// A working agent wins outright, then one waiting for input, then the tab's
+/// primary pane, then pane order. The row carries the throbber ring, so
+/// preferring the working agent is what keeps a tab whose agent is busy in a
+/// background split reading as busy.
+fn pick_sidebar_agent_pane(candidates: &[(PaneId, AgentStatus, bool)]) -> Option<PaneId> {
+    candidates
+        .iter()
+        .enumerate()
+        .min_by_key(|(index, (_, status, is_primary))| {
+            let rank = if agent_is_working(status) {
+                0u8
+            } else if *status == AgentStatus::WaitingForInput {
+                1
+            } else if *is_primary {
+                2
+            } else {
+                3
+            };
+            (rank, !*is_primary, *index)
+        })
+        .map(|(_, (pane_id, _, _))| *pane_id)
+}
+
+fn deflate_rect(rect: RectF, by: f32) -> RectF {
+    euclid::rect(
+        rect.min_x() + by,
+        rect.min_y() + by,
+        (rect.size.width - 2. * by).max(0.),
+        (rect.size.height - 2. * by).max(0.),
+    )
+}
+
 /// Accent for an agent status dot.
 ///
 /// `pulse` is `None` when nothing should animate. A phase modulates brightness
 /// only, never geometry, so a pulse can never trigger a relayout. Phase 1.0 is
 /// exactly the static colour, so enabling the pulse never makes a dot brighter
 /// than it was before.
+///
+/// A *working* dot pulses in `pulse_accent` (the ring's warm end) rather than in
+/// `base`: a dot breathing in the vendor's own hue sat right next to the
+/// throbber and read as a second, unrelated indicator. Identity is still carried
+/// by `base` everywhere the dot is not pulsing, so agents stay distinguishable
+/// in the lists. Waiting-for-input keeps its own attention colour, which is the
+/// one hue that is supposed to stand apart.
 fn agent_status_dot_accent(
     status: &AgentStatus,
     base: LinearRgba,
     surface: LinearRgba,
     pulse: Option<f32>,
+    pulse_accent: LinearRgba,
 ) -> LinearRgba {
     let color = if *status == AgentStatus::WaitingForInput {
         LinearRgba(0.94, 0.72, 0.26, 1.0)
+    } else if pulse.is_some() && agent_is_working(status) {
+        pulse_accent
     } else {
         base
     };
@@ -595,6 +1085,25 @@ where
         })
         .collect();
     sort_waiting_queue(queue)
+}
+
+/// Precedence between the three ring treatments a row can carry: the throbber
+/// outranks the departing ripple, which outranks the standing waiting glow. Two
+/// treatments on one row read as a rendering fault, and the glow is the one that
+/// can afford to wait — unlike the other two it has no end time of its own.
+fn waiting_glow_survives(spin: Option<f32>, resolve: Option<f32>, queued: bool) -> bool {
+    queued && spin.is_none() && resolve.is_none()
+}
+
+/// Whether one pane would appear in [`build_waiting_queue`], without building
+/// the queue. Expressed in terms of that function so the row glow and the rail
+/// chip can never disagree about who is waiting — in particular about the
+/// lazy-acknowledge exclusion, which is what clears the glow again.
+pub(crate) fn is_waiting_queued(
+    entry: (PaneId, Option<Instant>, Option<Instant>),
+    focused_active: Option<PaneId>,
+) -> bool {
+    !build_waiting_queue([entry], focused_active).is_empty()
 }
 
 /// Queue entry timestamp for a waiting pane: set on the first frame it shows
@@ -2047,7 +2556,12 @@ fn srgb8(color: LinearRgba) -> (u8, u8, u8) {
 fn herd_status_from_agent(status: AgentStatus) -> HerdStatus {
     match status {
         AgentStatus::Running | AgentStatus::Streaming => HerdStatus::Working,
-        AgentStatus::WaitingForInput => HerdStatus::Blocked,
+        // `Blocked` is reserved for an agent held up on an approval it cannot
+        // answer itself, which reaches us as a `blocked_reason`. All the pane
+        // detector saw is a prompt on screen, which means the agent is done and
+        // waiting on the human -- rendering that as "needs approval" invented an
+        // permission request that was never made.
+        AgentStatus::WaitingForInput => HerdStatus::Idle,
         AgentStatus::Idle => HerdStatus::Idle,
         AgentStatus::Exited => HerdStatus::Done,
         AgentStatus::Unknown => HerdStatus::Unknown,
@@ -3066,6 +3580,12 @@ pub(crate) struct AgentDetectionCacheEntry {
     detected_at: Instant,
     /// When the current status was last observed fresh, for the running grace.
     status_at: Instant,
+    /// Whether `status` is a grace hold rather than what the screen actually
+    /// says. The identity fast path keys on a fingerprint of the visible text,
+    /// and a finished agent stops redrawing -- so a held status would be
+    /// returned unchanged forever and the grace could never expire. While this
+    /// is set, the fast path is skipped so the hold gets re-evaluated.
+    status_held: bool,
     /// Consecutive detections agreeing on an adapter that is not the
     /// established one, for the identity switch hysteresis.
     pending_switch: Option<(String, u32)>,
@@ -3078,6 +3598,13 @@ pub(crate) struct AgentDetectionCacheEntry {
     /// unfocused, so the user probably never saw it finish. Experimental; only
     /// consulted when `agent_ui.track_exited_unseen` is on.
     unseen_exited_since: Option<Instant>,
+    /// When this pane first presented as an agent, for the slide-in. Reset if
+    /// the pane stops being an agent, so a second agent started in the same
+    /// pane slides in again.
+    first_seen_at: Option<Instant>,
+    /// When the agent last stopped working, for the one-shot resolve ring.
+    /// Cleared when it starts working again.
+    done_ring_started_at: Option<Instant>,
 }
 
 /// Agent identity carried over from this pane's previous detection.
@@ -3469,8 +3996,40 @@ const GENERIC_AGENT_RUNNING_MARKERS: &[&str] = &[
     "(interrupt)",
 ];
 
-/// Spinner glyphs agents lead their working line with.
-const AGENT_SPINNER_GLYPHS: &[char] = &['✻', '✽', '✶', '✷', '✳', '✢', '∗'];
+/// Spinner glyphs agents lead their working line with. The braille and
+/// quadrant cells cover the `ora`/`spinners` family most Node and Go CLIs use.
+const AGENT_SPINNER_GLYPHS: &[char] = &[
+    '✻', '✽', '✶', '✷', '✳', '✢', '∗', '⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏', '◐', '◓',
+    '◑', '◒',
+];
+
+/// How far into a line a spinner glyph may sit and still count.
+///
+/// The glyph is not reliably the first character: agents draw their status
+/// inside a box, so the line arrives as `│ ✻ Working…` or `  ⎿ ✻ …`, and
+/// matching only `chars().next()` silently missed every one of those.
+const AGENT_SPINNER_SCAN_CHARS: usize = 4;
+
+/// Non-blank lines from the bottom of the screen searched for a status line.
+///
+/// Sized to clear the docked input strip: `rich_input.dock_rows` plus the
+/// separator, the context bar and the mode line already exceed five, which is
+/// what the spinner scan used to look at, so the agent's status line sat just
+/// outside the window and every working agent read as `Unknown`.
+const AGENT_STATUS_TAIL_LINES: usize = 16;
+
+/// How far up the tail a prompt still means "waiting".
+///
+/// Matches the spinner window rather than sitting below it. Keeping this short
+/// looked defensible -- a prompt is only current if it is near the bottom --
+/// but the docked input strip pushes the agent's own prompt box just as far up
+/// as it pushes the spinner, so a finished agent decayed to `Unknown` the
+/// moment it printed a reply long enough to fill the gap.
+const AGENT_PROMPT_TAIL_LINES: usize = AGENT_STATUS_TAIL_LINES;
+
+/// Prompts drawn inside a box, as the leading border plus the prompt glyph.
+/// Claude Code renders `│ > …`, which no bare-glyph check ever matched.
+const AGENT_BOXED_PROMPT_PREFIXES: &[&str] = &["│ >", "│ ❯", "│ ›", "┃ >", "┃ ❯", "┃ ›"];
 
 /// How long a `Running` status is held after its marker disappears.
 const AGENT_RUNNING_GRACE: Duration = Duration::from_secs(3);
@@ -3488,6 +4047,26 @@ const AGENT_STICKY_VISIBLE_TTL: Duration = Duration::from_secs(30);
 /// Stop button disappeared mid-run. The whole visible region is scanned instead:
 /// it is the live screen, never scrollback, so a marker found there is current by
 /// construction and the input is already bounded.
+/// Whether a spinner-led line is the summary left behind after the work ended,
+/// rather than a live status line.
+///
+/// Agents reuse the spinner glyph for both ("✻ Cogitating…" while working,
+/// "✻ Cogitated for 2m 40s" once done) and the summary stays on screen, so
+/// without this the status never leaves `Running`. The tail after `" for "`
+/// being nothing but a duration is what separates them: "Running a tool for
+/// the user" carries no digits and is left alone.
+fn is_completed_summary_line(line: &str) -> bool {
+    let Some((_, rest)) = line.rsplit_once(" for ") else {
+        return false;
+    };
+    let rest = rest.trim();
+    !rest.is_empty()
+        && rest.chars().any(|c| c.is_ascii_digit())
+        && rest
+            .chars()
+            .all(|c| c.is_ascii_digit() || c.is_whitespace() || matches!(c, 'm' | 's' | 'h'))
+}
+
 fn infer_agent_status_from_visible_text(
     text: &str,
     adapter: Option<&AgentAdapterConfig>,
@@ -3508,32 +4087,43 @@ fn infer_agent_status_from_visible_text(
     {
         return AgentStatus::Running;
     }
-    // A spinner anywhere in the last few non-blank lines counts: agents redraw
-    // the spinner and the prompt box independently, so the spinner is not
-    // reliably the very last line.
+    // A spinner anywhere in the tail counts: agents redraw the spinner and the
+    // prompt box independently, so the spinner is not reliably the last line.
+    // The window has to clear the docked input strip, whose reserved rows plus
+    // the status lines under it push the spinner well past the last handful of
+    // lines; at five, `rich_input.docked` alone was enough to hide it and pin
+    // every working agent at `Unknown`.
     let tail: Vec<&str> = text
         .lines()
         .rev()
         .map(str::trim)
         .filter(|line| !line.is_empty())
-        .take(5)
+        .take(AGENT_STATUS_TAIL_LINES)
         .collect();
+    // The glyph alone is not evidence of work: the same glyph leads the summary
+    // an agent leaves behind when it finishes ("✻ Cogitated for 2m 40s"), which
+    // stays on screen and would otherwise pin the status at `Running` forever.
     if tail.iter().any(|line| {
         line.chars()
-            .next()
-            .is_some_and(|c| AGENT_SPINNER_GLYPHS.contains(&c))
+            .take(AGENT_SPINNER_SCAN_CHARS)
+            .any(|c| AGENT_SPINNER_GLYPHS.contains(&c))
+            && !is_completed_summary_line(line)
     }) {
         return AgentStatus::Running;
     }
-    // Otherwise, a bare prompt at the bottom means it is waiting for input.
-    if let Some(last) = tail.first() {
-        if matches!(*last, "❯" | ">" | "›")
-            || last.starts_with("❯ ")
-            || last.starts_with("> ")
-            || last.starts_with("› ")
-        {
-            return AgentStatus::WaitingForInput;
-        }
+    // Otherwise a prompt means it is waiting for input. Agents that box their
+    // prompt draw it as `│ > …`, so the bare-glyph check never fired for them.
+    let waiting = tail.iter().take(AGENT_PROMPT_TAIL_LINES).any(|line| {
+        matches!(*line, "❯" | ">" | "›")
+            || line.starts_with("❯ ")
+            || line.starts_with("> ")
+            || line.starts_with("› ")
+            || AGENT_BOXED_PROMPT_PREFIXES
+                .iter()
+                .any(|prefix| line.starts_with(prefix))
+    });
+    if waiting {
+        return AgentStatus::WaitingForInput;
     }
     AgentStatus::Unknown
 }
@@ -3574,6 +4164,31 @@ fn visible_agent_activity(text: &str) -> Option<HerdActivity> {
 /// redraws shows neither a running marker nor a prompt. Dropping to `Unknown`
 /// there is what made the Stop button flicker. A prompt line or an explicit
 /// `agent.status` ends the grace immediately.
+/// Whether this reading is too weak to end a run on its own.
+///
+/// `Unknown` is the obvious case. `WaitingForInput` is the one that mattered in
+/// practice: an agent redraws its prompt box between steps of a single turn, so
+/// the screen shows a prompt for a frame or two while the agent is still very
+/// much working. Ending the run on that made the throbber stop and restart
+/// several times through one answer.
+fn ends_run_only_after_grace(status: &AgentStatus) -> bool {
+    matches!(status, AgentStatus::Unknown | AgentStatus::WaitingForInput)
+}
+
+/// Whether a cached detection may be returned without re-reading the pane.
+///
+/// An entry whose status is *held* by the grace never qualifies, however
+/// unchanged the screen is. A finished agent stops redrawing, so its content
+/// fingerprint stops moving; served from the fast path, the held `Running`
+/// would be handed back forever and the throbber would spin for the rest of the
+/// session. The held entry has to be re-derived so the grace can expire.
+fn agent_detection_cache_hit(
+    entry: &AgentDetectionCacheEntry,
+    key: &AgentDetectionCacheKey,
+) -> bool {
+    entry.key == *key && !entry.status_held
+}
+
 fn stabilize_agent_status(
     fresh: AgentStatus,
     previous: Option<AgentStatus>,
@@ -3581,7 +4196,7 @@ fn stabilize_agent_status(
     now: Instant,
     grace: Duration,
 ) -> AgentStatus {
-    if fresh != AgentStatus::Unknown {
+    if !ends_run_only_after_grace(&fresh) {
         return fresh;
     }
     let was_running = matches!(
@@ -3590,7 +4205,7 @@ fn stabilize_agent_status(
     );
     let within_grace = previous_at.is_some_and(|at| now.duration_since(at) < grace);
     if was_running && within_grace {
-        return previous.unwrap_or(AgentStatus::Unknown);
+        return previous.unwrap_or(fresh);
     }
     fresh
 }
@@ -3755,12 +4370,14 @@ impl crate::TermWindow {
                 self.quad_generation += 1;
                 return true;
             }
+            self.sidebar_wants_animation.set(true);
             *self.has_animation.borrow_mut() = Some(close_after);
             return false;
         }
 
         let close_after = now + Duration::from_millis(AUTO_HIDE_COLLAPSE_DELAY_MS);
         self.sidebar_auto_hide_close_after = Some(close_after);
+        self.sidebar_wants_animation.set(true);
         *self.has_animation.borrow_mut() = Some(close_after);
         true
     }
@@ -3782,6 +4399,7 @@ impl crate::TermWindow {
             }
             self.sidebar_auto_hide_close_after = None;
         } else {
+            self.sidebar_wants_animation.set(true);
             *self.has_animation.borrow_mut() = Some(close_after);
         }
     }
@@ -4999,10 +5617,11 @@ impl crate::TermWindow {
             visible_fingerprint,
             ..cache_key
         };
-        if let Some(entry) = previous_entry.as_ref() {
-            if entry.key == cache_key {
-                return entry.state.clone();
-            }
+        if let Some(entry) = previous_entry
+            .as_ref()
+            .filter(|entry| agent_detection_cache_hit(entry, &cache_key))
+        {
+            return entry.state.clone();
         }
         let trust_visible = self.config.agent_ui.trust_visible_evidence;
         let mut fresh_identity = resolve_agent_identity(candidates);
@@ -5104,9 +5723,12 @@ impl crate::TermWindow {
                     last_wait_notification: previous_wait_notification,
                     detected_at: Instant::now(),
                     status_at: Instant::now(),
+                    status_held: false,
                     pending_switch: None,
                     waiting_since: None,
                     unseen_exited_since: None,
+                    first_seen_at: None,
+                    done_ring_started_at: None,
                 },
             );
             return None;
@@ -5126,9 +5748,12 @@ impl crate::TermWindow {
                     last_wait_notification: previous_wait_notification,
                     detected_at: Instant::now(),
                     status_at: Instant::now(),
+                    status_held: false,
                     pending_switch: None,
                     waiting_since: None,
                     unseen_exited_since: None,
+                    first_seen_at: None,
+                    done_ring_started_at: None,
                 },
             );
             return None;
@@ -5142,9 +5767,12 @@ impl crate::TermWindow {
                     last_wait_notification: previous_wait_notification,
                     detected_at: Instant::now(),
                     status_at: Instant::now(),
+                    status_held: false,
                     pending_switch: None,
                     waiting_since: None,
                     unseen_exited_since: None,
+                    first_seen_at: None,
+                    done_ring_started_at: None,
                 },
             );
             return None;
@@ -5170,8 +5798,11 @@ impl crate::TermWindow {
             AGENT_RUNNING_GRACE,
         );
         // Only a *fresh* observation refreshes the grace window; carrying the
-        // old timestamp forward is what makes the grace expire.
-        let status_at = if fresh_status == AgentStatus::Unknown {
+        // old timestamp forward is what makes the grace expire. This has to use
+        // the same test as the stabilizer: refreshing on a reading that was
+        // itself suppressed would restart the window on every frame and hold
+        // `Running` forever, so a finished agent would never stop spinning.
+        let status_at = if ends_run_only_after_grace(&fresh_status) {
             previous_entry
                 .as_ref()
                 .map(|entry| entry.status_at)
@@ -5179,6 +5810,7 @@ impl crate::TermWindow {
         } else {
             now
         };
+        let status_held = status != fresh_status;
         let actions = self.agent_supported_actions(
             adapter_id.as_deref(),
             &vars,
@@ -5223,7 +5855,7 @@ impl crate::TermWindow {
         let (should_notify_waiting, last_wait_notification) = waiting_notification_update(
             self.config.agent_ui.waiting_notification,
             state.as_ref().unwrap().status.clone(),
-            previous_status,
+            previous_status.clone(),
             previous_wait_notification,
             Instant::now(),
         );
@@ -5277,6 +5909,36 @@ impl crate::TermWindow {
             )
         };
 
+        // Animation bookkeeping. `first_seen_at` tracks when the *agent*
+        // appeared rather than when the pane did: a shell pane already holds a
+        // cache entry by the time the user starts an agent in it, so keying the
+        // slide-in on cache insertion would skip the common case.
+        let first_seen_at = previous_entry
+            .as_ref()
+            .and_then(|entry| entry.state.as_ref().and(entry.first_seen_at))
+            .unwrap_or(now);
+        let previous_working = previous_status.as_ref().is_some_and(agent_is_working);
+        // `WaitingForInput` counts as resolved: it is the usual end of a turn,
+        // and for every agent whose status is inferred from the screen
+        // `infer_agent_status_from_visible_text` never reports `Idle` or
+        // `Exited` at all — without it the resolve ring could only ever play
+        // for a pane that publishes `agent.status` itself.
+        let resolved_now = matches!(
+            state.as_ref().map(|s| &s.status),
+            Some(AgentStatus::Idle)
+                | Some(AgentStatus::Exited)
+                | Some(AgentStatus::WaitingForInput)
+        );
+        let done_ring_started_at = if state.as_ref().is_some_and(|s| agent_is_working(&s.status)) {
+            None
+        } else if previous_working && resolved_now {
+            Some(now)
+        } else {
+            previous_entry
+                .as_ref()
+                .and_then(|entry| entry.done_ring_started_at)
+        };
+
         self.agent_detection_cache.borrow_mut().insert(
             pane.pane_id(),
             AgentDetectionCacheEntry {
@@ -5285,10 +5947,33 @@ impl crate::TermWindow {
                 last_wait_notification,
                 detected_at: Instant::now(),
                 status_at,
+                status_held,
                 pending_switch,
                 waiting_since,
                 unseen_exited_since,
+                first_seen_at: Some(first_seen_at),
+                done_ring_started_at,
             },
+        );
+        // Runs at most once per pane per 500ms (the fast path above returns
+        // before here), and names no pane content: ids, enums and whether the
+        // screen was read at all.
+        log::debug!(
+            "agent detect: pane={} kind={} evidence={:?} status={} fresh={} \
+             visible_text_loaded={} done_ring={}",
+            pane.pane_id(),
+            state
+                .as_ref()
+                .map(|s| s.kind.label())
+                .unwrap_or("<not an agent>"),
+            evidence,
+            state
+                .as_ref()
+                .map(|s| s.status.label())
+                .unwrap_or(AgentStatus::Unknown.label()),
+            fresh_status.label(),
+            visible_text_loaded,
+            done_ring_started_at.is_some(),
         );
         // Keep the macOS dock badge live while the app is unfocused: waiting
         // transitions can happen at any time, not just around focus changes
@@ -6176,20 +6861,39 @@ impl crate::TermWindow {
             .is_some_and(|domain| domain.downcast_ref::<mux::ssh::RemoteSshDomain>().is_some())
     }
 
-    /// Agent shown as a badge on this tab's row, if any.
+    /// Agent shown as a badge on this tab's row, and the pane it was found on
+    /// so the caller can reach that pane's animation state.
     ///
     /// Badge-only: gated by `show_sidebar_badges`, which is a paint-time
     /// preference. Data paths must use [`Self::sidebar_agent_panes_for_tab_idx`]
     /// instead — turning a badge off may not switch off agent tracking.
-    fn sidebar_agent_for_tab_idx(&self, tab_idx: usize) -> Option<AgentPaneState> {
-        if !self.config.agent_ui.show_sidebar_badges {
+    ///
+    /// Scans every pane of the tab rather than only the primary one. The
+    /// launcher splits agents into their own pane and the user routinely clicks
+    /// back into the shell beside it; keying the row off the tab's *active*
+    /// pane alone made the agent's dot and throbber ring vanish the moment the
+    /// user looked away from it, while the herd section — which already scans
+    /// all panes — still listed the same agent. Detection is cached per pane
+    /// for 500ms, so the wider scan costs no extra work per frame.
+    fn sidebar_agent_row_for_tab_idx(&self, tab_idx: usize) -> Option<(PaneId, AgentPaneState)> {
+        if !self.config.agent_ui.show_sidebar_badges || !self.config.agent_ui.enabled {
             return None;
         }
-        let pane = self.sidebar_primary_pane_for_tab_idx(tab_idx)?;
-        if !self.config.agent_ui.enabled {
-            return None;
-        }
-        self.detect_agent_pane(&pane)
+        let primary = self
+            .sidebar_primary_pane_for_tab_idx(tab_idx)
+            .map(|pane| pane.pane_id());
+        let mut agents: Vec<(PaneId, AgentPaneState)> = self
+            .sidebar_agent_panes_for_tab_idx(tab_idx)
+            .into_iter()
+            .map(|(pane, state)| (pane.pane_id(), state))
+            .collect();
+        let ranked: Vec<(PaneId, AgentStatus, bool)> = agents
+            .iter()
+            .map(|(pane_id, state)| (*pane_id, state.status.clone(), Some(*pane_id) == primary))
+            .collect();
+        let chosen = pick_sidebar_agent_pane(&ranked)?;
+        let index = agents.iter().position(|(pane_id, _)| *pane_id == chosen)?;
+        Some(agents.swap_remove(index))
     }
 
     /// Every agent running in this tab, one entry per pane.
@@ -6226,20 +6930,174 @@ impl crate::TermWindow {
     ///
     /// Registering a next-frame deadline is what keeps the pulse going, so the
     /// early returns are also the cost control: with nothing working, nothing is
-    /// scheduled and the window falls back to event-driven repaints. Unfocused
-    /// windows return `None` rather than freezing at whatever brightness the
-    /// last frame happened to catch (the frame scheduler ignores unfocused
-    /// windows anyway).
+    /// scheduled and the window falls back to event-driven repaints.
     fn agent_dot_pulse(&self, agent: &AgentPaneState) -> Option<f32> {
-        if !self.config.agent_ui.pulse_working_dot || self.focused.is_none() {
+        if !self.sidebar_animation_gates().dot_pulse {
             return None;
         }
-        if !matches!(agent.status, AgentStatus::Running | AgentStatus::Streaming) {
+        // An agent blocked on you is the one the design most wants to look
+        // alive, so it breathes on the same schedule as a working one; it just
+        // does it in the amber `agent_status_dot_accent` picks for it.
+        if !agent_is_working(&agent.status) && agent.status != AgentStatus::WaitingForInput {
             return None;
         }
         let period = Duration::from_millis(self.config.agent_ui.pulse_period_ms.clamp(400, 6000));
-        self.update_next_frame_time(Some(next_agent_pulse_frame_due()));
+        self.schedule_sidebar_frame(next_agent_pulse_frame_due());
         Some(agent_pulse_phase(AGENT_PULSE_EPOCH.elapsed(), period))
+    }
+
+    /// The sidebar's resolved colours. See [`SidebarPalette`] for why this is
+    /// not simply `TabBarColors`.
+    fn sidebar_palette(&self) -> SidebarPalette {
+        let ring = RingColors::resolve(
+            self.config.agent_ui.ring_colors,
+            &self.config.agent_ui.resolved_animations().colors,
+        );
+        match self.config.resolved_palette.tab_bar.as_ref() {
+            Some(colors) => SidebarPalette::from_tab_bar(colors, ring),
+            None => SidebarPalette::modern(ring),
+        }
+    }
+
+    /// Which sidebar animations `agent_ui` allows. Focus deliberately does not
+    /// enter into it: the whole point of a throbber is to be readable from
+    /// another app, so by default the sidebar keeps animating in the background
+    /// and pays for it via [`Self::schedule_sidebar_frame`].
+    fn sidebar_animation_gates(&self) -> SidebarAnimationGates {
+        SidebarAnimationGates::from_config(&self.config.agent_ui)
+    }
+
+    /// Register a next-frame deadline for a sidebar animation.
+    ///
+    /// Same deadline bookkeeping as `update_next_frame_time`, plus the
+    /// `sidebar_wants_animation` opt-in that keeps `paint_impl` scheduling
+    /// frames while the window is unfocused. Every animated sidebar element
+    /// must go through here rather than calling `update_next_frame_time`
+    /// directly, or it will stall the moment focus leaves the window.
+    fn schedule_sidebar_frame(&self, next_due: Instant) {
+        if self.sidebar_animation_gates().unfocused {
+            self.sidebar_wants_animation.set(true);
+        }
+        self.update_next_frame_time(Some(next_due));
+    }
+
+    /// Rotation of the working-agent throbber, or `None` when this agent is not
+    /// working. Registering the next frame here is the cost control: with
+    /// nothing working, nothing is scheduled.
+    fn agent_spin_phase(&self, status: &AgentStatus) -> Option<f32> {
+        if !self.sidebar_animation_gates().working_ring || !agent_is_working(status) {
+            return None;
+        }
+        self.schedule_sidebar_frame(next_agent_pulse_frame_due());
+        Some(spin_phase(AGENT_PULSE_EPOCH.elapsed(), THROBBER_SPIN))
+    }
+
+    /// Opacity of the active tab's gradient rail.
+    fn sidebar_rail_breathe(&self) -> f32 {
+        if !self.sidebar_animation_gates().rail_breathe {
+            return 1.;
+        }
+        self.schedule_sidebar_frame(next_agent_pulse_frame_due());
+        RAIL_BREATHE_FLOOR
+            + (1. - RAIL_BREATHE_FLOOR)
+                * agent_pulse_phase(AGENT_PULSE_EPOCH.elapsed(), RAIL_BREATHE_PERIOD)
+    }
+
+    fn agent_row_animation(&self, pane_id: PaneId, status: &AgentStatus) -> AgentRowAnimation {
+        let anim = self.agent_row_animation_impl(pane_id, status);
+        // Fires only for rows that actually carry an agent, so the cost is
+        // bounded by the number of agent panes, not the number of tabs.
+        // Deliberately ids and status enums only — never pane text.
+        if log::log_enabled!(log::Level::Debug) {
+            let gates = self.sidebar_animation_gates();
+            log::debug!(
+                "sidebar agent row: pane={} status={} spin={:?} resolve={:?} settled={} \
+                 waiting={} enter={:?} cached={} focused={} ring_preset={:?} gates={:?}",
+                pane_id,
+                status.label(),
+                anim.spin,
+                anim.resolve,
+                anim.settled,
+                anim.waiting,
+                anim.enter,
+                self.agent_detection_cache.borrow().contains_key(&pane_id),
+                self.focused.is_some(),
+                self.config.agent_ui.ring_colors,
+                gates,
+            );
+        }
+        anim
+    }
+
+    fn agent_row_animation_impl(&self, pane_id: PaneId, status: &AgentStatus) -> AgentRowAnimation {
+        let mut anim = AgentRowAnimation::still();
+        let (first_seen_at, done_ring_started_at, waiting_since, unseen_exited_since) = {
+            let cache = self.agent_detection_cache.borrow();
+            match cache.get(&pane_id) {
+                Some(entry) => (
+                    entry.first_seen_at,
+                    entry.done_ring_started_at,
+                    entry.waiting_since,
+                    entry.unseen_exited_since,
+                ),
+                None => return anim,
+            }
+        };
+        // Resolving the focused pane costs a mux lookup, and this runs once per
+        // row per frame, so only a row that actually has something pending pays
+        // for it; the two timestamps decide every other row on their own.
+        let queued = (waiting_since.is_some() || unseen_exited_since.is_some())
+            && is_waiting_queued(
+                (pane_id, waiting_since, unseen_exited_since),
+                if self.focused.is_some() {
+                    self.get_active_pane_or_overlay().map(|p| p.pane_id())
+                } else {
+                    None
+                },
+            );
+        let gates = self.sidebar_animation_gates();
+        // The settled hairline and the waiting glow are state, not motion, so
+        // they survive the master switch and never ask for a frame.
+        anim.settled = done_ring_started_at.is_some() && gates.resolve_ripple;
+        anim.waiting = queued && gates.waiting_glow;
+        if !gates.any_motion() {
+            return anim;
+        }
+
+        if gates.agent_enter {
+            if let Some(first_seen_at) = first_seen_at {
+                let elapsed = first_seen_at.elapsed();
+                let span = Duration::from_millis(AGENT_ENTER_MS);
+                if elapsed < span {
+                    anim.enter = EasingFunction::EaseOut
+                        .evaluate_at_position(elapsed.as_secs_f32() / span.as_secs_f32())
+                        .clamp(0., 1.);
+                    self.schedule_sidebar_frame(next_agent_pulse_frame_due());
+                }
+            }
+        }
+
+        anim.spin = self.agent_spin_phase(status);
+        if anim.spin.is_none() && gates.resolve_ripple {
+            if let Some(started) = done_ring_started_at {
+                let mut ease = ColorEase::new(
+                    DONE_RING_IN_MS,
+                    EasingFunction::EaseOut,
+                    DONE_RING_OUT_MS,
+                    EasingFunction::EaseOut,
+                    Some(started),
+                );
+                // The local ease owns no state beyond this call; once it reports
+                // completion the row stops asking for frames and keeps only the
+                // static hairline.
+                if let Some((intensity, _)) = ease.intensity_one_shot() {
+                    anim.resolve = Some(intensity);
+                    self.schedule_sidebar_frame(next_agent_pulse_frame_due());
+                }
+            }
+        }
+        anim.waiting = gates.waiting_glow && waiting_glow_survives(anim.spin, anim.resolve, queued);
+        anim
     }
 
     fn sidebar_primary_pane_for_tab_idx(&self, tab_idx: usize) -> Option<Arc<dyn Pane>> {
@@ -6273,11 +7131,13 @@ impl crate::TermWindow {
         title: &str,
     ) -> (String, LinearRgba, Option<AgentPaneState>) {
         let pane = self.sidebar_primary_pane_for_tab_idx(tab_idx);
-        let agent = if self.config.agent_ui.enabled && self.config.agent_ui.show_sidebar_badges {
-            pane.as_ref().and_then(|pane| self.detect_agent_pane(pane))
-        } else {
-            None
-        };
+        // Same resolution the expanded row uses, so a tab whose agent is
+        // working in a background split spins on the rail too. The symbol and
+        // colour below still key off the primary pane, which is what the tab
+        // is named after.
+        let agent = self
+            .sidebar_agent_row_for_tab_idx(tab_idx)
+            .map(|(_, state)| state);
         let adapter = agent
             .as_ref()
             .and_then(|agent| self.agent_adapter_config_by_id(agent.adapter_id.as_deref()));
@@ -6475,28 +7335,27 @@ impl crate::TermWindow {
             AgentToolbeltPosition::Bottom => pane_y + pane_h - strip_h - AGENT_TOOLBELT_GAP,
         };
 
-        let colors = self
-            .config
-            .resolved_palette
-            .tab_bar
-            .clone()
-            .unwrap_or_else(TabBarColors::default);
-        let active_tab = colors.active_tab();
-        let inactive_tab = colors.inactive_tab();
-        let fg = active_tab.fg_color.to_linear();
-        let bg = opaque(inactive_tab.bg_color.to_linear());
-        let hover_bg = lerp_rgba(bg, fg, 0.18);
+        let sb = self.sidebar_palette();
+        let fg = sb.text_active;
+        let bg = sb.row_fill;
+        let hover_bg = sb.pressed_fill;
         let pressed_bg = lerp_rgba(bg, fg, 0.28);
         let accent = agent_status_dot_accent(
             &agent.status,
             adapter_color(adapter.as_ref(), &agent.kind),
             bg,
             None,
+            sb.ring.pulse,
         );
         // The dot breathes while the agent works; the rest of the strip keeps
         // the steady accent so button text and borders do not shimmer.
-        let dot_accent =
-            agent_status_dot_accent(&agent.status, accent, bg, self.agent_dot_pulse(&agent));
+        let dot_accent = agent_status_dot_accent(
+            &agent.status,
+            accent,
+            bg,
+            self.agent_dot_pulse(&agent),
+            sb.ring.pulse,
+        );
 
         self.sidebar_rounded_fill(
             layers,
@@ -6708,7 +7567,7 @@ impl crate::TermWindow {
         let row_h = (cell_h_f + 2. * row_vpad).max(AGENT_COPY_MENU_ROW_H * dpi_scale);
         let menu_pad = 8. * dpi_scale;
         let menu_radius = (RADIUS * dpi_scale).min(row_h * 0.5);
-        let row_radius = (5. * dpi_scale).min(row_h * 0.5);
+        let row_radius = (7. * dpi_scale).min(row_h * 0.5);
         let row_inset = 4. * dpi_scale;
         let row_text_inset = 12. * dpi_scale;
         let menu_w = AGENT_COPY_MENU_W;
@@ -6721,17 +7580,10 @@ impl crate::TermWindow {
             (menu.x as f32 - menu_w + AGENT_TOOLBELT_MIN_BUTTON_W).clamp(AGENT_TOOLBELT_GAP, max_x);
         let menu_y = (menu.y as f32 + AGENT_TOOLBELT_GAP).clamp(AGENT_TOOLBELT_GAP, max_y);
 
-        let colors = self
-            .config
-            .resolved_palette
-            .tab_bar
-            .clone()
-            .unwrap_or_else(TabBarColors::default);
-        let active_tab = colors.active_tab();
-        let inactive_tab = colors.inactive_tab();
-        let fg = active_tab.fg_color.to_linear();
-        let bg = opaque(inactive_tab.bg_color.to_linear());
-        let hover_bg = lerp_rgba(bg, fg, 0.18);
+        let sb = self.sidebar_palette();
+        let fg = sb.text_active;
+        let bg = sb.row_fill;
+        let hover_bg = sb.pressed_fill;
         let pressed_bg = lerp_rgba(bg, fg, 0.28);
 
         self.sidebar_rounded_fill(
@@ -6743,7 +7595,7 @@ impl crate::TermWindow {
         )?;
 
         // Thin border stroke so the menu stands out against overlapping rows.
-        let border = lerp_rgba(bg, fg, 0.12);
+        let border = sb.menu_border;
         let border_w = (1. * dpi_scale).max(1.);
         self.filled_rectangle(
             layers,
@@ -7347,7 +8199,7 @@ impl crate::TermWindow {
         let row_h = (cell_h_f + 2. * row_vpad).max(AGENT_COPY_MENU_ROW_H * dpi_scale);
         let menu_pad = 8. * dpi_scale;
         let menu_radius = (RADIUS * dpi_scale).min(row_h * 0.5);
-        let row_radius = (5. * dpi_scale).min(row_h * 0.5);
+        let row_radius = (7. * dpi_scale).min(row_h * 0.5);
         let row_inset = 4. * dpi_scale;
         let row_text_inset = 12. * dpi_scale;
         let divider_h = (1. * dpi_scale).max(1.);
@@ -7384,17 +8236,10 @@ impl crate::TermWindow {
             }
         };
 
-        let colors = self
-            .config
-            .resolved_palette
-            .tab_bar
-            .clone()
-            .unwrap_or_else(TabBarColors::default);
-        let active_tab = colors.active_tab();
-        let inactive_tab = colors.inactive_tab();
-        let fg = active_tab.fg_color.to_linear();
-        let bg = opaque(inactive_tab.bg_color.to_linear());
-        let hover_bg = lerp_rgba(bg, fg, 0.18);
+        let sb = self.sidebar_palette();
+        let fg = sb.text_active;
+        let bg = sb.row_fill;
+        let hover_bg = sb.pressed_fill;
         let pressed_bg = lerp_rgba(bg, fg, 0.28);
 
         self.sidebar_rounded_fill(
@@ -7406,7 +8251,7 @@ impl crate::TermWindow {
         )?;
 
         // Thin border stroke so the menu stands out against overlapping rows.
-        let border = lerp_rgba(bg, fg, 0.12);
+        let border = sb.menu_border;
         let border_w = (1. * dpi_scale).max(1.);
         self.filled_rectangle(
             layers,
@@ -7662,27 +8507,17 @@ impl crate::TermWindow {
             - border.bottom.get() as f32)
             .max(0.);
 
-        let colors = self
-            .config
-            .resolved_palette
-            .tab_bar
-            .clone()
-            .unwrap_or_else(TabBarColors::default);
-        let bg = colors.background().to_linear();
-        let active_tab = colors.active_tab();
-        let inactive_tab = colors.inactive_tab();
-        let active_fg = active_tab.fg_color.to_linear();
-        let inactive_fg = inactive_tab.fg_color.to_linear();
-        let inactive_bg = inactive_tab.bg_color.to_linear();
-        let hover_colors = colors.inactive_tab_hover();
-        let hover_fg = hover_colors.fg_color.to_linear();
-        let surface = opaque(bg);
-        let hover_fill = lerp_rgba(surface, inactive_fg, 0.10);
-        let pressed_fill = lerp_rgba(surface, inactive_fg, 0.15);
-        let active_fill = lerp_rgba(surface, inactive_fg, 0.18);
-        let search_fill = lerp_rgba(surface, inactive_fg, 0.07);
-        let focused_search_fill = lerp_rgba(surface, inactive_fg, 0.13);
-        let divider = inactive_bg.mul_alpha(0.8);
+        let sb = self.sidebar_palette();
+        let active_fg = sb.text_active;
+        let inactive_fg = sb.text_idle;
+        let hover_fg = sb.text_active;
+        let surface = sb.surface;
+        let hover_fill = sb.hover_fill;
+        let pressed_fill = sb.pressed_fill;
+        let active_fill = sb.active_fill;
+        let search_fill = sb.search_fill;
+        let focused_search_fill = sb.focused_search_fill;
+        let divider = sb.divider;
         let accent = active_fg;
         let hovered_item = self
             .last_ui_item
@@ -7693,6 +8528,7 @@ impl crate::TermWindow {
             let elapsed = started.elapsed();
             let duration = Duration::from_millis(180);
             if elapsed < duration {
+                self.sidebar_wants_animation.set(true);
                 *self.has_animation.borrow_mut() = Some(Instant::now() + Duration::from_millis(16));
                 Some((tab_idx, 1. - elapsed.as_secs_f32() / duration.as_secs_f32()))
             } else {
@@ -8018,20 +8854,31 @@ impl crate::TermWindow {
                     tab_bg
                 };
                 let tab_offset = if tab_pressed { 1. } else { 0. };
-                self.sidebar_rounded_fill(
-                    layers,
-                    1,
-                    euclid::rect(rail_x, rail_y + tab_offset, rail_side, rail_side),
-                    rail_radius,
-                    tab_bg,
-                )?;
+                let tile_rect = euclid::rect(rail_x, rail_y + tab_offset, rail_side, rail_side);
+                let tile_spin = rail_agent
+                    .as_ref()
+                    .and_then(|agent| self.agent_spin_phase(&agent.status));
+                match tile_spin {
+                    Some(phase) => self.paint_agent_working_ring(
+                        layers,
+                        1,
+                        tile_rect,
+                        (RING_RADIUS * dpi_scale).min(rail_side * 0.5),
+                        sb.ring,
+                        tab_bg,
+                        (2. * dpi_scale).max(2.),
+                        phase,
+                    )?,
+                    None => self.sidebar_rounded_fill(layers, 1, tile_rect, rail_radius, tab_bg)?,
+                }
                 if active {
                     let rail_w = 3.;
                     let active_x = match self.config.sidebar_position {
                         SidebarPosition::Left => rail_x - 4.,
                         SidebarPosition::Right => rail_x + rail_side + 1.,
                     };
-                    self.sidebar_pill_fill(
+                    let breathe = self.sidebar_rail_breathe();
+                    self.paint_active_rail(
                         layers,
                         2,
                         euclid::rect(
@@ -8040,8 +8887,9 @@ impl crate::TermWindow {
                             rail_w,
                             rail_side * 0.56,
                         ),
-                        rail_w * 0.5,
-                        accent,
+                        sb.ring,
+                        surface,
+                        breathe,
                     )?;
                 }
 
@@ -8086,6 +8934,7 @@ impl crate::TermWindow {
                         if active { accent } else { icon_color },
                         tab_bg,
                         self.agent_dot_pulse(agent),
+                        sb.ring.pulse,
                     );
                     self.sidebar_pill_fill(
                         layers,
@@ -8122,12 +8971,14 @@ impl crate::TermWindow {
                     search_fill
                 };
                 let ssh_offset = if ssh_pressed { 1. } else { 0. };
-                self.sidebar_rounded_fill(
+                self.sidebar_bordered_fill(
                     layers,
                     1,
                     euclid::rect(rail_x, ssh_y + ssh_offset, rail_side, rail_side),
                     rail_radius,
+                    dpi_scale.max(1.),
                     ssh_bg,
+                    sb.row_border,
                 )?;
                 let mut symbol = ">_".to_string();
                 let mut symbol_w = 2. * cell_width as f32;
@@ -8173,12 +9024,14 @@ impl crate::TermWindow {
                     search_fill
                 };
                 let launch_offset = if launch_pressed { 1. } else { 0. };
-                self.sidebar_rounded_fill(
+                self.sidebar_bordered_fill(
                     layers,
                     1,
                     euclid::rect(rail_x, launch_y + launch_offset, rail_side, rail_side),
                     rail_radius,
+                    dpi_scale.max(1.),
                     launch_bg,
+                    sb.row_border,
                 )?;
                 // Same 2-char badge the tab icons use, dropping to 1 char when
                 // the rail is too narrow for both glyphs.
@@ -8225,12 +9078,14 @@ impl crate::TermWindow {
                 search_fill
             };
             let new_tab_offset = if new_tab_pressed { 1. } else { 0. };
-            self.sidebar_rounded_fill(
+            self.sidebar_bordered_fill(
                 layers,
                 1,
                 euclid::rect(rail_x, new_tab_y + new_tab_offset, rail_side, rail_side),
                 rail_radius,
+                dpi_scale.max(1.),
                 new_tab_bg,
+                sb.row_border,
             )?;
             render_text(
                 self,
@@ -8446,7 +9301,15 @@ impl crate::TermWindow {
                     accent.mul_alpha(0.45),
                 )?;
             }
-            self.sidebar_rounded_fill(layers, 1, search_rect, search_radius, search_bg)?;
+            self.sidebar_bordered_fill(
+                layers,
+                1,
+                search_rect,
+                search_radius,
+                dpi_scale.max(1.),
+                search_bg,
+                sb.row_border,
+            )?;
 
             let search_cols = sidebar_text_cols(search_text_w, cell_width);
             // A typed query keeps its *tail*, so the caret you are typing at
@@ -8526,6 +9389,9 @@ impl crate::TermWindow {
         // the glyphs; only the corner radius (an unscaled px constant) needs
         // dpi_scale applied.
         let tab_row_radius = (RADIUS * dpi_scale).min(row_height as f32 * 0.5);
+        let ring_radius = (RING_RADIUS * dpi_scale).min(row_height as f32 * 0.5);
+        let ring_stroke = (2. * dpi_scale).max(2.);
+        let hairline = dpi_scale.max(1.);
         let new_tab_y = top + height - INSET - row_height as f32;
         let tab_list_bottom = self.sidebar_tab_list_bottom(top, height, row_height as f32);
         let tab_list_height = (tab_list_bottom - tab_list_top).max(0.);
@@ -8724,14 +9590,68 @@ impl crate::TermWindow {
             } else {
                 0.
             };
-            if active || tab_hovered || close_hovered || tab_dragging {
-                self.sidebar_rounded_fill(
+            let agent_row = self.sidebar_agent_row_for_tab_idx(tab_idx);
+            let anim = agent_row
+                .as_ref()
+                .map(|(pane_id, state)| self.agent_row_animation(*pane_id, &state.status))
+                .unwrap_or_else(AgentRowAnimation::still);
+            let agent = agent_row.map(|(_, state)| state);
+            let slide_x = anim.slide_x();
+            // Scales whatever alpha the colour already carried, so a settled row
+            // (`enter == 1.0`) is bit-identical to what it was before.
+            let fade = |color: LinearRgba| color.mul_alpha(anim.enter);
+            let row_rect =
+                euclid::rect(item_x + slide_x, y + row_offset, item_w, row_height as f32);
+            let row_filled = active || tab_hovered || close_hovered || tab_dragging;
+            // The ring painters punch their own interior back out, so they need
+            // an opaque colour to punch with; only the flat fills and the text
+            // ride the enter fade.
+            let ring_behind = if row_filled {
+                row_bg
+            } else if anim.spin.is_some() {
+                sb.working_fill
+            } else {
+                surface
+            };
+            let row_bg = fade(row_bg);
+            let treatment = anim.ring_treatment();
+            if let AgentRowRing::Spin(phase) = treatment {
+                self.paint_agent_working_ring(
                     layers,
                     1,
-                    euclid::rect(item_x, y + row_offset, item_w, row_height as f32),
-                    tab_row_radius,
-                    row_bg,
+                    row_rect,
+                    ring_radius,
+                    sb.ring,
+                    ring_behind,
+                    ring_stroke,
+                    phase,
                 )?;
+            } else {
+                if row_filled {
+                    self.sidebar_rounded_fill(layers, 1, row_rect, tab_row_radius, row_bg)?;
+                }
+                match treatment {
+                    AgentRowRing::Waiting => self.paint_agent_waiting_glow(
+                        layers,
+                        1,
+                        row_rect,
+                        ring_radius,
+                        sb.ring,
+                        ring_behind,
+                        hairline,
+                    )?,
+                    AgentRowRing::Resolve(intensity) => self.paint_agent_resolve_ring(
+                        layers,
+                        1,
+                        row_rect,
+                        ring_radius,
+                        sb.ring,
+                        ring_behind,
+                        hairline,
+                        intensity,
+                    )?,
+                    AgentRowRing::None | AgentRowRing::Spin(_) => {}
+                }
             }
             if drop_flash_alpha > 0. {
                 let flash_x = match self.config.sidebar_position {
@@ -8745,19 +9665,25 @@ impl crate::TermWindow {
                     active_fg.mul_alpha(0.18 * drop_flash_alpha),
                 )?;
             }
-            if active {
+            // The rail sits just inside the row's left edge, which is where the
+            // throbber ring also runs. Drawn together, the static rail reads as
+            // a detached dot the rotating ring keeps sliding past, so the ring
+            // owns the row while it spins — it already marks the row as active.
+            if active && anim.spin.is_none() {
                 let rail_h = (row_height as f32 * 0.55).max(cell_height as f32 * 0.6);
                 let rail_y = y + row_offset + (row_height as f32 - rail_h) * 0.5;
                 let rail_x = match self.config.sidebar_position {
                     SidebarPosition::Left => item_x + 2.,
                     SidebarPosition::Right => item_x + item_w - ACTIVE_RAIL_W - 2.,
                 };
-                self.sidebar_rounded_fill(
+                let breathe = self.sidebar_rail_breathe();
+                self.paint_active_rail(
                     layers,
                     2,
-                    euclid::rect(rail_x, rail_y, ACTIVE_RAIL_W, rail_h),
-                    ACTIVE_RAIL_W * 0.5,
-                    accent,
+                    euclid::rect(rail_x + slide_x, rail_y, ACTIVE_RAIL_W, rail_h),
+                    sb.ring,
+                    row_bg,
+                    breathe,
                 )?;
             }
 
@@ -8766,7 +9692,6 @@ impl crate::TermWindow {
             // nothing to expand, so nothing is drawn and nothing shifts.
             let expand_type = UIItemType::SidebarTabExpand { tab_idx };
             let expand_hovered = hovered_item.as_ref() == Some(&expand_type);
-            let agent = self.sidebar_agent_for_tab_idx(tab_idx);
             // One composition for the whole row: the title's origin *and* its
             // width both step past the chevron and the status dot. Deriving
             // only the width from them is what painted the leading "N: " index
@@ -8785,19 +9710,19 @@ impl crate::TermWindow {
                     layers,
                     if expanded { "⌄" } else { "›" },
                     &CellAttributes::default(),
-                    cols.chevron_x,
+                    cols.chevron_x + slide_x,
                     y + row_offset + (row_height as f32 - cell_height as f32) * 0.5,
                     cell_width as f32,
                     if expand_hovered {
-                        hover_fg
+                        fade(hover_fg)
                     } else {
-                        inactive_fg.mul_alpha(0.70)
+                        fade(inactive_fg.mul_alpha(0.70))
                     },
                     row_bg,
                 )?;
             }
 
-            if let Some(agent) = &agent {
+            if let Some(agent) = agent.as_ref().filter(|_| anim.shows_status_dot()) {
                 let badge_size = sidebar_status_dot_size(cell_height as f32);
                 let badge_y = y + row_offset + (row_height as f32 - badge_size) * 0.5;
                 let badge_base = if active {
@@ -8810,13 +9735,14 @@ impl crate::TermWindow {
                     badge_base,
                     row_bg,
                     self.agent_dot_pulse(agent),
+                    sb.ring.pulse,
                 );
                 self.sidebar_pill_fill(
                     layers,
                     2,
-                    euclid::rect(cols.badge_x, badge_y, badge_size, badge_size),
+                    euclid::rect(cols.badge_x + slide_x, badge_y, badge_size, badge_size),
                     badge_size * 0.5,
-                    badge_color,
+                    fade(badge_color),
                 )?;
             }
 
@@ -8838,14 +9764,14 @@ impl crate::TermWindow {
                 layers,
                 &display_title,
                 &CellAttributes::default(),
-                cols.text_x,
+                cols.text_x + slide_x,
                 primary_y,
                 cols.text_w,
-                if active || tab_hovered || close_hovered {
+                fade(if active || tab_hovered || close_hovered {
                     inactive_fg
                 } else {
                     inactive_fg.mul_alpha(0.78)
-                },
+                }),
                 row_bg,
             )?;
             if let Some(metadata_offset) = metadata_offset {
@@ -8854,14 +9780,14 @@ impl crate::TermWindow {
                     layers,
                     &metadata_text,
                     &CellAttributes::default(),
-                    cols.text_x,
+                    cols.text_x + slide_x,
                     y + row_offset + metadata_offset,
                     cols.text_w,
-                    if active || tab_hovered || close_hovered {
+                    fade(if active || tab_hovered || close_hovered {
                         inactive_fg.mul_alpha(0.60)
                     } else {
                         inactive_fg.mul_alpha(0.42)
-                    },
+                    }),
                     row_bg,
                 )?;
             }
@@ -9068,7 +9994,7 @@ impl crate::TermWindow {
                 search_fill
             };
             let worktree_offset = if worktree_pressed { 1. } else { 0. };
-            self.sidebar_rounded_fill(
+            self.sidebar_bordered_fill(
                 layers,
                 1,
                 euclid::rect(
@@ -9078,7 +10004,9 @@ impl crate::TermWindow {
                     row_height as f32,
                 ),
                 RADIUS * dpi_scale,
+                dpi_scale.max(1.),
                 worktree_bg,
+                sb.row_border,
             )?;
             let folder_color = if worktree_hovered {
                 hover_fg.mul_alpha(0.90)
@@ -9149,7 +10077,7 @@ impl crate::TermWindow {
                     search_fill
                 };
                 let agent_offset = if agent_pressed { 1. } else { 0. };
-                self.sidebar_rounded_fill(
+                self.sidebar_bordered_fill(
                     layers,
                     1,
                     euclid::rect(
@@ -9159,7 +10087,9 @@ impl crate::TermWindow {
                         row_height as f32,
                     ),
                     RADIUS * dpi_scale,
+                    dpi_scale.max(1.),
                     agent_bg,
+                    sb.row_border,
                 )?;
 
                 // Adapter-colored dot (or a neutral dot when no adapter).
@@ -9497,10 +10427,7 @@ impl crate::TermWindow {
             return;
         }
         let mux = Mux::get();
-        let claimed: Vec<PaneId> = agents
-            .iter()
-            .filter_map(|agent| agent.pane_id)
-            .collect();
+        let claimed: Vec<PaneId> = agents.iter().filter_map(|agent| agent.pane_id).collect();
         for (session_id, provider, floor, _) in binds.iter() {
             // The resumed agent is detached and carries this session id.
             let Some(agent) = agents
@@ -9511,29 +10438,24 @@ impl crate::TermWindow {
             };
             // First pane with a matching provider and an id above the floor
             // that is not already bound to some other agent.
-            let target = mux
-                .iter_panes()
-                .into_iter()
-                .find(|pane| {
-                    let id = pane.pane_id();
-                    if id <= *floor as usize {
-                        return false;
-                    }
-                    if claimed.contains(&id) {
-                        return false;
-                    }
-                    let pane_provider = pane
-                        .copy_user_vars()
-                        .get("agent.adapter")
-                        .cloned()
-                        .or_else(|| {
-                            pane.get_foreground_process_name(CachePolicy::AllowStale)
-                        });
-                    match pane_provider.as_deref() {
-                        None => false,
-                        Some(p) => p == provider,
-                    }
-                });
+            let target = mux.iter_panes().into_iter().find(|pane| {
+                let id = pane.pane_id();
+                if id <= *floor as usize {
+                    return false;
+                }
+                if claimed.contains(&id) {
+                    return false;
+                }
+                let pane_provider = pane
+                    .copy_user_vars()
+                    .get("agent.adapter")
+                    .cloned()
+                    .or_else(|| pane.get_foreground_process_name(CachePolicy::AllowStale));
+                match pane_provider.as_deref() {
+                    None => false,
+                    Some(p) => p == provider,
+                }
+            });
             if let Some(pane) = target {
                 agent.pane_id = Some(pane.pane_id());
                 agent.status = crate::agent_herd::HerdStatus::Working;
@@ -9786,15 +10708,10 @@ impl crate::TermWindow {
         let header_h = metrics.header_h;
         let pad = metrics.pad;
 
-        let colors = self
-            .config
-            .resolved_palette
-            .tab_bar
-            .clone()
-            .unwrap_or_else(TabBarColors::default);
-        let bg = opaque(colors.background().to_linear());
-        let fg = srgb8_to_linear(200, 200, 200);
-        let dim = srgb8_to_linear(130, 130, 130);
+        let sb = self.sidebar_palette();
+        let bg = sb.surface;
+        let fg = sb.text_active;
+        let dim = sb.text_meta;
 
         let section_x = sidebar_left;
         let section_w = sidebar_w;
@@ -10344,11 +11261,8 @@ impl crate::TermWindow {
                             .map(|a| unicode_column_width(a.label(), None))
                             .max()
                             .unwrap_or(0);
-                        let min_menu_w =
-                            max_label_cols as f32 * cell_w + 24.0 * dpi;
-                        let menu_w = (section_w - pad * 2.0)
-                            .max(min_menu_w)
-                            .min(section_w);
+                        let min_menu_w = max_label_cols as f32 * cell_w + 24.0 * dpi;
+                        let menu_w = (section_w - pad * 2.0).max(min_menu_w).min(section_w);
                         let row_h = cell_h + 4.0 * dpi;
                         let menu_h = actions.len() as f32 * row_h + pad * 2.0;
                         let menu_x = section_x + pad;
@@ -10388,10 +11302,8 @@ impl crate::TermWindow {
                             };
                             let label = action.label();
                             let label_cols = unicode_column_width(label, None);
-                            let available_cols =
-                                ((menu_w - 24.0 * dpi) / cell_w).max(0.0) as usize;
-                            let display_label =
-                                truncate_with_ellipsis(label, available_cols);
+                            let available_cols = ((menu_w - 24.0 * dpi) / cell_w).max(0.0) as usize;
+                            let display_label = truncate_with_ellipsis(label, available_cols);
                             self.filled_rectangle(
                                 layers,
                                 1,
@@ -10478,6 +11390,198 @@ impl crate::TermWindow {
             item_type,
         });
         Ok(bg)
+    }
+
+    /// Rounded fill carrying a hairline border, the modernised chip treatment.
+    fn sidebar_bordered_fill(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        layer_num: usize,
+        rect: RectF,
+        radius: f32,
+        stroke: f32,
+        fill: LinearRgba,
+        border: LinearRgba,
+    ) -> anyhow::Result<()> {
+        self.sidebar_rounded_fill(layers, layer_num, rect, radius, border)?;
+        self.sidebar_rounded_fill(
+            layers,
+            layer_num,
+            deflate_rect(rect, stroke),
+            (radius - stroke).max(0.),
+            fill,
+        )
+    }
+
+    /// The active tab's rail, as a two-colour vertical ramp.
+    ///
+    /// The ramp is quantised into [`RAIL_GRADIENT_BANDS`] flat quads because
+    /// there is no gradient primitive in this renderer; the rounded silhouette
+    /// is laid down once underneath so the bands never have to reproduce it.
+    /// `breathe` scales the whole rail against `behind` rather than using an
+    /// alpha, so the rail can never blend with whatever it happens to overlap.
+    fn paint_active_rail(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        layer_num: usize,
+        rect: RectF,
+        ring: RingColors,
+        behind: LinearRgba,
+        breathe: f32,
+    ) -> anyhow::Result<()> {
+        let h = rect.size.height;
+        let w = rect.size.width;
+        if !(h > 0. && w > 0.) {
+            return Ok(());
+        }
+        let shade = |t: f32| lerp_rgba(behind, lerp_rgba(ring.a, ring.b, t), breathe);
+        let r = w * 0.5;
+        self.sidebar_pill_fill(layers, layer_num, rect, r, shade(0.5))?;
+
+        let inner_y = rect.min_y() + r;
+        let inner_h = (h - 2. * r).max(0.);
+        if inner_h <= 0. {
+            return Ok(());
+        }
+        let step = inner_h / RAIL_GRADIENT_BANDS as f32;
+        for band in 0..RAIL_GRADIENT_BANDS {
+            let top = inner_y + band as f32 * step;
+            let t = ((top + step * 0.5) - rect.min_y()) / h;
+            self.filled_rectangle(
+                layers,
+                layer_num,
+                euclid::rect(rect.min_x(), top, w, step),
+                shade(t),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The working-agent throbber: a continuous hairline with two rotating arcs
+    /// riding on top of it, as the mockup layers them.
+    ///
+    /// The arcs are traced onto the four straight spans only. `filled_rectangle`
+    /// is the primitive here because it takes an `f32` rect directly, where
+    /// `poly_quad` truncates its cell size to `isize` and can hand the glyph
+    /// cache a zero-sized bitmap under fractional DPI; a square segment parked
+    /// on a rounded corner would also square that corner off. The hairline
+    /// underneath is what carries the ring around the corners.
+    fn paint_agent_working_ring(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        layer_num: usize,
+        rect: RectF,
+        radius: f32,
+        ring: RingColors,
+        behind: LinearRgba,
+        stroke: f32,
+        phase: f32,
+    ) -> anyhow::Result<()> {
+        let w = rect.size.width;
+        let h = rect.size.height;
+        if w <= 2. * stroke || h <= 2. * stroke {
+            return Ok(());
+        }
+        let hairline = (stroke * 0.5).max(1.);
+        let blend = lerp_rgba(ring.a, ring.b, 1. - (2. * phase - 1.).abs());
+        // The continuous under-ring the arcs ride on. The arcs must fade into
+        // *this*, not into the row: fading them to `behind` painted the
+        // under-ring out as they thinned, and the tiles below the visibility
+        // threshold were skipped entirely, leaving it exposed at full strength
+        // exactly where the ring should be faintest -- a bright pip sitting in
+        // the middle of the gap, drifting around the row with the sweep.
+        let under = lerp_rgba(behind, blend, 0.5);
+        self.sidebar_bordered_fill(layers, layer_num, rect, radius, hairline, behind, under)?;
+
+        let inset = stroke * 0.5;
+        let outline = throbber_outline(rect, radius, stroke);
+        let Some(turns) = throbber_outline_turns(&outline) else {
+            return Ok(());
+        };
+        for (index, (px, py)) in outline.iter().enumerate() {
+            self.filled_rectangle(
+                layers,
+                layer_num,
+                euclid::rect(px - inset, py - inset, stroke, stroke),
+                throbber_tile_color(ring, under, turns[index], phase),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The one-shot ring played when an agent stops working, and the quiet
+    /// hairline it settles into once `intensity` is `None`.
+    fn paint_agent_resolve_ring(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        layer_num: usize,
+        rect: RectF,
+        radius: f32,
+        ring: RingColors,
+        behind: LinearRgba,
+        stroke: f32,
+        intensity: Option<f32>,
+    ) -> anyhow::Result<()> {
+        // A ripple, not a border: the ring swells outward and thins away to
+        // nothing, so the eye reads one departing pulse. The previous shape
+        // shrank inward and then parked at a fixed 0.55 forever, which is why
+        // it registered as a permanent outline rather than as motion.
+        let (grow, strength) = match intensity {
+            Some(intensity) => {
+                let t = 1. - intensity.clamp(0., 1.);
+                let swell = (t * std::f32::consts::PI).sin();
+                (t * DONE_RING_GROW_PX, swell)
+            }
+            // What remains once the pulse has gone: present enough to mark the
+            // row as finished, far too faint to read as a border.
+            None => (0., DONE_RING_SETTLED_STRENGTH),
+        };
+        if strength <= 0.01 {
+            return Ok(());
+        }
+        let outer = euclid::rect(
+            rect.min_x() - grow,
+            rect.min_y() - grow,
+            rect.size.width + 2. * grow,
+            rect.size.height + 2. * grow,
+        );
+        self.sidebar_bordered_fill(
+            layers,
+            layer_num,
+            outer,
+            radius + grow,
+            stroke,
+            behind,
+            lerp_rgba(behind, ring.done, strength),
+        )
+    }
+
+    /// The standing outline on a row whose agent is blocked on the user.
+    ///
+    /// Deliberately frame-free: no phase, no `schedule_sidebar_frame`. A row can
+    /// sit here for hours, so anything animated would keep a whole window
+    /// repainting for as long as the user ignores it. Motion has already had its
+    /// turn by this point — the throbber and the departing ripple both ran — and
+    /// what is left to say is a fact, not an event.
+    fn paint_agent_waiting_glow(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        layer_num: usize,
+        rect: RectF,
+        radius: f32,
+        ring: RingColors,
+        behind: LinearRgba,
+        stroke: f32,
+    ) -> anyhow::Result<()> {
+        self.sidebar_bordered_fill(
+            layers,
+            layer_num,
+            rect,
+            radius,
+            stroke,
+            behind,
+            lerp_rgba(behind, ring.waiting, WAITING_GLOW_STRENGTH),
+        )
     }
 
     pub(crate) fn sidebar_rounded_fill(
@@ -10671,6 +11775,629 @@ fn sidebar_rounded_corner_radius(rect: RectF, radius: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use config::{AgentAnimationsConfig, RgbaColor};
+
+    /// Ring colours from a preset with no `animations.colors` overrides.
+    fn preset_ring(preset: AgentRingColors) -> RingColors {
+        RingColors::resolve(preset, &AgentAnimationColors::default())
+    }
+
+    /// `agent_ui` with the animation table written out, which is what opts a
+    /// config out of `pulse_working_dot`'s legacy master-switch meaning.
+    fn agent_ui_with_animations(animations: AgentAnimationsConfig) -> AgentUiConfig {
+        AgentUiConfig {
+            animations: Some(animations),
+            ..AgentUiConfig::default()
+        }
+    }
+
+    fn gates_with(mutate: impl FnOnce(&mut AgentAnimationsConfig)) -> SidebarAnimationGates {
+        let mut anim = AgentAnimationsConfig::default();
+        mutate(&mut anim);
+        SidebarAnimationGates::from_config(&agent_ui_with_animations(anim))
+    }
+
+    #[test]
+    fn every_animation_runs_out_of_the_box() {
+        let gates = SidebarAnimationGates::from_config(&AgentUiConfig::default());
+        assert_eq!(
+            gates,
+            SidebarAnimationGates {
+                working_ring: true,
+                resolve_ripple: true,
+                waiting_glow: true,
+                agent_enter: true,
+                rail_breathe: true,
+                dot_pulse: true,
+                unfocused: true,
+            }
+        );
+        assert!(gates.any_motion());
+    }
+
+    #[test]
+    fn each_animation_toggle_gates_only_its_own_effect() {
+        let all = gates_with(|_| {});
+
+        assert_eq!(
+            gates_with(|a| a.working_ring = false),
+            SidebarAnimationGates {
+                working_ring: false,
+                ..all
+            }
+        );
+        assert_eq!(
+            gates_with(|a| a.resolve_ripple = false),
+            SidebarAnimationGates {
+                resolve_ripple: false,
+                ..all
+            }
+        );
+        assert_eq!(
+            gates_with(|a| a.waiting_glow = false),
+            SidebarAnimationGates {
+                waiting_glow: false,
+                ..all
+            }
+        );
+        assert_eq!(
+            gates_with(|a| a.agent_enter = false),
+            SidebarAnimationGates {
+                agent_enter: false,
+                ..all
+            }
+        );
+        assert_eq!(
+            gates_with(|a| a.rail_breathe = false),
+            SidebarAnimationGates {
+                rail_breathe: false,
+                ..all
+            }
+        );
+        assert_eq!(
+            gates_with(|a| a.dot_pulse = false),
+            SidebarAnimationGates {
+                dot_pulse: false,
+                ..all
+            }
+        );
+        // Turning one animation off never stops the sidebar animating.
+        assert!(gates_with(|a| a.working_ring = false).any_motion());
+    }
+
+    #[test]
+    fn the_master_switch_stops_all_motion_but_leaves_the_waiting_glow() {
+        let gates = gates_with(|a| a.enabled = false);
+        assert!(!gates.any_motion());
+        assert!(!gates.working_ring);
+        assert!(!gates.resolve_ripple);
+        assert!(!gates.agent_enter);
+        assert!(!gates.rail_breathe);
+        assert!(!gates.dot_pulse);
+        assert!(!gates.unfocused);
+        // Static state, not motion: it is the only mark left saying which agent
+        // is still blocked on the user, so it needs its own toggle to go.
+        assert!(gates.waiting_glow);
+        assert!(
+            !gates_with(|a| {
+                a.enabled = false;
+                a.waiting_glow = false;
+            })
+            .waiting_glow
+        );
+    }
+
+    #[test]
+    fn unfocused_only_controls_background_frames() {
+        let gates = gates_with(|a| a.unfocused = false);
+        assert!(!gates.unfocused);
+        // Everything still animates; it just stops asking for frames once the
+        // window loses focus.
+        assert!(gates.any_motion());
+        assert!(gates.working_ring);
+        assert!(gates.dot_pulse);
+    }
+
+    #[test]
+    fn pulse_working_dot_stays_a_master_switch_until_the_table_is_written() {
+        // Historic behaviour: the key is named for the dot but shipped as the
+        // kill switch for every sidebar animation.
+        let legacy = SidebarAnimationGates::from_config(&AgentUiConfig {
+            pulse_working_dot: false,
+            ..AgentUiConfig::default()
+        });
+        assert!(!legacy.any_motion());
+        assert!(legacy.waiting_glow);
+
+        // Writing any `animations` table opts into the new model: the key is
+        // then nothing but an extra AND-gate on the dot pulse.
+        let modern = SidebarAnimationGates::from_config(&AgentUiConfig {
+            pulse_working_dot: false,
+            ..agent_ui_with_animations(AgentAnimationsConfig::default())
+        });
+        assert!(!modern.dot_pulse);
+        assert_eq!(
+            modern,
+            SidebarAnimationGates {
+                dot_pulse: false,
+                ..gates_with(|_| {})
+            }
+        );
+
+        // And it cannot revive a dot pulse the new table turned off.
+        assert!(
+            !SidebarAnimationGates::from_config(&AgentUiConfig {
+                pulse_working_dot: true,
+                ..agent_ui_with_animations(AgentAnimationsConfig {
+                    dot_pulse: false,
+                    ..AgentAnimationsConfig::default()
+                })
+            })
+            .dot_pulse
+        );
+    }
+
+    #[test]
+    fn animation_colour_overrides_win_over_the_preset() {
+        let overrides = AgentAnimationColors {
+            ring_a: Some(RgbaColor::from((0x11, 0x22, 0x33))),
+            ring_b: Some(RgbaColor::from((0x44, 0x55, 0x66))),
+            resolve: Some(RgbaColor::from((0x77, 0x88, 0x99))),
+            waiting_glow: Some(RgbaColor::from((0xaa, 0xbb, 0xcc))),
+            dot_pulse: Some(RgbaColor::from((0xdd, 0xee, 0xff))),
+        };
+        let ring = RingColors::resolve(AgentRingColors::TanSage, &overrides);
+        let preset = preset_ring(AgentRingColors::TanSage);
+
+        assert_eq!(ring.a, RgbaColor::from((0x11, 0x22, 0x33)).to_linear());
+        assert_eq!(ring.b, RgbaColor::from((0x44, 0x55, 0x66)).to_linear());
+        assert_eq!(ring.done, RgbaColor::from((0x77, 0x88, 0x99)).to_linear());
+        assert_eq!(
+            ring.waiting,
+            RgbaColor::from((0xaa, 0xbb, 0xcc)).to_linear()
+        );
+        assert_eq!(ring.pulse, RgbaColor::from((0xdd, 0xee, 0xff)).to_linear());
+        assert_ne!(ring.a, preset.a);
+        assert_ne!(ring.done, preset.done);
+    }
+
+    #[test]
+    fn unset_animation_colours_fall_back_to_the_preset() {
+        for preset in [
+            AgentRingColors::RedBlue,
+            AgentRingColors::OrangeCyan,
+            AgentRingColors::TanSage,
+            AgentRingColors::BrownSlate,
+        ] {
+            let ring = preset_ring(preset);
+            let ((ar, ag, ab), (br, bg, bb)) = preset.stops();
+            assert_eq!(ring.a, srgb8_to_linear(ar, ag, ab), "{preset:?} warm end");
+            assert_eq!(ring.b, srgb8_to_linear(br, bg, bb), "{preset:?} cool end");
+            // The glow and the dot pulse both default to the warm end.
+            assert_eq!(ring.waiting, ring.a, "{preset:?} waiting glow");
+            assert_eq!(ring.pulse, ring.a, "{preset:?} dot pulse");
+        }
+
+        // One override never disturbs the others.
+        let ring = RingColors::resolve(
+            AgentRingColors::RedBlue,
+            &AgentAnimationColors {
+                dot_pulse: Some(RgbaColor::from((0x01, 0x02, 0x03))),
+                ..AgentAnimationColors::default()
+            },
+        );
+        let plain = preset_ring(AgentRingColors::RedBlue);
+        assert_eq!(ring.pulse, RgbaColor::from((0x01, 0x02, 0x03)).to_linear());
+        assert_eq!(ring.a, plain.a);
+        assert_eq!(ring.waiting, plain.waiting);
+        assert_eq!(ring.done, plain.done);
+    }
+
+    #[test]
+    fn an_unset_resolve_colour_stays_the_cool_end_at_55_percent() {
+        for preset in [
+            AgentRingColors::RedBlue,
+            AgentRingColors::OrangeCyan,
+            AgentRingColors::TanSage,
+            AgentRingColors::BrownSlate,
+        ] {
+            let ring = preset_ring(preset);
+            let (dr, dg, db) = preset.settled_stop();
+            assert_eq!(ring.done, srgb8_to_linear(dr, dg, db), "{preset:?}");
+            // Never the full-strength cool end: at 100% the settled hairline
+            // competes with the active row's own outline.
+            assert_ne!(ring.done, ring.b, "{preset:?}");
+        }
+
+        // Overriding the cool end moves the hairline with it, still at 55%,
+        // rather than leaving it on the abandoned preset's hue.
+        let ring = RingColors::resolve(
+            AgentRingColors::RedBlue,
+            &AgentAnimationColors {
+                ring_b: Some(RgbaColor::from((0x64, 0x64, 0x64))),
+                ..AgentAnimationColors::default()
+            },
+        );
+        assert_eq!(
+            ring.done,
+            srgb8_to_linear(dim_srgb(0x64), dim_srgb(0x64), dim_srgb(0x64))
+        );
+        assert_ne!(ring.done, ring.b);
+    }
+
+    #[test]
+    fn the_prompt_and_status_scan_windows_are_the_same_size() {
+        // They must move together: the docked input strip pushes the agent's
+        // prompt box exactly as far up as it pushes the spinner, so a shorter
+        // prompt window made a finished agent decay to `Unknown` the moment it
+        // printed a reply long enough to fill the gap.
+        assert_eq!(AGENT_PROMPT_TAIL_LINES, AGENT_STATUS_TAIL_LINES);
+        assert!(
+            AGENT_STATUS_TAIL_LINES >= 12,
+            "a {AGENT_STATUS_TAIL_LINES}-line window does not clear a 3-row docked strip \
+             plus its separator, context bar and mode line"
+        );
+    }
+
+    #[test]
+    fn a_prompt_under_the_docked_input_strip_still_reads_as_waiting() {
+        // Realistic screen: the agent's finished reply, its boxed prompt, then
+        // the docked composer (separator + 3 reserved rows + mode line) and the
+        // status footer under it. A six-line window put the prompt outside the
+        // scan and the row stopped glowing.
+        let screen = "⎿ Updated three call sites.\n\
+             Done — the sidebar now reads its colours from config.\n\
+             ╭───────────────────────────────────────────╮\n\
+             │ >                                         │\n\
+             ╰───────────────────────────────────────────╯\n\
+             ? for shortcuts\n\
+             ───────────────────────────────────────────\n\
+             [ type a message ]\n\
+             \n\
+             \n\
+             ───────────────────────────────────────────\n\
+             11% used · 89% left (110k/1000k tokens) · tgzterminal main\n\
+             ▶▶ auto mode on (shift+tab to cycle)\n";
+        assert_eq!(
+            infer_agent_status_from_visible_text(screen, None),
+            AgentStatus::WaitingForInput
+        );
+
+        // And the prompt really is buried: this is the distance the old
+        // six-line window could not reach.
+        let depth = screen
+            .lines()
+            .rev()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .position(|line| line.starts_with("│ >"))
+            .expect("prompt line is in the tail");
+        assert!(
+            depth >= 6,
+            "prompt sat only {depth} non-blank lines up; the regression needs a deeper screen"
+        );
+        assert!(AGENT_PROMPT_TAIL_LINES > depth);
+    }
+
+    #[test]
+    fn a_spinner_under_the_docked_input_strip_still_reads_as_running() {
+        let screen = "✻ Synthesizing… (26s · ↓ 1.6k tokens)\n\
+             ╭───────────────────────────────────────────╮\n\
+             │                                           │\n\
+             ╰───────────────────────────────────────────╯\n\
+             ? for shortcuts\n\
+             ───────────────────────────────────────────\n\
+             [ type a message ]\n\
+             \n\
+             ───────────────────────────────────────────\n\
+             11% used · 89% left (110k/1000k tokens) · tgzterminal main\n\
+             ▶▶ auto mode on (shift+tab to cycle)\n";
+        assert_eq!(
+            infer_agent_status_from_visible_text(screen, None),
+            AgentStatus::Running
+        );
+        let depth = screen
+            .lines()
+            .rev()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .position(|line| line.starts_with('✻'))
+            .expect("spinner line is in the tail");
+        assert!(depth >= 6, "spinner sat only {depth} non-blank lines up");
+        assert!(AGENT_STATUS_TAIL_LINES > depth);
+    }
+
+    #[test]
+    fn the_grace_holds_running_through_a_waiting_blip_then_releases() {
+        let now = Instant::now();
+        let fresh = now - Duration::from_millis(500);
+
+        // Agents redraw their prompt box between steps of one turn, so a frame
+        // captured there shows a prompt while the agent is still working.
+        assert_eq!(
+            stabilize_agent_status(
+                AgentStatus::WaitingForInput,
+                Some(AgentStatus::Running),
+                Some(fresh),
+                now,
+                AGENT_RUNNING_GRACE,
+            ),
+            AgentStatus::Running
+        );
+        assert_eq!(
+            stabilize_agent_status(
+                AgentStatus::Unknown,
+                Some(AgentStatus::Streaming),
+                Some(fresh),
+                now,
+                AGENT_RUNNING_GRACE,
+            ),
+            AgentStatus::Streaming
+        );
+
+        // Once the grace is spent the weak reading takes over, which is what
+        // finally stops the throbber.
+        let stale = now - AGENT_RUNNING_GRACE - Duration::from_millis(1);
+        assert_eq!(
+            stabilize_agent_status(
+                AgentStatus::WaitingForInput,
+                Some(AgentStatus::Running),
+                Some(stale),
+                now,
+                AGENT_RUNNING_GRACE,
+            ),
+            AgentStatus::WaitingForInput
+        );
+    }
+
+    #[test]
+    fn a_positive_reading_always_beats_the_grace() {
+        let now = Instant::now();
+        let fresh = now - Duration::from_millis(500);
+        for previous in [
+            AgentStatus::WaitingForInput,
+            AgentStatus::Running,
+            AgentStatus::Unknown,
+        ] {
+            assert_eq!(
+                stabilize_agent_status(
+                    AgentStatus::Running,
+                    Some(previous.clone()),
+                    Some(fresh),
+                    now,
+                    AGENT_RUNNING_GRACE,
+                ),
+                AgentStatus::Running,
+                "{previous:?} must not suppress a live running marker"
+            );
+        }
+    }
+
+    #[test]
+    fn a_held_status_is_never_served_from_the_content_keyed_fast_path() {
+        let key = detection_key(Some("node"), "claude");
+        let entry = detection_entry(detection_key(Some("node"), "claude"), Some(claude_state()));
+        assert!(agent_detection_cache_hit(&entry, &key));
+
+        // Same pane, same screen, but the status is only alive because the
+        // grace is holding it. A finished agent stops redrawing, so its content
+        // fingerprint never moves again — served from the fast path, the held
+        // `Running` came back forever and the row span for the whole session.
+        let mut held = detection_entry(detection_key(Some("node"), "claude"), Some(claude_state()));
+        held.status_held = true;
+        assert!(!agent_detection_cache_hit(&held, &key));
+
+        // A changed key misses regardless of the hold.
+        assert!(!agent_detection_cache_hit(
+            &entry,
+            &detection_key(Some("node"), "codex")
+        ));
+    }
+
+    /// A full-width sidebar row at 1x: the shape the ring bugs showed up on.
+    fn wide_row() -> RectF {
+        euclid::rect(0., 0., 264., 44.)
+    }
+
+    #[test]
+    fn the_throbber_outline_leaves_no_undrawn_gap() {
+        // Tiles are `stroke` wide and advance by less than that, so every step
+        // has to stay under one stroke or a sub-pixel sliver of the row's dark
+        // interior shows through between them.
+        for (rect, radius, stroke) in [
+            (wide_row(), 10., 2.5),
+            (euclid::rect(0., 0., 24., 24.), 6., 2.),
+            (euclid::rect(4., 7., 130., 28.), 8., 3.),
+        ] {
+            let outline = throbber_outline(rect, radius, stroke);
+            assert!(outline.len() > 16, "outline is too coarse to be a ring");
+            let mut previous = *outline.last().unwrap();
+            for (index, point) in outline.iter().enumerate() {
+                let step = (point.0 - previous.0).hypot(point.1 - previous.1);
+                assert!(
+                    step < stroke,
+                    "step {step} at index {index} exceeds the {stroke}px tile, leaving a gap"
+                );
+                previous = *point;
+            }
+        }
+    }
+
+    #[test]
+    fn a_gap_in_the_colour_ramp_still_paints_the_under_tone() {
+        let ring = preset_ring(AgentRingColors::RedBlue);
+        let under = LinearRgba(0.10, 0.10, 0.12, 1.0);
+
+        // 0deg and 180deg are the two gap centres.
+        for gap in [0., 0.5] {
+            assert!(
+                throbber_ring_color(ring, gap, 0.).is_none(),
+                "{gap} is a gap"
+            );
+            assert_eq!(
+                throbber_tile_color(ring, under, gap, 0.),
+                under,
+                "the gap must still paint the under-ring, not nothing"
+            );
+        }
+        // A lit point is emphatically not the under-tone.
+        assert_ne!(throbber_tile_color(ring, under, 0.25, 0.), under);
+    }
+
+    #[test]
+    fn throbber_colour_advances_with_arc_length_not_angle() {
+        let rect = wide_row();
+        let stroke = 2.5;
+        let outline = throbber_outline(rect, 10., stroke);
+        let turns = throbber_outline_turns(&outline).expect("a real outline");
+        assert_eq!(turns.len(), outline.len());
+
+        // Junction points where an arc hands over to a span coincide, so their
+        // zero-length steps are not colour steps.
+        let spread = |steps: Vec<f32>| {
+            let real: Vec<f32> = steps
+                .into_iter()
+                .filter(|d| *d > 1e-4 && *d < 0.5)
+                .collect();
+            assert!(real.len() > 100, "not enough steps to judge uniformity");
+            let max = real.iter().copied().fold(f32::MIN, f32::max);
+            let min = real.iter().copied().fold(f32::MAX, f32::min);
+            max / min
+        };
+
+        // Equal steps along the outline get equal shares of the sweep.
+        let by_arc = spread(turns.windows(2).map(|w| w[1] - w[0]).collect());
+        assert!(
+            by_arc < 1.3,
+            "arc-length colour advance is uneven by {by_arc}x"
+        );
+
+        // The angle from the row's centre is what this replaced: on a 264x44
+        // row it crushes each short edge into a few degrees while spreading the
+        // middle of each long edge over many, so a whole edge lit and went dark
+        // as one blob.
+        let (cx, cy) = (
+            rect.min_x() + rect.size.width * 0.5,
+            rect.min_y() + rect.size.height * 0.5,
+        );
+        let angles: Vec<f32> = outline
+            .iter()
+            .map(|(px, py)| ring_turn_at(cx, cy, *px, *py))
+            .collect();
+        let by_angle = spread(
+            angles
+                .windows(2)
+                .map(|w| (w[1] - w[0]).rem_euclid(1.0))
+                .collect(),
+        );
+        assert!(
+            by_angle > 8. * by_arc,
+            "the angle parameterisation should be far more uneven ({by_angle}x) than arc \
+             length ({by_arc}x); if it is not, this row shape no longer reproduces the bug"
+        );
+    }
+
+    #[test]
+    fn ring_treatment_precedence_is_spin_then_waiting_then_resolve() {
+        let everything = AgentRowAnimation {
+            enter: 1.,
+            spin: Some(0.25),
+            resolve: Some(0.5),
+            settled: true,
+            waiting: true,
+        };
+        // A spinning row never also glows and never also ripples.
+        assert_eq!(everything.ring_treatment(), AgentRowRing::Spin(0.25));
+
+        let waiting = AgentRowAnimation {
+            spin: None,
+            ..everything
+        };
+        assert_eq!(waiting.ring_treatment(), AgentRowRing::Waiting);
+
+        let rippling = AgentRowAnimation {
+            spin: None,
+            waiting: false,
+            ..everything
+        };
+        assert_eq!(rippling.ring_treatment(), AgentRowRing::Resolve(Some(0.5)));
+
+        let settled = AgentRowAnimation {
+            spin: None,
+            waiting: false,
+            resolve: None,
+            ..everything
+        };
+        assert_eq!(settled.ring_treatment(), AgentRowRing::Resolve(None));
+        assert_eq!(
+            AgentRowAnimation::still().ring_treatment(),
+            AgentRowRing::None
+        );
+    }
+
+    #[test]
+    fn the_status_dot_is_suppressed_while_the_row_spins() {
+        // The turning ring already says what the dot says, louder; both at once
+        // left a static pip inside a moving outline.
+        assert!(!AgentRowAnimation {
+            spin: Some(0.1),
+            ..AgentRowAnimation::still()
+        }
+        .shows_status_dot());
+        assert!(AgentRowAnimation::still().shows_status_dot());
+        assert!(AgentRowAnimation {
+            waiting: true,
+            settled: true,
+            resolve: Some(0.4),
+            ..AgentRowAnimation::still()
+        }
+        .shows_status_dot());
+    }
+
+    /// The docked input strip is what broke this: its reserved rows plus the
+    /// status lines beneath it pushed the spinner past the old five-line
+    /// window, so a working agent reported `Unknown` and never span.
+    #[test]
+    fn spinner_is_found_above_the_docked_input_strip() {
+        let screen = "\u{2733} Synthesizing… (26s · ↓ 1.6k tokens)\n\
+             \n\
+             ───────────────\n\
+             › \n\
+             ⚠ Transcript saving is off\n\
+             11% used · 89% left (110k/1000k tokens) · tgzterminal main\n\
+             ▶▶ auto mode on (shift+tab to cycle)\n";
+        assert_eq!(
+            infer_agent_status_from_visible_text(screen, None),
+            AgentStatus::Running
+        );
+    }
+
+    /// The summary an agent leaves behind carries the same glyph but no
+    /// ellipsis; matching it pinned the status at `Running` after the work had
+    /// already finished.
+    #[test]
+    fn finished_summary_is_not_running() {
+        let screen = "\u{273b} Cogitated for 2m 40s\n\
+             \n\
+             │ > \n\
+             ▶▶ auto mode on (shift+tab to cycle)\n";
+        assert_ne!(
+            infer_agent_status_from_visible_text(screen, None),
+            AgentStatus::Running
+        );
+    }
+
+    #[test]
+    fn boxed_prompt_counts_as_waiting() {
+        let screen = "some earlier output\n\
+             ╭──────────────╮\n\
+             │ > \n\
+             ╰──────────────╯\n";
+        assert_eq!(
+            infer_agent_status_from_visible_text(screen, None),
+            AgentStatus::WaitingForInput
+        );
+    }
 
     fn pane_row(pane_id: PaneId) -> SidebarRow {
         SidebarRow::Pane {
@@ -12008,18 +13735,222 @@ mod tests {
     }
 
     #[test]
+    fn spin_phase_is_a_linear_saw() {
+        let period = Duration::from_millis(9000);
+        assert_eq!(spin_phase(Duration::ZERO, period), 0.);
+        assert!((spin_phase(Duration::from_millis(4500), period) - 0.5).abs() < 0.001);
+        // Wraps rather than running past 1.0, so the ring never jumps back.
+        assert_eq!(spin_phase(period, period), 0.);
+        assert!((spin_phase(Duration::from_millis(13_500), period) - 0.5).abs() < 0.001);
+        assert_eq!(spin_phase(Duration::from_millis(5), Duration::ZERO), 0.);
+    }
+
+    #[test]
+    fn ring_turn_runs_clockwise_from_twelve() {
+        let (cx, cy) = (10., 10.);
+        assert!(ring_turn_at(cx, cy, 10., 0.) < 0.001);
+        assert!((ring_turn_at(cx, cy, 20., 10.) - 0.25).abs() < 0.001);
+        assert!((ring_turn_at(cx, cy, 10., 20.) - 0.5).abs() < 0.001);
+        assert!((ring_turn_at(cx, cy, 0., 10.) - 0.75).abs() < 0.001);
+    }
+
+    #[test]
+    fn throbber_has_two_arcs_separated_by_gaps() {
+        // 90deg and 270deg sit mid-arc; 0deg and 180deg are the gap centres.
+        let ring = preset_ring(AgentRingColors::TanSage);
+        let warm = throbber_ring_color(ring, 0.25, 0.).expect("warm arc");
+        assert_eq!((warm.0, warm.1, warm.2), (ring.a.0, ring.a.1, ring.a.2));
+        assert!((warm.3 - 1.0).abs() < 0.001);
+        let sage = throbber_ring_color(ring, 0.75, 0.).expect("sage arc");
+        assert_eq!((sage.0, sage.1, sage.2), (ring.b.0, ring.b.1, ring.b.2));
+        assert!(throbber_ring_color(ring, 0., 0.).is_none(), "gap at 0deg");
+        assert!(
+            throbber_ring_color(ring, 0.5, 0.).is_none(),
+            "gap at 180deg"
+        );
+    }
+
+    #[test]
+    fn throbber_rotates_with_phase_and_wraps() {
+        // Half a turn of phase swaps which arc covers a given point, and a whole
+        // turn brings it back — the ring must not snap when the spin wraps.
+        let ring = preset_ring(AgentRingColors::TanSage);
+        let at_quarter = throbber_ring_color(ring, 0.25, 0.).unwrap();
+        let after_half = throbber_ring_color(ring, 0.75, 0.5).unwrap();
+        assert!((at_quarter.0 - after_half.0).abs() < 0.001);
+        assert_eq!(
+            throbber_ring_color(ring, 0.25, 0.).map(|c| c.3),
+            throbber_ring_color(ring, 0.25, 1.).map(|c| c.3)
+        );
+        // Coverage ramps rather than stepping, so no segment pops on.
+        let edge = throbber_ring_color(ring, 26. / 360., 0.).expect("mid ramp");
+        assert!(
+            edge.3 > 0.4 && edge.3 < 0.6,
+            "coverage {} not mid-ramp",
+            edge.3
+        );
+    }
+
+    #[test]
+    fn ring_presets_resolve_through_the_srgb_conversion() {
+        for (preset, a, b) in [
+            (
+                AgentRingColors::RedBlue,
+                (0xff, 0x6b, 0x6b),
+                (0x58, 0xa6, 0xff),
+            ),
+            (
+                AgentRingColors::OrangeCyan,
+                (0xff, 0x8a, 0x3d),
+                (0x35, 0xd6, 0xd6),
+            ),
+            (
+                AgentRingColors::TanSage,
+                (0xa9, 0x7f, 0x5c),
+                (0x7d, 0x90, 0x60),
+            ),
+            (
+                AgentRingColors::BrownSlate,
+                (0x6e, 0x61, 0x47),
+                (0x4a, 0x64, 0x70),
+            ),
+        ] {
+            let ring = preset_ring(preset);
+            assert_eq!(
+                ring.a,
+                srgb8_to_linear(a.0, a.1, a.2),
+                "{preset:?} warm end"
+            );
+            assert_eq!(
+                ring.b,
+                srgb8_to_linear(b.0, b.1, b.2),
+                "{preset:?} cool end"
+            );
+            let (dr, dg, db) = preset.settled_stop();
+            assert_eq!(
+                ring.done,
+                srgb8_to_linear(dr, dg, db),
+                "{preset:?} settled hairline"
+            );
+            // Gamma conversion, not a raw 0..1 fraction: sRGB 0x7f is ~0.216
+            // linear, nowhere near 0x7f/255.
+            assert!(ring.a != LinearRgba(a.0 as f32, a.1 as f32, a.2 as f32, 1.0));
+        }
+    }
+
+    #[test]
+    fn ring_done_is_the_cool_end_at_55_percent() {
+        // Tan/sage was the hardcoded #454f35 before the preset became
+        // selectable; deriving it must land on exactly that colour.
+        assert_eq!(
+            preset_ring(AgentRingColors::TanSage).done,
+            srgb8_to_linear(0x45, 0x4f, 0x35)
+        );
+        for preset in [
+            AgentRingColors::RedBlue,
+            AgentRingColors::OrangeCyan,
+            AgentRingColors::TanSage,
+            AgentRingColors::BrownSlate,
+        ] {
+            let (_, (r, g, b)) = preset.stops();
+            let expected = srgb8_to_linear(
+                (r as f32 * 0.55).round() as u8,
+                (g as f32 * 0.55).round() as u8,
+                (b as f32 * 0.55).round() as u8,
+            );
+            assert_eq!(preset_ring(preset).done, expected, "{preset:?}");
+        }
+    }
+
+    #[test]
+    fn default_ring_pair_is_red_blue() {
+        let ring = preset_ring(AgentRingColors::default());
+        assert_eq!(ring.a, srgb8_to_linear(0xff, 0x6b, 0x6b));
+        assert_eq!(ring.b, srgb8_to_linear(0x58, 0xa6, 0xff));
+    }
+
+    #[test]
+    fn tab_row_prefers_a_working_agent_in_a_background_split() {
+        // The launcher splits agents into their own pane and the user clicks
+        // back into the shell beside it, so the tab's *active* pane is often
+        // not the one running the agent. The row carries the throbber ring, so
+        // the working agent has to win.
+        let primary = 1;
+        let split = 2;
+        assert_eq!(
+            pick_sidebar_agent_pane(&[
+                (primary, AgentStatus::Idle, true),
+                (split, AgentStatus::Running, false),
+            ]),
+            Some(split)
+        );
+        assert_eq!(
+            pick_sidebar_agent_pane(&[
+                (primary, AgentStatus::Unknown, true),
+                (split, AgentStatus::Streaming, false),
+            ]),
+            Some(split)
+        );
+        // Waiting outranks a quiet primary, but not a working split.
+        assert_eq!(
+            pick_sidebar_agent_pane(&[
+                (primary, AgentStatus::WaitingForInput, true),
+                (split, AgentStatus::Running, false),
+            ]),
+            Some(split)
+        );
+        assert_eq!(
+            pick_sidebar_agent_pane(&[
+                (primary, AgentStatus::Idle, true),
+                (split, AgentStatus::WaitingForInput, false),
+            ]),
+            Some(split)
+        );
+    }
+
+    #[test]
+    fn tab_row_keeps_the_primary_pane_when_nothing_is_working() {
+        // Equal standing must not shuffle the badge between panes frame to
+        // frame; the primary pane is the stable tie-break.
+        assert_eq!(
+            pick_sidebar_agent_pane(&[
+                (7, AgentStatus::Idle, false),
+                (8, AgentStatus::Idle, true),
+                (9, AgentStatus::Idle, false),
+            ]),
+            Some(8)
+        );
+        // Two working agents: pane order decides, so it never flickers.
+        assert_eq!(
+            pick_sidebar_agent_pane(&[
+                (7, AgentStatus::Running, false),
+                (8, AgentStatus::Running, true),
+            ]),
+            Some(8)
+        );
+        assert_eq!(
+            pick_sidebar_agent_pane(&[
+                (7, AgentStatus::Running, false),
+                (8, AgentStatus::Running, false),
+            ]),
+            Some(7)
+        );
+        assert_eq!(pick_sidebar_agent_pane(&[]), None);
+    }
+
+    #[test]
     fn pulse_only_dims_never_brightens() {
         let base = LinearRgba(0.8, 0.5, 0.3, 1.0);
         let surface = LinearRgba(0.1, 0.1, 0.1, 1.0);
         assert_eq!(
-            agent_status_dot_accent(&AgentStatus::Idle, base, surface, None),
+            agent_status_dot_accent(&AgentStatus::Idle, base, surface, None, base),
             base
         );
-        // Full phase is exactly the static colour, so turning the pulse on never
+        // Full phase is exactly the pulse colour, so turning the pulse on never
         // makes a dot brighter than it was.
-        let full = agent_status_dot_accent(&AgentStatus::Running, base, surface, Some(1.0));
+        let full = agent_status_dot_accent(&AgentStatus::Running, base, surface, Some(1.0), base);
         assert!((full.0 - base.0).abs() < 0.001);
-        let dim = agent_status_dot_accent(&AgentStatus::Running, base, surface, Some(0.0));
+        let dim = agent_status_dot_accent(&AgentStatus::Running, base, surface, Some(0.0), base);
         assert!(dim.0 < base.0);
         assert!(dim.0 > surface.0);
     }
@@ -12028,12 +13959,40 @@ mod tests {
     fn waiting_dot_keeps_its_attention_color_while_pulsing() {
         let base = LinearRgba(0.2, 0.4, 0.9, 1.0);
         let surface = LinearRgba(0.1, 0.1, 0.1, 1.0);
-        let pulsed =
-            agent_status_dot_accent(&AgentStatus::WaitingForInput, base, surface, Some(1.0));
+        let ring = preset_ring(AgentRingColors::default());
+        let pulsed = agent_status_dot_accent(
+            &AgentStatus::WaitingForInput,
+            base,
+            surface,
+            Some(1.0),
+            ring.a,
+        );
         assert!(
             pulsed.0 > pulsed.2,
             "waiting must stay in the orange family, not revert to the adapter accent"
         );
+    }
+
+    #[test]
+    fn working_pulse_uses_the_ring_accent_but_the_static_dot_keeps_its_vendor_color() {
+        // Turquoise, as a vendor adapter colour would be.
+        let vendor = LinearRgba(0.3, 0.8, 0.78, 1.0);
+        let surface = LinearRgba(0.1, 0.1, 0.1, 1.0);
+        let ring = preset_ring(AgentRingColors::default());
+
+        let pulsing =
+            agent_status_dot_accent(&AgentStatus::Running, vendor, surface, Some(1.0), ring.a);
+        assert!(
+            (pulsing.0 - ring.a.0).abs() < 0.001 && (pulsing.2 - ring.a.2).abs() < 0.001,
+            "a pulsing working dot must take the ring's warm end, not the vendor hue"
+        );
+
+        // Same agent, pulse switched off: identity comes back untouched, which
+        // is what keeps agents distinguishable in the lists.
+        let still = agent_status_dot_accent(&AgentStatus::Running, vendor, surface, None, ring.a);
+        assert_eq!(still, vendor);
+        let idle = agent_status_dot_accent(&AgentStatus::Idle, vendor, surface, Some(1.0), ring.a);
+        assert_eq!(idle, vendor);
     }
 
     #[test]
@@ -12768,6 +14727,38 @@ mod tests {
     }
 
     #[test]
+    fn waiting_glow_tracks_queue_membership() {
+        let now = Instant::now();
+        let pane: PaneId = 1;
+        let other: PaneId = 2;
+
+        assert!(is_waiting_queued((pane, Some(now), None), Some(other)));
+        assert!(is_waiting_queued((pane, None, Some(now)), None));
+        // Lazy acknowledge: the user is looking at it, so the glow clears
+        // without any explicit dismiss action.
+        assert!(!is_waiting_queued((pane, Some(now), None), Some(pane)));
+        // Nothing pending at all.
+        assert!(!is_waiting_queued((pane, None, None), None));
+    }
+
+    #[test]
+    fn waiting_glow_yields_to_spin_and_to_the_resolve_ripple() {
+        assert!(waiting_glow_survives(None, None, true));
+        assert!(!waiting_glow_survives(Some(0.5), None, true));
+        assert!(!waiting_glow_survives(None, Some(0.5), true));
+        assert!(!waiting_glow_survives(Some(0.5), Some(0.5), true));
+        // A row nobody is waiting on never glows, whatever else it is doing.
+        assert!(!waiting_glow_survives(None, None, false));
+    }
+
+    #[test]
+    fn still_row_carries_no_glow() {
+        let still = AgentRowAnimation::still();
+        assert!(!still.waiting);
+        assert!(!still.settled);
+    }
+
+    #[test]
     fn agent_copy_payload_marks_a_clipped_window() {
         let clipped = AgentRawTranscript {
             text: "❯ hi\nthere".to_string(),
@@ -12872,6 +14863,44 @@ mod tests {
     }
 
     #[test]
+    fn spinner_glyph_counts_when_the_agent_boxes_its_status_line() {
+        // Agents draw the working line inside their chrome, so it arrives with
+        // a border or indent in front of the spinner. Matching only the first
+        // character missed every one of these and left status at Unknown, which
+        // is what suppresses the throbber ring.
+        for line in [
+            "│ ✻ Cogitating…",
+            "  ⎿ ✳ Running a tool",
+            "▌ ⠹ Working",
+            "✻ Brewing",
+        ] {
+            assert_eq!(
+                infer_agent_status_from_visible_text(&format!("Thinking\n{line}"), None),
+                AgentStatus::Running,
+                "{line:?} should read as running"
+            );
+        }
+        // A glyph deep inside prose is not a spinner.
+        assert_eq!(
+            infer_agent_status_from_visible_text("the file uses a ✻ marker here", None),
+            AgentStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn generic_running_marker_beats_any_chrome() {
+        // Every built-in adapter's working line carries this, so it is the load
+        // -bearing path for Claude Code, Codex and OpenCode alike.
+        assert_eq!(
+            infer_agent_status_from_visible_text(
+                "· Herding (12s · ↑ 1.2k tokens · esc to interrupt)",
+                None
+            ),
+            AgentStatus::Running
+        );
+    }
+
+    #[test]
     fn status_inference_detects_running_and_waiting() {
         assert_eq!(
             infer_agent_status_from_visible_text("Thinking\n✻ Brewing", None),
@@ -12952,9 +14981,12 @@ mod tests {
             last_wait_notification: None,
             detected_at: Instant::now(),
             status_at: Instant::now(),
+            status_held: false,
             pending_switch: None,
             waiting_since: None,
             unseen_exited_since: None,
+            first_seen_at: None,
+            done_ring_started_at: None,
         }
     }
 
@@ -12970,9 +15002,12 @@ mod tests {
             last_wait_notification: None,
             detected_at,
             status_at: detected_at,
+            status_held: false,
             pending_switch: None,
             waiting_since: None,
             unseen_exited_since: None,
+            first_seen_at: None,
+            done_ring_started_at: None,
         }
     }
 
@@ -13645,16 +15680,41 @@ gemini is a constellation\n";
             ),
             AgentStatus::Unknown
         );
-        // A fresh reading always wins over the grace.
+        // A prompt drawn mid-turn does not end the run either: agents redraw
+        // their prompt box between steps of one answer, and treating that as
+        // the end made the throbber stop and restart several times through a
+        // single response.
         assert_eq!(
             stabilize_agent_status(
                 AgentStatus::WaitingForInput,
                 Some(AgentStatus::Running),
-                Some(now),
+                Some(now - Duration::from_millis(500)),
+                now,
+                grace
+            ),
+            AgentStatus::Running
+        );
+        // But a prompt that persists past the grace really is the end of it.
+        assert_eq!(
+            stabilize_agent_status(
+                AgentStatus::WaitingForInput,
+                Some(AgentStatus::Running),
+                Some(now - Duration::from_secs(4)),
                 now,
                 grace
             ),
             AgentStatus::WaitingForInput
+        );
+        // A positive reading still wins outright, with no grace involved.
+        assert_eq!(
+            stabilize_agent_status(
+                AgentStatus::Running,
+                Some(AgentStatus::WaitingForInput),
+                Some(now - Duration::from_secs(4)),
+                now,
+                grace
+            ),
+            AgentStatus::Running
         );
     }
 

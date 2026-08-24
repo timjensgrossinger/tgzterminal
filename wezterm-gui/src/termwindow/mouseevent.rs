@@ -2365,9 +2365,11 @@ impl super::TermWindow {
                             (agent.cwd.as_ref(), agent.session_id.as_deref())
                         {
                             if let Some(home) = dirs_home() {
-                                if let Some(path) = crate::agent_herd::claude::session_transcript_path(
-                                    &home, cwd, session_id,
-                                ) {
+                                if let Some(path) =
+                                    crate::agent_herd::claude::session_transcript_path(
+                                        &home, cwd, session_id,
+                                    )
+                                {
                                     let _ = open_url(&format!("file://{}", path.display()));
                                 } else {
                                     self.set_agent_feedback("Transcript not found");

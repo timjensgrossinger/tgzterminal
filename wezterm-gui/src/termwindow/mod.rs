@@ -58,7 +58,7 @@ use mux_lua::MuxPane;
 use percent_encoding::percent_decode_str;
 use smol::channel::Sender;
 use smol::Timer;
-use std::cell::{RefCell, RefMut};
+use std::cell::{Cell, RefCell, RefMut};
 use std::collections::{HashMap, HashSet, LinkedList};
 use std::ops::Add;
 use std::path::{Path, PathBuf};
@@ -957,6 +957,16 @@ pub struct TermWindow {
     event_states: HashMap<String, EventState>,
     pub current_event: Option<Value>,
     has_animation: RefCell<Option<Instant>>,
+    /// Raised during a paint when the deadline in `has_animation` was
+    /// registered by the sidebar.
+    ///
+    /// `paint_impl` only reschedules animation frames for a focused window,
+    /// because upstream's use of that deadline is animated-image playback,
+    /// which must stay paused in the background. Sidebar agent motion is the
+    /// one exception, so it opts in here rather than relaxing the focus rule
+    /// for everything. Reset alongside `has_animation` at the top of each
+    /// paint, so a window whose sidebar stops asking stops animating.
+    pub(crate) sidebar_wants_animation: Cell<bool>,
     /// We use this to attempt to do something reasonable
     /// if we run out of texture space
     allow_images: AllowImage,
@@ -1366,6 +1376,7 @@ impl TermWindow {
             event_states: HashMap::new(),
             current_event: None,
             has_animation: RefCell::new(None),
+            sidebar_wants_animation: Cell::new(false),
             scheduled_animation: RefCell::new(None),
             allow_images: AllowImage::Yes,
             semantic_zones: HashMap::new(),

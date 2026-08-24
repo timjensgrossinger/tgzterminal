@@ -19,6 +19,10 @@ impl crate::TermWindow {
         // If nothing on screen needs animating, then we can avoid
         // invalidating as frequently
         *self.has_animation.borrow_mut() = None;
+        // Cleared with it, and for the same reason: only this frame's sidebar
+        // may claim the unfocused-animation exemption below. A sidebar that is
+        // switched off, scrolled away, or simply idle never re-raises it.
+        self.sidebar_wants_animation.set(false);
         // Start with the assumption that we should allow images to render
         self.allow_images = AllowImage::Yes;
 
@@ -118,7 +122,13 @@ impl crate::TermWindow {
         // If self.has_animation is some, then the last render detected
         // image attachments with multiple frames, so we also need to
         // invalidate the viewport when the next frame is due
-        if self.focused.is_some() {
+        //
+        // Unfocused windows are skipped so background image playback costs
+        // nothing, which is upstream behaviour and stays that way. The sidebar
+        // opts out of that rule for its own deadlines only: agent throbbers are
+        // there to be watched from another app, so they are useless if they
+        // freeze the moment the window loses focus.
+        if self.focused.is_some() || self.sidebar_wants_animation.get() {
             if let Some(next_due) = *self.has_animation.borrow() {
                 let prior = self.scheduled_animation.borrow_mut().take();
                 match prior {
