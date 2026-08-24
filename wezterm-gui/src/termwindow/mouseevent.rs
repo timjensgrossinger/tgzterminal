@@ -27,11 +27,6 @@ use termwiz::surface::Line;
 use wezterm_dynamic::ToDynamic;
 use wezterm_open_url::open_url;
 use wezterm_term::input::{MouseButton, MouseEventKind as TMEK};
-
-/// Resolve the user's home directory for vendor path helpers.
-fn dirs_home() -> Option<std::path::PathBuf> {
-    std::env::var_os("HOME").map(std::path::PathBuf::from)
-}
 use wezterm_term::{ClickPosition, KeyCode, KeyModifiers, LastMouseClick, StableRowIndex};
 
 impl super::TermWindow {
@@ -2355,31 +2350,29 @@ impl super::TermWindow {
                 }
             }
             AgentRowAction::Transcript => {
-                match agent.provider.as_str() {
+                match crate::agent_herd::transcript_source(
+                    &agent.provider,
+                    agent.session_id.as_deref(),
+                    agent.cwd.as_deref(),
+                ) {
                     // OpenCode keeps every session in one opencode.db with no
                     // per-session file; the Log overlay reads it live instead.
-                    "opencode" => self.show_agent_log(agent.clone()),
-                    // Claude has a real per-session transcript file: reveal it.
-                    "claude" => {
-                        if let (Some(cwd), Some(session_id)) =
-                            (agent.cwd.as_ref(), agent.session_id.as_deref())
-                        {
-                            if let Some(home) = dirs_home() {
-                                if let Some(path) =
-                                    crate::agent_herd::claude::session_transcript_path(
-                                        &home, cwd, session_id,
-                                    )
-                                {
-                                    let _ = open_url(&format!("file://{}", path.display()));
-                                } else {
-                                    self.set_agent_feedback("Transcript not found");
-                                }
-                            }
-                        }
+                    crate::agent_herd::TranscriptSource::Live => self.show_agent_log(agent.clone()),
+                    // A vendor with a real per-session transcript file: reveal it.
+                    crate::agent_herd::TranscriptSource::File(path) => {
+                        let _ = open_url(&format!("file://{}", path.display()));
                     }
-                    // Anything else: fall back to the working directory.
-                    _ => {
-                        if let Some(cwd) = agent.cwd.as_ref() {
+                    // Claude reports "not found" only once it had enough to
+                    // look (a session id and a cwd) and still came up empty;
+                    // missing identity for Claude silently does nothing, same
+                    // as before. Every other vendor with no transcript falls
+                    // back to the working directory.
+                    crate::agent_herd::TranscriptSource::None => {
+                        if agent.provider == "claude" {
+                            if agent.cwd.is_some() && agent.session_id.is_some() {
+                                self.set_agent_feedback("Transcript not found");
+                            }
+                        } else if let Some(cwd) = agent.cwd.as_ref() {
                             let _ = open_url(&format!("file://{}", cwd.display()));
                         }
                     }

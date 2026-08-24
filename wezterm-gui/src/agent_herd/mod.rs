@@ -849,6 +849,78 @@ fn sort_agents(agents: &mut [HerdAgent]) {
     });
 }
 
+/// Where a vendor's transcript for one session can be read from.
+///
+/// This is the single vendor-neutral decision point for "can we show this
+/// agent's transcript, and how" — consumed by the Log overlay
+/// (`overlay/agent_log.rs`) and the sidebar's Transcript row action
+/// (`termwindow/mouseevent.rs`). Neither call site should match on a vendor
+/// string of its own; add a new vendor here instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TranscriptSource {
+    /// A real per-session file on disk that can be revealed or re-read.
+    File(PathBuf),
+    /// No per-session file: the vendor keeps everything in one store that has
+    /// to be queried live (OpenCode's single `opencode.db`).
+    Live,
+    /// This vendor exposes no readable transcript.
+    None,
+}
+
+/// Resolve [`TranscriptSource`] for one agent, reading `$HOME` for the
+/// vendor-specific stores that need it.
+pub fn transcript_source(
+    provider: &str,
+    session_id: Option<&str>,
+    cwd: Option<&Path>,
+) -> TranscriptSource {
+    let Some(home) = dirs_home() else {
+        return TranscriptSource::None;
+    };
+    transcript_source_at(&home, provider, session_id, cwd)
+}
+
+/// Same as [`transcript_source`] but with an injectable `home`, so tests
+/// don't depend on the real `$HOME` of whatever machine runs them.
+fn transcript_source_at(
+    home: &Path,
+    provider: &str,
+    session_id: Option<&str>,
+    cwd: Option<&Path>,
+) -> TranscriptSource {
+    match provider {
+        "claude" => match (session_id, cwd) {
+            (Some(session_id), Some(cwd)) => {
+                match claude::session_transcript_path(home, cwd, session_id) {
+                    Some(path) => TranscriptSource::File(path),
+                    None => TranscriptSource::None,
+                }
+            }
+            _ => TranscriptSource::None,
+        },
+        // OpenCode keeps every session in one opencode.db with no per-session
+        // file; the Log overlay queries it live instead of reading a path.
+        "opencode" => TranscriptSource::Live,
+        "codex" => match session_id.and_then(|id| codex::find_transcript_path(home, id)) {
+            Some(path) => TranscriptSource::File(path),
+            None => TranscriptSource::None,
+        },
+        "copilot" => match session_id {
+            Some(id) => TranscriptSource::File(copilot::session_events_path(home, id)),
+            None => TranscriptSource::None,
+        },
+        "antigravity" => match session_id {
+            Some(id) => TranscriptSource::File(antigravity::transcript_path(home, id)),
+            None => TranscriptSource::None,
+        },
+        _ => TranscriptSource::None,
+    }
+}
+
+fn dirs_home() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
 /// Walk up from `dir` looking for a repo root.
 ///
 /// Handles the `.git`-as-a-file case so linked worktrees resolve to their own
@@ -1232,6 +1304,120 @@ mod tests {
     fn project_root_is_none_outside_a_repo() {
         let temp = tempfile::tempdir().unwrap();
         assert_eq!(project_root_for(temp.path()), None);
+    }
+
+    #[test]
+    fn opencode_transcript_is_live() {
+        let temp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            transcript_source_at(temp.path(), "opencode", Some("sess-1"), None),
+            TranscriptSource::Live
+        );
+        // Live doesn't need a cwd at all.
+        assert_eq!(
+            transcript_source_at(temp.path(), "opencode", Some("sess-1"), None),
+            TranscriptSource::Live
+        );
+    }
+
+    #[test]
+    fn claude_transcript_resolves_to_its_session_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        let cwd = PathBuf::from("/repo");
+        let project_dir = home
+            .join(".claude")
+            .join("projects")
+            .join(claude::encode_project_path(&cwd));
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::write(project_dir.join("sess-1.jsonl"), "{}\n").unwrap();
+
+        let expected = claude::session_transcript_path(home, &cwd, "sess-1").unwrap();
+        assert_eq!(
+            transcript_source_at(home, "claude", Some("sess-1"), Some(&cwd)),
+            TranscriptSource::File(expected)
+        );
+    }
+
+    #[test]
+    fn codex_transcript_resolves_by_searching_the_rollout_tree() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        let path = home
+            .join(".codex/sessions/2026/08/16")
+            .join("rollout-2026-08-16T00-00-00-sess-codex.jsonl");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{}\n").unwrap();
+
+        assert_eq!(
+            transcript_source_at(home, "codex", Some("sess-codex"), None),
+            TranscriptSource::File(path)
+        );
+    }
+
+    #[test]
+    fn copilot_transcript_resolves_to_a_deterministic_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        assert_eq!(
+            transcript_source_at(home, "copilot", Some("sess-copilot"), None),
+            TranscriptSource::File(copilot::session_events_path(home, "sess-copilot"))
+        );
+    }
+
+    #[test]
+    fn antigravity_transcript_resolves_to_a_deterministic_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        assert_eq!(
+            transcript_source_at(home, "antigravity", Some("sess-agy"), None),
+            TranscriptSource::File(antigravity::transcript_path(home, "sess-agy"))
+        );
+    }
+
+    #[test]
+    fn unsupported_vendors_have_no_transcript() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        for provider in ["gemini", "cursor", "amp", "nonsense"] {
+            assert_eq!(
+                transcript_source_at(home, provider, Some("sess-1"), None),
+                TranscriptSource::None,
+                "provider {provider} should have no transcript source",
+            );
+        }
+    }
+
+    #[test]
+    fn missing_identity_never_panics() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        let cwd = PathBuf::from("/repo");
+
+        // Claude needs both session id and cwd.
+        assert_eq!(
+            transcript_source_at(home, "claude", None, Some(&cwd)),
+            TranscriptSource::None
+        );
+        assert_eq!(
+            transcript_source_at(home, "claude", Some("sess-1"), None),
+            TranscriptSource::None
+        );
+
+        // Codex/Copilot/Antigravity only need a session id, but must not
+        // panic when it's missing either.
+        assert_eq!(
+            transcript_source_at(home, "codex", None, None),
+            TranscriptSource::None
+        );
+        assert_eq!(
+            transcript_source_at(home, "copilot", None, None),
+            TranscriptSource::None
+        );
+        assert_eq!(
+            transcript_source_at(home, "antigravity", None, None),
+            TranscriptSource::None
+        );
     }
 }
 

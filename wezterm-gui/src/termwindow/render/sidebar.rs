@@ -1,8 +1,8 @@
 use crate::agent_herd::claude::{self, ProjectDirError as ClaudeLogsPathError};
 use crate::agent_herd::vendor::{AgentVendor, VendorSession};
 use crate::agent_herd::{
-    group_by_project, HerdActivity, HerdAgent, HerdContent, HerdEvent, HerdEventKind, HerdStatus,
-    HerdView, PaneAgentRow,
+    group_by_project, HerdActivity, HerdAgent, HerdContent, HerdDisplayStatus, HerdEvent,
+    HerdEventKind, HerdStatus, HerdView, PaneAgentRow,
 };
 use crate::colorease::ColorEase;
 use crate::quad::TripleLayerQuadAllocator;
@@ -24,7 +24,7 @@ use config::{
     default_agent_adapters, dim_srgb, AgentAdapterConfig, AgentAnimationColors, AgentLaunchTarget,
     AgentRemoteBehavior, AgentRingColors, AgentSplitDirection, AgentTelemetryField,
     AgentToolbeltPosition, AgentUiConfig, ConfigHandle, EasingFunction, SidebarPosition,
-    SidebarTabDensity, SidebarTabMetadata, SidebarTabTitleSource, TabBarColors,
+    SidebarTabDensity, SidebarTabMetadata, SidebarTabTitleSource, SidebarTheme, TabBarColors,
 };
 use finl_unicode::grapheme_clusters::Graphemes;
 use mux::pane::{CachePolicy, Pane, PaneId};
@@ -384,6 +384,40 @@ impl SidebarPalette {
             ring,
         }
     }
+
+    /// Derive the whole palette from just the window's background and
+    /// foreground, for the common case where the user themed `colors.background`
+    /// and `colors.foreground` but never set `tab_bar`.
+    ///
+    /// The surface is lifted one step *toward* the foreground so the sidebar
+    /// reads as raised chrome against the recessed terminal well, matching the
+    /// convention editors use for their side panels. Everything else is a lerp
+    /// from that surface toward the foreground, so the same ratios invert
+    /// correctly under a light colour scheme: lerping a white background toward
+    /// a dark foreground darkens the sidebar, preserving the contrast direction
+    /// rather than flipping it.
+    fn from_window_colors(bg: LinearRgba, fg: LinearRgba, ring: RingColors) -> Self {
+        let surface = opaque(lerp_rgba(bg, fg, 0.05));
+        Self {
+            surface,
+            row_fill: lerp_rgba(surface, fg, 0.05),
+            row_border: lerp_rgba(surface, fg, 0.14),
+            active_fill: lerp_rgba(surface, fg, 0.13),
+            hover_fill: lerp_rgba(surface, fg, 0.09),
+            pressed_fill: lerp_rgba(surface, fg, 0.17),
+            search_fill: lerp_rgba(surface, fg, 0.05),
+            focused_search_fill: lerp_rgba(surface, fg, 0.13),
+            // Stronger than the other borders on purpose: this is the only
+            // thing separating the sidebar from the terminal beside it.
+            divider: lerp_rgba(surface, fg, 0.22),
+            menu_border: lerp_rgba(surface, fg, 0.18),
+            text_active: fg,
+            text_idle: lerp_rgba(surface, fg, 0.68),
+            text_meta: lerp_rgba(surface, fg, 0.42),
+            working_fill: lerp_rgba(surface, fg, 0.04),
+            ring,
+        }
+    }
 }
 
 /// How long a window waits before writing its agent-session snapshot again.
@@ -733,15 +767,23 @@ fn deflate_rect(rect: RectF, by: f32) -> RectF {
 /// by `base` everywhere the dot is not pulsing, so agents stay distinguishable
 /// in the lists. Waiting-for-input keeps its own attention colour, which is the
 /// one hue that is supposed to stand apart.
+///
+/// `waiting_color` is that attention colour, resolved by the caller via
+/// `RingColors::waiting` -- the same source `paint_agent_waiting_glow` uses
+/// for the row's own glow -- so the dot and the glow never disagree and
+/// neither ignores a `sidebar_theme`/`agent_ui.animations.colors.waiting_glow`
+/// override. This function stays pure: it takes the resolved colour rather
+/// than reaching for config or globals itself.
 fn agent_status_dot_accent(
     status: &AgentStatus,
     base: LinearRgba,
     surface: LinearRgba,
     pulse: Option<f32>,
     pulse_accent: LinearRgba,
+    waiting_color: LinearRgba,
 ) -> LinearRgba {
     let color = if *status == AgentStatus::WaitingForInput {
-        LinearRgba(0.94, 0.72, 0.26, 1.0)
+        waiting_color
     } else if pulse.is_some() && agent_is_working(status) {
         pulse_accent
     } else {
@@ -763,11 +805,17 @@ fn srgb8_to_linear(r: u8, g: u8, b: u8) -> LinearRgba {
     LinearRgba::with_srgba(r, g, b, 255)
 }
 
-fn contrast_label_color(bg: LinearRgba) -> LinearRgba {
+/// Label colour for a chip or row whose fill is `bg`.
+///
+/// `fg` is the palette's own foreground and is what a dark fill gets, so these
+/// labels follow the configured colour scheme rather than being forced to pure
+/// white. A light fill still falls back to near-black, since no dark-scheme
+/// foreground would be readable on it.
+fn contrast_label_color(bg: LinearRgba, fg: LinearRgba) -> LinearRgba {
     if bg.relative_luminance() > 0.46 {
         LinearRgba(0.03, 0.03, 0.035, 1.0)
     } else {
-        LinearRgba(1.0, 1.0, 1.0, 1.0)
+        fg
     }
 }
 
@@ -1064,21 +1112,27 @@ pub(crate) fn sort_waiting_queue(
     queue
 }
 
-/// Waiting-queue membership from raw detection-cache entries. The active pane
-/// of a focused window is excluded (lazy acknowledge); a pane belongs when it
-/// is either waiting or exited-unseen. Empty in, empty out — which is what
-/// hides the rail chip and clears the dock badge at zero.
+/// One pane's queue-relevant timestamps: `(pane, waiting_since,
+/// unseen_exited_since, acknowledged_at)`.
+pub(crate) type WaitingQueueEntry = (PaneId, Option<Instant>, Option<Instant>, Option<Instant>);
+
+/// Waiting-queue membership from raw detection-cache entries. A pane belongs
+/// when it is either waiting or exited-unseen, and has not been acknowledged.
+/// The active pane of a focused window is excluded too, which covers the frame
+/// between a click and the next detection pass recording the acknowledgement.
+/// Empty in, empty out — which is what hides the rail chip and clears the dock
+/// badge at zero.
 pub(crate) fn build_waiting_queue<I>(
     entries: I,
     focused_active: Option<PaneId>,
 ) -> Vec<(PaneId, Option<Instant>)>
 where
-    I: IntoIterator<Item = (PaneId, Option<Instant>, Option<Instant>)>,
+    I: IntoIterator<Item = WaitingQueueEntry>,
 {
     let queue: Vec<(PaneId, Option<Instant>)> = entries
         .into_iter()
-        .filter_map(|(pane_id, waiting, unseen)| {
-            if focused_active == Some(pane_id) {
+        .filter_map(|(pane_id, waiting, unseen, acknowledged)| {
+            if focused_active == Some(pane_id) || acknowledged.is_some() {
                 return None;
             }
             waiting.or(unseen).map(|at| (pane_id, Some(at)))
@@ -1098,11 +1152,8 @@ fn waiting_glow_survives(spin: Option<f32>, resolve: Option<f32>, queued: bool) 
 /// Whether one pane would appear in [`build_waiting_queue`], without building
 /// the queue. Expressed in terms of that function so the row glow and the rail
 /// chip can never disagree about who is waiting — in particular about the
-/// lazy-acknowledge exclusion, which is what clears the glow again.
-pub(crate) fn is_waiting_queued(
-    entry: (PaneId, Option<Instant>, Option<Instant>),
-    focused_active: Option<PaneId>,
-) -> bool {
+/// acknowledgement, which is what clears the glow again.
+pub(crate) fn is_waiting_queued(entry: WaitingQueueEntry, focused_active: Option<PaneId>) -> bool {
     !build_waiting_queue([entry], focused_active).is_empty()
 }
 
@@ -3134,6 +3185,11 @@ fn merge_agent_adapter_config(
         } else {
             configured.running_patterns.clone()
         },
+        waiting_patterns: if configured.waiting_patterns.is_empty() {
+            base.waiting_patterns.clone()
+        } else {
+            configured.waiting_patterns.clone()
+        },
         chrome_patterns: if configured.chrome_patterns.is_empty() {
             base.chrome_patterns.clone()
         } else {
@@ -3590,10 +3646,18 @@ pub(crate) struct AgentDetectionCacheEntry {
     /// established one, for the identity switch hysteresis.
     pending_switch: Option<(String, u32)>,
     /// When this pane entered the waiting queue (a `WaitingForInput`
-    /// transition). `None` otherwise. Drives the waiting-queue UX; the active
-    /// pane of a focused window is treated as acknowledged at query time, so we
-    /// never need to clear this on focus (lazy acknowledge).
+    /// transition). `None` otherwise. Drives the waiting-queue UX.
     waiting_since: Option<Instant>,
+    /// When the user acknowledged this pane's *current* waiting episode by
+    /// focusing it.
+    ///
+    /// The active pane of a focused window is also excluded from the queue at
+    /// query time, but that exclusion alone is not enough: it stops applying
+    /// the moment focus moves elsewhere, so the glow came back on a pane the
+    /// user had already dealt with. Recording the acknowledgement makes it
+    /// stick. Cleared when a *new* waiting episode begins, so a later prompt
+    /// re-arms the glow — see the reset beside `next_waiting_since`.
+    acknowledged_at: Option<Instant>,
     /// The agent identity was lost (became non-agent) while the window was
     /// unfocused, so the user probably never saw it finish. Experimental; only
     /// consulted when `agent_ui.track_exited_unseen` is on.
@@ -4110,6 +4174,24 @@ fn infer_agent_status_from_visible_text(
             && !is_completed_summary_line(line)
     }) {
         return AgentStatus::Running;
+    }
+    // An adapter-declared waiting pattern (e.g. Gemini's "type your message")
+    // is checked next, after every `Running` signal and before the generic
+    // glyph-based prompt check below. Running must always win over waiting --
+    // a vendor whose spinner line also happens to contain a waiting phrase
+    // should still read as busy -- so this sits strictly after step 3. It also
+    // has to run *before* the generic glyph check rather than replace it: an
+    // adapter that declares nothing here (the common case) must fall through
+    // untouched, so the glyph scan remains the floor for every vendor that has
+    // not configured `waiting_patterns`.
+    if let Some(adapter) = adapter {
+        if adapter.waiting_patterns.iter().any(|pattern| {
+            tail.iter()
+                .take(AGENT_PROMPT_TAIL_LINES)
+                .any(|line| agent_pattern_matches(line, pattern))
+        }) {
+            return AgentStatus::WaitingForInput;
+        }
     }
     // Otherwise a prompt means it is waiting for input. Agents that box their
     // prompt draw it as `│ > …`, so the bare-glyph check never fired for them.
@@ -5727,6 +5809,7 @@ impl crate::TermWindow {
                     pending_switch: None,
                     waiting_since: None,
                     unseen_exited_since: None,
+                    acknowledged_at: None,
                     first_seen_at: None,
                     done_ring_started_at: None,
                 },
@@ -5752,6 +5835,7 @@ impl crate::TermWindow {
                     pending_switch: None,
                     waiting_since: None,
                     unseen_exited_since: None,
+                    acknowledged_at: None,
                     first_seen_at: None,
                     done_ring_started_at: None,
                 },
@@ -5771,6 +5855,7 @@ impl crate::TermWindow {
                     pending_switch: None,
                     waiting_since: None,
                     unseen_exited_since: None,
+                    acknowledged_at: None,
                     first_seen_at: None,
                     done_ring_started_at: None,
                 },
@@ -5880,11 +5965,27 @@ impl crate::TermWindow {
             .map(|s| s.status == AgentStatus::WaitingForInput)
             .unwrap_or(false);
         let now = Instant::now();
-        let waiting_since = next_waiting_since(
-            previous_entry.as_ref().and_then(|e| e.waiting_since),
-            is_waiting,
-            now,
-        );
+        let previous_waiting_since = previous_entry.as_ref().and_then(|e| e.waiting_since);
+        let waiting_since = next_waiting_since(previous_waiting_since, is_waiting, now);
+        // Acknowledgement follows the episode, not the pane. A `None -> Some`
+        // transition is a *new* prompt, so any earlier acknowledgement is stale
+        // and the glow re-arms; while one episode persists the acknowledgement
+        // carries over untouched.
+        let acknowledged_at = if previous_waiting_since.is_none() {
+            None
+        } else {
+            previous_entry.as_ref().and_then(|e| e.acknowledged_at)
+        };
+        // Focusing a waiting pane is the acknowledgement. Doing it here rather
+        // than in the click handlers covers every route to focus: the sidebar
+        // row and herd row clicks, the rail chip, `CycleWaitingAgent`, keyboard
+        // tab switching, and a plain click into the terminal itself.
+        let acknowledged_at =
+            if waiting_since.is_some() && self.is_focused_active_pane(pane.pane_id()) {
+                acknowledged_at.or(Some(now))
+            } else {
+                acknowledged_at
+            };
         // Exited-unseen: the pane was an agent last time, is not anymore, and
         // the window was not focused when we noticed. Experimental; off unless
         // the user opts in.
@@ -5951,6 +6052,7 @@ impl crate::TermWindow {
                 pending_switch,
                 waiting_since,
                 unseen_exited_since,
+                acknowledged_at,
                 first_seen_at: Some(first_seen_at),
                 done_ring_started_at,
             },
@@ -5990,19 +6092,52 @@ impl crate::TermWindow {
     /// Returns `(pane_id, entered_at)` pairs, `entered_at` `None` only for the
     /// degenerate sort key.
     pub(crate) fn waiting_queue(&self) -> Vec<(PaneId, Option<Instant>)> {
-        let focused_active = if self.focused.is_some() {
-            self.get_active_pane_or_overlay().map(|p| p.pane_id())
-        } else {
-            None
-        };
-        let entries: Vec<(PaneId, Option<Instant>, Option<Instant>)> = {
+        let focused_active = self.focused_active_pane_id();
+        let entries: Vec<WaitingQueueEntry> = {
             let cache = self.agent_detection_cache.borrow();
             cache
                 .iter()
-                .map(|(pane_id, entry)| (*pane_id, entry.waiting_since, entry.unseen_exited_since))
+                .map(|(pane_id, entry)| {
+                    (
+                        *pane_id,
+                        entry.waiting_since,
+                        entry.unseen_exited_since,
+                        entry.acknowledged_at,
+                    )
+                })
                 .collect()
         };
         build_waiting_queue(entries, focused_active)
+    }
+
+    /// The active pane of this window, but only while the window has focus.
+    /// `None` otherwise, so an unfocused window never suppresses its own queue.
+    pub(crate) fn focused_active_pane_id(&self) -> Option<PaneId> {
+        if self.focused.is_some() {
+            self.get_active_pane_or_overlay().map(|p| p.pane_id())
+        } else {
+            None
+        }
+    }
+
+    /// Whether `pane_id` is the pane the user is actually looking at right now.
+    fn is_focused_active_pane(&self, pane_id: PaneId) -> bool {
+        self.focused_active_pane_id() == Some(pane_id)
+    }
+
+    /// Mark a waiting pane as handled, so its glow and queue entry clear on this
+    /// frame rather than on the next detection pass.
+    ///
+    /// The detection pass acknowledges the focused-active pane on its own, and
+    /// that is what covers every other route to focus; this exists only so a
+    /// click does not leave the row glowing until detection next runs.
+    pub(crate) fn acknowledge_waiting_pane(&self, pane_id: PaneId) {
+        let mut cache = self.agent_detection_cache.borrow_mut();
+        if let Some(entry) = cache.get_mut(&pane_id) {
+            if entry.waiting_since.is_some() && entry.acknowledged_at.is_none() {
+                entry.acknowledged_at = Some(Instant::now());
+            }
+        }
     }
 
     /// Raw queue flags for a single pane, used by the rail badge rendering.
@@ -6946,6 +7081,32 @@ impl crate::TermWindow {
         Some(agent_pulse_phase(AGENT_PULSE_EPOCH.elapsed(), period))
     }
 
+    /// Phase to pulse a herd row's status dot at, or `None` when it must not
+    /// animate.
+    ///
+    /// Herd rows have no `PaneId` -- a session may never have been bound to a
+    /// pane -- so they cannot use the per-row `AgentRowAnimation` state the
+    /// way a tab row does. `agent_pulse_phase` is a pure function of elapsed
+    /// time, so it works here anyway: same shared `AGENT_PULSE_EPOCH`, same
+    /// `agent_ui.pulse_period_ms` and `dot_pulse` gate as [`Self::agent_dot_pulse`],
+    /// so a herd dot and a tab-row dot for the same agent breathe in phase and
+    /// respect the same animation opt-out. Only the `Working` display status
+    /// pulses -- the caller is responsible for leaving the `NeedsApproval`
+    /// (attention) pip untouched.
+    ///
+    /// Registering a next-frame deadline is what keeps the pulse going, so the
+    /// early return for `working == false` is also the cost control: an
+    /// all-idle herd list schedules nothing and falls back to event-driven
+    /// repaints.
+    fn agent_herd_dot_pulse(&self, working: bool) -> Option<f32> {
+        if !working || !self.sidebar_animation_gates().dot_pulse {
+            return None;
+        }
+        let period = Duration::from_millis(self.config.agent_ui.pulse_period_ms.clamp(400, 6000));
+        self.schedule_sidebar_frame(next_agent_pulse_frame_due());
+        Some(agent_pulse_phase(AGENT_PULSE_EPOCH.elapsed(), period))
+    }
+
     /// The sidebar's resolved colours. See [`SidebarPalette`] for why this is
     /// not simply `TabBarColors`.
     fn sidebar_palette(&self) -> SidebarPalette {
@@ -6953,9 +7114,23 @@ impl crate::TermWindow {
             self.config.agent_ui.ring_colors,
             &self.config.agent_ui.resolved_animations().colors,
         );
-        match self.config.resolved_palette.tab_bar.as_ref() {
-            Some(colors) => SidebarPalette::from_tab_bar(colors, ring),
-            None => SidebarPalette::modern(ring),
+        let palette = &self.config.resolved_palette;
+        let from_window = || match (palette.background, palette.foreground) {
+            (Some(bg), Some(fg)) => Some(SidebarPalette::from_window_colors(
+                bg.to_linear(),
+                fg.to_linear(),
+                ring,
+            )),
+            _ => None,
+        };
+        match self.config.sidebar_theme {
+            SidebarTheme::Modern => SidebarPalette::modern(ring),
+            SidebarTheme::Auto | SidebarTheme::FollowColorScheme => {
+                match palette.tab_bar.as_ref() {
+                    Some(colors) => SidebarPalette::from_tab_bar(colors, ring),
+                    None => from_window().unwrap_or_else(|| SidebarPalette::modern(ring)),
+                }
+            }
         }
     }
 
@@ -7031,7 +7206,13 @@ impl crate::TermWindow {
 
     fn agent_row_animation_impl(&self, pane_id: PaneId, status: &AgentStatus) -> AgentRowAnimation {
         let mut anim = AgentRowAnimation::still();
-        let (first_seen_at, done_ring_started_at, waiting_since, unseen_exited_since) = {
+        let (
+            first_seen_at,
+            done_ring_started_at,
+            waiting_since,
+            unseen_exited_since,
+            acknowledged_at,
+        ) = {
             let cache = self.agent_detection_cache.borrow();
             match cache.get(&pane_id) {
                 Some(entry) => (
@@ -7039,21 +7220,18 @@ impl crate::TermWindow {
                     entry.done_ring_started_at,
                     entry.waiting_since,
                     entry.unseen_exited_since,
+                    entry.acknowledged_at,
                 ),
                 None => return anim,
             }
         };
         // Resolving the focused pane costs a mux lookup, and this runs once per
         // row per frame, so only a row that actually has something pending pays
-        // for it; the two timestamps decide every other row on their own.
+        // for it; the timestamps decide every other row on their own.
         let queued = (waiting_since.is_some() || unseen_exited_since.is_some())
             && is_waiting_queued(
-                (pane_id, waiting_since, unseen_exited_since),
-                if self.focused.is_some() {
-                    self.get_active_pane_or_overlay().map(|p| p.pane_id())
-                } else {
-                    None
-                },
+                (pane_id, waiting_since, unseen_exited_since, acknowledged_at),
+                self.focused_active_pane_id(),
             );
         let gates = self.sidebar_animation_gates();
         // The settled hairline and the waiting glow are state, not motion, so
@@ -7346,6 +7524,7 @@ impl crate::TermWindow {
             bg,
             None,
             sb.ring.pulse,
+            sb.ring.waiting,
         );
         // The dot breathes while the agent works; the rest of the strip keeps
         // the steady accent so button text and borders do not shimmer.
@@ -7355,6 +7534,7 @@ impl crate::TermWindow {
             bg,
             self.agent_dot_pulse(&agent),
             sb.ring.pulse,
+            sb.ring.waiting,
         );
 
         self.sidebar_rounded_fill(
@@ -7512,7 +7692,7 @@ impl crate::TermWindow {
                 button_radius,
                 button_bg,
             )?;
-            let button_fg = contrast_label_color(button_bg);
+            let button_fg = contrast_label_color(button_bg, sb.text_active);
             let button_side_pad = AGENT_TOOLBELT_BUTTON_PAD_X * dpi_scale * 0.5;
             render_text(
                 self,
@@ -7733,7 +7913,7 @@ impl crate::TermWindow {
                 menu_x + row_text_inset,
                 row_y + (row_h - cell_h_f) * 0.5,
                 menu_w - row_text_inset * 2.,
-                contrast_label_color(row_bg),
+                contrast_label_color(row_bg, sb.text_active),
                 row_bg,
             )?;
             self.ui_items.push(UIItem {
@@ -8457,7 +8637,7 @@ impl crate::TermWindow {
                 text_x,
                 row_y + (row_h - cell_h_f) * 0.5,
                 (menu_x + menu_w - row_text_inset - chevron_w - text_x).max(1.),
-                contrast_label_color(row_bg),
+                contrast_label_color(row_bg, sb.text_active),
                 row_bg,
             )?;
             if row.trailing_chevron {
@@ -8468,7 +8648,7 @@ impl crate::TermWindow {
                     menu_x + menu_w - row_text_inset - cell_width as f32,
                     row_y + (row_h - cell_h_f) * 0.5,
                     cell_width as f32,
-                    contrast_label_color(row_bg),
+                    contrast_label_color(row_bg, sb.text_active),
                     row_bg,
                 )?;
             }
@@ -8560,11 +8740,20 @@ impl crate::TermWindow {
             item_type: UIItemType::TabBar(TabBarItem::None),
         });
 
+        // The seam between the sidebar and the terminal. Scaled like the rest of
+        // the hand-drawn geometry below, since a fixed 1 physical px is a
+        // hairline on a Retina display and effectively disappears.
+        let divider_w = (self.dimensions.dpi as f32 / 96.).clamp(1., 2.5).round();
         let divider_x = match self.config.sidebar_position {
-            SidebarPosition::Left => left + width as f32 - 1.,
+            SidebarPosition::Left => left + width as f32 - divider_w,
             SidebarPosition::Right => left,
         };
-        self.filled_rectangle(layers, 2, euclid::rect(divider_x, top, 1., height), divider)?;
+        self.filled_rectangle(
+            layers,
+            2,
+            euclid::rect(divider_x, top, divider_w, height),
+            divider,
+        )?;
         let cell_width = self.render_metrics.cell_size.width as usize;
         let cell_height = self.render_metrics.cell_size.height as usize;
         // DPI-scaled geometry for the fixed-size hand-drawn boxes below
@@ -8901,7 +9090,7 @@ impl crate::TermWindow {
                     symbol_cols = 1;
                     symbol_pixel_width = cell_width as f32;
                 }
-                let label_fg = contrast_label_color(tab_bg);
+                let label_fg = contrast_label_color(tab_bg, sb.text_active);
                 let mut symbol_attrs = CellAttributes::default();
                 symbol_attrs
                     .set_foreground(ColorAttribute::TrueColorWithDefaultFallback(
@@ -8935,6 +9124,7 @@ impl crate::TermWindow {
                         tab_bg,
                         self.agent_dot_pulse(agent),
                         sb.ring.pulse,
+                        sb.ring.waiting,
                     );
                     self.sidebar_pill_fill(
                         layers,
@@ -9736,6 +9926,7 @@ impl crate::TermWindow {
                     row_bg,
                     self.agent_dot_pulse(agent),
                     sb.ring.pulse,
+                    sb.ring.waiting,
                 );
                 self.sidebar_pill_fill(
                     layers,
@@ -10871,12 +11062,16 @@ impl crate::TermWindow {
                 agent.vendor_dot_color()
             };
             let dot_rect = euclid::rect(dot_x - 4.0 * dpi, dot_y - 4.0 * dpi, 8.0 * dpi, 8.0 * dpi);
-            self.filled_rectangle(
-                layers,
-                1,
-                dot_rect,
-                srgb8_to_linear(dot_color.0, dot_color.1, dot_color.2),
-            )?;
+            let dot_fill = srgb8_to_linear(dot_color.0, dot_color.1, dot_color.2);
+            // Attention rows keep their static pip untouched (early-out below);
+            // only a row genuinely `Working` gains motion, breathing the same
+            // way a bound pane's tab-row dot does.
+            let dot_fill =
+                match self.agent_herd_dot_pulse(display_status == HerdDisplayStatus::Working) {
+                    Some(phase) => lerp_rgba(row_bg, dot_fill, 0.55 + 0.45 * phase.clamp(0., 1.)),
+                    None => dot_fill,
+                };
+            self.filled_rectangle(layers, 1, dot_rect, dot_fill)?;
             if display_status.is_attention() {
                 let attention_rect =
                     euclid::rect(dot_x + 3.0 * dpi, dot_y - 2.0 * dpi, 4.0 * dpi, 4.0 * dpi);
@@ -13710,6 +13905,25 @@ mod tests {
     }
 
     #[test]
+    fn herd_dot_pulse_phase_advances_and_stays_in_phase_across_rows() {
+        // Herd rows carry no `PaneId` -- a session may never have bound to a
+        // pane -- so `agent_herd_dot_pulse` cannot key any per-row animation
+        // state and leans entirely on this pure function instead.
+        let period = Duration::from_millis(1600);
+        let early = agent_pulse_phase(Duration::from_millis(50), period);
+        let later = agent_pulse_phase(Duration::from_millis(400), period);
+        assert!(later > early, "phase must advance with elapsed time");
+
+        // Two herd rows sampled at the same instant must agree exactly --
+        // that is what lets every row breathe in phase with no per-row
+        // mutable clock, the same guarantee the tab-row throbber relies on.
+        let elapsed = Duration::from_millis(733);
+        let row_one = agent_pulse_phase(elapsed, period);
+        let row_two = agent_pulse_phase(elapsed, period);
+        assert_eq!(row_one, row_two);
+    }
+
+    #[test]
     fn pulse_frame_deadline_is_snapped_to_the_grid_and_in_the_future() {
         // `now + interval` would drift by however long each repaint took, so
         // dots asking on different frames would slowly spread apart.
@@ -13943,14 +14157,16 @@ mod tests {
         let base = LinearRgba(0.8, 0.5, 0.3, 1.0);
         let surface = LinearRgba(0.1, 0.1, 0.1, 1.0);
         assert_eq!(
-            agent_status_dot_accent(&AgentStatus::Idle, base, surface, None, base),
+            agent_status_dot_accent(&AgentStatus::Idle, base, surface, None, base, base),
             base
         );
         // Full phase is exactly the pulse colour, so turning the pulse on never
         // makes a dot brighter than it was.
-        let full = agent_status_dot_accent(&AgentStatus::Running, base, surface, Some(1.0), base);
+        let full =
+            agent_status_dot_accent(&AgentStatus::Running, base, surface, Some(1.0), base, base);
         assert!((full.0 - base.0).abs() < 0.001);
-        let dim = agent_status_dot_accent(&AgentStatus::Running, base, surface, Some(0.0), base);
+        let dim =
+            agent_status_dot_accent(&AgentStatus::Running, base, surface, Some(0.0), base, base);
         assert!(dim.0 < base.0);
         assert!(dim.0 > surface.0);
     }
@@ -13966,6 +14182,7 @@ mod tests {
             surface,
             Some(1.0),
             ring.a,
+            ring.waiting,
         );
         assert!(
             pulsed.0 > pulsed.2,
@@ -13980,8 +14197,14 @@ mod tests {
         let surface = LinearRgba(0.1, 0.1, 0.1, 1.0);
         let ring = preset_ring(AgentRingColors::default());
 
-        let pulsing =
-            agent_status_dot_accent(&AgentStatus::Running, vendor, surface, Some(1.0), ring.a);
+        let pulsing = agent_status_dot_accent(
+            &AgentStatus::Running,
+            vendor,
+            surface,
+            Some(1.0),
+            ring.a,
+            ring.waiting,
+        );
         assert!(
             (pulsing.0 - ring.a.0).abs() < 0.001 && (pulsing.2 - ring.a.2).abs() < 0.001,
             "a pulsing working dot must take the ring's warm end, not the vendor hue"
@@ -13989,10 +14212,89 @@ mod tests {
 
         // Same agent, pulse switched off: identity comes back untouched, which
         // is what keeps agents distinguishable in the lists.
-        let still = agent_status_dot_accent(&AgentStatus::Running, vendor, surface, None, ring.a);
+        let still = agent_status_dot_accent(
+            &AgentStatus::Running,
+            vendor,
+            surface,
+            None,
+            ring.a,
+            ring.waiting,
+        );
         assert_eq!(still, vendor);
-        let idle = agent_status_dot_accent(&AgentStatus::Idle, vendor, surface, Some(1.0), ring.a);
+        let idle = agent_status_dot_accent(
+            &AgentStatus::Idle,
+            vendor,
+            surface,
+            Some(1.0),
+            ring.a,
+            ring.waiting,
+        );
         assert_eq!(idle, vendor);
+    }
+
+    #[test]
+    fn agent_status_dot_accent_uses_the_resolved_waiting_color() {
+        // No override: falls back to the ring's warm stop, exactly what
+        // `paint_agent_waiting_glow` falls back to for the row glow.
+        let default_ring = preset_ring(AgentRingColors::default());
+        let base = LinearRgba(0.2, 0.4, 0.9, 1.0);
+        let surface = LinearRgba(0.1, 0.1, 0.1, 1.0);
+        let default_dot = agent_status_dot_accent(
+            &AgentStatus::WaitingForInput,
+            base,
+            surface,
+            None,
+            default_ring.a,
+            default_ring.waiting,
+        );
+        assert_eq!(default_dot, default_ring.a);
+
+        // An explicit `waiting_glow` override changes the dot too, not just
+        // the glow.
+        let overridden = RgbaColor::from((0x11u8, 0x99u8, 0x22u8));
+        let overridden_ring = RingColors::resolve(
+            AgentRingColors::default(),
+            &AgentAnimationColors {
+                waiting_glow: Some(overridden),
+                ..AgentAnimationColors::default()
+            },
+        );
+        let overridden_dot = agent_status_dot_accent(
+            &AgentStatus::WaitingForInput,
+            base,
+            surface,
+            None,
+            overridden_ring.a,
+            overridden_ring.waiting,
+        );
+        assert_eq!(overridden_dot, overridden_ring.waiting);
+        assert_ne!(overridden_dot, default_dot);
+    }
+
+    #[test]
+    fn waiting_dot_color_is_no_longer_the_bare_hardcoded_literal_when_overridden() {
+        let legacy_hardcoded_orange = LinearRgba(0.94, 0.72, 0.26, 1.0);
+        let base = LinearRgba(0.2, 0.4, 0.9, 1.0);
+        let surface = LinearRgba(0.1, 0.1, 0.1, 1.0);
+        let overridden_ring = RingColors::resolve(
+            AgentRingColors::default(),
+            &AgentAnimationColors {
+                waiting_glow: Some(RgbaColor::from((0x11u8, 0x99u8, 0x22u8))),
+                ..AgentAnimationColors::default()
+            },
+        );
+        let dot = agent_status_dot_accent(
+            &AgentStatus::WaitingForInput,
+            base,
+            surface,
+            None,
+            overridden_ring.a,
+            overridden_ring.waiting,
+        );
+        assert_ne!(
+            dot, legacy_hardcoded_orange,
+            "waiting dot must follow the resolved override, not the old bare literal"
+        );
     }
 
     #[test]
@@ -14705,25 +15007,87 @@ mod tests {
         let exited_unseen: PaneId = 3;
         let idle: PaneId = 4;
         let entries = vec![
-            (waiting, Some(now - Duration::from_secs(20)), None),
-            (waiting_viewed, Some(now - Duration::from_secs(10)), None),
-            (exited_unseen, None, Some(now - Duration::from_secs(5))),
-            (idle, None, None),
+            (waiting, Some(now - Duration::from_secs(20)), None, None),
+            (
+                waiting_viewed,
+                Some(now - Duration::from_secs(10)),
+                None,
+                None,
+            ),
+            (
+                exited_unseen,
+                None,
+                Some(now - Duration::from_secs(5)),
+                None,
+            ),
+            (idle, None, None, None),
         ];
         // Window focused and the user is looking at `waiting_viewed`: it is
-        // acknowledged (excluded) even though it is still waiting.
+        // excluded even though it is still waiting.
         let queue = build_waiting_queue(entries.clone(), Some(waiting_viewed));
         assert_eq!(queue.len(), 2);
         assert_eq!(queue[0].0, waiting); // oldest wait first
         assert_eq!(queue[1].0, exited_unseen);
         // Nothing queued: empty output — the rail chip hides and the dock
         // badge clears.
-        assert!(build_waiting_queue(vec![(idle, None, None)], Some(99)).is_empty());
-        assert!(build_waiting_queue(
-            Vec::<(PaneId, Option<Instant>, Option<Instant>)>::new(),
+        assert!(build_waiting_queue(vec![(idle, None, None, None)], Some(99)).is_empty());
+        assert!(build_waiting_queue(Vec::<WaitingQueueEntry>::new(), None).is_empty());
+    }
+
+    /// The reported bug: acknowledging a waiting pane has to outlive focus.
+    /// Before `acknowledged_at`, focus alone excluded the pane, so the glow
+    /// came straight back the moment the user looked at something else.
+    #[test]
+    fn acknowledgement_survives_losing_focus() {
+        let now = Instant::now();
+        let pane: PaneId = 1;
+        let other: PaneId = 2;
+        let waiting_at = now - Duration::from_secs(30);
+
+        // Waiting, never acknowledged, user looking elsewhere: queued.
+        assert!(is_waiting_queued(
+            (pane, Some(waiting_at), None, None),
+            Some(other)
+        ));
+        // Acknowledged while focused.
+        let acked = (pane, Some(waiting_at), None, Some(now));
+        assert!(!is_waiting_queued(acked, Some(pane)));
+        // Focus moves away — the acknowledgement still holds.
+        assert!(!is_waiting_queued(acked, Some(other)));
+        // Window loses focus entirely: still acknowledged, so no dock badge.
+        assert!(!is_waiting_queued(acked, None));
+        // An exited-unseen pane is acknowledged the same way.
+        assert!(!is_waiting_queued(
+            (pane, None, Some(waiting_at), Some(now)),
             None
-        )
-        .is_empty());
+        ));
+    }
+
+    /// A later prompt is a new episode and must re-arm the glow, which is what
+    /// the `previous_waiting_since.is_none()` reset in the detection pass does.
+    #[test]
+    fn a_new_waiting_episode_clears_the_acknowledgement() {
+        let now = Instant::now();
+        let earlier = now - Duration::from_secs(60);
+
+        // Episode in progress and acknowledged: the ack carries over frame to
+        // frame while `waiting_since` stays set.
+        let carried = |previous_waiting: Option<Instant>, ack: Option<Instant>| {
+            if previous_waiting.is_none() {
+                None
+            } else {
+                ack
+            }
+        };
+        assert_eq!(carried(Some(earlier), Some(earlier)), Some(earlier));
+        // Status moved on, so `waiting_since` cleared; the next prompt starts
+        // from a `None` previous and drops the stale acknowledgement.
+        assert_eq!(carried(None, Some(earlier)), None);
+
+        // And the timestamp itself restarts rather than inheriting the old one.
+        assert_eq!(next_waiting_since(None, true, now), Some(now));
+        assert_eq!(next_waiting_since(Some(earlier), true, now), Some(earlier));
+        assert_eq!(next_waiting_since(Some(earlier), false, now), None);
     }
 
     #[test]
@@ -14732,13 +15096,73 @@ mod tests {
         let pane: PaneId = 1;
         let other: PaneId = 2;
 
-        assert!(is_waiting_queued((pane, Some(now), None), Some(other)));
-        assert!(is_waiting_queued((pane, None, Some(now)), None));
-        // Lazy acknowledge: the user is looking at it, so the glow clears
-        // without any explicit dismiss action.
-        assert!(!is_waiting_queued((pane, Some(now), None), Some(pane)));
+        assert!(is_waiting_queued(
+            (pane, Some(now), None, None),
+            Some(other)
+        ));
+        assert!(is_waiting_queued((pane, None, Some(now), None), None));
+        // The user is looking at it, so the glow clears without any explicit
+        // dismiss action.
+        assert!(!is_waiting_queued(
+            (pane, Some(now), None, None),
+            Some(pane)
+        ));
         // Nothing pending at all.
-        assert!(!is_waiting_queued((pane, None, None), None));
+        assert!(!is_waiting_queued((pane, None, None, None), None));
+    }
+
+    /// The sidebar has to read as a distinct surface from the terminal it sits
+    /// beside, in either direction of colour scheme.
+    #[test]
+    fn window_colour_palette_lifts_the_surface_off_the_background() {
+        let ring =
+            RingColors::resolve(AgentRingColors::default(), &AgentAnimationColors::default());
+
+        // Dark scheme: #1E1E1E terminal, #AFAEAE text.
+        let bg = srgb8_to_linear(0x1e, 0x1e, 0x1e);
+        let fg = srgb8_to_linear(0xaf, 0xae, 0xae);
+        let sb = SidebarPalette::from_window_colors(bg, fg, ring);
+        assert!(
+            sb.surface.relative_luminance() > bg.relative_luminance(),
+            "sidebar should sit above the terminal on a dark scheme"
+        );
+        // The seam has to be visible against both sides, not just its own.
+        assert!(sb.divider.relative_luminance() > sb.surface.relative_luminance());
+        assert!(sb.divider.relative_luminance() > bg.relative_luminance());
+        // Body text follows the configured foreground exactly.
+        assert_eq!(sb.text_active, fg);
+        assert!(sb.text_idle.relative_luminance() < sb.text_active.relative_luminance());
+        assert!(sb.text_meta.relative_luminance() < sb.text_idle.relative_luminance());
+
+        // Light scheme: the same ratios must invert rather than wash out.
+        let light_bg = srgb8_to_linear(0xff, 0xff, 0xff);
+        let dark_fg = srgb8_to_linear(0x33, 0x33, 0x33);
+        let light = SidebarPalette::from_window_colors(light_bg, dark_fg, ring);
+        assert!(
+            light.surface.relative_luminance() < light_bg.relative_luminance(),
+            "sidebar should sit below the terminal on a light scheme"
+        );
+        assert!(light.divider.relative_luminance() < light.surface.relative_luminance());
+        assert_eq!(light.text_active, dark_fg);
+    }
+
+    /// Sidebar labels used to be hardcoded pure white, ignoring the scheme.
+    #[test]
+    fn chip_labels_follow_the_palette_on_dark_fills() {
+        let fg = srgb8_to_linear(0xaf, 0xae, 0xae);
+        let dark_fill = srgb8_to_linear(0x25, 0x25, 0x27);
+        assert_eq!(contrast_label_color(dark_fill, fg), fg);
+        assert_ne!(
+            contrast_label_color(dark_fill, fg),
+            LinearRgba(1.0, 1.0, 1.0, 1.0)
+        );
+        // A light fill still needs near-black: no dark-scheme foreground would
+        // be readable on it.
+        let light_fill = srgb8_to_linear(0xf0, 0xf0, 0xf0);
+        assert_eq!(
+            contrast_label_color(light_fill, fg),
+            LinearRgba(0.03, 0.03, 0.035, 1.0)
+        );
     }
 
     #[test]
@@ -14888,6 +15312,29 @@ mod tests {
     }
 
     #[test]
+    fn completed_summary_line_detection_across_vendors() {
+        // `is_completed_summary_line` is Claude-shaped ("✻ Cogitated for 2m
+        // 40s") but applies to every vendor's spinner-glyph line, since the
+        // function that calls it has no adapter context at that point. This
+        // pins current behavior for vendor-shaped lines without changing the
+        // function's logic.
+        let cases: &[(&str, bool)] = &[
+            ("⠋ Compiling for 12s", true),
+            ("⠹ Building for 3m", true),
+            ("✻ Cogitated for 2m 40s", true),
+            ("◐ Running a tool for the user", false),
+            ("plain line with no summary tail", false),
+        ];
+        for (line, expected) in cases {
+            assert_eq!(
+                is_completed_summary_line(line),
+                *expected,
+                "{line:?} should be {expected}"
+            );
+        }
+    }
+
+    #[test]
     fn generic_running_marker_beats_any_chrome() {
         // Every built-in adapter's working line carries this, so it is the load
         // -bearing path for Claude Code, Codex and OpenCode alike.
@@ -14985,6 +15432,7 @@ mod tests {
             pending_switch: None,
             waiting_since: None,
             unseen_exited_since: None,
+            acknowledged_at: None,
             first_seen_at: None,
             done_ring_started_at: None,
         }
@@ -15006,6 +15454,7 @@ mod tests {
             pending_switch: None,
             waiting_since: None,
             unseen_exited_since: None,
+            acknowledged_at: None,
             first_seen_at: None,
             done_ring_started_at: None,
         }
@@ -15639,6 +16088,73 @@ gemini is a constellation\n";
         assert_eq!(
             infer_agent_status_from_visible_text(text, None),
             AgentStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn status_boxed_prompt_still_wins_with_no_adapter_waiting_patterns() {
+        // Regression guard: an adapter with an empty `waiting_patterns` list
+        // must behave bit-for-bit as before this feature existed -- Claude's
+        // boxed prompt is handled entirely by the generic glyph check.
+        let adapter = AgentAdapterConfig::default();
+        let text = "Here is my answer.\n╭──────────────╮\n│ >            │\n╰──────────────╯";
+        assert_eq!(
+            infer_agent_status_from_visible_text(text, Some(&adapter)),
+            AgentStatus::WaitingForInput
+        );
+    }
+
+    #[test]
+    fn status_boxed_prompt_still_wins_with_unrelated_waiting_patterns() {
+        let adapter = AgentAdapterConfig {
+            waiting_patterns: vec!["type your message".to_string()],
+            ..Default::default()
+        };
+        let text = "Here is my answer.\n╭──────────────╮\n│ >            │\n╰──────────────╯";
+        assert_eq!(
+            infer_agent_status_from_visible_text(text, Some(&adapter)),
+            AgentStatus::WaitingForInput
+        );
+    }
+
+    #[test]
+    fn status_uses_adapter_waiting_patterns_with_no_prompt_glyph() {
+        // The Gemini case: `type your message` carries no prompt glyph at all,
+        // so before this wiring the tail fell through to `Unknown`.
+        let adapter = AgentAdapterConfig {
+            waiting_patterns: vec!["type your message".to_string()],
+            ..Default::default()
+        };
+        let text = "Here is my answer.\nType your message here...";
+        assert_eq!(
+            infer_agent_status_from_visible_text(text, Some(&adapter)),
+            AgentStatus::WaitingForInput
+        );
+    }
+
+    #[test]
+    fn status_running_marker_beats_adapter_waiting_pattern() {
+        let adapter = AgentAdapterConfig {
+            waiting_patterns: vec!["type your message".to_string()],
+            ..Default::default()
+        };
+        let text = "Working... (esc to interrupt)\nType your message here...";
+        assert_eq!(
+            infer_agent_status_from_visible_text(text, Some(&adapter)),
+            AgentStatus::Running
+        );
+    }
+
+    #[test]
+    fn status_uses_regex_prefixed_adapter_waiting_pattern() {
+        let adapter = AgentAdapterConfig {
+            waiting_patterns: vec!["re:type your \\w+".to_string()],
+            ..Default::default()
+        };
+        let text = "Here is my answer.\nType your message here...";
+        assert_eq!(
+            infer_agent_status_from_visible_text(text, Some(&adapter)),
+            AgentStatus::WaitingForInput
         );
     }
 

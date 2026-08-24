@@ -968,7 +968,11 @@ pub fn activity_from_session_files(
     (!activity.is_empty()).then_some(activity)
 }
 
-fn find_session_artifact(root: &Path, session_id: &str) -> Option<PathBuf> {
+/// Search a vendor's session store for the newest artifact whose file name
+/// contains `session_id`. Exposed beyond this module so vendor-specific
+/// `transcript_source` lookups (see `agent_herd::transcript_source`) can reuse
+/// the same search instead of re-walking the tree themselves.
+pub(crate) fn find_session_artifact(root: &Path, session_id: &str) -> Option<PathBuf> {
     const MAX_FILES: usize = 2048;
     let mut stack = vec![root.to_path_buf()];
     let mut newest: Option<(SystemTime, PathBuf)> = None;

@@ -11,6 +11,25 @@ fn codex_sessions_dir(home: &Path) -> PathBuf {
     home.join(".codex")
 }
 
+/// Root of the nested `YYYY/MM/DD/rollout-*.jsonl` tree searched by
+/// [`collect_rollout_sessions`] and reused here so a transcript lookup by
+/// session id walks the same tree rather than re-deriving the path.
+fn rollout_sessions_root(home: &Path) -> PathBuf {
+    home.join(".codex").join("sessions")
+}
+
+/// Path to one session's rollout transcript, if any file under the rollout
+/// tree has `session_id` in its name. Rollout files are timestamp-prefixed
+/// (`rollout-2026-07-03T16-25-16-<session_id>.jsonl`), so there is no
+/// deterministic path to construct — this is a genuine search, reusing the
+/// same walk `activity_from_session_files` already does for live activity.
+pub(crate) fn find_transcript_path(home: &Path, session_id: &str) -> Option<PathBuf> {
+    if session_id.is_empty() {
+        return None;
+    }
+    crate::agent_herd::sessions::find_session_artifact(&rollout_sessions_root(home), session_id)
+}
+
 fn session_files(dir: &Path) -> Vec<PathBuf> {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
@@ -110,7 +129,7 @@ impl SessionSource for CodexDetector {
 }
 
 fn collect_rollout_sessions(home: &Path) -> Vec<VendorSession> {
-    let root = home.join(".codex").join("sessions");
+    let root = rollout_sessions_root(home);
     let mut dirs = vec![root.clone()];
     for _ in 0..3 {
         let mut next = Vec::new();

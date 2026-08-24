@@ -11,6 +11,22 @@ fn copilot_sessions_dir(home: &Path) -> PathBuf {
     home.join(".copilot")
 }
 
+/// Root of the `<session_id>/` directories searched by
+/// [`collect_state_sessions`], reused by [`session_events_path`] so a
+/// transcript lookup by session id agrees with detection.
+fn session_state_root(home: &Path) -> PathBuf {
+    home.join(".copilot").join("session-state")
+}
+
+/// Path to one session's event log. Unlike Codex's rollout files, Copilot
+/// names each session directory after its session id, so this is a
+/// deterministic join rather than a search.
+pub(crate) fn session_events_path(home: &Path, session_id: &str) -> PathBuf {
+    session_state_root(home)
+        .join(session_id)
+        .join("events.jsonl")
+}
+
 fn session_files(dir: &Path) -> Vec<PathBuf> {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
@@ -105,7 +121,7 @@ impl SessionSource for CopilotDetector {
 }
 
 fn collect_state_sessions(home: &Path) -> Vec<VendorSession> {
-    let root = home.join(".copilot").join("session-state");
+    let root = session_state_root(home);
     let Ok(entries) = std::fs::read_dir(&root) else {
         return Vec::new();
     };
@@ -120,7 +136,7 @@ fn collect_state_sessions(home: &Path) -> Vec<VendorSession> {
             continue;
         };
         let workspace = dir.join("workspace.yaml");
-        let events = dir.join("events.jsonl");
+        let events = session_events_path(home, session_id);
         let Ok(modified) = std::fs::metadata(&events)
             .or_else(|_| std::fs::metadata(&workspace))
             .and_then(|metadata| metadata.modified())

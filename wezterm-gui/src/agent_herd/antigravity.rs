@@ -8,6 +8,21 @@ use std::time::{Duration, SystemTime};
 const AGY_ACTIVE_WINDOW: Duration = Duration::from_secs(15 * 60);
 const AGY_WORKING_WINDOW: Duration = Duration::from_secs(2 * 60);
 
+/// Root of the antigravity-cli store under `$HOME`.
+fn antigravity_root(home: &Path) -> PathBuf {
+    home.join(".gemini").join("antigravity-cli")
+}
+
+/// Path to one conversation's transcript. Antigravity names each
+/// conversation's log directory after its own id, so this is a deterministic
+/// join, matching what [`SessionSource::collect_sessions`] already builds.
+pub(crate) fn transcript_path(home: &Path, session_id: &str) -> PathBuf {
+    antigravity_root(home)
+        .join("brain")
+        .join(session_id)
+        .join(".system_generated/logs/transcript.jsonl")
+}
+
 #[derive(serde::Deserialize)]
 struct HistoryEntry {
     display: Option<String>,
@@ -25,7 +40,7 @@ impl SessionSource for AntigravityDetector {
     }
 
     fn collect_sessions(&self, home: &Path) -> Vec<VendorSession> {
-        let root = home.join(".gemini").join("antigravity-cli");
+        let root = antigravity_root(home);
         let last_path = root.join("cache/last_conversations.json");
         let Ok(last_text) = std::fs::read_to_string(last_path) else {
             return Vec::new();
@@ -69,10 +84,7 @@ impl SessionSource for AntigravityDetector {
                 if cwd.as_os_str().is_empty() {
                     return None;
                 }
-                let transcript = root
-                    .join("brain")
-                    .join(&session_id)
-                    .join(".system_generated/logs/transcript.jsonl");
+                let transcript = transcript_path(home, &session_id);
                 let activity = transcript
                     .exists()
                     .then(|| {

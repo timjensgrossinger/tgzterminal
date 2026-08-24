@@ -1,8 +1,7 @@
 use crate::agent_herd::HerdAgent;
 use mux::termwiztermtab::TermWizTerminal;
-use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
-use termwiz::cell::{AttributeChange, CellAttributes, Intensity};
+use termwiz::cell::{AttributeChange, CellAttributes};
 use termwiz::color::AnsiColor;
 use termwiz::input::{InputEvent, KeyCode, KeyEvent};
 use termwiz::surface::Change;
@@ -81,27 +80,15 @@ fn refresh_activity(
     session_id: Option<&str>,
     cwd: Option<&std::path::Path>,
 ) -> Option<crate::agent_herd::HerdActivity> {
-    if provider != "claude" && provider != "opencode" {
-        return None;
-    }
-    let (session_id, cwd) = match (session_id, cwd) {
-        (Some(s), Some(c)) => (s.to_string(), c.to_path_buf()),
-        _ => return None,
-    };
-    match provider {
-        "claude" => {
-            let home = dirs_home()?;
-            let path =
-                crate::agent_herd::claude::session_transcript_path(&home, &cwd, &session_id)?;
+    match crate::agent_herd::transcript_source(provider, session_id, cwd) {
+        crate::agent_herd::TranscriptSource::File(path) => {
             Some(crate::agent_herd::transcript::read_activity(&path, 500))
         }
-        "opencode" => crate::agent_herd::opencode::read_session_activity(&session_id, 500),
-        _ => None,
+        crate::agent_herd::TranscriptSource::Live => {
+            crate::agent_herd::opencode::read_session_activity(session_id?, 500)
+        }
+        crate::agent_herd::TranscriptSource::None => None,
     }
-}
-
-fn dirs_home() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
 }
 
 /// A human `HH:MM:SS` timestamp, or empty when the source gave none.

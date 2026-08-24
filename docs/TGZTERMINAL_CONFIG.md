@@ -25,6 +25,7 @@ config.sidebar_scroll_bar = true
 | `sidebar_collapsed_width_px` | int px | `48` | Also the reserved width under `sidebar_auto_hide`, where it is forced to at least 48. |
 | `sidebar_auto_hide` | bool | `true` | Reserves only the collapsed width and expands the sidebar as an overlay on hover. The in-app toggle persists to `tgz-ui-state.json` and then takes precedence over this key. |
 | `sidebar_position` | enum | `"Left"` | `"Left"`, `"Right"` |
+| `sidebar_theme` | enum | `"Auto"` | `"Auto"`, `"Modern"`, `"FollowColorScheme"`. `Auto` derives the sidebar from `colors.tab_bar` when the scheme defines it, else from `colors.background` + `colors.foreground`, else uses the fork's near-black palette. `Modern` pins that near-black palette regardless of the scheme. |
 | `sidebar_tab_density` | enum | `"Comfortable"` | `"Comfortable"`, `"Compact"`. `Compact` also suppresses the metadata sub-line entirely. |
 | `sidebar_tab_title_source` | enum | `"Title"` | `"Title"`, `"Command"`, `"WorkingDirectory"`, `"GitBranch"` |
 | `sidebar_tab_metadata` | list of enum | `{ "GitBranch", "WorkingDirectory" }` | Elements: `"GitBranch"`, `"WorkingDirectory"` |
@@ -187,6 +188,9 @@ config.agent_ui = {
       title_patterns = { "claude code", "claude" },
       visible_patterns = { "claude code", "claude team", "welcome to claude" },
       running_patterns = { "esc to interrupt" },
+      -- Left empty: Claude's boxed `| > ` prompt is already covered by the
+      -- built-in generic prompt-glyph scan.
+      waiting_patterns = {},
       chrome_patterns = { "? for shortcuts", "auto mode on (shift+tab" },
       strip_patterns = { "auto mode", "token usage" },
       model_patterns = { "sonnet", "opus", "haiku" },
@@ -210,7 +214,9 @@ config.agent_ui = {
       resume_latest_command = { "codex", "resume", "--last" },
       detail_paths = { "{home}/.codex/sessions", "{home}/.codex/log" },
     },
-    gemini = { enabled = true },
+    -- Gemini prints an idle hint rather than a prompt glyph, so it is the one
+    -- built-in adapter that ships a waiting pattern.
+    gemini = { enabled = true, waiting_patterns = { "type your message" } },
     opencode = {
       enabled = true,
       resume_command = { "opencode", "-s", "{session_id}" },
@@ -309,7 +315,7 @@ vendor-neutral agent.
 
 Each adapter accepts `enabled`, `label`, `short_label`, `color`,
 `process_names`, `title_patterns`, `visible_patterns`, `running_patterns`,
-`chrome_patterns`, `strip_patterns`, and
+`waiting_patterns`, `chrome_patterns`, `strip_patterns`, and
 `model_patterns`. It may also accept action templates: `resume_command`,
 `resume_latest_command`, `attach_command`, `detail_paths`,
 `launch_command`, and `launch_domain`. Pattern entries
@@ -499,6 +505,15 @@ Pattern conventions, which the built-in defaults follow:
 - **`running_patterns`** are printed only while that adapter is working. They
   drive the Running status and count as identity when no other enabled adapter
   claims the same string.
+- **`waiting_patterns`** are printed only while that adapter sits idle at its own
+  prompt. They drive the `WaitingForInput` status, and therefore the waiting
+  queue, the row glow and the dock badge. Never identity: a prompt glyph is not
+  a brand, and treating one as identity would badge every plain shell. They are
+  consulted only after the running checks have already declined, so a busy agent
+  is never read as waiting. Leave the list empty — as every built-in adapter
+  except Gemini does — to fall back to the built-in generic prompt-glyph scan
+  (`>`, `❯`, `›`, and the boxed `│ >` form), which is what all adapters relied
+  on before this key existed.
 - **`chrome_patterns`** are the adapter's permanent TUI furniture (footer, hint
   line). Identity only, never status.
 - **`strip_patterns`** are never identity. They are deliberately short and
@@ -1121,7 +1136,7 @@ you are not left hunting for one.
 | Toolbelt button labels, sizes and drop order | Hardcoded. When the strip is too narrow buttons are dropped in a fixed order (Input/Compose, then Details, Attach, Resume), and Stop and Copy are the last two standing. |
 | Per-toolbelt-button visibility | Toolbelt visibility is derived. Herd-row `Stop` is governed by `agent_ui.show_stop`; it appears when the agent can be interrupted. `Copy` whenever an agent is detected; `Attach` / `Resume` / `Details` need their action templates *and* the control-action gate; `Input` / `Compose` follow `rich_input.enabled` and `rich_input.docked`. If a button is missing, it is a detection or a gate question — see *How an agent is identified*. |
 | Sidebar spacing, radii and row geometry | Compile-time constants. |
-| Sidebar colors | Derived from the active color scheme. |
+| Individual sidebar colors | No per-element keys. The whole palette is derived — see `sidebar_theme` for which source it derives from. |
 | Worktree picker behavior | No config surface. |
 
 Two keys are accepted by the schema but currently read by no code:

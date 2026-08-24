@@ -5219,6 +5219,7 @@ done
         // An error here just means the tab is already active; the pane change
         // above still stands, so there is nothing to recover from.
         let _ = self.activate_tab(tab_idx as isize);
+        self.acknowledge_waiting_pane(pane_id);
         self.update_title();
         true
     }

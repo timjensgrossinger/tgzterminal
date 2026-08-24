@@ -60,6 +60,28 @@ impl Default for SidebarPosition {
     }
 }
 
+/// Where the sidebar takes its colours from.
+///
+/// `Auto` (the default) prefers `tab_bar` when the colour scheme defines it,
+/// falls back to the window `background`/`foreground` pair, and only uses the
+/// fork's own near-black scheme when neither is configured.
+/// `FollowColorScheme` is the explicit spelling of that same behaviour, for a
+/// config that wants to state the intent rather than rely on the default.
+/// `Modern` pins the near-black scheme regardless of what the colour scheme
+/// defines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromDynamic, ToDynamic)]
+pub enum SidebarTheme {
+    Auto,
+    Modern,
+    FollowColorScheme,
+}
+
+impl Default for SidebarTheme {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, FromDynamic, ToDynamic)]
 pub enum SidebarTabDensity {
     Comfortable,
@@ -392,6 +414,18 @@ pub struct AgentAdapterConfig {
     #[dynamic(default)]
     pub running_patterns: Vec<String>,
 
+    /// Visible text fragments printed only while this adapter sits idle at its
+    /// own prompt. Drive the `WaitingForInput` status, and therefore the waiting
+    /// queue, the row glow and the dock badge.
+    ///
+    /// Never identity evidence: a prompt glyph is not a brand, and treating one
+    /// as identity would badge every plain shell. Consulted only after the
+    /// running checks have already declined, so a busy agent is never read as
+    /// waiting. Leave empty to fall back to the built-in generic prompt-glyph
+    /// scan, which is what every adapter relied on before this field existed.
+    #[dynamic(default)]
+    pub waiting_patterns: Vec<String>,
+
     /// Visible text fragments belonging to this adapter's own TUI furniture —
     /// its footer, hint line or status bar. Identity evidence only, never
     /// status: they are on screen whether or not the agent is busy.
@@ -449,6 +483,7 @@ impl Default for AgentAdapterConfig {
             title_patterns: Vec::new(),
             visible_patterns: Vec::new(),
             running_patterns: Vec::new(),
+            waiting_patterns: Vec::new(),
             chrome_patterns: Vec::new(),
             strip_patterns: Vec::new(),
             model_patterns: Vec::new(),
@@ -488,6 +523,7 @@ impl AgentAdapterConfig {
                 .map(|pattern| pattern.to_string())
                 .collect(),
             running_patterns: Vec::new(),
+            waiting_patterns: Vec::new(),
             chrome_patterns: Vec::new(),
             strip_patterns: strip_patterns
                 .iter()
@@ -518,6 +554,14 @@ impl AgentAdapterConfig {
     fn with_markers(mut self, running: &[&str], chrome: &[&str]) -> Self {
         self.running_patterns = running.iter().map(|p| p.to_string()).collect();
         self.chrome_patterns = chrome.iter().map(|p| p.to_string()).collect();
+        self
+    }
+
+    /// Set the visible-text fragments that mean this adapter is idle at its own
+    /// prompt. Separate from `with_markers` because most adapters have no
+    /// distinctive prompt and are better served by the generic glyph scan.
+    fn with_waiting(mut self, waiting: &[&str]) -> Self {
+        self.waiting_patterns = waiting.iter().map(|p| p.to_string()).collect();
         self
     }
 }
@@ -627,21 +671,21 @@ pub fn default_agent_adapters() -> AgentAdaptersConfig {
     .map(|p| p.to_string())
     .collect();
     adapters.insert("codex".to_string(), codex);
-    adapters.insert(
-        "gemini".to_string(),
-        AgentAdapterConfig::with_defaults(
-            "Gemini",
-            "G",
-            "#4785eb",
-            &["gemini", "gemini-cli", "gemini_cli"],
-            &["gemini"],
-            &["gemini cli", "google gemini", "welcome to gemini"],
-            &["tokens", "context"],
-            &["gemini"],
-        )
-        .with_launch("gemini")
-        .with_markers(&["esc to cancel"], &["type your message", "/help for more"]),
-    );
+    let mut gemini = AgentAdapterConfig::with_defaults(
+        "Gemini",
+        "G",
+        "#4785eb",
+        &["gemini", "gemini-cli", "gemini_cli"],
+        &["gemini"],
+        &["gemini cli", "google gemini", "welcome to gemini"],
+        &["tokens", "context"],
+        &["gemini"],
+    )
+    .with_launch("gemini")
+    .with_markers(&["esc to cancel"], &["type your message", "/help for more"])
+    .with_waiting(&["type your message"]);
+    gemini.detail_paths = Some(vec!["{home}/.gemini".to_string()]);
+    adapters.insert("gemini".to_string(), gemini);
     let mut opencode = AgentAdapterConfig::with_defaults(
         "OpenCode",
         "Oc",
@@ -734,6 +778,10 @@ pub fn default_agent_adapters() -> AgentAdaptersConfig {
         "antigravity cli".to_string(),
         "antigravity agent".to_string(),
     ];
+    antigravity.detail_paths = Some(vec![
+        "{home}/.gemini/antigravity-cli/brain/{session_id}/.system_generated/logs".to_string(),
+        "{home}/.gemini/antigravity-cli".to_string(),
+    ]);
     adapters.insert("antigravity".to_string(), antigravity);
     adapters.insert(
         "cursor".to_string(),
@@ -1742,6 +1790,10 @@ pub struct Config {
     /// Which side of the window hosts the vertical sidebar.
     #[dynamic(default)]
     pub sidebar_position: SidebarPosition,
+
+    /// Where the sidebar takes its colours from.
+    #[dynamic(default)]
+    pub sidebar_theme: SidebarTheme,
 
     /// Row density for sidebar tab entries.
     #[dynamic(default)]
@@ -3449,6 +3501,52 @@ mod agent_ui_tests {
             .strip_patterns
             .iter()
             .any(|pattern| pattern == "auto mode"));
+    }
+
+    #[test]
+    fn waiting_patterns_are_empty_except_for_gemini() {
+        let adapters = default_agent_adapters();
+        for name in [
+            "claude",
+            "codex",
+            "opencode",
+            "copilot",
+            "cursor",
+            "amp",
+            "antigravity",
+        ] {
+            assert!(
+                adapters[name].waiting_patterns.is_empty(),
+                "expected {name} to have no waiting_patterns"
+            );
+        }
+    }
+
+    #[test]
+    fn gemini_waiting_patterns_include_type_your_message() {
+        let adapters = default_agent_adapters();
+        assert!(adapters["gemini"]
+            .waiting_patterns
+            .iter()
+            .any(|pattern| pattern == "type your message"));
+    }
+
+    #[test]
+    fn gemini_and_antigravity_now_have_detail_paths() {
+        let adapters = default_agent_adapters();
+        assert!(adapters["gemini"].detail_paths.is_some());
+        assert!(adapters["antigravity"].detail_paths.is_some());
+    }
+
+    #[test]
+    fn unverified_adapters_have_no_resume_command() {
+        let adapters = default_agent_adapters();
+        for name in ["gemini", "antigravity", "cursor", "amp"] {
+            assert!(
+                adapters[name].resume_command.is_none(),
+                "expected {name} to have no resume_command"
+            );
+        }
     }
 
     #[test]

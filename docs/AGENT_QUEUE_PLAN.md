@@ -7,9 +7,15 @@ The terminal shows how many agents are waiting for input, lets the user jump
 between them with one action, and makes waiting panes visible at a glance in
 the collapsed icon rail.
 
-This is Track 5. It depends on reliable status inference
-(`WaitingForInput` must actually fire for Claude/Codex panes) and pairs with
-Track 4 events, but does not require Track 4 to ship.
+This is Track 5. It depends on reliable status inference: `WaitingForInput`
+must actually fire for **every** supported vendor's panes, not just the ones
+that happen to be installed on the developer's machine. It pairs with Track 4
+events, but does not require Track 4 to ship.
+
+Vendors that print a prompt glyph (`>`, `❯`, `›`, or the boxed `│ >` form) are
+covered by the built-in generic scan. Vendors that signal idleness some other
+way — Gemini prints `type your message` — supply their own
+`agent_ui.adapters.<id>.waiting_patterns`.
 
 ## Non-Goals
 
@@ -38,7 +44,8 @@ Active surfaces:
   ordered oldest-wait-first. Repeated presses cycle through the queue.
 - Clicking the rail counter jumps to the oldest waiting pane.
 - After the user focuses a waiting pane, it leaves the queue immediately
-  (focus = acknowledged), even before the agent status flips.
+  (focus = acknowledged), even before the agent status flips, and does not
+  come back when focus moves on.
 
 Default key binding suggestion (not forced): `CMD|SHIFT-j`.
 
@@ -48,10 +55,26 @@ Default key binding suggestion (not forced): `CMD|SHIFT-j`.
   panes that transitioned to `Exited` while unfocused and have not been
   focused since ("finished behind your back").
 - Order: time entered queue, oldest first.
-- Acknowledgement: focusing the pane removes it from the queue. If the agent
-  prompts again later, it re-enters.
+- Acknowledgement: focusing the pane removes it from the queue, and *stays*
+  removed after focus moves elsewhere. If the agent prompts again later, that
+  is a new episode and it re-enters.
 - The queue lives on the same per-pane `AgentRuntimeState` cache introduced
   in Track 4 step 1 (entered-queue timestamp + acknowledged flag).
+
+Implemented as `AgentDetectionCacheEntry.waiting_since` +
+`acknowledged_at` in `render/sidebar.rs`. The acknowledgement is stamped by the
+detection pass whenever a waiting pane is the focused-active pane, which covers
+every route to focus (sidebar row, herd row, rail chip, `CycleWaitingAgent`,
+keyboard tab switch, a click in the terminal); `activate_sidebar_pane` also
+calls `acknowledge_waiting_pane` directly so a click clears the glow on the same
+frame. It is reset when `waiting_since` goes `None -> Some`, which is what
+re-arms the glow on a re-prompt. `build_waiting_queue` filters on it, so the row
+glow, the rail chip and the dock badge cannot disagree.
+
+Note the earlier implementation excluded the focused-active pane at *query
+time* only. That looked equivalent but was not: nothing was recorded, so the
+glow returned as soon as focus moved away from a pane the user had already
+handled.
 
 ## Config
 
@@ -82,8 +105,8 @@ New key assignment: `wezterm.action.CycleWaitingAgent` (and
 
 ## Implementation Steps
 
-1. Add queue state (entered_at, acknowledged) to the per-pane agent runtime
-   cache; update on status transitions and on focus events.
+1. ~~Add queue state (entered_at, acknowledged) to the per-pane agent runtime
+   cache; update on status transitions and on focus events.~~ Done.
 2. Render waiting badge state in compact tab icons.
 3. Render rail counter pill + UIItem + click dispatch.
 4. Add `CycleWaitingAgent` / `ActivateOldestWaitingAgent` key assignments in
@@ -103,8 +126,10 @@ Focused checks:
 
 Runtime smoke:
 
-- Two Claude panes prompting → counter shows 2, cycle key visits both
-  oldest-first, focusing each clears it.
+- Two agent panes prompting → counter shows 2, cycle key visits both
+  oldest-first, focusing each clears it. Run this for each vendor CLI installed,
+  not only for Claude: a vendor whose prompt shape the generic scan misses is
+  exactly the regression this check exists to catch.
 - Exited agent in background tab appears dimmed-attention until visited.
 - Empty queue renders nothing and costs nothing.
 - Dock badge appears only while app unfocused and count > 0.
