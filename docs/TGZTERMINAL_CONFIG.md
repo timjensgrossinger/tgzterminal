@@ -157,6 +157,25 @@ config.agent_ui = {
   trust_visible_evidence = true,
   pulse_working_dot = true,
   pulse_period_ms = 1600,
+  ring_colors = "RedBlue", -- or "OrangeCyan", "TanSage", "BrownSlate"
+  animations = {
+    enabled = true,
+    unfocused = true,
+    working_ring = true,
+    resolve_ripple = true,
+    waiting_glow = true,
+    agent_enter = true,
+    rail_breathe = true,
+    dot_pulse = true,
+    colors = {
+      -- all optional; each falls back to the `ring_colors` preset
+      ring_a = "#ff6b6b",
+      ring_b = "#58a6ff",
+      resolve = "#305b8c",
+      waiting_glow = "#ff6b6b",
+      dot_pulse = "#ff6b6b",
+    },
+  },
   show_stop = true,
   adapters = {
     claude = {
@@ -281,8 +300,10 @@ vendor-neutral agent.
 | `toolbelt_position` | enum | `"Top"` | `"Top"`, `"Bottom"` |
 | `visible_identity_signals` | int | `2` | Distinct adapter-exclusive patterns that must agree before visible text names an agent. Clamped by how many the adapter declares. |
 | `trust_visible_evidence` | bool | `true` | Whether multi-signal visible-text evidence counts as trusted for control actions. |
-| `pulse_working_dot` | bool | `true` | Pulse the status dot while an agent is Running/Streaming. |
+| `pulse_working_dot` | bool | `true` | Pulse the status dot while an agent is Running/Streaming/WaitingForInput. Historically also the single kill switch for every sidebar animation; see [Sidebar animations](#sidebar-animations) for exactly when it still is. |
 | `pulse_period_ms` | int | `1600` | One pulse cycle. Clamped to `400..=6000`. |
+| `ring_colors` | enum | `"RedBlue"` | Colour pair for the working-agent throbber ring and the active-tab rail gradient. `"RedBlue"` (`#ff6b6b` → `#58a6ff`), `"OrangeCyan"` (`#ff8a3d` → `#35d6d6`), `"TanSage"` (`#a97f5c` → `#7d9060`), `"BrownSlate"` (`#6e6147` → `#4a6470`). The settled hairline left behind after an agent resolves is derived from the cool end at 55% brightness, so it stays coherent with whichever pair is selected. |
+| `animations` | table | *(absent)* | Sidebar motion switches and per-animation colour overrides. See [Sidebar animations](#sidebar-animations). |
 | `dock_badge` | bool | `true` | Show a count badge on the macOS dock icon for agents waiting for input while the app is unfocused. Ignored on non-macOS platforms. |
 | `track_exited_unseen` | bool | `true` | Keep agents that finished while the window was unfocused in the waiting queue with a dimmed badge until seen. **Experimental**: relies on detecting the loss of agent identity, which is less reliable than the `WaitingForInput` signal. |
 
@@ -326,6 +347,89 @@ Non-Claude local session or state paths are shown as `Details` in the toolbelt.
 
 `waiting_notification` enables a throttled local toast when an agent appears to
 be waiting for input.
+
+### Sidebar animations
+
+`agent_ui.animations` controls every moving element the sidebar draws. Each
+field is optional; naming one does not require naming the rest.
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `enabled` | bool | `true` | Master switch for all sidebar **motion**. Off leaves the sidebar completely still — no throbber, no ripple, no slide-in, no rail breathe, no dot pulse — and the window stops scheduling animation frames for it. The waiting glow survives; see below. |
+| `unfocused` | bool | `true` | Keep animating while the window is not focused. Off restores upstream's focus-gated frame scheduling, so sidebar animations freeze the moment the window loses focus and resume when it regains it. Nothing else changes: the elements are still enabled, they just stop asking for frames in the background. |
+| `working_ring` | bool | `true` | Rotating two-tone throbber around a working agent's tab row. |
+| `resolve_ripple` | bool | `true` | One-shot swell-and-fade when an agent finishes, **and** the faint hairline it settles into afterwards. Off means a finished row is drawn exactly like an idle one. |
+| `waiting_glow` | bool | `true` | Standing outline marking an agent that is blocked on you. |
+| `agent_enter` | bool | `true` | Slide-in played when a new agent row appears. |
+| `rail_breathe` | bool | `true` | Opacity drift of the active tab's gradient rail. Off pins the rail at full opacity. |
+| `dot_pulse` | bool | `true` | Brightness pulse of a working agent's status dot. Additionally gated by `pulse_working_dot` — both must be true for the dot to breathe. |
+| `colors` | table | `{}` | Per-animation colour overrides; see below. |
+
+**The waiting glow survives the master switch.** It is the one element here that
+is not motion: it is drawn with no phase, never asks for a repaint, and can sit
+on a row for hours. It is also the only mark left saying which agent still needs
+you, so turning motion off must not silently discard it. Turn it off explicitly
+with `animations = { waiting_glow = false }`.
+
+Precedence is fixed and not configurable: the throbber outranks the waiting
+glow, which outranks the resolve ripple. A row never carries two of them at
+once, and a spinning row hides its status dot because the ring already says the
+same thing.
+
+#### Colours
+
+`animations.colors` accepts the same colour syntax as every other colour key —
+`"#rrggbb"`, `"rgb(...)"`, or an X11/CSS name such as `"rebeccapurple"`.
+
+| Key | Applies to | Fallback when unset |
+|---|---|---|
+| `ring_a` | throbber's warm arc, rail gradient start | warm stop of the `ring_colors` preset |
+| `ring_b` | throbber's cool arc, rail gradient end | cool stop of the `ring_colors` preset |
+| `resolve` | resolve ripple and the settled hairline | the **effective** cool end at 55% brightness — i.e. `ring_b` if you overrode it, otherwise the preset's cool stop. It is never the full-strength cool end. |
+| `waiting_glow` | standing waiting outline | the effective `ring_a` |
+| `dot_pulse` | colour a working status dot breathes in | the effective `ring_a` |
+
+So overriding `ring_b` alone moves the settled hairline with it (still at 55%),
+and overriding `ring_a` alone moves the waiting glow and the dot pulse with it.
+Set the derived keys explicitly to break those links.
+
+#### `pulse_working_dot` back-compat
+
+`pulse_working_dot` predates this table. Its name says "dot pulse" but it
+shipped as the master switch for every animated element, so it cannot simply be
+re-scoped without re-enabling motion for people who had already turned it off.
+The rule is:
+
+- **No `agent_ui.animations` table in your config** — `pulse_working_dot`
+  behaves exactly as it always did: `false` stops every sidebar animation.
+- **Any `agent_ui.animations` table, even `animations = {}`** — you have opted
+  into the new model. `animations.enabled` is the only master switch, and
+  `pulse_working_dot` is nothing but an extra AND-gate on the dot pulse.
+
+Writing `animations = {}` is therefore the supported way to say "I want the new
+semantics and none of the old ones".
+
+### Debugging agent status and the throbber ring
+
+If a working agent's row is not spinning, run with the sidebar logger turned up:
+
+```sh
+WEZTERM_LOG=wezterm_gui::termwindow::render::sidebar=debug \
+  ~/Applications/TGZTerminal.app/Contents/MacOS/wezterm-gui
+```
+
+Two lines per agent tell you where the chain breaks. `agent detect:` fires at
+most once per pane per 500ms and reports the inferred status plus whether the
+pane's screen was read at all (`visible_text_loaded=false` means status can only
+ever be `unknown`). `sidebar agent row:` fires once per painted agent row and
+reports the status the row saw, whether `spin` fired, the selected ring preset,
+and the resolved animation `gates`. Neither line contains any pane or transcript
+text — ids, enums and booleans only.
+
+If no `sidebar agent row:` line appears while `agent detect:` reports a running
+agent, the row is not finding the pane; if `spin=None` while `status=running`,
+check `gates` on the same line for `working_ring: false` (see
+[Sidebar animations](#sidebar-animations)).
 
 ### Waiting-queue UX
 

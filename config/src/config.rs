@@ -215,6 +215,145 @@ impl Default for AgentToolbeltPosition {
     }
 }
 
+/// Colour pair used by the sidebar's working-agent throbber ring and the
+/// active-tab rail gradient.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromDynamic, ToDynamic)]
+pub enum AgentRingColors {
+    RedBlue,
+    OrangeCyan,
+    TanSage,
+    BrownSlate,
+}
+
+impl Default for AgentRingColors {
+    fn default() -> Self {
+        Self::RedBlue
+    }
+}
+
+impl AgentRingColors {
+    /// The two sRGB stops of the pair, warm end first.
+    pub fn stops(self) -> ((u8, u8, u8), (u8, u8, u8)) {
+        match self {
+            Self::RedBlue => ((0xff, 0x6b, 0x6b), (0x58, 0xa6, 0xff)),
+            Self::OrangeCyan => ((0xff, 0x8a, 0x3d), (0x35, 0xd6, 0xd6)),
+            Self::TanSage => ((0xa9, 0x7f, 0x5c), (0x7d, 0x90, 0x60)),
+            Self::BrownSlate => ((0x6e, 0x61, 0x47), (0x4a, 0x64, 0x70)),
+        }
+    }
+
+    /// Settled-ring stop: the cool end at 55% brightness, scaled in sRGB bytes
+    /// exactly as the design mockup's `applyVars()` does.
+    pub fn settled_stop(self) -> (u8, u8, u8) {
+        let (_, (r, g, b)) = self.stops();
+        (dim_srgb(r), dim_srgb(g), dim_srgb(b))
+    }
+}
+
+/// The 55% scaling that turns a ring's cool end into its settled hairline.
+/// Exposed so a `ring_b` override can be dimmed by exactly the same rule the
+/// presets are.
+pub fn dim_srgb(channel: u8) -> u8 {
+    (channel as f32 * 0.55).round() as u8
+}
+
+/// Per-animation colour overrides for the sidebar.
+///
+/// Every entry is optional and falls back to the `agent_ui.ring_colors` preset;
+/// an unset `resolve` keeps the derived cool-end-at-55% hairline rather than
+/// becoming the full-strength cool end.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, FromDynamic, ToDynamic)]
+pub struct AgentAnimationColors {
+    /// Warm ring stop: the throbber's first arc, and the default source for
+    /// the waiting glow and the working dot pulse.
+    #[dynamic(default)]
+    pub ring_a: Option<RgbaColor>,
+
+    /// Cool ring stop: the throbber's second arc and the far end of the rail
+    /// gradient.
+    #[dynamic(default)]
+    pub ring_b: Option<RgbaColor>,
+
+    /// Resolve ripple and the hairline it settles into.
+    #[dynamic(default)]
+    pub resolve: Option<RgbaColor>,
+
+    /// Standing outline on a row whose agent is blocked on the user.
+    #[dynamic(default)]
+    pub waiting_glow: Option<RgbaColor>,
+
+    /// Colour a working agent's status dot breathes in.
+    #[dynamic(default)]
+    pub dot_pulse: Option<RgbaColor>,
+}
+
+/// Sidebar motion switches.
+///
+/// `enabled` is the master switch for every animated element. The waiting glow
+/// is deliberately *not* under it: it is static state (this agent is blocked on
+/// you) drawn with no phase and no scheduled frame, so switching motion off
+/// must not also throw away the only mark saying which agent still needs you.
+/// It has its own `waiting_glow` toggle for users who want it gone.
+#[derive(Debug, Clone, FromDynamic, ToDynamic)]
+pub struct AgentAnimationsConfig {
+    /// Master switch for all sidebar motion. See the struct comment for why
+    /// the (static) waiting glow survives it.
+    #[dynamic(default = "default_true")]
+    pub enabled: bool,
+
+    /// Keep animating while the window is not focused. Off restores upstream's
+    /// focus-gated frame scheduling, so throbbers freeze in the background.
+    #[dynamic(default = "default_true")]
+    pub unfocused: bool,
+
+    /// Rotating two-tone throbber around a working agent's tab row.
+    #[dynamic(default = "default_true")]
+    pub working_ring: bool,
+
+    /// One-shot swell-and-fade when an agent finishes, plus the faint hairline
+    /// it leaves behind.
+    #[dynamic(default = "default_true")]
+    pub resolve_ripple: bool,
+
+    /// Standing outline marking an agent that needs input. Static, but listed
+    /// here so it can be turned off.
+    #[dynamic(default = "default_true")]
+    pub waiting_glow: bool,
+
+    /// Slide-in played when a new agent row appears.
+    #[dynamic(default = "default_true")]
+    pub agent_enter: bool,
+
+    /// Opacity drift of the active tab's gradient rail.
+    #[dynamic(default = "default_true")]
+    pub rail_breathe: bool,
+
+    /// Brightness pulse of a working agent's status dot. Additionally gated by
+    /// the older `agent_ui.pulse_working_dot`.
+    #[dynamic(default = "default_true")]
+    pub dot_pulse: bool,
+
+    /// Per-animation colour overrides.
+    #[dynamic(default)]
+    pub colors: AgentAnimationColors,
+}
+
+impl Default for AgentAnimationsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            unfocused: true,
+            working_ring: true,
+            resolve_ripple: true,
+            waiting_glow: true,
+            agent_enter: true,
+            rail_breathe: true,
+            dot_pulse: true,
+            colors: AgentAnimationColors::default(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, FromDynamic, ToDynamic)]
 pub struct AgentAdapterConfig {
     /// Enable passive detection for this adapter.
@@ -1024,6 +1163,22 @@ pub struct AgentUiConfig {
     #[dynamic(default = "default_agent_pulse_period_ms")]
     pub pulse_period_ms: u64,
 
+    /// Colour pair for the sidebar's working-agent throbber ring and the
+    /// active-tab rail. One of `RedBlue`, `OrangeCyan`, `TanSage`,
+    /// `BrownSlate`.
+    #[dynamic(default)]
+    pub ring_colors: AgentRingColors,
+
+    /// Sidebar motion switches and per-animation colour overrides.
+    ///
+    /// `None` means the user never wrote the table, which is the only thing
+    /// that keeps `pulse_working_dot`'s historic master-switch meaning alive —
+    /// see [`AgentUiConfig::legacy_animation_kill_switch`]. Read it through
+    /// [`AgentUiConfig::resolved_animations`] rather than matching on the
+    /// `Option` at call sites.
+    #[dynamic(default)]
+    pub animations: Option<AgentAnimationsConfig>,
+
     /// Show a count badge on the macOS dock icon for the number of agents
     /// waiting for input while the app is unfocused. Ignored on non-macOS
     /// platforms. Default on; set false to disable.
@@ -1056,9 +1211,33 @@ impl Default for AgentUiConfig {
             trust_visible_evidence: true,
             pulse_working_dot: true,
             pulse_period_ms: default_agent_pulse_period_ms(),
+            ring_colors: AgentRingColors::default(),
+            animations: None,
             dock_badge: true,
             track_exited_unseen: true,
         }
+    }
+}
+
+impl AgentUiConfig {
+    /// The animation table, with an absent one standing in for all-defaults.
+    pub fn resolved_animations(&self) -> &AgentAnimationsConfig {
+        static DEFAULTS: std::sync::LazyLock<AgentAnimationsConfig> =
+            std::sync::LazyLock::new(AgentAnimationsConfig::default);
+        self.animations.as_ref().unwrap_or(&DEFAULTS)
+    }
+
+    /// Whether `pulse_working_dot = false` still means what it used to: kill
+    /// every animated sidebar element, not just the status dot.
+    ///
+    /// The key is named for the dot but shipped as the master switch, so it
+    /// cannot simply be re-scoped without silently re-enabling motion for
+    /// people who already turned it off. Writing *any* `agent_ui.animations`
+    /// table — `animations = {}` is enough — opts into the new model, where
+    /// `animations.enabled` is the only master switch and `pulse_working_dot`
+    /// is nothing but an extra AND-gate on the dot pulse.
+    pub fn legacy_animation_kill_switch(&self) -> bool {
+        self.animations.is_none() && !self.pulse_working_dot
     }
 }
 
@@ -3395,6 +3574,167 @@ mod agent_ui_tests {
         assert!(agent_ui.trust_visible_evidence);
         assert!(agent_ui.pulse_working_dot);
         assert_eq!(agent_ui.pulse_period_ms, 1600);
+        assert_eq!(agent_ui.ring_colors, AgentRingColors::RedBlue);
+    }
+
+    #[test]
+    fn agent_ring_color_presets_map_to_their_design_hexes() {
+        assert_eq!(
+            AgentRingColors::RedBlue.stops(),
+            ((0xff, 0x6b, 0x6b), (0x58, 0xa6, 0xff))
+        );
+        assert_eq!(
+            AgentRingColors::OrangeCyan.stops(),
+            ((0xff, 0x8a, 0x3d), (0x35, 0xd6, 0xd6))
+        );
+        assert_eq!(
+            AgentRingColors::TanSage.stops(),
+            ((0xa9, 0x7f, 0x5c), (0x7d, 0x90, 0x60))
+        );
+        assert_eq!(
+            AgentRingColors::BrownSlate.stops(),
+            ((0x6e, 0x61, 0x47), (0x4a, 0x64, 0x70))
+        );
+    }
+
+    #[test]
+    fn agent_ring_settled_stop_is_the_cool_end_at_55_percent() {
+        // The tan/sage pair's settled hairline used to be the hardcoded
+        // #454f35; deriving it must reproduce that value exactly.
+        assert_eq!(AgentRingColors::TanSage.settled_stop(), (0x45, 0x4f, 0x35));
+        for preset in [
+            AgentRingColors::RedBlue,
+            AgentRingColors::OrangeCyan,
+            AgentRingColors::TanSage,
+            AgentRingColors::BrownSlate,
+        ] {
+            let (_, (r, g, b)) = preset.stops();
+            let (dr, dg, db) = preset.settled_stop();
+            assert_eq!(
+                (dr, dg, db),
+                (
+                    (r as f32 * 0.55).round() as u8,
+                    (g as f32 * 0.55).round() as u8,
+                    (b as f32 * 0.55).round() as u8
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn agent_animations_default_to_every_toggle_on_and_no_colour_overrides() {
+        let agent_ui = Config::default_config().agent_ui;
+
+        // The table is absent by default; that absence is load-bearing for the
+        // `pulse_working_dot` back-compat rule, so it must not be defaulted to
+        // `Some(..)` for convenience.
+        assert!(agent_ui.animations.is_none());
+
+        let anim = agent_ui.resolved_animations();
+        assert!(anim.enabled);
+        assert!(anim.unfocused);
+        assert!(anim.working_ring);
+        assert!(anim.resolve_ripple);
+        assert!(anim.waiting_glow);
+        assert!(anim.agent_enter);
+        assert!(anim.rail_breathe);
+        assert!(anim.dot_pulse);
+        assert_eq!(anim.colors, AgentAnimationColors::default());
+        assert!(anim.colors.ring_a.is_none());
+        assert!(anim.colors.resolve.is_none());
+    }
+
+    #[test]
+    fn agent_animations_table_fields_are_all_optional_in_lua() {
+        use wezterm_dynamic::{FromDynamic, Value};
+
+        // Every field carries a `#[dynamic(default = ..)]`, so naming one must
+        // not force the user to name the rest.
+        let mut table = std::collections::BTreeMap::new();
+        table.insert(
+            Value::String("rail_breathe".to_string()),
+            Value::Bool(false),
+        );
+        let anim =
+            AgentAnimationsConfig::from_dynamic(&Value::Object(table.into()), Default::default())
+                .unwrap();
+
+        assert!(!anim.rail_breathe);
+        assert!(anim.enabled);
+        assert!(anim.working_ring);
+        assert!(anim.dot_pulse);
+        assert_eq!(anim.colors, AgentAnimationColors::default());
+    }
+
+    #[test]
+    fn agent_animation_colors_accept_hex_and_named_colours() {
+        use wezterm_dynamic::{FromDynamic, Value};
+
+        let mut table = std::collections::BTreeMap::new();
+        table.insert(
+            Value::String("ring_a".to_string()),
+            Value::String("#ff6b6b".to_string()),
+        );
+        table.insert(
+            Value::String("waiting_glow".to_string()),
+            Value::String("rebeccapurple".to_string()),
+        );
+        let colors =
+            AgentAnimationColors::from_dynamic(&Value::Object(table.into()), Default::default())
+                .unwrap();
+
+        assert_eq!(colors.ring_a, Some(RgbaColor::from((0xff, 0x6b, 0x6b))));
+        assert_eq!(
+            colors.waiting_glow,
+            Some(RgbaColor::from((0x66, 0x33, 0x99)))
+        );
+        // Unnamed entries stay unset so the preset keeps supplying them.
+        assert!(colors.ring_b.is_none());
+        assert!(colors.resolve.is_none());
+        assert!(colors.dot_pulse.is_none());
+    }
+
+    #[test]
+    fn pulse_working_dot_keeps_its_master_switch_meaning_only_without_the_table() {
+        // Historic config: the key was documented as the dot pulse but shipped
+        // as the kill switch for every sidebar animation. Turning it off must
+        // still turn everything off for people who already did that.
+        let legacy = AgentUiConfig {
+            pulse_working_dot: false,
+            ..AgentUiConfig::default()
+        };
+        assert!(legacy.legacy_animation_kill_switch());
+
+        // Writing the table — even an empty one — opts into the new model,
+        // where `animations.enabled` is the only master switch.
+        let opted_in = AgentUiConfig {
+            pulse_working_dot: false,
+            animations: Some(AgentAnimationsConfig::default()),
+            ..AgentUiConfig::default()
+        };
+        assert!(!opted_in.legacy_animation_kill_switch());
+
+        // Left alone, the key gates nothing at all.
+        assert!(!AgentUiConfig::default().legacy_animation_kill_switch());
+        assert!(!AgentUiConfig {
+            animations: Some(AgentAnimationsConfig::default()),
+            ..AgentUiConfig::default()
+        }
+        .legacy_animation_kill_switch());
+    }
+
+    #[test]
+    fn agent_ring_colors_parse_from_lua_variant_names() {
+        use wezterm_dynamic::{FromDynamic, Value};
+
+        assert_eq!(
+            AgentRingColors::from_dynamic(
+                &Value::String("BrownSlate".to_string()),
+                Default::default()
+            )
+            .unwrap(),
+            AgentRingColors::BrownSlate
+        );
     }
 
     #[test]

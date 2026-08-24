@@ -460,19 +460,15 @@ impl HerdAgent {
             }
             HerdStatus::Idle => HerdDisplayStatus::WaitingForInput,
             HerdStatus::Done => HerdDisplayStatus::Done,
-            HerdStatus::Unknown => {
-                let fresh = self
-                    .activity
-                    .as_ref()
-                    .and_then(HerdActivity::last_activity)
-                    .and_then(|at| now.duration_since(at).ok())
-                    .is_some_and(|age| age < ACTIVITY_FRESH_WINDOW);
-                if fresh {
-                    HerdDisplayStatus::Working
-                } else {
-                    HerdDisplayStatus::Unknown
-                }
-            }
+            // A recent write means the agent was active, not that it is
+            // working now: a finished turn writes the transcript on its way
+            // out, and Claude's own session file carries no `status` field to
+            // correct it with, so promoting freshness to `Working` left every
+            // idle agent reading as busy until the transcript aged out. The
+            // live pane is the only thing that can say, and it already wins in
+            // `join_sessions_with_panes`; with no pane, `Unknown` is the honest
+            // answer.
+            HerdStatus::Unknown => HerdDisplayStatus::Unknown,
         }
     }
 
@@ -601,7 +597,15 @@ pub fn join_sessions_with_panes(
                 .unwrap_or_else(|| session.session_id.clone()),
             provider: session.vendor.adapter_id().to_string(),
             vendor: session.vendor.clone(),
-            status: session.status,
+            // A bound pane is the live screen; the session status is inferred
+            // from how recently the transcript was written, which keeps
+            // reporting `Working` for a session that has already finished and
+            // has no way to observe it going idle. Only fall back to the
+            // session when the pane could not say.
+            status: match pane.map(|p| p.status) {
+                Some(HerdStatus::Unknown) | None => session.status,
+                Some(live) => live,
+            },
             blocked_reason: session.blocked_reason.clone(),
             model: session
                 .model

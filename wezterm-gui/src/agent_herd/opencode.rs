@@ -373,7 +373,9 @@ pub fn read_session_activity(session_id: &str, max_events: usize) -> Option<Herd
     }
     let Ok(conn) = Connection::open_with_flags(
         db,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_URI,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_URI,
     ) else {
         return None;
     };
@@ -392,7 +394,11 @@ pub fn read_session_activity(session_id: &str, max_events: usize) -> Option<Herd
     Some(activity)
 }
 
-fn opencode_all_events(conn: &Connection, session_id: &str, max_events: usize) -> Option<Vec<HerdEvent>> {
+fn opencode_all_events(
+    conn: &Connection,
+    session_id: &str,
+    max_events: usize,
+) -> Option<Vec<HerdEvent>> {
     let mut stmt = conn
         .prepare(
             "SELECT data, time_created FROM part \
@@ -429,7 +435,14 @@ fn opencode_all_events(conn: &Connection, session_id: &str, max_events: usize) -
                 tool_use_id: None,
                 parent_id: None,
             }),
-            "text" if !value.get("text").and_then(|t| t.as_str()).unwrap_or("").trim().is_empty() => {
+            "text"
+                if !value
+                    .get("text")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .is_empty() =>
+            {
                 Some(HerdEvent {
                     at: Some(at),
                     kind: HerdEventKind::Assistant,
@@ -457,7 +470,6 @@ fn opencode_all_events(conn: &Connection, session_id: &str, max_events: usize) -
 fn dirs_home() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
-
 
 fn clean_title(title: &str) -> Option<String> {
     let title = title.trim();
