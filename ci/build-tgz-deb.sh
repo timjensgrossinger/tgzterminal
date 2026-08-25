@@ -107,7 +107,21 @@ install -Dm644 assets/shell-completion/bash \
 install -Dm644 assets/shell-completion/zsh \
     "$root/usr/share/zsh/site-functions/_tgzterminal"
 
-deps=$(dpkg-shlibdeps -O \
+# dpkg-shlibdeps insists on a debian/control relative to its own cwd, even
+# with -O (stdout, no substvars written). This is a raw-tree build with no
+# debian/ source package, so give it a throwaway one; the binaries are passed
+# by absolute path and are unaffected by the cd.
+shlibdeps_dir=$(mktemp -d "${TMPDIR:-/tmp}/tgzterminal-shlibdeps.XXXXXX")
+trap 'rm -rf "$root" "$shlibdeps_dir"' EXIT
+mkdir -p "$shlibdeps_dir/debian"
+cat > "$shlibdeps_dir/debian/control" <<EOF
+Source: tgzterminal
+
+Package: tgzterminal
+Architecture: $arch
+EOF
+
+deps=$(cd "$shlibdeps_dir" && dpkg-shlibdeps -O \
     -e "$root/usr/bin/tgzterminal" \
     -e "$root/usr/bin/wezterm-gui" \
     -e "$root/usr/bin/wezterm-mux-server" \

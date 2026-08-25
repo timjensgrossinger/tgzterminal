@@ -143,7 +143,13 @@ jobs:
       # x64compatible needs at least 6.3. --allow-downgrade is required
       # because recent runner images ship a newer Inno Setup than this pin,
       # and choco otherwise refuses to "install" over it.
+      # The installer is best-effort: chocolatey is a third-party service and
+      # has returned 504s mid-release. A flaky installer build must never cost
+      # us the portable zip, which is the primary Windows artifact, so both
+      # installer steps are non-fatal and the publish steps tolerate a missing
+      # Setup exe.
       - name: Install Inno Setup
+        continue-on-error: true
         shell: pwsh
         run: |
           choco install innosetup --version=6.3.3 --no-progress -y --allow-downgrade --force
@@ -151,6 +157,7 @@ jobs:
 
       - name: Build installer
         id: installer
+        continue-on-error: true
         shell: bash
         run: |
           set -euo pipefail
@@ -193,7 +200,17 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for f in TGZTerminal-windows-portable-*.zip TGZTerminal-Setup-*.exe; do
+          shopt -s nullglob
+          zips=( TGZTerminal-windows-portable-*.zip )
+          if [ ${#zips[@]} -eq 0 ]; then
+            printf 'portable zip missing - the primary Windows artifact did not build\n' >&2
+            exit 1
+          fi
+          setups=( TGZTerminal-Setup-*.exe )
+          if [ ${#setups[@]} -eq 0 ]; then
+            printf 'note: no Setup exe - installer step failed, publishing the zip alone\n'
+          fi
+          for f in "${zips[@]}" "${setups[@]}"; do
             sha256sum "$f" > "$f.sha256"
           done
           cat ./*.sha256
@@ -216,4 +233,6 @@ jobs:
             TGZTerminal-windows-portable-*.zip
             TGZTerminal-Setup-*.exe
             *.sha256
-          fail_on_unmatched_files: true
+          # The Setup exe is best-effort and may legitimately be absent; the
+          # Checksums step above already hard-fails if the zip is missing.
+          fail_on_unmatched_files: false
