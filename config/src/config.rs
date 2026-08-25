@@ -3704,7 +3704,10 @@ mod agent_ui_tests {
         assert!(agent_ui.trust_visible_evidence);
         assert!(agent_ui.pulse_working_dot);
         assert_eq!(agent_ui.pulse_period_ms, 1600);
-        assert_eq!(agent_ui.ring_colors, AgentRingColors::RedBlue);
+        // Not pinned to RedBlue: a build compiled with a brand palette defaults
+        // to `Brand` instead, which is the whole point of the flavour layer.
+        // `flavor_defaults_track_the_build` is what asserts *which* one applies.
+        assert_eq!(agent_ui.ring_colors, AgentRingColors::default());
     }
 
     #[test]
