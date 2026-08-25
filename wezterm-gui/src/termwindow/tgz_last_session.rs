@@ -83,7 +83,7 @@ struct LastSessionFile {
 }
 
 fn state_path() -> PathBuf {
-    config::DATA_DIR.join("tgz-last-session.json")
+    config::DATA_DIR.join(config::brand::state_file_name("tgz-last-session", "json"))
 }
 
 /// Serializes the read-modify-write cycle between windows of this process.

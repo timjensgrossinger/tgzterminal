@@ -48,10 +48,15 @@ const ACTIVITY_FRESH_WINDOW: Duration = Duration::from_secs(120);
 
 /// sRGB color for "this agent is waiting on you".
 ///
-/// Matches the amber the sidebar already uses for waiting badges. Named here so
-/// there is one place to change it; `sidebar.rs` still carries two hardcoded
-/// copies of the same literal that should adopt this (see the note in
-/// `docs/AGENT_QUEUE_PLAN.md` about sourcing it from the palette instead).
+/// The amber the sidebar has always used for waiting badges. It is now the
+/// *default* rather than the only answer: `SidebarPalette::attention` carries
+/// the themed colour and every herd paint site reads that, so a branded theme
+/// (`sidebar_theme = "Brand"`, coloured by `BRAND_ATTENTION`) speaks its own
+/// attention colour. This constant is what the unbranded palettes seed that
+/// field with.
+///
+/// Still hardcoded, deliberately: `subagent_status_color`'s Blocked shade in
+/// `sidebar.rs`, which colours the subagent tree rather than the waiting queue.
 pub const ATTENTION_RGB: (u8, u8, u8) = (240, 184, 66);
 
 /// Coarse agent state, shared across vendors.

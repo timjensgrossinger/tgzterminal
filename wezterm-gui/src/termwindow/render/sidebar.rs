@@ -21,10 +21,11 @@ use crate::termwindow::{
 };
 use config::keyassignment::{SpawnCommand, SpawnTabDomain};
 use config::{
-    default_agent_adapters, dim_srgb, AgentAdapterConfig, AgentAnimationColors, AgentLaunchTarget,
-    AgentRemoteBehavior, AgentRingColors, AgentSplitDirection, AgentTelemetryField,
-    AgentToolbeltPosition, AgentUiConfig, ConfigHandle, EasingFunction, SidebarPosition,
-    SidebarTabDensity, SidebarTabMetadata, SidebarTabTitleSource, SidebarTheme, TabBarColors,
+    brand, default_agent_adapters, dim_srgb, AgentAdapterConfig, AgentAnimationColors,
+    AgentLaunchTarget, AgentRemoteBehavior, AgentRingColors, AgentSplitDirection,
+    AgentTelemetryField, AgentToolbeltPosition, AgentUiConfig, ConfigHandle, EasingFunction,
+    SidebarPosition, SidebarTabDensity, SidebarTabMetadata, SidebarTabTitleSource, SidebarTheme,
+    TabBarColors,
 };
 use finl_unicode::grapheme_clusters::Graphemes;
 use mux::pane::{CachePolicy, Pane, PaneId};
@@ -337,6 +338,14 @@ struct SidebarPalette {
     /// Fill behind a row whose agent is working, one shade under `row_fill` so
     /// the throbber ring has something to sit on.
     working_fill: LinearRgba,
+    /// Colour of every "this agent needs you" mark: the herd status dot, its
+    /// pip, the keyboard-selection accent bar and the attention detail line.
+    ///
+    /// Palette-sourced rather than read straight from
+    /// [`agent_herd::ATTENTION_RGB`] so a branded theme can speak its own
+    /// attention colour without four literals drifting apart — the note in
+    /// `docs/AGENT_QUEUE_PLAN.md` asked for exactly this.
+    attention: LinearRgba,
     ring: RingColors,
 }
 
@@ -358,6 +367,52 @@ impl SidebarPalette {
             text_idle: srgb8_to_linear(0x8a, 0x8a, 0x94),
             text_meta: srgb8_to_linear(0x5a, 0x5a, 0x63),
             working_fill: srgb8_to_linear(0x13, 0x13, 0x17),
+            attention: default_attention(),
+        }
+    }
+
+    /// The chrome of whatever brand this build was compiled with
+    /// (`BRAND_ACCENT` / `BRAND_ATTENTION` / `BRAND_NEUTRAL`, see
+    /// `config::brand`).
+    ///
+    /// Brand *accents* on a dark neutral base, not a wash of brand colour:
+    /// surfaces are near-black tinted a few percent toward the brand neutral, the
+    /// accent appears only where the UI means *active / focused*, and the
+    /// attention colour is reserved for "this agent needs you". That keeps a
+    /// sidebar full of idle rows readable and leaves the brand colours meaning
+    /// something when they do show up.
+    fn brand(ring: RingColors) -> Self {
+        let accent = srgb8_to_linear_tuple(brand::accent());
+        let grey = srgb8_to_linear_tuple(brand::neutral());
+        let base = srgb8_to_linear(0x0a, 0x0a, 0x0b);
+        // Near-black, warmed toward the brand neutral so the chrome reads as the
+        // brand's own grey rather than blue-black.
+        let surface = lerp_rgba(base, grey, 0.06);
+        let row_fill = lerp_rgba(base, grey, 0.13);
+        Self {
+            surface,
+            row_fill,
+            row_border: lerp_rgba(lerp_rgba(base, grey, 0.24), accent, 0.10),
+            active_fill: lerp_rgba(row_fill, accent, 0.14),
+            hover_fill: lerp_rgba(base, grey, 0.17),
+            pressed_fill: lerp_rgba(row_fill, accent, 0.22),
+            search_fill: row_fill,
+            focused_search_fill: lerp_rgba(row_fill, accent, 0.12),
+            divider: lerp_rgba(base, grey, 0.20),
+            menu_border: lerp_rgba(lerp_rgba(base, grey, 0.28), accent, 0.10),
+            text_active: srgb8_to_linear(0xe9, 0xea, 0xec),
+            // Brand neutral lifted until it clears body-text contrast; the
+            // unlifted neutral stays exact on `text_meta`, where it belongs.
+            text_idle: lerp_rgba(grey, srgb8_to_linear(0xff, 0xff, 0xff), 0.32),
+            text_meta: grey,
+            working_fill: lerp_rgba(base, grey, 0.10),
+            // An unbranded build keeps the stock amber, so `sidebar_theme =
+            // "Brand"` is coherent even with no palette compiled in.
+            attention: match brand::ATTENTION {
+                Some(c) => srgb8_to_linear_tuple(c),
+                None => default_attention(),
+            },
+            ring,
         }
     }
 
@@ -381,6 +436,7 @@ impl SidebarPalette {
             text_idle,
             text_meta: text_idle.mul_alpha(0.60),
             working_fill: row_fill,
+            attention: default_attention(),
             ring,
         }
     }
@@ -415,6 +471,7 @@ impl SidebarPalette {
             text_idle: lerp_rgba(surface, fg, 0.68),
             text_meta: lerp_rgba(surface, fg, 0.42),
             working_fill: lerp_rgba(surface, fg, 0.04),
+            attention: default_attention(),
             ring,
         }
     }
@@ -803,6 +860,17 @@ fn opaque(color: LinearRgba) -> LinearRgba {
 
 fn srgb8_to_linear(r: u8, g: u8, b: u8) -> LinearRgba {
     LinearRgba::with_srgba(r, g, b, 255)
+}
+
+/// Same, for the `(u8, u8, u8)` triples the brand and vendor tables store.
+fn srgb8_to_linear_tuple((r, g, b): (u8, u8, u8)) -> LinearRgba {
+    srgb8_to_linear(r, g, b)
+}
+
+/// Attention colour for every theme that does not brand its own: the amber the
+/// waiting queue has always used.
+fn default_attention() -> LinearRgba {
+    srgb8_to_linear_tuple(crate::agent_herd::ATTENTION_RGB)
 }
 
 /// Label colour for a chip or row whose fill is `bg`.
@@ -7125,6 +7193,7 @@ impl crate::TermWindow {
         };
         match self.config.sidebar_theme {
             SidebarTheme::Modern => SidebarPalette::modern(ring),
+            SidebarTheme::Brand => SidebarPalette::brand(ring),
             SidebarTheme::Auto | SidebarTheme::FollowColorScheme => {
                 match palette.tab_bar.as_ref() {
                     Some(colors) => SidebarPalette::from_tab_bar(colors, ring),
@@ -11021,15 +11090,15 @@ impl crate::TermWindow {
             // Keyboard cursor: a solid accent bar on the row's leading edge.
             if selected {
                 let accent = if display_status.is_attention() {
-                    crate::agent_herd::ATTENTION_RGB
+                    sb.attention
                 } else {
-                    agent.vendor_dot_color()
+                    srgb8_to_linear_tuple(agent.vendor_dot_color())
                 };
                 self.filled_rectangle(
                     layers,
                     1,
                     euclid::rect(section_x, y + 2.0 * dpi, 3.0 * dpi, row_h - 4.0 * dpi),
-                    srgb8_to_linear(accent.0, accent.1, accent.2),
+                    accent,
                 )?;
             }
             let text_y = y + (row_h - cell_h) * 0.5;
@@ -11056,13 +11125,12 @@ impl crate::TermWindow {
             // Status dot.
             let dot_x = section_x + pad + chevron_w + 6.0 * dpi;
             let dot_y = y + row_h * 0.5;
-            let dot_color = if display_status.is_attention() {
-                crate::agent_herd::ATTENTION_RGB
-            } else {
-                agent.vendor_dot_color()
-            };
             let dot_rect = euclid::rect(dot_x - 4.0 * dpi, dot_y - 4.0 * dpi, 8.0 * dpi, 8.0 * dpi);
-            let dot_fill = srgb8_to_linear(dot_color.0, dot_color.1, dot_color.2);
+            let dot_fill = if display_status.is_attention() {
+                sb.attention
+            } else {
+                srgb8_to_linear_tuple(agent.vendor_dot_color())
+            };
             // Attention rows keep their static pip untouched (early-out below);
             // only a row genuinely `Working` gains motion, breathing the same
             // way a bound pane's tab-row dot does.
@@ -11075,7 +11143,10 @@ impl crate::TermWindow {
             if display_status.is_attention() {
                 let attention_rect =
                     euclid::rect(dot_x + 3.0 * dpi, dot_y - 2.0 * dpi, 4.0 * dpi, 4.0 * dpi);
-                self.filled_rectangle(layers, 1, attention_rect, srgb8_to_linear(255, 230, 120))?;
+                // A lightened cast of the same attention colour, so the pip
+                // stays legible on top of the dot in any theme.
+                let pip = lerp_rgba(sb.attention, srgb8_to_linear(0xff, 0xff, 0xff), 0.45);
+                self.filled_rectangle(layers, 1, attention_rect, pip)?;
             }
 
             // Name on the left, project on the right, in disjoint column
@@ -11232,7 +11303,7 @@ impl crate::TermWindow {
                             detail_x,
                             detail_line_y,
                             detail_w,
-                            srgb8_to_linear(240, 184, 66),
+                            sb.attention,
                             bg,
                             false,
                         )?;
@@ -15144,6 +15215,94 @@ mod tests {
         );
         assert!(light.divider.relative_luminance() < light.surface.relative_luminance());
         assert_eq!(light.text_active, dark_fg);
+    }
+
+    /// The brand theme is accents on a dark neutral base, not a wash of brand
+    /// colour: idle chrome must stay dark, and the brand colours must keep
+    /// meaning "focused" and "needs you" respectively.
+    #[test]
+    fn brand_palette_is_dark_with_brand_accents() {
+        let ring = RingColors::resolve(AgentRingColors::Brand, &AgentAnimationColors::default());
+        let sb = SidebarPalette::brand(ring);
+
+        // Every idle surface stays dark chrome.
+        for (name, color) in [
+            ("surface", sb.surface),
+            ("row_fill", sb.row_fill),
+            ("hover_fill", sb.hover_fill),
+            ("working_fill", sb.working_fill),
+            ("divider", sb.divider),
+        ] {
+            assert!(
+                color.relative_luminance() < 0.06,
+                "{name} should stay dark chrome, got {}",
+                color.relative_luminance()
+            );
+        }
+
+        // Selection reads brighter than an idle row, and accent-ward: it has to
+        // move toward the accent, which a plain grey lift cannot do.
+        assert!(sb.active_fill.relative_luminance() > sb.row_fill.relative_luminance());
+        let accent = srgb8_to_linear_tuple(brand::accent());
+        let toward_accent = |a: LinearRgba, b: LinearRgba| {
+            (a.0 - b.0) * (accent.0 - b.0)
+                + (a.1 - b.1) * (accent.1 - b.1)
+                + (a.2 - b.2) * (accent.2 - b.2)
+        };
+        assert!(toward_accent(sb.active_fill, sb.row_fill) > 0.);
+
+        // Text ramp keeps its ordering, with the brand neutral exact on meta.
+        assert_eq!(sb.text_meta, srgb8_to_linear_tuple(brand::neutral()));
+        assert!(sb.text_idle.relative_luminance() > sb.text_meta.relative_luminance());
+        assert!(sb.text_active.relative_luminance() > sb.text_idle.relative_luminance());
+
+        // Attention is the brand's own colour here (the stock amber when the
+        // build carries none), and the stock amber in every other theme.
+        match brand::ATTENTION {
+            Some(c) => assert_eq!(sb.attention, srgb8_to_linear_tuple(c)),
+            None => assert_eq!(sb.attention, default_attention()),
+        }
+        assert_eq!(SidebarPalette::modern(ring).attention, default_attention());
+        assert_eq!(
+            SidebarPalette::from_window_colors(
+                srgb8_to_linear(0x1e, 0x1e, 0x1e),
+                srgb8_to_linear(0xaf, 0xae, 0xae),
+                ring,
+            )
+            .attention,
+            default_attention()
+        );
+    }
+
+    /// The ring carries the brand roles: the attention colour warms the
+    /// throbber, the waiting glow and the dot pulse; the accent is progress and
+    /// the settled hairline.
+    #[test]
+    fn brand_ring_maps_attention_to_warm_and_accent_to_progress() {
+        let ring = RingColors::resolve(AgentRingColors::Brand, &AgentAnimationColors::default());
+        let (warm, cool) = AgentRingColors::Brand.stops();
+        let warm_linear = srgb8_to_linear_tuple(warm);
+
+        assert_eq!(ring.a, warm_linear);
+        assert_eq!(ring.b, srgb8_to_linear_tuple(cool));
+        assert_eq!(ring.waiting, warm_linear);
+        assert_eq!(ring.pulse, warm_linear);
+        // Settled hairline is the dimmed cool end, same rule as every preset.
+        let (cr, cg, cb) = cool;
+        assert_eq!(
+            ring.done,
+            srgb8_to_linear(dim_srgb(cr), dim_srgb(cg), dim_srgb(cb))
+        );
+
+        // An explicit override still wins over the brand preset.
+        let overridden = RingColors::resolve(
+            AgentRingColors::Brand,
+            &AgentAnimationColors {
+                ring_a: Some(RgbaColor::from((0x11, 0x22, 0x33))),
+                ..AgentAnimationColors::default()
+            },
+        );
+        assert_ne!(overridden.a, warm_linear);
     }
 
     /// Sidebar labels used to be hardcoded pure white, ignoring the scheme.

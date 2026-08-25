@@ -69,16 +69,27 @@ impl Default for SidebarPosition {
 /// config that wants to state the intent rather than rely on the default.
 /// `Modern` pins the near-black scheme regardless of what the colour scheme
 /// defines.
+/// `Brand` pins the chrome of whatever brand the build was compiled with: a dark
+/// neutral base tinted with `BRAND_NEUTRAL`, `BRAND_ACCENT` for active/focus,
+/// `BRAND_ATTENTION` for attention (see `brand.rs`). Like every other variant it
+/// is chrome only — terminal colours are never touched.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, FromDynamic, ToDynamic)]
 pub enum SidebarTheme {
     Auto,
     Modern,
     FollowColorScheme,
+    Brand,
 }
 
 impl Default for SidebarTheme {
+    /// A build compiled with a brand palette defaults to its own chrome; every
+    /// other build keeps deriving the sidebar from the user's colour scheme.
     fn default() -> Self {
-        Self::Auto
+        if crate::brand::has_palette() {
+            Self::Brand
+        } else {
+            Self::Auto
+        }
     }
 }
 
@@ -245,15 +256,27 @@ pub enum AgentRingColors {
     OrangeCyan,
     TanSage,
     BrownSlate,
+    /// This build's brand pair: `BRAND_ATTENTION` warm, `BRAND_ACCENT` cool.
+    /// Falls back to the accent default when the build carries no palette.
+    Brand,
 }
 
 impl Default for AgentRingColors {
     fn default() -> Self {
-        Self::RedBlue
+        if crate::brand::has_palette() {
+            Self::Brand
+        } else {
+            Self::RedBlue
+        }
     }
 }
 
 impl AgentRingColors {
+    /// The warm end alone, for a partially configured brand pair.
+    pub fn warm_stop(self) -> (u8, u8, u8) {
+        self.stops().0
+    }
+
     /// The two sRGB stops of the pair, warm end first.
     pub fn stops(self) -> ((u8, u8, u8), (u8, u8, u8)) {
         match self {
@@ -261,6 +284,15 @@ impl AgentRingColors {
             Self::OrangeCyan => ((0xff, 0x8a, 0x3d), (0x35, 0xd6, 0xd6)),
             Self::TanSage => ((0xa9, 0x7f, 0x5c), (0x7d, 0x90, 0x60)),
             Self::BrownSlate => ((0x6e, 0x61, 0x47), (0x4a, 0x64, 0x70)),
+            // An unset BRAND_ATTENTION keeps the default warm stop, so a brand
+            // that names only an accent still gets a coherent pair.
+            Self::Brand => (
+                match crate::brand::ATTENTION {
+                    Some(c) => c,
+                    None => Self::RedBlue.warm_stop(),
+                },
+                crate::brand::accent(),
+            ),
         }
     }
 
@@ -3832,6 +3864,63 @@ mod agent_ui_tests {
             )
             .unwrap(),
             AgentRingColors::BrownSlate
+        );
+
+        assert_eq!(
+            AgentRingColors::from_dynamic(&Value::String("Brand".to_string()), Default::default())
+                .unwrap(),
+            AgentRingColors::Brand
+        );
+    }
+
+    /// The brand preset carries whatever palette the build was compiled with, in
+    /// the warm-first order every other preset uses, and stays coherent when only
+    /// part of the palette is configured.
+    #[test]
+    fn brand_ring_preset_uses_the_compiled_palette() {
+        let (warm, cool) = AgentRingColors::Brand.stops();
+        assert_eq!(cool, crate::brand::accent());
+        match crate::brand::ATTENTION {
+            Some(c) => assert_eq!(warm, c),
+            None => assert_eq!(warm, AgentRingColors::RedBlue.warm_stop()),
+        }
+
+        // Settled hairline is the same 55% rule as the built-in presets.
+        let (r, g, b) = cool;
+        assert_eq!(
+            AgentRingColors::Brand.settled_stop(),
+            (dim_srgb(r), dim_srgb(g), dim_srgb(b))
+        );
+    }
+
+    /// The flavour only ever moves *defaults*; a stock build must be bit-for-bit
+    /// the chrome it always had.
+    #[test]
+    fn flavor_defaults_track_the_build() {
+        if crate::brand::has_palette() {
+            assert_eq!(SidebarTheme::default(), SidebarTheme::Brand);
+            assert_eq!(AgentRingColors::default(), AgentRingColors::Brand);
+        } else {
+            assert_eq!(SidebarTheme::default(), SidebarTheme::Auto);
+            assert_eq!(AgentRingColors::default(), AgentRingColors::RedBlue);
+        }
+    }
+
+    /// Both variants have to exist in *every* build, so a stock config can opt
+    /// into brand chrome and a branded build can opt out.
+    #[test]
+    fn brand_variants_are_selectable_from_lua_in_any_build() {
+        use wezterm_dynamic::{FromDynamic, Value};
+
+        assert_eq!(
+            SidebarTheme::from_dynamic(&Value::String("Brand".to_string()), Default::default())
+                .unwrap(),
+            SidebarTheme::Brand
+        );
+        assert_eq!(
+            SidebarTheme::from_dynamic(&Value::String("Auto".to_string()), Default::default())
+                .unwrap(),
+            SidebarTheme::Auto
         );
     }
 

@@ -96,6 +96,11 @@ New key assignment: `wezterm.action.CycleWaitingAgent` (and
 - Badge states render in the existing compact tab icon path
   (`sidebar_compact_tab_icon`); waiting state overrides the per-agent color
   with the attention color from the palette, not a hardcoded orange.
+  *Done for the herd section:* `SidebarPalette::attention` now carries that
+  colour (seeded from `agent_herd::ATTENTION_RGB` for the unbranded themes,
+  the brand's own under `sidebar_theme = "Brand"`), and the status dot, its pip,
+  the keyboard-selection bar and the attention detail line all read it. The
+  compact-rail badge and `subagent_status_color` are still literal.
 - Pulse animation: reuse the existing sidebar easing helpers; must render
   nothing new when the queue is empty (zero cost in the common case).
 - Counter is a small pill in the rail using existing pill-fill helpers; it is
