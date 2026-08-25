@@ -84,6 +84,14 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
 cd "$REPO_ROOT"
 
+# A relative CARGO_TARGET_DIR breaks wezterm-gui/build.rs, which resolves its
+# Info.plist copy destination from the crate directory rather than the workspace
+# root, so normalise it to an absolute path before cargo ever sees it. Branded
+# builds routinely set this to keep flavours from rebuilding each other.
+if [[ -n "${CARGO_TARGET_DIR:-}" && "${CARGO_TARGET_DIR}" != /* ]]; then
+  CARGO_TARGET_DIR="$(cd "$REPO_ROOT" && mkdir -p "$CARGO_TARGET_DIR" && cd "$CARGO_TARGET_DIR" && pwd)"
+  export CARGO_TARGET_DIR
+fi
 TARGET_DIR=${CARGO_TARGET_DIR:-target}
 # Resolve the signing identity. A stable identity matters beyond distribution:
 # macOS pins privacy (TCC) grants for ad-hoc bundles to the binary's code

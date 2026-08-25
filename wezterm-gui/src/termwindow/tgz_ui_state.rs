@@ -38,7 +38,7 @@ struct TgzUiState {
 }
 
 fn state_path() -> PathBuf {
-    config::DATA_DIR.join("tgz-ui-state.json")
+    config::DATA_DIR.join(config::brand::state_file_name("tgz-ui-state", "json"))
 }
 
 fn read_state() -> TgzUiState {

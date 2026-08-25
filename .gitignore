@@ -80,3 +80,8 @@ CONVENTIONS.md
 .windsurfrules
 .clinerules
 .cline_rules
+
+# Branded-flavour build outputs (a brand build sets its own CARGO_TARGET_DIR;
+# see the Build flavours section of docs/TGZTERMINAL_CONFIG.md)
+/target-*
+assets/branding/**/*.icns

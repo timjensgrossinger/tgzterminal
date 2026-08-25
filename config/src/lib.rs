@@ -22,6 +22,7 @@ use wezterm_term::UnicodeVersion;
 
 mod background;
 mod bell;
+pub mod brand;
 mod cell;
 mod color;
 mod config;

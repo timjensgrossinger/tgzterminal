@@ -25,7 +25,7 @@ config.sidebar_scroll_bar = true
 | `sidebar_collapsed_width_px` | int px | `48` | Also the reserved width under `sidebar_auto_hide`, where it is forced to at least 48. |
 | `sidebar_auto_hide` | bool | `true` | Reserves only the collapsed width and expands the sidebar as an overlay on hover. The in-app toggle persists to `tgz-ui-state.json` and then takes precedence over this key. |
 | `sidebar_position` | enum | `"Left"` | `"Left"`, `"Right"` |
-| `sidebar_theme` | enum | `"Auto"` | `"Auto"`, `"Modern"`, `"FollowColorScheme"`. `Auto` derives the sidebar from `colors.tab_bar` when the scheme defines it, else from `colors.background` + `colors.foreground`, else uses the fork's near-black palette. `Modern` pins that near-black palette regardless of the scheme. |
+| `sidebar_theme` | enum | `"Auto"` (`"Brand"` in a build with a brand palette) | `"Auto"`, `"Modern"`, `"FollowColorScheme"`, `"Brand"`. `Auto` derives the sidebar from `colors.tab_bar` when the scheme defines it, else from `colors.background` + `colors.foreground`, else uses the fork's near-black palette. `Modern` pins that near-black palette regardless of the scheme. `Brand` pins the chrome of the brand this binary was compiled with: dark base tinted with `BRAND_NEUTRAL`, `BRAND_ACCENT` for active/focus, `BRAND_ATTENTION` for attention. Every variant is chrome only — terminal colours are never touched. See [Build flavours](#build-flavours). |
 | `sidebar_tab_density` | enum | `"Comfortable"` | `"Comfortable"`, `"Compact"`. `Compact` also suppresses the metadata sub-line entirely. |
 | `sidebar_tab_title_source` | enum | `"Title"` | `"Title"`, `"Command"`, `"WorkingDirectory"`, `"GitBranch"` |
 | `sidebar_tab_metadata` | list of enum | `{ "GitBranch", "WorkingDirectory" }` | Elements: `"GitBranch"`, `"WorkingDirectory"` |
@@ -158,7 +158,7 @@ config.agent_ui = {
   trust_visible_evidence = true,
   pulse_working_dot = true,
   pulse_period_ms = 1600,
-  ring_colors = "RedBlue", -- or "OrangeCyan", "TanSage", "BrownSlate"
+  ring_colors = "RedBlue", -- or "OrangeCyan", "TanSage", "BrownSlate", "Brand"
   animations = {
     enabled = true,
     unfocused = true,
@@ -308,10 +308,12 @@ vendor-neutral agent.
 | `trust_visible_evidence` | bool | `true` | Whether multi-signal visible-text evidence counts as trusted for control actions. |
 | `pulse_working_dot` | bool | `true` | Pulse the status dot while an agent is Running/Streaming/WaitingForInput. Historically also the single kill switch for every sidebar animation; see [Sidebar animations](#sidebar-animations) for exactly when it still is. |
 | `pulse_period_ms` | int | `1600` | One pulse cycle. Clamped to `400..=6000`. |
-| `ring_colors` | enum | `"RedBlue"` | Colour pair for the working-agent throbber ring and the active-tab rail gradient. `"RedBlue"` (`#ff6b6b` → `#58a6ff`), `"OrangeCyan"` (`#ff8a3d` → `#35d6d6`), `"TanSage"` (`#a97f5c` → `#7d9060`), `"BrownSlate"` (`#6e6147` → `#4a6470`). The settled hairline left behind after an agent resolves is derived from the cool end at 55% brightness, so it stays coherent with whichever pair is selected. |
+| `ring_colors` | enum | `"RedBlue"` | Colour pair for the working-agent throbber ring and the active-tab rail gradient. `"RedBlue"` (`#ff6b6b` → `#58a6ff`), `"OrangeCyan"` (`#ff8a3d` → `#35d6d6`), `"TanSage"` (`#a97f5c` → `#7d9060`), `"BrownSlate"` (`#6e6147` → `#4a6470`), `"Brand"` (`BRAND_ATTENTION` → `BRAND_ACCENT`, this build's own pair; see [Build flavours](#build-flavours)). The settled hairline left behind after an agent resolves is derived from the cool end at 55% brightness, so it stays coherent with whichever pair is selected. |
 | `animations` | table | *(absent)* | Sidebar motion switches and per-animation colour overrides. See [Sidebar animations](#sidebar-animations). |
 | `dock_badge` | bool | `true` | Show a count badge on the macOS dock icon for agents waiting for input while the app is unfocused. Ignored on non-macOS platforms. |
 | `track_exited_unseen` | bool | `true` | Keep agents that finished while the window was unfocused in the waiting queue with a dimmed badge until seen. **Experimental**: relies on detecting the loss of agent identity, which is less reliable than the `WaitingForInput` signal. |
+| `activity_from_output` | bool | `true` | Treat a sustained burst of pane output (>=400 ms of activity, still flowing within the last 1.5 s) as evidence that the agent is working, even when its visible text shows a prompt. Ignored for the focused pane, where the output is your own keystrokes echoing back. This is what keeps the throbber — and with it the sidebar's whole repaint chain — alive while a tool call runs behind a redrawn prompt box. |
+| `activity_from_subagents` | bool | `true` | Treat a working subagent as evidence that its parent agent is working. Covers what `activity_from_output` cannot see: a subagent runs inside its parent's process and may write nothing to the parent's screen for minutes. Needs `agent_ui.section.enabled`, which is what populates the herd state subagents are read from. |
 
 Each adapter accepts `enabled`, `label`, `short_label`, `color`,
 `process_names`, `title_patterns`, `visible_patterns`, `running_patterns`,
@@ -1080,6 +1082,17 @@ rebrand without patching source.
 | `BRAND_CLI_BIN` | `tgzterminal` | CLI binary name in `Contents/MacOS` (the `wezterm` compatibility symlink is always kept) |
 | `BRAND_ICON` | _(unset)_ | Path to a `.icns` copied over `Contents/Resources/terminal.icns`; the build fails if set but missing. `CFBundleIconFile` stays `terminal.icns`. |
 
+`config` and `wezterm-gui-subcommands` read two more at compile time (each crate
+emits `cargo:rerun-if-env-changed`, so a flavour switch forces a rebuild):
+
+| Env var | Default | Controls |
+|---|---|---|
+| `BRAND_FLAVOR` | `tgz` | Build flavour name (`config/src/brand.rs`). Anything other than `tgz` suffixes the two state files (`tgz-ui-state-<flavor>.json`, `tgz-last-session-<flavor>.json`) so two flavours running side by side do not overwrite each other's UI state. |
+| `BRAND_ACCENT` | _(unset)_ | Brand accent as `#RRGGBB`: what the chrome means by *active / focused*, and the cool end of the agent ring. **Setting it is what makes a build "branded"**: `sidebar_theme` and `agent_ui.ring_colors` then default to `"Brand"`. Defaults only — Lua still wins. |
+| `BRAND_ATTENTION` | _(unset)_ | Brand attention colour as `#RRGGBB`: the waiting-queue dot, its pip, the selection bar, the attention line, the ring's warm end and the waiting glow. Falls back to the stock amber. |
+| `BRAND_NEUTRAL` | _(unset)_ | Brand neutral as `#RRGGBB`: the grey the dark chrome is tinted with, and the exact colour of meta text. Falls back to a near-grey. |
+| `BRAND_WINDOW_CLASS` | `org.wezfurlong.wezterm` | Default window class (`wezterm-gui-subcommands`). Single-instance detection resolves the gui socket from the window class, **not** the bundle id, so a branded build must set this or it will adopt a running stock instance's windows instead of opening its own. Equivalent to passing `--class` on every launch. |
+
 `wezterm-gui` reads these at compile time (via `option_env!`, resolved in
 `wezterm-gui/src/brand.rs`):
 
@@ -1091,6 +1104,35 @@ rebrand without patching source.
 `CFBundleExecutable` stays `wezterm-gui`, and the internal namespaces
 (`tgzterminal.worktree` user var, `TGZTERMINAL_BIN`, `.cache/tgzterminal`) are
 unaffected by branding.
+
+### Build flavours
+
+A flavour is a rebranded build of the same binary: same features, different
+identity, different *default* chrome colours. Nothing in this repo names a
+specific brand — a downstream fork supplies its identity entirely through the
+environment, so its diff stays out of the `.rs` files and merging this repo's
+changes never conflicts on them:
+
+```sh
+BRAND_APP_NAME=acme BRAND_BUNDLE_ID=com.acme.terminal BRAND_CLI_BIN=acme \
+BRAND_PRODUCT_NAME=acme BRAND_FLAVOR=acme BRAND_WINDOW_CLASS=com.acme.terminal \
+BRAND_ACCENT='#00AAA7' BRAND_ATTENTION='#ED6B06' BRAND_NEUTRAL='#63656A' \
+BRAND_ICON=assets/branding/acme/acme.icns \
+CARGO_TARGET_DIR=target-acme \
+  ci/build-macos-bundle.sh --native
+```
+
+Notes:
+
+- A separate `CARGO_TARGET_DIR` is worth setting: the brand is a compile-time
+  input, so sharing `target/` makes the two flavours rebuild each other.
+- `BRAND_WINDOW_CLASS` is not optional for a side-by-side install. Single-instance
+  detection resolves the gui socket from the window class, not the bundle id.
+- Brand colours are parsed at compile time by a `const fn`, so a malformed hex is
+  a build error rather than a silent fallback.
+- For the icon, `ci/make-icns.sh <square-image> <out.icns>` converts a ≥1024px
+  square PNG. `BRAND_ICON` hard-fails when set but missing, so only set it once
+  the file exists.
 
 ## Portable mode (Windows)
 
@@ -1136,7 +1178,7 @@ you are not left hunting for one.
 | Toolbelt button labels, sizes and drop order | Hardcoded. When the strip is too narrow buttons are dropped in a fixed order (Input/Compose, then Details, Attach, Resume), and Stop and Copy are the last two standing. |
 | Per-toolbelt-button visibility | Toolbelt visibility is derived. Herd-row `Stop` is governed by `agent_ui.show_stop`; it appears when the agent can be interrupted. `Copy` whenever an agent is detected; `Attach` / `Resume` / `Details` need their action templates *and* the control-action gate; `Input` / `Compose` follow `rich_input.enabled` and `rich_input.docked`. If a button is missing, it is a detection or a gate question — see *How an agent is identified*. |
 | Sidebar spacing, radii and row geometry | Compile-time constants. |
-| Individual sidebar colors | No per-element keys. The whole palette is derived — see `sidebar_theme` for which source it derives from. |
+| Individual sidebar colors | No per-element keys. The whole palette is derived — see `sidebar_theme` for which source it derives from. The attention colour (waiting-queue dot, pip, selection bar, attention line) comes from the palette too, so it follows the theme rather than being separately settable. |
 | Worktree picker behavior | No config surface. |
 
 Two keys are accepted by the schema but currently read by no code:

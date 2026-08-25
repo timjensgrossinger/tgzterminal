@@ -4,7 +4,17 @@ use config::{GuiPosition, SshParameters};
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-pub const DEFAULT_WINDOW_CLASS: &str = "org.wezfurlong.wezterm";
+/// Window class used when `--class` is not given.
+///
+/// This is what single-instance detection keys the gui socket off, so it — not
+/// the bundle id — is what keeps two flavours of the app from adopting each
+/// other's windows. A branded build compiles its own class in via
+/// `BRAND_WINDOW_CLASS` (see `build.rs`), which is why such a build needs no
+/// `--class` wrapper script around its binary.
+pub const DEFAULT_WINDOW_CLASS: &str = match option_env!("BRAND_WINDOW_CLASS") {
+    Some(v) => v,
+    None => "org.wezfurlong.wezterm",
+};
 
 /// Helper for parsing config overrides
 pub fn name_equals_value(arg: &str) -> Result<(String, String), String> {
