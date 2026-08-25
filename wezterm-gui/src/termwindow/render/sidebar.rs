@@ -43,7 +43,7 @@ use std::time::{Duration, Instant, SystemTime};
 use std::{env, fs};
 use termwiz::cell::{grapheme_column_width, unicode_column_width, CellAttributes, Intensity};
 use termwiz::color::ColorAttribute;
-use termwiz::surface::{Line, SEQ_ZERO};
+use termwiz::surface::{Line, SequenceNo, SEQ_ZERO};
 use url::Url;
 use window::color::LinearRgba;
 use window::{MousePress, RectF, WindowOps};
@@ -2532,6 +2532,12 @@ pub(crate) enum SidebarRow {
         /// Marks a pane living on another host, so a local agent split off an
         /// SSH shell is visibly distinct from the shell it sits beside.
         is_remote: bool,
+        /// The agent running in this pane, if any.
+        ///
+        /// The tab row speaks for one pane only (`pick_sidebar_agent_pane`), so
+        /// without this an expanded four-way split showed a single ring and no
+        /// way to tell which of its panes was the busy one.
+        agent: Option<AgentPaneState>,
     },
 }
 
@@ -3696,6 +3702,17 @@ pub(crate) struct AgentDetectionCacheKey {
     visible_fingerprint: u64,
 }
 
+/// One sample of a pane's output activity, carried from the top of
+/// `detect_agent_pane` to whichever cache entry that call ends up writing.
+#[derive(Clone, Copy, Debug)]
+struct PaneOutputActivity {
+    seqno: SequenceNo,
+    changed_at: Option<Instant>,
+    active_since: Option<Instant>,
+    /// Whether this counts as work in progress right now.
+    busy: bool,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct AgentDetectionCacheEntry {
     key: AgentDetectionCacheKey,
@@ -3737,6 +3754,15 @@ pub(crate) struct AgentDetectionCacheEntry {
     /// When the agent last stopped working, for the one-shot resolve ring.
     /// Cleared when it starts working again.
     done_ring_started_at: Option<Instant>,
+    /// The pane's sequence number as of the last sample, for the output-activity
+    /// signal. Sampled before the detection fast path, so a burst is still seen
+    /// while cached state is being served.
+    last_seqno: SequenceNo,
+    /// When `last_seqno` last changed.
+    seqno_changed_at: Option<Instant>,
+    /// When the current burst of output started -- the first change after a
+    /// quiet period longer than [`AGENT_OUTPUT_ACTIVITY_WINDOW`].
+    seqno_active_since: Option<Instant>,
 }
 
 /// Agent identity carried over from this pane's previous detection.
@@ -4166,6 +4192,19 @@ const AGENT_BOXED_PROMPT_PREFIXES: &[&str] = &["│ >", "│ ❯", "│ ›", "�
 /// How long a `Running` status is held after its marker disappears.
 const AGENT_RUNNING_GRACE: Duration = Duration::from_secs(3);
 
+/// How recently a pane must have written for its output to count as work.
+///
+/// Wider than one repaint so a burst that pauses between tool calls still reads
+/// as continuous, narrow enough that a finished agent stops looking busy well
+/// inside [`AGENT_RUNNING_GRACE`].
+const AGENT_OUTPUT_ACTIVITY_WINDOW: Duration = Duration::from_millis(1500);
+
+/// How long a burst of output must have been running before it counts as work.
+///
+/// A single keystroke echoing back, a cursor report or a one-shot redraw all
+/// move the sequence number; only sustained output means something is happening.
+const AGENT_OUTPUT_ACTIVITY_MIN_RUN: Duration = Duration::from_millis(400);
+
 /// How long a visible-text or metadata identity may be reused without fresh
 /// evidence before it has to be re-earned.
 const AGENT_STICKY_VISIBLE_TTL: Duration = Duration::from_secs(30);
@@ -4358,6 +4397,61 @@ fn stabilize_agent_status(
         return previous.unwrap_or(fresh);
     }
     fresh
+}
+
+/// Whether a pane's recent output amounts to work in progress.
+///
+/// `changed_at` is when the pane's sequence number last moved; `active_since` is
+/// when the current burst started. Both `None` means the pane has written
+/// nothing since it was first sampled.
+fn output_activity_is_busy(
+    changed_at: Option<Instant>,
+    active_since: Option<Instant>,
+    now: Instant,
+    window: Duration,
+    min_run: Duration,
+) -> bool {
+    let (Some(changed_at), Some(active_since)) = (changed_at, active_since) else {
+        return false;
+    };
+    if now.duration_since(changed_at) >= window {
+        return false;
+    }
+    changed_at.duration_since(active_since) >= min_run
+}
+
+/// Promote an inferred status to `Running` when something other than the screen
+/// says the agent is working.
+///
+/// The screen is the weakest of the three signals: an agent redraws its prompt
+/// box between steps of one turn, and a subagent can work for minutes without
+/// the parent printing anything at all. Both cases used to read as
+/// `WaitingForInput`, which stopped the throbber -- and because a stopped
+/// throbber schedules no frame, it stopped every other sidebar animation with
+/// it.
+///
+/// Deliberately only ever escalates, and never touches `Exited`: a dead pane
+/// must not spin however recently it wrote its last line.
+fn escalate_agent_status(
+    inferred: AgentStatus,
+    output_busy: bool,
+    subagent_working: bool,
+) -> AgentStatus {
+    if agent_is_working(&inferred) || inferred == AgentStatus::Exited {
+        return inferred;
+    }
+    if subagent_working {
+        return AgentStatus::Running;
+    }
+    if output_busy
+        && matches!(
+            inferred,
+            AgentStatus::Unknown | AgentStatus::WaitingForInput
+        )
+    {
+        return AgentStatus::Running;
+    }
+    inferred
 }
 
 /// Whether an established identity may be replaced by a fresh candidate.
@@ -5663,6 +5757,93 @@ impl crate::TermWindow {
         self.detect_agent_pane(pane).is_some()
     }
 
+    /// Sample the pane's output sequence number and fold it into the cached
+    /// burst bookkeeping, reporting whether the pane counts as busy.
+    ///
+    /// Called before the detection fast path so a burst is still tracked while
+    /// cached state is being served; the sequence number is a plain counter, so
+    /// this is cheap enough for the paint path.
+    fn sample_pane_output_activity(&self, pane: &Arc<dyn Pane>) -> PaneOutputActivity {
+        let pane_id = pane.pane_id();
+        let seqno = pane.get_current_seqno();
+        let now = Instant::now();
+        let previous = self
+            .agent_detection_cache
+            .borrow()
+            .get(&pane_id)
+            .map(|entry| {
+                (
+                    entry.last_seqno,
+                    entry.seqno_changed_at,
+                    entry.seqno_active_since,
+                )
+            });
+        let (changed_at, active_since) = match previous {
+            // First sample: there is no previous number to compare against, so
+            // the pane is neither busy nor idle yet.
+            None => (None, None),
+            Some((last, changed_at, active_since)) if last == seqno => (changed_at, active_since),
+            Some((_, changed_at, active_since)) => {
+                // A change close behind the last one continues that burst;
+                // anything later starts a new one, so the min-run test measures
+                // the current burst rather than the whole session.
+                let continuing = changed_at
+                    .is_some_and(|at| now.duration_since(at) < AGENT_OUTPUT_ACTIVITY_WINDOW);
+                let active_since = if continuing {
+                    active_since.or(Some(now))
+                } else {
+                    Some(now)
+                };
+                (Some(now), active_since)
+            }
+        };
+        if let Some(entry) = self.agent_detection_cache.borrow_mut().get_mut(&pane_id) {
+            entry.last_seqno = seqno;
+            entry.seqno_changed_at = changed_at;
+            entry.seqno_active_since = active_since;
+        }
+        // The focused pane's output is mostly the user's own keystrokes echoing
+        // back, and its agent is being watched anyway.
+        let busy = self.config.agent_ui.activity_from_output
+            && !self.is_focused_active_pane(pane_id)
+            && output_activity_is_busy(
+                changed_at,
+                active_since,
+                now,
+                AGENT_OUTPUT_ACTIVITY_WINDOW,
+                AGENT_OUTPUT_ACTIVITY_MIN_RUN,
+            );
+        PaneOutputActivity {
+            seqno,
+            changed_at,
+            active_since,
+            busy,
+        }
+    }
+
+    /// Whether a subagent is working inside the agent bound to this pane.
+    ///
+    /// Reads the herd state built earlier in the frame by
+    /// `update_agent_herd_state`, so it is at most one frame old -- and it is
+    /// only populated when `agent_ui.section.enabled`, which is why the
+    /// output-activity signal has to stand on its own.
+    fn pane_has_working_subagent(&self, pane_id: PaneId) -> bool {
+        if !self.config.agent_ui.activity_from_subagents {
+            return false;
+        }
+        self.agent_herd_state
+            .borrow()
+            .agents
+            .iter()
+            .filter(|agent| agent.pane_id == Some(pane_id))
+            .any(|agent| {
+                agent
+                    .subagents
+                    .iter()
+                    .any(|sub| sub.status == crate::agent_herd::HerdStatus::Working)
+            })
+    }
+
     fn detect_agent_pane(&self, pane: &Arc<dyn Pane>) -> Option<AgentPaneState> {
         if !self.config.agent_ui.enabled {
             return None;
@@ -5673,6 +5854,10 @@ impl crate::TermWindow {
         // The insight pane no longer exists as a separate mux pane.
 
         let vars = pane.copy_user_vars();
+        // Before the fast path below: a pane that is quietly producing output
+        // has an unchanged title, process and viewport, so the cached entry
+        // would be served without the burst ever being noticed.
+        let activity = self.sample_pane_output_activity(pane);
         let foreground_process = pane.get_foreground_process_name(CachePolicy::AllowStale);
         let pane_title = pane.get_title();
         let dims = pane.get_dimensions();
@@ -5880,6 +6065,9 @@ impl crate::TermWindow {
                     acknowledged_at: None,
                     first_seen_at: None,
                     done_ring_started_at: None,
+                    last_seqno: activity.seqno,
+                    seqno_changed_at: activity.changed_at,
+                    seqno_active_since: activity.active_since,
                 },
             );
             return None;
@@ -5906,6 +6094,9 @@ impl crate::TermWindow {
                     acknowledged_at: None,
                     first_seen_at: None,
                     done_ring_started_at: None,
+                    last_seqno: activity.seqno,
+                    seqno_changed_at: activity.changed_at,
+                    seqno_active_since: activity.active_since,
                 },
             );
             return None;
@@ -5926,6 +6117,9 @@ impl crate::TermWindow {
                     acknowledged_at: None,
                     first_seen_at: None,
                     done_ring_started_at: None,
+                    last_seqno: activity.seqno,
+                    seqno_changed_at: activity.changed_at,
+                    seqno_active_since: activity.active_since,
                 },
             );
             return None;
@@ -5935,12 +6129,22 @@ impl crate::TermWindow {
         let previous_state = previous_entry
             .as_ref()
             .and_then(|entry| entry.state.as_ref());
+        // A pane that publishes `agent.status` keeps the last word; the two
+        // activity signals only ever escalate a status *inferred* from the
+        // screen, which is the weakest evidence we have.
         let fresh_status = if explicit_status.is_some() {
             AgentStatus::from_hint(explicit_status)
-        } else if visible_text_loaded {
-            infer_agent_status_from_visible_text(&visible_text, adapter.as_ref())
         } else {
-            AgentStatus::Unknown
+            let inferred = if visible_text_loaded {
+                infer_agent_status_from_visible_text(&visible_text, adapter.as_ref())
+            } else {
+                AgentStatus::Unknown
+            };
+            escalate_agent_status(
+                inferred,
+                activity.busy,
+                self.pane_has_working_subagent(pane.pane_id()),
+            )
         };
         let now = Instant::now();
         let status = stabilize_agent_status(
@@ -6123,6 +6327,9 @@ impl crate::TermWindow {
                 acknowledged_at,
                 first_seen_at: Some(first_seen_at),
                 done_ring_started_at,
+                last_seqno: activity.seqno,
+                seqno_changed_at: activity.changed_at,
+                seqno_active_since: activity.active_since,
             },
         );
         // Runs at most once per pane per 500ms (the fast path above returns
@@ -7014,6 +7221,10 @@ impl crate::TermWindow {
                 active: pos.is_active,
                 label: self.sidebar_pane_label(&pos.pane),
                 is_remote: self.pane_looks_remote_cached(&pos.pane),
+                // A cache hit: these panes were already detected this frame,
+                // by `sidebar_agent_panes_for_tab_idx`. Pane rows are only
+                // built for expanded tabs, so the cost is bounded either way.
+                agent: self.detect_agent_pane(&pos.pane),
             })
             .collect()
     }
@@ -9689,6 +9900,7 @@ impl crate::TermWindow {
                     active,
                     label,
                     is_remote,
+                    agent,
                 } => {
                     let row_type = UIItemType::SidebarPaneRow { pane_id };
                     let close_type = UIItemType::SidebarPaneClose { pane_id };
@@ -9715,16 +9927,68 @@ impl crate::TermWindow {
                         surface
                     };
                     let row_offset = if row_pressed { 1. } else { 0. };
-                    if active || row_hovered || close_hovered {
-                        self.sidebar_rounded_fill(
+                    // Same three treatments the tab row draws, on the indented
+                    // rect: with the tab row speaking for one pane only, this is
+                    // the only place that can say *which* pane of a split is
+                    // working, waiting or just finished.
+                    let anim = agent
+                        .as_ref()
+                        .map(|state| self.agent_row_animation(pane_id, &state.status))
+                        .unwrap_or_else(AgentRowAnimation::still);
+                    let row_rect = euclid::rect(row_x, y + row_offset, row_w, row_height as f32);
+                    let row_filled = active || row_hovered || close_hovered;
+                    // The ring painters punch their own interior back out, so
+                    // they need an opaque colour to punch with.
+                    let ring_behind = if row_filled {
+                        row_bg
+                    } else if anim.spin.is_some() {
+                        sb.working_fill
+                    } else {
+                        surface
+                    };
+                    let treatment = anim.ring_treatment();
+                    if let AgentRowRing::Spin(phase) = treatment {
+                        self.paint_agent_working_ring(
                             layers,
                             1,
-                            euclid::rect(row_x, y + row_offset, row_w, row_height as f32),
-                            tab_row_radius,
-                            row_bg,
+                            row_rect,
+                            ring_radius,
+                            sb.ring,
+                            ring_behind,
+                            ring_stroke,
+                            phase,
                         )?;
+                    } else {
+                        if row_filled {
+                            self.sidebar_rounded_fill(layers, 1, row_rect, tab_row_radius, row_bg)?;
+                        }
+                        match treatment {
+                            AgentRowRing::Waiting => self.paint_agent_waiting_glow(
+                                layers,
+                                1,
+                                row_rect,
+                                ring_radius,
+                                sb.ring,
+                                ring_behind,
+                                hairline,
+                            )?,
+                            AgentRowRing::Resolve(intensity) => self.paint_agent_resolve_ring(
+                                layers,
+                                1,
+                                row_rect,
+                                ring_radius,
+                                sb.ring,
+                                ring_behind,
+                                hairline,
+                                intensity,
+                            )?,
+                            AgentRowRing::None | AgentRowRing::Spin(_) => {}
+                        }
                     }
-                    if active {
+                    // The rail runs where the ring does, so it reads as a
+                    // detached dot the ring keeps sliding past; the spinning
+                    // ring already marks the row.
+                    if active && anim.spin.is_none() {
                         let rail_h = (row_height as f32 * 0.45).max(cell_height as f32 * 0.5);
                         let rail_y = y + row_offset + (row_height as f32 - rail_h) * 0.5;
                         let rail_x = match self.config.sidebar_position {
@@ -9748,13 +10012,49 @@ impl crate::TermWindow {
                     } else {
                         label
                     };
-                    let label_x = content_x + indent + PAD_X + ACTIVE_TEXT_GAP;
+                    // The dot takes a column of its own rather than sharing the
+                    // gap the rail sits in, so it can never land on the rail.
+                    let badge = agent
+                        .as_ref()
+                        .filter(|_| anim.shows_status_dot())
+                        .map(|state| {
+                            let size = sidebar_status_dot_size(cell_height as f32);
+                            let color = agent_status_dot_accent(
+                                &state.status,
+                                if active {
+                                    accent
+                                } else {
+                                    inactive_fg.mul_alpha(0.58)
+                                },
+                                row_bg,
+                                self.agent_dot_pulse(state),
+                                sb.ring.pulse,
+                                sb.ring.waiting,
+                            );
+                            (size, color)
+                        });
+                    let badge_w = badge
+                        .map(|_| sidebar_agent_badge_w(cell_height as f32))
+                        .unwrap_or(0.);
+                    let label_x = content_x + indent + PAD_X + ACTIVE_TEXT_GAP + badge_w;
                     let label_w = (content_w
                         - indent
                         - PAD_X * 2.
                         - ACTIVE_TEXT_GAP
+                        - badge_w
                         - sidebar_close_text_reserve(cell_width as f32))
                     .max(0.);
+                    if let Some((size, color)) = badge {
+                        let badge_x = content_x + indent + PAD_X + ACTIVE_TEXT_GAP;
+                        let badge_y = y + row_offset + (row_height as f32 - size) * 0.5;
+                        self.sidebar_pill_fill(
+                            layers,
+                            2,
+                            euclid::rect(badge_x, badge_y, size, size),
+                            size * 0.5,
+                            color,
+                        )?;
+                    }
                     render_text(
                         self,
                         layers,
@@ -12417,6 +12717,103 @@ mod tests {
     }
 
     #[test]
+    fn output_activity_needs_a_sustained_and_recent_burst() {
+        let now = Instant::now();
+        let window = AGENT_OUTPUT_ACTIVITY_WINDOW;
+        let min_run = AGENT_OUTPUT_ACTIVITY_MIN_RUN;
+
+        // Nothing sampled yet, and a pane that has written nothing since.
+        assert!(!output_activity_is_busy(None, None, now, window, min_run));
+        assert!(!output_activity_is_busy(
+            Some(now),
+            None,
+            now,
+            window,
+            min_run
+        ));
+
+        // A single keystroke echoing back: recent, but the burst is one frame
+        // long, so it is not work.
+        let blip = now - Duration::from_millis(20);
+        assert!(!output_activity_is_busy(
+            Some(blip),
+            Some(blip),
+            now,
+            window,
+            min_run
+        ));
+
+        // Output still flowing, and it has been for longer than the min run.
+        let started = now - min_run - Duration::from_millis(200);
+        assert!(output_activity_is_busy(
+            Some(now - Duration::from_millis(100)),
+            Some(started),
+            now,
+            window,
+            min_run
+        ));
+
+        // The same burst, gone quiet for longer than the window: whatever it
+        // was, it is over, and the ring has to be allowed to stop.
+        assert!(!output_activity_is_busy(
+            Some(now - window),
+            Some(started - window),
+            now,
+            window,
+            min_run
+        ));
+    }
+
+    #[test]
+    fn activity_escalates_only_a_weak_reading_and_never_a_dead_pane() {
+        // The two cases the screen cannot see: a tool call running behind a
+        // redrawn prompt box, and a subagent working while the parent is quiet.
+        assert_eq!(
+            escalate_agent_status(AgentStatus::WaitingForInput, true, false),
+            AgentStatus::Running
+        );
+        assert_eq!(
+            escalate_agent_status(AgentStatus::WaitingForInput, false, true),
+            AgentStatus::Running
+        );
+        assert_eq!(
+            escalate_agent_status(AgentStatus::Unknown, true, false),
+            AgentStatus::Running
+        );
+
+        // A subagent outranks the output signal's own gating: it is evidence
+        // about the agent, not about the screen.
+        assert_eq!(
+            escalate_agent_status(AgentStatus::Idle, false, true),
+            AgentStatus::Running
+        );
+        // ... whereas output alone is too weak to overrule a positive reading
+        // of idleness.
+        assert_eq!(
+            escalate_agent_status(AgentStatus::Idle, true, false),
+            AgentStatus::Idle
+        );
+
+        // A dead pane must not spin however recently it wrote its last line.
+        assert_eq!(
+            escalate_agent_status(AgentStatus::Exited, true, true),
+            AgentStatus::Exited
+        );
+
+        // Nothing to escalate.
+        assert_eq!(
+            escalate_agent_status(AgentStatus::WaitingForInput, false, false),
+            AgentStatus::WaitingForInput
+        );
+        for working in [AgentStatus::Running, AgentStatus::Streaming] {
+            assert_eq!(
+                escalate_agent_status(working.clone(), false, false),
+                working
+            );
+        }
+    }
+
+    #[test]
     fn a_positive_reading_always_beats_the_grace() {
         let now = Instant::now();
         let fresh = now - Duration::from_millis(500);
@@ -12671,6 +13068,7 @@ mod tests {
             active: false,
             label: format!("pane {pane_id}"),
             is_remote: false,
+            agent: None,
         }
     }
 
@@ -15607,6 +16005,9 @@ mod tests {
             acknowledged_at: None,
             first_seen_at: None,
             done_ring_started_at: None,
+            last_seqno: SEQ_ZERO,
+            seqno_changed_at: None,
+            seqno_active_since: None,
         }
     }
 
@@ -15629,6 +16030,9 @@ mod tests {
             acknowledged_at: None,
             first_seen_at: None,
             done_ring_started_at: None,
+            last_seqno: SEQ_ZERO,
+            seqno_changed_at: None,
+            seqno_active_since: None,
         }
     }
 

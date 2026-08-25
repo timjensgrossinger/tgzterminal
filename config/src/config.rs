@@ -1270,6 +1270,26 @@ pub struct AgentUiConfig {
     /// queue with a dimmed badge until seen. Experimental.
     #[dynamic(default = "default_true")]
     pub track_exited_unseen: bool,
+
+    /// Treat a sustained burst of pane output as evidence that the agent is
+    /// working, even when its visible text says otherwise.
+    ///
+    /// Agent TUIs redraw their prompt box between steps of a single turn, so
+    /// the screen alone reports `waiting` while a tool call is still running --
+    /// which stopped the throbber, and with it the repaint chain that drives
+    /// every other sidebar animation. Ignored for the focused pane, where the
+    /// output would just be your own keystrokes echoing back.
+    #[dynamic(default = "default_true")]
+    pub activity_from_output: bool,
+
+    /// Treat a working subagent as evidence that its parent agent is working.
+    ///
+    /// A subagent runs inside its parent's process and may write nothing to the
+    /// parent's screen for minutes, so this is the only signal for the case
+    /// `activity_from_output` cannot see. Needs `agent_ui.section.enabled`,
+    /// which is what populates the herd state the subagents are read from.
+    #[dynamic(default = "default_true")]
+    pub activity_from_subagents: bool,
 }
 
 impl Default for AgentUiConfig {
@@ -1295,6 +1315,8 @@ impl Default for AgentUiConfig {
             animations: None,
             dock_badge: true,
             track_exited_unseen: true,
+            activity_from_output: true,
+            activity_from_subagents: true,
         }
     }
 }

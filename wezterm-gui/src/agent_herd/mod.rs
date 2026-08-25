@@ -565,6 +565,24 @@ pub struct PaneAgentRow {
     pub can_open_logs: bool,
 }
 
+/// Promote a resolved status to `Working` when a subagent is working.
+///
+/// Only `Idle` and `Unknown` are escalated: `Blocked` outranks working (the
+/// human is the bottleneck), `Working` is already right, and `Done` is a view
+/// state the sources never report.
+fn escalate_for_subagents(status: HerdStatus, subagents: &[HerdSubagent]) -> HerdStatus {
+    if !matches!(status, HerdStatus::Idle | HerdStatus::Unknown) {
+        return status;
+    }
+    if subagents
+        .iter()
+        .any(|sub| sub.status == HerdStatus::Working)
+    {
+        return HerdStatus::Working;
+    }
+    status
+}
+
 /// Join filesystem-discovered Claude sessions to detected panes.
 ///
 /// Binding is by pid first (exact, via the pane's process tree), then by cwd
@@ -607,9 +625,17 @@ pub fn join_sessions_with_panes(
             // reporting `Working` for a session that has already finished and
             // has no way to observe it going idle. Only fall back to the
             // session when the pane could not say.
-            status: match pane.map(|p| p.status) {
-                Some(HerdStatus::Unknown) | None => session.status,
-                Some(live) => live,
+            status: {
+                let resolved = match pane.map(|p| p.status) {
+                    Some(HerdStatus::Unknown) | None => session.status,
+                    Some(live) => live,
+                };
+                // A subagent runs inside its parent's process, so the parent's
+                // screen can sit at a prompt -- and read as idle -- for the
+                // whole time one is working. Without this the pane status wins
+                // and the only signal that anything is happening is a line of
+                // text in the herd section.
+                escalate_for_subagents(resolved, &session.subagents)
             },
             blocked_reason: session.blocked_reason.clone(),
             model: session
@@ -1134,6 +1160,40 @@ mod tests {
         assert_eq!(alpha.pane_id, Some(5));
         let beta = agents.iter().find(|a| a.name == "beta").unwrap();
         assert_eq!(beta.pane_id, None);
+    }
+
+    #[test]
+    fn a_working_subagent_keeps_its_parent_working() {
+        let mut sub = HerdSubagent {
+            agent_id: "sub-1".to_string(),
+            agent_type: "Explore".to_string(),
+            description: "read the sidebar".to_string(),
+            status: HerdStatus::Working,
+            depth: 1,
+            last_activity: None,
+        };
+
+        // The parent's screen sits at a prompt while the subagent works, so the
+        // pane reports idle and used to win outright.
+        let mut idle_pane = pane(7, "claude", &[4242]);
+        idle_pane.status = HerdStatus::Idle;
+        let mut with_sub = session(4242, "alpha", "/repo");
+        with_sub.subagents = vec![sub.clone()];
+        let agents = join_sessions_with_panes(vec![with_sub.clone()], vec![idle_pane.clone()]);
+        assert_eq!(agents[0].status, HerdStatus::Working);
+
+        // No subagent working: the pane's own reading stands.
+        sub.status = HerdStatus::Done;
+        let mut done_sub = session(4242, "alpha", "/repo");
+        done_sub.subagents = vec![sub];
+        let agents = join_sessions_with_panes(vec![done_sub], vec![idle_pane.clone()]);
+        assert_eq!(agents[0].status, HerdStatus::Idle);
+
+        // Blocked outranks working: the human is the bottleneck either way.
+        let mut blocked_pane = idle_pane;
+        blocked_pane.status = HerdStatus::Blocked;
+        let agents = join_sessions_with_panes(vec![with_sub], vec![blocked_pane]);
+        assert_eq!(agents[0].status, HerdStatus::Blocked);
     }
 
     #[test]

@@ -312,6 +312,8 @@ vendor-neutral agent.
 | `animations` | table | *(absent)* | Sidebar motion switches and per-animation colour overrides. See [Sidebar animations](#sidebar-animations). |
 | `dock_badge` | bool | `true` | Show a count badge on the macOS dock icon for agents waiting for input while the app is unfocused. Ignored on non-macOS platforms. |
 | `track_exited_unseen` | bool | `true` | Keep agents that finished while the window was unfocused in the waiting queue with a dimmed badge until seen. **Experimental**: relies on detecting the loss of agent identity, which is less reliable than the `WaitingForInput` signal. |
+| `activity_from_output` | bool | `true` | Treat a sustained burst of pane output (>=400 ms of activity, still flowing within the last 1.5 s) as evidence that the agent is working, even when its visible text shows a prompt. Ignored for the focused pane, where the output is your own keystrokes echoing back. This is what keeps the throbber — and with it the sidebar's whole repaint chain — alive while a tool call runs behind a redrawn prompt box. |
+| `activity_from_subagents` | bool | `true` | Treat a working subagent as evidence that its parent agent is working. Covers what `activity_from_output` cannot see: a subagent runs inside its parent's process and may write nothing to the parent's screen for minutes. Needs `agent_ui.section.enabled`, which is what populates the herd state subagents are read from. |
 
 Each adapter accepts `enabled`, `label`, `short_label`, `color`,
 `process_names`, `title_patterns`, `visible_patterns`, `running_patterns`,
