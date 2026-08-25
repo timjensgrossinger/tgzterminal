@@ -14147,9 +14147,22 @@ mod tests {
         }
     }
 
+    /// The default ring is whatever preset the build defaults to — RedBlue
+    /// unbranded, `Brand` in a build compiled with a brand palette — resolved
+    /// with no overrides applied.
     #[test]
-    fn default_ring_pair_is_red_blue() {
+    fn default_ring_pair_follows_the_default_preset() {
         let ring = preset_ring(AgentRingColors::default());
+        let (warm, cool) = AgentRingColors::default().stops();
+        assert_eq!(ring.a, srgb8_to_linear_tuple(warm));
+        assert_eq!(ring.b, srgb8_to_linear_tuple(cool));
+    }
+
+    /// The RedBlue stops themselves are a fixed design decision and must not
+    /// drift, whichever preset a given build defaults to.
+    #[test]
+    fn red_blue_preset_keeps_its_design_hexes() {
+        let ring = preset_ring(AgentRingColors::RedBlue);
         assert_eq!(ring.a, srgb8_to_linear(0xff, 0x6b, 0x6b));
         assert_eq!(ring.b, srgb8_to_linear(0x58, 0xa6, 0xff));
     }
