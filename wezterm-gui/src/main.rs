@@ -46,6 +46,7 @@ mod inputmap;
 mod macos_dock_badge;
 #[cfg(target_os = "macos")]
 mod macos_permissions;
+mod notification_focus;
 mod overlay;
 mod quad;
 mod renderstate;

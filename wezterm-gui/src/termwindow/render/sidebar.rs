@@ -1261,6 +1261,30 @@ pub(crate) fn next_unseen_exited_since(
     }
 }
 
+/// Should a herd row still be showing its attention mark?
+///
+/// Two ways to stop: the user is looking at the agent's pane right now, or they
+/// looked at it earlier during this same attention episode. A detached agent has
+/// no pane to look at, so nothing can acknowledge it and the mark stands.
+///
+/// This is the herd list's counterpart to `is_waiting_queued`; the two are
+/// separate because they answer to different status models, but the
+/// focus-is-the-acknowledgement rule is deliberately the same.
+pub(crate) fn herd_attention_is_live(
+    is_attention: bool,
+    pane_id: Option<PaneId>,
+    focused_active_pane: Option<PaneId>,
+    acknowledged: bool,
+) -> bool {
+    if !is_attention || acknowledged {
+        return false;
+    }
+    match pane_id {
+        Some(pane_id) => focused_active_pane != Some(pane_id),
+        None => true,
+    }
+}
+
 /// Pick the next pane for `CycleWaitingAgent` from an oldest-first queue:
 /// the entry after `current`, wrapping around; the oldest entry when
 /// `current` is not itself waiting; `None` when the queue is empty.
@@ -4366,16 +4390,34 @@ fn ends_run_only_after_grace(status: &AgentStatus) -> bool {
 
 /// Whether a cached detection may be returned without re-reading the pane.
 ///
-/// An entry whose status is *held* by the grace never qualifies, however
-/// unchanged the screen is. A finished agent stops redrawing, so its content
-/// fingerprint stops moving; served from the fast path, the held `Running`
-/// would be handed back forever and the throbber would spin for the rest of the
-/// session. The held entry has to be re-derived so the grace can expire.
+/// An entry whose status is *held* -- by the grace, or by an activity
+/// escalation -- never qualifies, however unchanged the screen is. A finished
+/// agent stops redrawing, so its content fingerprint stops moving; served from
+/// the fast path, the held `Running` would be handed back forever and the
+/// throbber would spin for the rest of the session. The held entry has to be
+/// re-derived so the grace, and the activity window behind an escalation, can
+/// expire.
 fn agent_detection_cache_hit(
     entry: &AgentDetectionCacheEntry,
     key: &AgentDetectionCacheKey,
 ) -> bool {
     entry.key == *key && !entry.status_held
+}
+
+/// Whether a detection has to be re-derived rather than cached against its
+/// screen content.
+///
+/// Two ways a status outlives the screen it was read from. The grace holds a
+/// `Running` whose marker has gone (`status != fresh`), and an activity signal
+/// promotes a weak reading to `Running` on evidence the screen never carried
+/// (`escalated`). Both expire on a clock, so both need another look; only a
+/// status the current screen actually says may be pinned to that screen.
+fn status_must_be_rederived(
+    status: &AgentStatus,
+    fresh_status: &AgentStatus,
+    activity_escalated: bool,
+) -> bool {
+    status != fresh_status || activity_escalated
 }
 
 fn stabilize_agent_status(
@@ -6132,19 +6174,21 @@ impl crate::TermWindow {
         // A pane that publishes `agent.status` keeps the last word; the two
         // activity signals only ever escalate a status *inferred* from the
         // screen, which is the weakest evidence we have.
-        let fresh_status = if explicit_status.is_some() {
-            AgentStatus::from_hint(explicit_status)
+        let (fresh_status, activity_escalated) = if explicit_status.is_some() {
+            (AgentStatus::from_hint(explicit_status), false)
         } else {
             let inferred = if visible_text_loaded {
                 infer_agent_status_from_visible_text(&visible_text, adapter.as_ref())
             } else {
                 AgentStatus::Unknown
             };
-            escalate_agent_status(
-                inferred,
+            let escalated = escalate_agent_status(
+                inferred.clone(),
                 activity.busy,
                 self.pane_has_working_subagent(pane.pane_id()),
-            )
+            );
+            let changed = escalated != inferred;
+            (escalated, changed)
         };
         let now = Instant::now();
         let status = stabilize_agent_status(
@@ -6167,7 +6211,12 @@ impl crate::TermWindow {
         } else {
             now
         };
-        let status_held = status != fresh_status;
+        // A status the screen did not produce also has to be re-derived. The
+        // activity window that justified an escalated `Running` expires on a
+        // clock, not on a screen change, and a finished agent stops redrawing:
+        // served from the content-keyed fast path, that `Running` would be
+        // handed back for the rest of the session and the ring would never stop.
+        let status_held = status_must_be_rederived(&status, &fresh_status, activity_escalated);
         let actions = self.agent_supported_actions(
             adapter_id.as_deref(),
             &vars,
@@ -6218,13 +6267,20 @@ impl crate::TermWindow {
         );
         if should_notify_waiting {
             let label = state.as_ref().unwrap().kind.label().to_string();
+            let notify_pane_id = pane.pane_id();
             promise::spawn::spawn_into_main_thread(async move {
-                wezterm_toast_notification::show(wezterm_toast_notification::ToastNotification {
-                    title: "Agent waiting".to_string(),
-                    message: format!("{} is waiting for input", label),
-                    url: None,
-                    timeout: Some(Duration::from_millis(2500)),
-                });
+                // No timeout: the point of this notification is that clicking it
+                // takes you to the agent, and a banner that removes itself after
+                // a couple of seconds cannot be clicked.
+                wezterm_toast_notification::show_with_click(
+                    wezterm_toast_notification::ToastNotification {
+                        title: "Agent waiting".to_string(),
+                        message: format!("{} is waiting for input", label),
+                        url: None,
+                        timeout: None,
+                    },
+                    crate::notification_focus::focus_pane_on_click(notify_pane_id),
+                );
             })
             .detach();
         }
@@ -10955,15 +11011,41 @@ impl crate::TermWindow {
             scope_herd_agents_to_project(agents, current_project.as_deref())
         };
 
+        // Attention episodes. Focusing an agent's pane acknowledges its current
+        // episode and the acknowledgement sticks until the episode ends, so the
+        // mark does not come back the moment focus moves elsewhere.
+        let attention_now = SystemTime::now();
+        let focused_active = self.focused_active_pane_id();
+        {
+            let mut state = self.agent_herd_state.borrow_mut();
+            let mut live: std::collections::HashSet<crate::agent_herd::AgentKey> =
+                std::collections::HashSet::new();
+            for agent in &agents {
+                if !agent.display_status(attention_now).is_attention() {
+                    continue;
+                }
+                let key = agent.key();
+                live.insert(key.clone());
+                if agent.pane_id.is_some() && agent.pane_id == focused_active {
+                    state.attention_acked.insert(key);
+                }
+            }
+            // An episode that ended takes its acknowledgement with it.
+            state.attention_acked.retain(|key| live.contains(key));
+        }
+        let attention_acked = self.agent_herd_state.borrow().attention_acked.clone();
+        let attention_live = |agent: &crate::agent_herd::HerdAgent| {
+            herd_attention_is_live(
+                agent.display_status(attention_now).is_attention(),
+                agent.pane_id,
+                focused_active,
+                attention_acked.contains(&agent.key()),
+            )
+        };
+
         // Surface attention-needing agents first so they are not buried.
         if self.config.agent_ui.section.sort_attention_first {
-            let now = SystemTime::now();
-            agents.sort_by_key(|agent| {
-                (
-                    !agent.display_status(now).is_attention(),
-                    agent.name.clone(),
-                )
-            });
+            agents.sort_by_key(|agent| (!attention_live(agent), agent.name.clone()));
         }
 
         let mut state = self.agent_herd_state.borrow_mut();
@@ -11256,7 +11338,12 @@ impl crate::TermWindow {
             .as_ref()
             .filter(|(_, at)| at.elapsed() < Duration::from_secs(5))
             .map(|(message, _)| message.clone());
+        let attention_acked = state.attention_acked.clone();
         drop(state);
+        // Which agent, if any, the user is looking at right now. `None` while
+        // this window is unfocused, so an unfocused window never hides its own
+        // attention marks.
+        let focused_active = self.focused_active_pane_id();
 
         let dpi = (self.dimensions.dpi as f32 / 96.0).clamp(1.0, 2.5);
         let cell_h = self.render_metrics.cell_size.height as f32;
@@ -11286,7 +11373,14 @@ impl crate::TermWindow {
         let now = SystemTime::now();
         let attention_count = agents
             .iter()
-            .filter(|agent| agent.display_status(now).is_attention())
+            .filter(|agent| {
+                herd_attention_is_live(
+                    agent.display_status(now).is_attention(),
+                    agent.pane_id,
+                    focused_active,
+                    attention_acked.contains(&agent.key()),
+                )
+            })
             .count();
 
         let content_h = metrics.content_h;
@@ -11372,6 +11466,14 @@ impl crate::TermWindow {
             // reads dimmer and its click offers Resume instead.
             let detached = agent.is_detached();
             let display_status = agent.display_status(SystemTime::now());
+            // Focus is the acknowledgement here too, so a row you have already
+            // been taken to stops shouting.
+            let attention = herd_attention_is_live(
+                display_status.is_attention(),
+                agent.pane_id,
+                focused_active,
+                attention_acked.contains(&key),
+            );
             let row_fg = if detached { dim } else { fg };
             let row_type = UIItemType::SidebarAgentRow { key: key.clone() };
             let row_hovered = hovered_item.as_ref() == Some(&row_type);
@@ -11389,7 +11491,7 @@ impl crate::TermWindow {
             self.filled_rectangle(layers, 0, row_rect, row_bg)?;
             // Keyboard cursor: a solid accent bar on the row's leading edge.
             if selected {
-                let accent = if display_status.is_attention() {
+                let accent = if attention {
                     sb.attention
                 } else {
                     srgb8_to_linear_tuple(agent.vendor_dot_color())
@@ -11426,7 +11528,7 @@ impl crate::TermWindow {
             let dot_x = section_x + pad + chevron_w + 6.0 * dpi;
             let dot_y = y + row_h * 0.5;
             let dot_rect = euclid::rect(dot_x - 4.0 * dpi, dot_y - 4.0 * dpi, 8.0 * dpi, 8.0 * dpi);
-            let dot_fill = if display_status.is_attention() {
+            let dot_fill = if attention {
                 sb.attention
             } else {
                 srgb8_to_linear_tuple(agent.vendor_dot_color())
@@ -11440,7 +11542,7 @@ impl crate::TermWindow {
                     None => dot_fill,
                 };
             self.filled_rectangle(layers, 1, dot_rect, dot_fill)?;
-            if display_status.is_attention() {
+            if attention {
                 let attention_rect =
                     euclid::rect(dot_x + 3.0 * dpi, dot_y - 2.0 * dpi, 4.0 * dpi, 4.0 * dpi);
                 // A lightened cast of the same attention colour, so the pip
@@ -12855,6 +12957,41 @@ mod tests {
             &entry,
             &detection_key(Some("node"), "codex")
         ));
+    }
+
+    #[test]
+    fn an_activity_escalated_status_is_re_derived_not_cached() {
+        // The grace case: the screen no longer says `Running`, the stabilizer
+        // does.
+        assert!(status_must_be_rederived(
+            &AgentStatus::Running,
+            &AgentStatus::WaitingForInput,
+            false
+        ));
+
+        // The regression. Output activity promoted the reading, so the
+        // stabilizer passes it straight through and `status == fresh`. Pinning
+        // that to the screen it was read from latches the ring: a finished
+        // agent stops redrawing, the fingerprint never moves again, and the
+        // 1.5s activity window is never re-evaluated.
+        assert!(status_must_be_rederived(
+            &AgentStatus::Running,
+            &AgentStatus::Running,
+            true
+        ));
+
+        // A status the screen itself reported may be cached against it.
+        for status in [
+            AgentStatus::Running,
+            AgentStatus::WaitingForInput,
+            AgentStatus::Idle,
+            AgentStatus::Exited,
+        ] {
+            assert!(
+                !status_must_be_rederived(&status, &status, false),
+                "{status:?} was read off this very screen and may be cached"
+            );
+        }
     }
 
     /// A full-width sidebar row at 1x: the shape the ring bugs showed up on.
@@ -15463,6 +15600,27 @@ mod tests {
             next_unseen_exited_since(Some(t0), false, false, true, t0),
             Some(t0)
         );
+    }
+
+    #[test]
+    fn herd_attention_clears_on_focus_and_on_acknowledgement() {
+        let pane: PaneId = 5;
+        let other: PaneId = 6;
+
+        // Not attention at all: nothing to show.
+        assert!(!herd_attention_is_live(false, Some(pane), None, false));
+        // Attention on an unfocused pane: show it.
+        assert!(herd_attention_is_live(true, Some(pane), Some(other), false));
+        // The window is unfocused, so nothing is focused-active and the mark
+        // stands.
+        assert!(herd_attention_is_live(true, Some(pane), None, false));
+        // Looking right at it clears it.
+        assert!(!herd_attention_is_live(true, Some(pane), Some(pane), false));
+        // Having looked at it earlier in this episode also clears it, even
+        // after focus moved elsewhere.
+        assert!(!herd_attention_is_live(true, Some(pane), Some(other), true));
+        // Detached: no pane to look at, so focus can never acknowledge it.
+        assert!(herd_attention_is_live(true, None, Some(pane), false));
     }
 
     #[test]

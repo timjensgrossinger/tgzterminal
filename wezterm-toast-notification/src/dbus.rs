@@ -1,7 +1,7 @@
 #![cfg(all(not(target_os = "macos"), not(windows)))]
 //! See <https://developer.gnome.org/notification-spec/>
 
-use crate::ToastNotification;
+use crate::{ToastClick, ToastNotification};
 use futures_util::stream::{abortable, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -87,18 +87,25 @@ impl Reason {
     }
 }
 
-async fn show_notif_impl(notif: ToastNotification) -> Result<(), Box<dyn std::error::Error>> {
+async fn show_notif_impl(
+    notif: ToastNotification,
+    on_click: Option<ToastClick>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let connection = zbus::ConnectionBuilder::session()?.build().await?;
 
     let proxy = NotificationsProxy::new(&connection).await?;
     let caps = proxy.get_capabilities().await?;
 
-    if notif.url.is_some() && !caps.iter().any(|cap| cap == "actions") {
+    let supports_actions = caps.iter().any(|cap| cap == "actions");
+    if notif.url.is_some() && !supports_actions {
         // Server doesn't support actions, so skip showing this notification
         // because it might have text that says "click to see more"
         // and that just wouldn't work.
         return Ok(());
     }
+    // A click handler is worth offering a button for, but unlike a url it is not
+    // worth suppressing the notification over: the text stands on its own.
+    let offer_action = supports_actions && (notif.url.is_some() || on_click.is_some());
 
     let mut hints = HashMap::new();
     hints.insert("urgency", Value::U8(2 /* Critical */));
@@ -109,11 +116,7 @@ async fn show_notif_impl(notif: ToastNotification) -> Result<(), Box<dyn std::er
             "org.wezfurlong.wezterm",
             &notif.title,
             &notif.message,
-            if notif.url.is_some() {
-                &["show", "Show"]
-            } else {
-                &[]
-            },
+            if offer_action { &["show", "Show"] } else { &[] },
             &hints,
             notif.timeout.map(|d| d.as_millis() as _).unwrap_or(0),
         )
@@ -127,8 +130,13 @@ async fn show_notif_impl(notif: ToastNotification) -> Result<(), Box<dyn std::er
             while let Some(signal) = invoked_stream.next().await {
                 let args = signal.args()?;
                 if args.nid == notification {
+                    if let Some(on_click) = on_click.as_ref() {
+                        on_click();
+                    }
                     if let Some(url) = notif.url.as_ref() {
                         wezterm_open_url::open_url(url);
+                    }
+                    if on_click.is_some() || notif.url.is_some() {
                         abort_closed.abort();
                         break;
                     }
@@ -152,11 +160,14 @@ async fn show_notif_impl(notif: ToastNotification) -> Result<(), Box<dyn std::er
     Ok(())
 }
 
-pub fn show_notif(notif: ToastNotification) -> Result<(), Box<dyn std::error::Error>> {
+pub fn show_notif(
+    notif: ToastNotification,
+    on_click: Option<ToastClick>,
+) -> Result<(), Box<dyn std::error::Error>> {
     // Run this in a separate thread as we don't know if dbus or the notification
     // service on the other end are up, and we'd otherwise block for some time.
     std::thread::spawn(move || {
-        let res = async_io::block_on(async move { show_notif_impl(notif).await });
+        let res = async_io::block_on(async move { show_notif_impl(notif, on_click).await });
         if let Err(err) = res {
             log::error!("while showing notification: {:#}", err);
         }

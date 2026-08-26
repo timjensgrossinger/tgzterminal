@@ -354,7 +354,16 @@ directories are canonicalized and must resolve under `~/.claude/projects`.
 Non-Claude local session or state paths are shown as `Details` in the toolbelt.
 
 `waiting_notification` enables a throttled local toast when an agent appears to
-be waiting for input.
+be waiting for input. Clicking the notification raises the window that owns the
+agent, switches to its tab and makes that exact pane active — which also counts
+as acknowledging the wait, so the row's glow and the dock badge clear. The toast
+is persistent for that reason: a banner that dismissed itself after a couple of
+seconds could not be clicked.
+
+The same click-to-focus applies to notifications an agent raises itself through
+the `OSC 9` / `OSC 777` escape sequences, which is the better route when the
+agent supports it — the notification is then posted by this terminal rather than
+by whatever tool the agent shells out to.
 
 ### Sidebar animations
 

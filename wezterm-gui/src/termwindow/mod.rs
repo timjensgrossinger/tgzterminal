@@ -586,6 +586,14 @@ pub struct AgentHerdState {
     pub view: crate::agent_herd::HerdView,
     /// Short-lived feedback for control actions. OS notifications may be denied.
     pub feedback: Option<(String, std::time::Instant)>,
+    /// Agents whose current attention episode the user has already looked at.
+    ///
+    /// Keyed by identity rather than position, like `expanded` and `selection`,
+    /// because the list is rebuilt every refresh. An entry is dropped when the
+    /// episode ends, so a fresh approval request re-arms the mark. Unlike the
+    /// pane waiting queue this is not persisted: an attention state that
+    /// survives a restart should ask again.
+    pub attention_acked: std::collections::HashSet<crate::agent_herd::AgentKey>,
 }
 
 impl Default for AgentHerdState {
@@ -601,6 +609,7 @@ impl Default for AgentHerdState {
             context_menu: None,
             view: crate::agent_herd::HerdView::CurrentProject,
             feedback: None,
+            attention_acked: std::collections::HashSet::new(),
         }
     }
 }
@@ -5138,7 +5147,11 @@ done
                     self.waiting_queue().into_iter().map(|(id, _)| id).collect();
                 if let Some(target) = render::sidebar::cycle_waiting_target(&queue, pane.pane_id())
                 {
-                    self.activate_pane_by_id(target)?;
+                    // See the note in `mouse_event_sidebar_waiting_counter`:
+                    // this path acknowledges the wait as it focuses.
+                    if !self.activate_sidebar_pane(target) {
+                        self.activate_pane_by_id(target)?;
+                    }
                 }
             }
         };

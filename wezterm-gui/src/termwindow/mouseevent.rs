@@ -1033,7 +1033,13 @@ impl super::TermWindow {
             self.pressed_ui_item = None;
             let oldest = self.waiting_queue().into_iter().next().map(|(id, _)| id);
             if let Some(target) = oldest {
-                let _ = self.activate_pane_by_id(target);
+                // `activate_sidebar_pane` rather than `activate_pane_by_id`: it
+                // reaches a pane that is not its tab's active one, and it records
+                // the acknowledgement immediately instead of leaving the glow up
+                // until the next detection pass.
+                if !self.activate_sidebar_pane(target) {
+                    let _ = self.activate_pane_by_id(target);
+                }
             }
         }
         context.invalidate();

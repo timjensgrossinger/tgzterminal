@@ -1,5 +1,6 @@
 #![cfg(target_os = "macos")]
-use crate::ToastNotification;
+use crate::click::{self, ResponseKind};
+use crate::{ToastClick, ToastNotification};
 use block2::{Block, RcBlock};
 use objc2::rc::Retained;
 use objc2::runtime::{Bool, NSObject, NSObjectProtocol, ProtocolObject};
@@ -8,10 +9,19 @@ use objc2_foundation::{ns_string, NSArray, NSDictionary, NSError, NSSet, NSStrin
 use objc2_user_notifications::{
     UNAuthorizationOptions, UNMutableNotificationContent, UNNotification, UNNotificationAction,
     UNNotificationActionOptions, UNNotificationCategory, UNNotificationCategoryOptions,
-    UNNotificationPresentationOptions, UNNotificationRequest, UNNotificationResponse,
-    UNUserNotificationCenter, UNUserNotificationCenterDelegate,
+    UNNotificationDismissActionIdentifier, UNNotificationPresentationOptions,
+    UNNotificationRequest, UNNotificationResponse, UNUserNotificationCenter,
+    UNUserNotificationCenterDelegate,
 };
 use std::sync::{LazyLock, Once};
+use std::time::Instant;
+
+/// Action + category for a notification whose click focuses something inside
+/// this app rather than opening a url. Separate from `SHOW_URL_ACTION` because
+/// the two mean different things, and `setNotificationCategories` replaces the
+/// whole set, so both have to be registered together.
+const FOCUS_ACTION: &str = "FOCUS_TARGET";
+const FOCUS_CATEGORY: &str = "FOCUS_TARGET_ACTION";
 
 const NEEDS_SIGN: &str = "Note that the application must be code-signed \
                           for UNUserNotificationCenter to work";
@@ -61,15 +71,40 @@ define_class!(
             response: &UNNotificationResponse,
             completion_handler: &Block<dyn Fn()>,
         ) {
-            let action = response.actionIdentifier();
-            let user_info = response.notification().request().content().userInfo();
+            let action = response.actionIdentifier().to_string();
+            let request = response.notification().request();
+            let identifier = request.identifier().to_string();
+            let user_info = request.content().userInfo();
             let url = user_info.valueForKey(ns_string!("url"));
 
-            log::debug!("did_receive_notification -> action={action:?} url={url:?}");
+            log::debug!(
+                "did_receive_notification -> action={action:?} id={identifier} url={url:?}"
+            );
 
-            if let Some(url) = url {
-                if let Ok(url_str) = url.downcast::<NSString>() {
-                    wezterm_open_url::open_url(&url_str.to_string());
+            let dismiss = UNNotificationDismissActionIdentifier.to_string();
+            match click::classify_action(&action, &dismiss) {
+                ResponseKind::Dismiss => {
+                    // Swiping a notification away is not a request to go
+                    // anywhere; drop the parked handler unfired.
+                    click::with(|registry| registry.forget(&identifier));
+                }
+                ResponseKind::Activate => {
+                    // Take the handler out from under the lock before running
+                    // it: a handler is free to post another notification, and
+                    // doing that while holding the registry would deadlock.
+                    let handler = click::with(|registry| registry.take(&identifier));
+                    match handler {
+                        Some(handler) => handler(),
+                        None => {
+                            log::debug!("no click handler parked for {identifier}");
+                        }
+                    }
+
+                    if let Some(url) = url {
+                        if let Ok(url_str) = url.downcast::<NSString>() {
+                            wezterm_open_url::open_url(&url_str.to_string());
+                        }
+                    }
                 }
             }
 
@@ -125,7 +160,25 @@ pub fn initialize() {
                 &NSArray::from_slice(&[]),
                 UNNotificationCategoryOptions::CustomDismissAction,
             );
-        CENTER.setNotificationCategories(&NSSet::from_retained_slice(&[show_url_cat]));
+        // `Foreground` is what brings the app forward when the button is used.
+        let focus_target = UNNotificationAction::actionWithIdentifier_title_options(
+            &NSString::from_str(FOCUS_ACTION),
+            ns_string!("Show"),
+            UNNotificationActionOptions::Foreground,
+        );
+        let focus_target_cat =
+            UNNotificationCategory::categoryWithIdentifier_actions_intentIdentifiers_options(
+                &NSString::from_str(FOCUS_CATEGORY),
+                &NSArray::from_retained_slice(&[focus_target]),
+                &NSArray::from_slice(&[]),
+                // Report swipe-aways, so a dismissed notification frees its
+                // parked handler instead of waiting to be evicted.
+                UNNotificationCategoryOptions::CustomDismissAction,
+            );
+        CENTER.setNotificationCategories(&NSSet::from_retained_slice(&[
+            show_url_cat,
+            focus_target_cat,
+        ]));
 
         let delegate = NotifDelegate::new();
         let delegate_proto = ProtocolObject::from_retained(delegate.clone());
@@ -147,11 +200,17 @@ pub fn initialize() {
     });
 }
 
-pub fn show_notif(toast: ToastNotification) -> Result<(), Box<dyn std::error::Error>> {
+pub fn show_notif(
+    toast: ToastNotification,
+    on_click: Option<ToastClick>,
+) -> Result<(), Box<dyn std::error::Error>> {
     initialize();
     unsafe {
         log::debug!("show_notif center.delegate is {:?}", CENTER.delegate());
 
+        // Minted up front: this is both the request id and the key the delegate
+        // uses to find the click handler again.
+        let identifier = uuid::Uuid::new_v4().to_string();
         let notif = UNMutableNotificationContent::new();
         notif.setTitle(&NSString::from_str(&toast.title));
         notif.setBody(&NSString::from_str(&toast.message));
@@ -164,9 +223,14 @@ pub fn show_notif(toast: ToastNotification) -> Result<(), Box<dyn std::error::Er
                     .expect("is NSDictionary"),
             );
             notif.setCategoryIdentifier(ns_string!("SHOW_URL_ACTION"));
+        } else if on_click.is_some() {
+            notif.setCategoryIdentifier(&NSString::from_str(FOCUS_CATEGORY));
         }
 
-        let identifier = uuid::Uuid::new_v4().to_string();
+        if let Some(on_click) = on_click {
+            click::with(|registry| registry.insert(identifier.clone(), on_click, Instant::now()));
+        }
+
         let request = UNNotificationRequest::requestWithIdentifier_content_trigger(
             &NSString::from_str(&identifier),
             &*notif,
@@ -178,6 +242,7 @@ pub fn show_notif(toast: ToastNotification) -> Result<(), Box<dyn std::error::Er
             Some(&RcBlock::new(move |err: *mut NSError| {
                 if err.is_null() {
                     if let Some(timeout) = toast.timeout {
+                        let expiring = identifier.clone();
                         // Spawn a thread to wait. This could be more efficient.
                         // We cannot simply use performSelector:withObject:afterDelay:
                         // because we're not guaranteed to be called from the main
@@ -190,10 +255,13 @@ pub fn show_notif(toast: ToastNotification) -> Result<(), Box<dyn std::error::Er
                             let ident_array =
                                 NSArray::from_retained_slice(&[NSString::from_str(&identifier)]);
                             CENTER.removeDeliveredNotificationsWithIdentifiers(&ident_array);
+                            // The banner is gone, so nothing can click it now.
+                            click::with(|registry| registry.forget(&expiring));
                         });
                     }
                 } else {
                     log::error!("notif failed {}. {NEEDS_SIGN}", ns_error_to_string(err));
+                    click::with(|registry| registry.forget(&identifier));
                 }
             })),
         );

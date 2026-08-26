@@ -1,6 +1,6 @@
 #![cfg(windows)]
 
-use crate::ToastNotification as TN;
+use crate::{ToastClick, ToastNotification as TN};
 use xml::escape::escape_str_pcdata;
 
 use windows::core::{Error as WinError, IInspectable, Interface, HSTRING};
@@ -18,10 +18,13 @@ fn unwrap_arg<T>(a: &Option<T>) -> Result<&T, WinError> {
     }
 }
 
-fn show_notif_impl(toast: TN) -> Result<(), Box<dyn std::error::Error>> {
+fn show_notif_impl(
+    toast: TN,
+    on_click: Option<ToastClick>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let xml = XmlDocument::new()?;
 
-    let url_actions = if toast.url.is_some() {
+    let url_actions = if toast.url.is_some() || on_click.is_some() {
         r#"
         <actions>
            <action content="Show" arguments="show" />
@@ -55,6 +58,14 @@ fn show_notif_impl(toast: TN) -> Result<(), Box<dyn std::error::Error>> {
 
             let args = result.Arguments()?;
 
+            // Clicking the toast body arrives with the (empty) launch argument;
+            // the button arrives as "show". Both mean "take me there".
+            if args == "show" || args.is_empty() {
+                if let Some(on_click) = on_click.as_ref() {
+                    on_click();
+                }
+            }
+
             if args == "show" {
                 if let Some(url) = toast.url.as_ref() {
                     wezterm_open_url::open_url(url);
@@ -86,12 +97,15 @@ fn show_notif_impl(toast: TN) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-pub fn show_notif(notif: TN) -> Result<(), Box<dyn std::error::Error>> {
+pub fn show_notif(
+    notif: TN,
+    on_click: Option<ToastClick>,
+) -> Result<(), Box<dyn std::error::Error>> {
     // We need to be in a different thread from the caller
     // in case we get called in the guts of a windows message
     // loop dispatch and are unable to pump messages
     std::thread::spawn(move || {
-        if let Err(err) = show_notif_impl(notif) {
+        if let Err(err) = show_notif_impl(notif, on_click) {
             log::error!("Failed to show toast notification: {:#}", err);
         }
     });

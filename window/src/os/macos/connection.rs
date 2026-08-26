@@ -10,7 +10,7 @@ use crate::screen::{ScreenInfo, Screens};
 use crate::spawn::*;
 use crate::Appearance;
 use cocoa::appkit::{NSApp, NSApplication, NSApplicationActivationPolicyRegular, NSScreen};
-use cocoa::base::{id, nil};
+use cocoa::base::{id, nil, YES};
 use cocoa::foundation::{NSArray, NSInteger};
 use objc::runtime::Object;
 use objc::*;
@@ -164,6 +164,15 @@ impl ConnectionOps for Connection {
     fn hide_application(&self) {
         unsafe {
             let () = msg_send![self.ns_app, hide: self.ns_app];
+        }
+    }
+
+    fn activate_application(&self) {
+        unsafe {
+            // Deprecated in macOS 14 in favour of `-[NSApplication activate]`,
+            // but that is a no-op for a background app unless it is already
+            // "activatable", which is exactly the case we need to cover.
+            self.ns_app.activateIgnoringOtherApps_(YES);
         }
     }
 

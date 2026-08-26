@@ -73,6 +73,16 @@ pub trait ConnectionOps {
     /// focus away from it.
     fn hide_application(&self) {}
 
+    /// Bring the whole application to the foreground.
+    ///
+    /// `WindowOps::focus` only reorders windows *within* the application, which
+    /// is enough when the app is already frontmost. Something arriving from
+    /// outside — a notification click, say — has to activate the app first or
+    /// the window it raises stays behind whatever the user was looking at.
+    /// A no-op where the platform has no such concept, or where `focus` already
+    /// implies it.
+    fn activate_application(&self) {}
+
     /// Perform the system beep/notification sound
     fn beep(&self) {}
 

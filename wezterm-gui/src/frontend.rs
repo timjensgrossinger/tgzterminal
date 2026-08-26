@@ -96,12 +96,7 @@ impl GuiFrontEnd {
                 MuxNotification::PaneAdded(_) => {}
                 MuxNotification::Alert {
                     pane_id,
-                    alert:
-                        Alert::ToastNotification {
-                            title,
-                            body,
-                            focus: _,
-                        },
+                    alert: Alert::ToastNotification { title, body, focus },
                 } => {
                     let mux = Mux::get();
 
@@ -124,10 +119,19 @@ impl GuiFrontEnd {
                             if show {
                                 let message = if title.is_none() { "" } else { &body };
                                 let title = title.as_ref().unwrap_or(&body);
-                                // FIXME: if notification.focus is true, we should do
-                                // something here to arrange to focus pane_id when the
-                                // notification is clicked
-                                persistent_toast_notification(title, message);
+                                // `focus` is the sending application asking that a
+                                // click take the user back to it. Resolve the pane
+                                // at click time, not now: it may have moved windows
+                                // or died while the banner waited.
+                                if focus {
+                                    persistent_toast_notification_with_click(
+                                        title,
+                                        message,
+                                        crate::notification_focus::focus_pane_on_click(pane_id),
+                                    );
+                                } else {
+                                    persistent_toast_notification(title, message);
+                                }
                             }
                         }
                     }
