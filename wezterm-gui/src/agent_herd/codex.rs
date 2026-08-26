@@ -7,6 +7,45 @@ use std::time::{Duration, SystemTime};
 const CODEX_ACTIVE_WINDOW: Duration = Duration::from_secs(15 * 60);
 const CODEX_WORKING_WINDOW: Duration = Duration::from_secs(2 * 60);
 
+/// How many trailing records to search for Codex's turn boundary.
+///
+/// A completed turn ends `task_complete`, but token-count and other event
+/// records follow it, so the final line is not reliably the boundary.
+const TURN_SEARCH_LINES: usize = 24;
+
+/// What a Codex rollout says about whether the turn is over.
+///
+/// Codex is explicit where most vendors are not: it writes an `event_msg`
+/// record whose payload type is `task_complete` when it finishes. That beats
+/// the file-mtime band this store otherwise relies on, which cannot tell "still
+/// working" from "finished a moment ago".
+fn turn_state_from_rollout(path: &Path) -> crate::agent_herd::TurnState {
+    use crate::agent_herd::TurnState;
+    for line in crate::agent_herd::transcript::tail_lines(path, TURN_SEARCH_LINES)
+        .into_iter()
+        .rev()
+    {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if value.get("type").and_then(|v| v.as_str()) != Some("event_msg") {
+            continue;
+        }
+        return match value
+            .get("payload")
+            .and_then(|payload| payload.get("type"))
+            .and_then(|v| v.as_str())
+        {
+            Some("task_complete") => TurnState::Finished,
+            // Any other event is the middle of a turn: a message going out, a
+            // token count coming back.
+            Some(_) => TurnState::Working,
+            None => TurnState::Unknown,
+        };
+    }
+    TurnState::Unknown
+}
+
 fn codex_sessions_dir(home: &Path) -> PathBuf {
     home.join(".codex")
 }
@@ -106,6 +145,8 @@ impl SessionSource for CodexDetector {
                         // sessions from interactive ones.
                         interactive: true,
                         vendor: AgentVendor::Codex,
+                        // This store exposes no turn boundary; freshness is all it has.
+                        turn: crate::agent_herd::TurnState::Unknown,
                         session_id,
                         cwd,
                         project_root: None,
@@ -178,6 +219,7 @@ fn collect_rollout_sessions(home: &Path) -> Vec<VendorSession> {
                 pid: 0,
                 interactive: true,
                 vendor: AgentVendor::Codex,
+                turn: turn_state_from_rollout(&path),
                 session_id,
                 cwd,
                 project_root: None,

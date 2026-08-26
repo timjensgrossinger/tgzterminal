@@ -101,6 +101,8 @@ impl SessionSource for AntigravityDetector {
                     pid: 0,
                     interactive: true,
                     vendor: AgentVendor::Antigravity,
+                    // This store exposes no turn boundary; freshness is all it has.
+                    turn: crate::agent_herd::TurnState::Unknown,
                     session_id,
                     cwd,
                     project_root: None,

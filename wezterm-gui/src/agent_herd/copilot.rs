@@ -98,6 +98,8 @@ impl SessionSource for CopilotDetector {
                         // sessions from interactive ones.
                         interactive: true,
                         vendor: AgentVendor::Copilot,
+                        // This store exposes no turn boundary; freshness is all it has.
+                        turn: crate::agent_herd::TurnState::Unknown,
                         session_id,
                         cwd,
                         project_root: None,
@@ -166,6 +168,8 @@ fn collect_state_sessions(home: &Path) -> Vec<VendorSession> {
             pid: 0,
             interactive: true,
             vendor: AgentVendor::Copilot,
+            // This store exposes no turn boundary; freshness is all it has.
+            turn: crate::agent_herd::TurnState::Unknown,
             session_id: session_id.to_string(),
             cwd,
             project_root: None,

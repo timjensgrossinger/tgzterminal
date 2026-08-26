@@ -3787,6 +3787,12 @@ pub(crate) struct AgentDetectionCacheEntry {
     /// When the current burst of output started -- the first change after a
     /// quiet period longer than [`AGENT_OUTPUT_ACTIVITY_WINDOW`].
     seqno_active_since: Option<Instant>,
+    /// Hash of the spinner-led line as of the last screen read, and when it
+    /// last differed from the read before it. A live spinner mutates; the
+    /// summary an agent leaves behind is frozen, and comparing the line across
+    /// frames is the only test for that which no vendor's wording can defeat.
+    spinner_line: Option<u64>,
+    spinner_changed_at: Option<Instant>,
 }
 
 /// Agent identity carried over from this pane's previous detection.
@@ -4233,6 +4239,27 @@ const AGENT_OUTPUT_ACTIVITY_MIN_RUN: Duration = Duration::from_millis(400);
 /// evidence before it has to be re-earned.
 const AGENT_STICKY_VISIBLE_TTL: Duration = Duration::from_secs(30);
 
+/// How long an in-flight herd scan may go unreported before a new one is
+/// allowed anyway.
+///
+/// The scan clears its own marker from the worker's completion callback, so a
+/// worker that dies, or a window that never processes the notification, would
+/// otherwise suppress every later scan and freeze the whole herd view. The
+/// value only has to be longer than a slow scan; OpenCode's store is the
+/// pathological case, at hundreds of megabytes.
+const HERD_SCAN_WATCHDOG: Duration = Duration::from_secs(15);
+
+/// How long the same spinner-led line may sit on screen before it stops
+/// counting as a spinner.
+///
+/// A live spinner mutates continuously -- the glyph rotates, the elapsed count
+/// ticks -- while the summary an agent leaves behind when it finishes is
+/// frozen. Motion is the only difference that holds across vendors, so it is
+/// what the status decision uses. Trying to out-parse each vendor's summary
+/// wording is what let `<glyph> Churned for 1m 22s . done 10:10 AM` read as a
+/// live spinner and pin the row at `working` for the rest of the session.
+const AGENT_SPINNER_STALE_AFTER: Duration = Duration::from_millis(1200);
+
 /// Infer status from the pane's visible region.
 ///
 /// The previous implementation looked only at the last 20 lines of an up-to-120
@@ -4254,18 +4281,107 @@ fn is_completed_summary_line(line: &str) -> bool {
     let Some((_, rest)) = line.rsplit_once(" for ") else {
         return false;
     };
-    let rest = rest.trim();
-    !rest.is_empty()
-        && rest.chars().any(|c| c.is_ascii_digit())
-        && rest
-            .chars()
-            .all(|c| c.is_ascii_digit() || c.is_whitespace() || matches!(c, 'm' | 's' | 'h'))
+    // Only the duration itself has to look like a duration. Agents decorate the
+    // summary after it -- Claude Code appends `. done 10:10 AM` -- and requiring
+    // the *whole* remainder to be digits and unit letters is what let
+    // `Churned for 1m 22s . done 10:10 AM` read as a live spinner.
+    rest.split_whitespace()
+        .next()
+        .is_some_and(is_duration_token)
+}
+
+/// `12s`, `1m`, `2h`: digits followed by a single unit letter.
+///
+/// Deliberately strict, so "Running a tool for the user" is still not a
+/// summary: `the` is not a duration.
+fn is_duration_token(token: &str) -> bool {
+    let Some(unit) = token.chars().last() else {
+        return false;
+    };
+    if !matches!(unit, 'h' | 'm' | 's') {
+        return false;
+    }
+    let digits = &token[..token.len() - unit.len_utf8()];
+    !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())
+}
+
+/// Whether the spinner-led line on screen is actually moving.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SpinnerMotion {
+    /// The line changed recently, so something is still drawing it.
+    Live,
+    /// The same line has been on screen too long to be a spinner.
+    Frozen,
+}
+
+/// Non-blank lines from the bottom of the visible region, nearest first.
+fn agent_status_tail(text: &str) -> Vec<&str> {
+    text.lines()
+        .rev()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .take(AGENT_STATUS_TAIL_LINES)
+        .collect()
+}
+
+/// The spinner-led line in the pane's status tail, if there is one.
+///
+/// Shared by the status inference and by the hash the caller carries between
+/// frames, so both always agree on which line is being watched.
+fn spinner_line(text: &str) -> Option<&str> {
+    agent_status_tail(text).into_iter().find(|line| {
+        line.chars()
+            .take(AGENT_SPINNER_SCAN_CHARS)
+            .any(|c| AGENT_SPINNER_GLYPHS.contains(&c))
+            && !is_completed_summary_line(line)
+    })
+}
+
+/// Hash of the spinner-led line, for frame-to-frame comparison.
+fn spinner_line_hash(text: &str) -> Option<u64> {
+    spinner_line(text).map(visible_text_fingerprint)
+}
+
+/// Decide whether the spinner is live, and when it last changed.
+///
+/// A first sighting counts as motion: an agent that has only just started
+/// drawing its spinner must not be held at `Unknown` for a whole window.
+fn spinner_motion(
+    observed: Option<u64>,
+    previous: Option<u64>,
+    previous_changed_at: Option<Instant>,
+    now: Instant,
+    stale_after: Duration,
+) -> (SpinnerMotion, Option<Instant>) {
+    let Some(observed) = observed else {
+        return (SpinnerMotion::Frozen, None);
+    };
+    let changed_at = match previous {
+        Some(previous) if previous == observed => previous_changed_at.unwrap_or(now),
+        // Either the line changed, or this is the first one we have seen.
+        _ => now,
+    };
+    let motion = if now.duration_since(changed_at) < stale_after {
+        SpinnerMotion::Live
+    } else {
+        SpinnerMotion::Frozen
+    };
+    (motion, Some(changed_at))
 }
 
 fn infer_agent_status_from_visible_text(
     text: &str,
     adapter: Option<&AgentAdapterConfig>,
+    spinner: SpinnerMotion,
 ) -> AgentStatus {
+    let tail = agent_status_tail(text);
+    // Markers are matched against the whole visible region, not the tail. An
+    // agent prints its working line once and then streams tool output below it,
+    // so by mid-turn the marker is dozens of lines above the prompt box -- see
+    // `status_running_marker_is_found_outside_the_last_twenty_lines`. What
+    // bounds this is that the region is now the physical viewport only (see
+    // `visible_agent_text`), so scrollback can no longer contribute a marker,
+    // and that a transcript turn boundary can overrule the screen entirely.
     let lower = text.to_ascii_lowercase();
     let adapter_markers = adapter
         .map(|adapter| adapter.running_patterns.clone())
@@ -4283,27 +4399,15 @@ fn infer_agent_status_from_visible_text(
         return AgentStatus::Running;
     }
     // A spinner anywhere in the tail counts: agents redraw the spinner and the
-    // prompt box independently, so the spinner is not reliably the last line.
-    // The window has to clear the docked input strip, whose reserved rows plus
-    // the status lines under it push the spinner well past the last handful of
-    // lines; at five, `rich_input.docked` alone was enough to hide it and pin
-    // every working agent at `Unknown`.
-    let tail: Vec<&str> = text
-        .lines()
-        .rev()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .take(AGENT_STATUS_TAIL_LINES)
-        .collect();
-    // The glyph alone is not evidence of work: the same glyph leads the summary
-    // an agent leaves behind when it finishes ("✻ Cogitated for 2m 40s"), which
-    // stays on screen and would otherwise pin the status at `Running` forever.
-    if tail.iter().any(|line| {
-        line.chars()
-            .take(AGENT_SPINNER_SCAN_CHARS)
-            .any(|c| AGENT_SPINNER_GLYPHS.contains(&c))
-            && !is_completed_summary_line(line)
-    }) {
+    // prompt box independently, so it is not reliably the last line.
+    //
+    // Neither the glyph nor the wording beside it is evidence of work on its
+    // own: the same glyph leads the summary an agent leaves behind when it
+    // finishes, and that line stays on screen. `is_completed_summary_line`
+    // catches the shapes we know; `spinner` catches the rest, because a line
+    // that has not changed in `AGENT_SPINNER_STALE_AFTER` is not a spinner
+    // whatever it says.
+    if spinner == SpinnerMotion::Live && spinner_line(text).is_some() {
         return AgentStatus::Running;
     }
     // An adapter-declared waiting pattern (e.g. Gemini's "type your message")
@@ -4361,7 +4465,11 @@ fn visible_agent_activity(text: &str) -> Option<HerdActivity> {
     Some(HerdActivity {
         current: None,
         recent: vec![HerdEvent {
-            at: Some(SystemTime::now()),
+            // Read time, not event time: we have no idea when this line was
+            // printed. Stamping `now` made every pane-derived row permanently
+            // fresh, which is what stopped `display_status` ever applying
+            // `WORKING_STALE_AFTER` to one.
+            at: None,
             kind: HerdEventKind::Assistant,
             content: HerdContent::SingleLine(text),
             tool_use_id: None,
@@ -4386,6 +4494,29 @@ fn visible_agent_activity(text: &str) -> Option<HerdActivity> {
 /// several times through one answer.
 fn ends_run_only_after_grace(status: &AgentStatus) -> bool {
     matches!(status, AgentStatus::Unknown | AgentStatus::WaitingForInput)
+}
+
+/// Whether the herd's filesystem scan should run now.
+///
+/// Split out of `kick_agent_herd_scan` so the two ways it can wrongly say "no"
+/// -- a fresh cache, and a scan that is still in flight -- are testable. The
+/// watchdog is the important half: an in-flight marker that is never cleared
+/// used to mean no scan ever ran again, and every disk-derived status froze
+/// with it.
+fn herd_scan_is_due(
+    scan_started_at: Option<Instant>,
+    scanned_at: Option<Instant>,
+    ttl: Duration,
+    watchdog: Duration,
+    now: Instant,
+) -> bool {
+    let scan_in_flight =
+        scan_started_at.is_some_and(|started_at| now.duration_since(started_at) < watchdog);
+    if scan_in_flight {
+        return false;
+    }
+    let cache_is_fresh = scanned_at.is_some_and(|scanned_at| now.duration_since(scanned_at) < ttl);
+    !cache_is_fresh
 }
 
 /// Whether a cached detection may be returned without re-reading the pane.
@@ -5772,8 +5903,13 @@ impl crate::TermWindow {
         let start = dims.physical_top;
         let end = dims.physical_top + dims.viewport_rows.min(120) as isize;
         let mut text = String::new();
-        for logical in pane.get_logical_lines(start..end) {
-            text.push_str(&line_to_string(&logical.logical));
+        // Physical lines, not logical ones: `get_logical_lines` walks *above*
+        // `physical_top` to find the start of a wrapped line, so up to a
+        // kilobyte of scrollback leaked into what the status scan treats as the
+        // live screen. A running marker up there is not current.
+        let (_first, lines) = pane.get_lines(start..end);
+        for line in lines {
+            text.push_str(&line_to_string(&line));
             text.push('\n');
         }
         text
@@ -5873,6 +6009,11 @@ impl crate::TermWindow {
         if !self.config.agent_ui.activity_from_subagents {
             return false;
         }
+        // Freshness is re-checked here rather than trusted from the scan: the
+        // status was computed against the clock at scan time and then cached,
+        // so a slow or stalled scan kept escalating this pane long after the
+        // subagent went quiet -- which is exactly how the ring got stuck.
+        let now = SystemTime::now();
         self.agent_herd_state
             .borrow()
             .agents
@@ -5882,7 +6023,7 @@ impl crate::TermWindow {
                 agent
                     .subagents
                     .iter()
-                    .any(|sub| sub.status == crate::agent_herd::HerdStatus::Working)
+                    .any(|sub| crate::agent_herd::subagent_is_working(sub, now))
             })
     }
 
@@ -6110,6 +6251,8 @@ impl crate::TermWindow {
                     last_seqno: activity.seqno,
                     seqno_changed_at: activity.changed_at,
                     seqno_active_since: activity.active_since,
+                    spinner_line: None,
+                    spinner_changed_at: None,
                 },
             );
             return None;
@@ -6139,6 +6282,8 @@ impl crate::TermWindow {
                     last_seqno: activity.seqno,
                     seqno_changed_at: activity.changed_at,
                     seqno_active_since: activity.active_since,
+                    spinner_line: None,
+                    spinner_changed_at: None,
                 },
             );
             return None;
@@ -6162,6 +6307,8 @@ impl crate::TermWindow {
                     last_seqno: activity.seqno,
                     seqno_changed_at: activity.changed_at,
                     seqno_active_since: activity.active_since,
+                    spinner_line: None,
+                    spinner_changed_at: None,
                 },
             );
             return None;
@@ -6174,11 +6321,43 @@ impl crate::TermWindow {
         // A pane that publishes `agent.status` keeps the last word; the two
         // activity signals only ever escalate a status *inferred* from the
         // screen, which is the weakest evidence we have.
+        let now = Instant::now();
+        // Spinner motion is a cross-frame measurement, so the caller owns the
+        // comparison and the inference only receives the verdict.
+        let spinner_observed = visible_text_loaded
+            .then(|| spinner_line_hash(&visible_text))
+            .flatten();
+        let (spinner, spinner_changed_at) = if visible_text_loaded {
+            spinner_motion(
+                spinner_observed,
+                previous_entry.as_ref().and_then(|entry| entry.spinner_line),
+                previous_entry
+                    .as_ref()
+                    .and_then(|entry| entry.spinner_changed_at),
+                now,
+                AGENT_SPINNER_STALE_AFTER,
+            )
+        } else {
+            // The screen was not read this frame, so there is nothing to
+            // compare. Carry the previous observation rather than inventing
+            // either motion or stillness.
+            (
+                SpinnerMotion::Frozen,
+                previous_entry
+                    .as_ref()
+                    .and_then(|entry| entry.spinner_changed_at),
+            )
+        };
+        let spinner_line = if visible_text_loaded {
+            spinner_observed
+        } else {
+            previous_entry.as_ref().and_then(|entry| entry.spinner_line)
+        };
         let (fresh_status, activity_escalated) = if explicit_status.is_some() {
             (AgentStatus::from_hint(explicit_status), false)
         } else {
             let inferred = if visible_text_loaded {
-                infer_agent_status_from_visible_text(&visible_text, adapter.as_ref())
+                infer_agent_status_from_visible_text(&visible_text, adapter.as_ref(), spinner)
             } else {
                 AgentStatus::Unknown
             };
@@ -6190,7 +6369,6 @@ impl crate::TermWindow {
             let changed = escalated != inferred;
             (escalated, changed)
         };
-        let now = Instant::now();
         let status = stabilize_agent_status(
             fresh_status.clone(),
             previous_state.map(|state| state.status.clone()),
@@ -6386,6 +6564,8 @@ impl crate::TermWindow {
                 last_seqno: activity.seqno,
                 seqno_changed_at: activity.changed_at,
                 seqno_active_since: activity.active_since,
+                spinner_line,
+                spinner_changed_at,
             },
         );
         // Runs at most once per pane per 500ms (the fast path above returns
@@ -11185,12 +11365,15 @@ impl crate::TermWindow {
     /// Refresh vendor session files without blocking paint on filesystem I/O.
     fn kick_agent_herd_scan(&mut self) {
         let ttl = Duration::from_millis(self.config.agent_ui.section.refresh_ms.clamp(100, 10000));
-        if self.agent_herd_scan_pending
-            || self
-                .agent_herd_session_cache
+        if !herd_scan_is_due(
+            self.agent_herd_scan_started_at,
+            self.agent_herd_session_cache
                 .as_ref()
-                .is_some_and(|(scanned_at, _)| scanned_at.elapsed() < ttl)
-        {
+                .map(|(scanned_at, _)| *scanned_at),
+            ttl,
+            HERD_SCAN_WATCHDOG,
+            Instant::now(),
+        ) {
             return;
         }
         let Some(home) = dirs_next::home_dir() else {
@@ -11200,11 +11383,11 @@ impl crate::TermWindow {
             return;
         };
 
-        self.agent_herd_scan_pending = true;
+        self.agent_herd_scan_started_at = Some(Instant::now());
         let future = promise::spawn::spawn_into_new_thread(move || {
             let sessions = crate::agent_herd::default_registry().collect_all(&home);
             window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
-                term_window.agent_herd_scan_pending = false;
+                term_window.agent_herd_scan_started_at = None;
                 term_window.agent_herd_session_cache = Some((Instant::now(), Arc::new(sessions)));
             })));
             Ok::<(), anyhow::Error>(())
@@ -12727,7 +12910,7 @@ mod tests {
              11% used · 89% left (110k/1000k tokens) · tgzterminal main\n\
              ▶▶ auto mode on (shift+tab to cycle)\n";
         assert_eq!(
-            infer_agent_status_from_visible_text(screen, None),
+            infer_agent_status_from_visible_text(screen, None, SpinnerMotion::Live),
             AgentStatus::WaitingForInput
         );
 
@@ -12761,7 +12944,7 @@ mod tests {
              11% used · 89% left (110k/1000k tokens) · tgzterminal main\n\
              ▶▶ auto mode on (shift+tab to cycle)\n";
         assert_eq!(
-            infer_agent_status_from_visible_text(screen, None),
+            infer_agent_status_from_visible_text(screen, None, SpinnerMotion::Live),
             AgentStatus::Running
         );
         let depth = screen
@@ -13167,7 +13350,7 @@ mod tests {
              11% used · 89% left (110k/1000k tokens) · tgzterminal main\n\
              ▶▶ auto mode on (shift+tab to cycle)\n";
         assert_eq!(
-            infer_agent_status_from_visible_text(screen, None),
+            infer_agent_status_from_visible_text(screen, None, SpinnerMotion::Live),
             AgentStatus::Running
         );
     }
@@ -13182,9 +13365,150 @@ mod tests {
              │ > \n\
              ▶▶ auto mode on (shift+tab to cycle)\n";
         assert_ne!(
-            infer_agent_status_from_visible_text(screen, None),
+            infer_agent_status_from_visible_text(screen, None, SpinnerMotion::Live),
             AgentStatus::Running
         );
+    }
+
+    /// The bug this whole change exists for. Claude Code decorates its
+    /// finished-turn summary (`· done 10:10 AM`), and the old
+    /// `is_completed_summary_line` -- which required the entire remainder after
+    /// `" for "` to be a duration -- refused to recognise it. The line then
+    /// scored as a live spinner, and because a finished agent stops redrawing,
+    /// it scored that way on every frame for the rest of the session.
+    /// The freeze: an in-flight marker that never got cleared suppressed every
+    /// later scan, so every filesystem-derived status -- `Working` included --
+    /// stayed frozen for the life of the window.
+    #[test]
+    fn a_lost_herd_scan_does_not_suppress_every_later_one() {
+        let now = Instant::now();
+        let ttl = Duration::from_millis(500);
+        let watchdog = HERD_SCAN_WATCHDOG;
+
+        // Nothing known yet: scan.
+        assert!(herd_scan_is_due(None, None, ttl, watchdog, now));
+        // Cache still fresh: don't.
+        assert!(!herd_scan_is_due(
+            None,
+            Some(now - ttl / 2),
+            ttl,
+            watchdog,
+            now
+        ));
+        // Cache aged out: scan.
+        assert!(herd_scan_is_due(
+            None,
+            Some(now - ttl - Duration::from_millis(1)),
+            ttl,
+            watchdog,
+            now
+        ));
+        // A scan genuinely in flight: don't pile on.
+        assert!(!herd_scan_is_due(
+            Some(now - Duration::from_millis(10)),
+            None,
+            ttl,
+            watchdog,
+            now
+        ));
+        // A scan that never reported back: scan anyway.
+        assert!(herd_scan_is_due(
+            Some(now - watchdog - Duration::from_secs(1)),
+            Some(now - ttl - Duration::from_millis(1)),
+            ttl,
+            watchdog,
+            now
+        ));
+    }
+
+    #[test]
+    fn a_decorated_finished_summary_is_not_running() {
+        let screen = "\u{273b} Churned for 1m 22s · done 10:10 AM\n\
+             \n\
+             │ > we still have the issue\n\
+             plan mode on (shift+tab to cycle)\n";
+        assert_eq!(
+            infer_agent_status_from_visible_text(screen, None, SpinnerMotion::Live),
+            AgentStatus::WaitingForInput,
+            "a decorated summary above a prompt is a finished agent"
+        );
+    }
+
+    #[test]
+    fn summary_matcher_needs_a_duration_not_just_digits() {
+        for line in [
+            "\u{273b} Cogitated for 2m 40s",
+            "\u{273b} Churned for 1m 22s · done 10:10 AM",
+            "\u{273b} Thought for 3s",
+        ] {
+            assert!(is_completed_summary_line(line), "{line} is a summary");
+        }
+        for line in [
+            // No duration follows " for ", so these are live status lines and
+            // have to stay eligible to read as `Running`.
+            "\u{273b} Running a tool for the user",
+            "\u{273b} Waiting for approval",
+            "\u{273b} Brewing",
+        ] {
+            assert!(!is_completed_summary_line(line), "{line} is not a summary");
+        }
+    }
+
+    /// A spinner is a moving thing. Whatever the wording, a line that has not
+    /// changed in [`AGENT_SPINNER_STALE_AFTER`] is not one -- which is the part
+    /// that does not need a new guard every time a vendor rewords its summary.
+    #[test]
+    fn a_frozen_spinner_line_is_not_running() {
+        let screen = "\u{273b} Devising something new\n\
+             \n\
+             │ > \n";
+        assert_eq!(
+            infer_agent_status_from_visible_text(screen, None, SpinnerMotion::Live),
+            AgentStatus::Running,
+            "a moving spinner is work"
+        );
+        assert_eq!(
+            infer_agent_status_from_visible_text(screen, None, SpinnerMotion::Frozen),
+            AgentStatus::WaitingForInput,
+            "the same line, no longer moving, is not"
+        );
+    }
+
+    #[test]
+    fn spinner_motion_tracks_the_line_not_the_clock() {
+        let start = Instant::now();
+        let stale = AGENT_SPINNER_STALE_AFTER;
+
+        // A first sighting counts as motion, so an agent that has only just
+        // started drawing its spinner is not held back for a whole window.
+        let (motion, changed_at) = spinner_motion(Some(7), None, None, start, stale);
+        assert_eq!(motion, SpinnerMotion::Live);
+        assert_eq!(changed_at, Some(start));
+
+        // Same line, still inside the window: still live.
+        let mid = start + stale / 2;
+        let (motion, changed_at) = spinner_motion(Some(7), Some(7), Some(start), mid, stale);
+        assert_eq!(motion, SpinnerMotion::Live);
+        assert_eq!(
+            changed_at,
+            Some(start),
+            "an unchanged line does not restart"
+        );
+
+        // Same line, past the window: frozen. This is the finished agent.
+        let late = start + stale + Duration::from_millis(1);
+        let (motion, _) = spinner_motion(Some(7), Some(7), Some(start), late, stale);
+        assert_eq!(motion, SpinnerMotion::Frozen);
+
+        // A changed line restarts the window even after a long silence.
+        let (motion, changed_at) = spinner_motion(Some(8), Some(7), Some(start), late, stale);
+        assert_eq!(motion, SpinnerMotion::Live);
+        assert_eq!(changed_at, Some(late));
+
+        // Nothing spinner-shaped on screen at all.
+        let (motion, changed_at) = spinner_motion(None, Some(7), Some(start), mid, stale);
+        assert_eq!(motion, SpinnerMotion::Frozen);
+        assert_eq!(changed_at, None);
     }
 
     #[test]
@@ -13194,7 +13518,7 @@ mod tests {
              │ > \n\
              ╰──────────────╯\n";
         assert_eq!(
-            infer_agent_status_from_visible_text(screen, None),
+            infer_agent_status_from_visible_text(screen, None, SpinnerMotion::Live),
             AgentStatus::WaitingForInput
         );
     }
@@ -13251,6 +13575,7 @@ mod tests {
             project_root: Some(PathBuf::from("/tmp/project")),
             name: Some("build agent".to_string()),
             model: None,
+            turn: crate::agent_herd::TurnState::Unknown,
             status: HerdStatus::Blocked,
             blocked_reason: Some("permission".to_string()),
             started_at: None,
@@ -16027,14 +16352,22 @@ mod tests {
             "✻ Brewing",
         ] {
             assert_eq!(
-                infer_agent_status_from_visible_text(&format!("Thinking\n{line}"), None),
+                infer_agent_status_from_visible_text(
+                    &format!("Thinking\n{line}"),
+                    None,
+                    SpinnerMotion::Live
+                ),
                 AgentStatus::Running,
                 "{line:?} should read as running"
             );
         }
         // A glyph deep inside prose is not a spinner.
         assert_eq!(
-            infer_agent_status_from_visible_text("the file uses a ✻ marker here", None),
+            infer_agent_status_from_visible_text(
+                "the file uses a ✻ marker here",
+                None,
+                SpinnerMotion::Live
+            ),
             AgentStatus::Unknown
         );
     }
@@ -16069,7 +16402,8 @@ mod tests {
         assert_eq!(
             infer_agent_status_from_visible_text(
                 "· Herding (12s · ↑ 1.2k tokens · esc to interrupt)",
-                None
+                None,
+                SpinnerMotion::Live
             ),
             AgentStatus::Running
         );
@@ -16078,15 +16412,15 @@ mod tests {
     #[test]
     fn status_inference_detects_running_and_waiting() {
         assert_eq!(
-            infer_agent_status_from_visible_text("Thinking\n✻ Brewing", None),
+            infer_agent_status_from_visible_text("Thinking\n✻ Brewing", None, SpinnerMotion::Live),
             AgentStatus::Running
         );
         assert_eq!(
-            infer_agent_status_from_visible_text("Done\n\n❯", None),
+            infer_agent_status_from_visible_text("Done\n\n❯", None, SpinnerMotion::Live),
             AgentStatus::WaitingForInput
         );
         assert_eq!(
-            infer_agent_status_from_visible_text("Here is the answer.", None),
+            infer_agent_status_from_visible_text("Here is the answer.", None, SpinnerMotion::Live),
             AgentStatus::Unknown
         );
     }
@@ -16166,6 +16500,8 @@ mod tests {
             last_seqno: SEQ_ZERO,
             seqno_changed_at: None,
             seqno_active_since: None,
+            spinner_line: None,
+            spinner_changed_at: None,
         }
     }
 
@@ -16191,6 +16527,8 @@ mod tests {
             last_seqno: SEQ_ZERO,
             seqno_changed_at: None,
             seqno_active_since: None,
+            spinner_line: None,
+            spinner_changed_at: None,
         }
     }
 
@@ -16628,7 +16966,7 @@ gemini is a constellation\n";
         );
         assert!(visible_agent_candidates(text, &adapters, &ambiguous, 2).is_empty());
         assert_eq!(
-            infer_agent_status_from_visible_text(text, None),
+            infer_agent_status_from_visible_text(text, None, SpinnerMotion::Live),
             AgentStatus::Running
         );
     }
@@ -16803,7 +17141,7 @@ gemini is a constellation\n";
         lines.push("╰──────────────╯".to_string());
         let text = lines.join("\n");
         assert_eq!(
-            infer_agent_status_from_visible_text(&text, None),
+            infer_agent_status_from_visible_text(&text, None, SpinnerMotion::Live),
             AgentStatus::Running
         );
     }
@@ -16816,11 +17154,11 @@ gemini is a constellation\n";
         };
         let text = "crunching numbers\nplease hold\n";
         assert_eq!(
-            infer_agent_status_from_visible_text(text, Some(&adapter)),
+            infer_agent_status_from_visible_text(text, Some(&adapter), SpinnerMotion::Live),
             AgentStatus::Running
         );
         assert_eq!(
-            infer_agent_status_from_visible_text(text, None),
+            infer_agent_status_from_visible_text(text, None, SpinnerMotion::Live),
             AgentStatus::Unknown
         );
     }
@@ -16833,7 +17171,7 @@ gemini is a constellation\n";
         let adapter = AgentAdapterConfig::default();
         let text = "Here is my answer.\n╭──────────────╮\n│ >            │\n╰──────────────╯";
         assert_eq!(
-            infer_agent_status_from_visible_text(text, Some(&adapter)),
+            infer_agent_status_from_visible_text(text, Some(&adapter), SpinnerMotion::Live),
             AgentStatus::WaitingForInput
         );
     }
@@ -16846,7 +17184,7 @@ gemini is a constellation\n";
         };
         let text = "Here is my answer.\n╭──────────────╮\n│ >            │\n╰──────────────╯";
         assert_eq!(
-            infer_agent_status_from_visible_text(text, Some(&adapter)),
+            infer_agent_status_from_visible_text(text, Some(&adapter), SpinnerMotion::Live),
             AgentStatus::WaitingForInput
         );
     }
@@ -16861,7 +17199,7 @@ gemini is a constellation\n";
         };
         let text = "Here is my answer.\nType your message here...";
         assert_eq!(
-            infer_agent_status_from_visible_text(text, Some(&adapter)),
+            infer_agent_status_from_visible_text(text, Some(&adapter), SpinnerMotion::Live),
             AgentStatus::WaitingForInput
         );
     }
@@ -16874,7 +17212,7 @@ gemini is a constellation\n";
         };
         let text = "Working... (esc to interrupt)\nType your message here...";
         assert_eq!(
-            infer_agent_status_from_visible_text(text, Some(&adapter)),
+            infer_agent_status_from_visible_text(text, Some(&adapter), SpinnerMotion::Live),
             AgentStatus::Running
         );
     }
@@ -16887,7 +17225,7 @@ gemini is a constellation\n";
         };
         let text = "Here is my answer.\nType your message here...";
         assert_eq!(
-            infer_agent_status_from_visible_text(text, Some(&adapter)),
+            infer_agent_status_from_visible_text(text, Some(&adapter), SpinnerMotion::Live),
             AgentStatus::WaitingForInput
         );
     }
@@ -16898,7 +17236,7 @@ gemini is a constellation\n";
         // is not reliably the final line.
         let text = "✻ Thinking\n\n> \n";
         assert_eq!(
-            infer_agent_status_from_visible_text(text, None),
+            infer_agent_status_from_visible_text(text, None, SpinnerMotion::Live),
             AgentStatus::Running
         );
     }

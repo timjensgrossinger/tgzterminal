@@ -72,6 +72,8 @@ impl SessionSource for GeminiDetector {
                         // sessions from interactive ones.
                         interactive: true,
                         vendor: AgentVendor::Gemini,
+                        // This store exposes no turn boundary; freshness is all it has.
+                        turn: crate::agent_herd::TurnState::Unknown,
                         session_id,
                         cwd,
                         project_root: None,

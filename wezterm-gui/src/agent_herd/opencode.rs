@@ -97,6 +97,8 @@ impl SessionSource for OpenCodeDetector {
                         // sessions from interactive ones.
                         interactive: true,
                         vendor: AgentVendor::OpenCode,
+                        // This store exposes no turn boundary; freshness is all it has.
+                        turn: crate::agent_herd::TurnState::Unknown,
                         session_id,
                         cwd,
                         project_root: None,
@@ -225,6 +227,8 @@ fn collect_database_sessions(home: &Path) -> Vec<VendorSession> {
             pid: 0,
             interactive: true,
             vendor: AgentVendor::OpenCode,
+            // This store exposes no turn boundary; freshness is all it has.
+            turn: crate::agent_herd::TurnState::Unknown,
             session_id,
             cwd: PathBuf::from(directory),
             project_root: None,

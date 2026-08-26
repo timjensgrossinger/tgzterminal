@@ -853,7 +853,11 @@ pub struct TermWindow {
     agent_herd_state: RefCell<AgentHerdState>,
     /// Vendor session scan result. Filesystem work runs off the GUI thread.
     agent_herd_session_cache: Option<(Instant, Arc<Vec<crate::agent_herd::vendor::VendorSession>>)>,
-    agent_herd_scan_pending: bool,
+    /// When the in-flight scan started, or `None` if none is. A timestamp
+    /// rather than a bool so a worker that never reports back cannot suppress
+    /// every later scan for the life of the window -- see
+    /// `HERD_SCAN_WATCHDOG`.
+    agent_herd_scan_started_at: Option<Instant>,
     /// Pending resume bindings: (session_id, adapter_id, pane_id_floor, expiry).
     /// When a resume command spawns a new pane, OpenCode does not emit OSC 7 so
     /// its cwd is unknown and the cwd-based bind cannot fire; instead we bind the
@@ -1296,7 +1300,7 @@ impl TermWindow {
                 ..AgentHerdState::default()
             }),
             agent_herd_session_cache: None,
-            agent_herd_scan_pending: false,
+            agent_herd_scan_started_at: None,
             agent_resume_binds: RefCell::new(Vec::new()),
             adapter_cache: RefCell::new(None),
             launcher_cache: RefCell::new(None),

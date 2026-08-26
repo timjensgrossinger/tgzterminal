@@ -38,6 +38,14 @@ use std::time::{Duration, SystemTime};
 /// How long after its last write a subagent transcript still counts as active.
 const SUBAGENT_ACTIVITY_WINDOW: Duration = Duration::from_secs(10);
 
+/// How long a nominally-`Working` agent may go without activity before the view
+/// stops believing it.
+///
+/// The last line of defence, not the mechanism: a vendor that reports a real
+/// turn boundary is caught by [`TurnState`] in seconds. This only covers the
+/// vendors that report nothing at all.
+const WORKING_STALE_AFTER: Duration = Duration::from_secs(300);
+
 /// How recent the newest transcript event must be for the activity headline to
 /// claim the agent is doing it *now* rather than that it did it last.
 ///
@@ -178,6 +186,28 @@ pub fn subagent_status(
     // died, or it is between turns. Claiming either "working" or "done" here
     // would be a guess, so say so.
     HerdStatus::Unknown
+}
+
+/// What a transcript's own turn structure says, independent of file mtime.
+///
+/// Every vendor writes to its transcript while it works, so freshness alone
+/// cannot tell "working" from "just finished" -- worse, Claude Code appends
+/// bookkeeping records (`ai-title`, `mode`, `atis-latch`) while a session sits
+/// idle at its prompt, so a fresh mtime is routinely a lie. What is not a lie
+/// is the turn boundary the agent writes when it stops: `stop_reason:
+/// "end_turn"` for Claude, a `task_complete` event for Codex. Those are
+/// monotone and timestamped, so they can overrule a status the agent reports
+/// about itself and a status guessed from the screen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum TurnState {
+    /// The last thing in the transcript is mid-turn: a tool call, or a result
+    /// being fed back.
+    Working,
+    /// The agent signed off. It is waiting for a human, not working.
+    Finished,
+    /// No turn boundary this vendor exposes, or nothing readable.
+    #[default]
+    Unknown,
 }
 
 /// A subagent: a `Task` agent running inside its parent's process.
@@ -456,7 +486,7 @@ impl HerdAgent {
                     .as_ref()
                     .and_then(HerdActivity::last_activity)
                     .and_then(|at| now.duration_since(at).ok())
-                    .is_some_and(|age| age >= Duration::from_secs(300));
+                    .is_some_and(|age| age >= WORKING_STALE_AFTER);
                 if stale {
                     HerdDisplayStatus::WaitingForInput
                 } else {
@@ -570,17 +600,56 @@ pub struct PaneAgentRow {
 /// Only `Idle` and `Unknown` are escalated: `Blocked` outranks working (the
 /// human is the bottleneck), `Working` is already right, and `Done` is a view
 /// state the sources never report.
-fn escalate_for_subagents(status: HerdStatus, subagents: &[HerdSubagent]) -> HerdStatus {
+fn escalate_for_subagents(
+    status: HerdStatus,
+    subagents: &[HerdSubagent],
+    now: SystemTime,
+) -> HerdStatus {
     if !matches!(status, HerdStatus::Idle | HerdStatus::Unknown) {
         return status;
     }
-    if subagents
-        .iter()
-        .any(|sub| sub.status == HerdStatus::Working)
-    {
+    if subagents.iter().any(|sub| subagent_is_working(sub, now)) {
         return HerdStatus::Working;
     }
     status
+}
+
+/// Demote a nominally-working agent whose transcript says the turn is over.
+///
+/// Only `Working` is touched: `Blocked` means a human is the bottleneck, and
+/// `Idle`/`Done`/`Unknown` are already at least as quiet as `Finished` is.
+fn veto_finished_turn(
+    status: HerdStatus,
+    turn: TurnState,
+    subagents: &[HerdSubagent],
+    now: SystemTime,
+) -> HerdStatus {
+    if turn != TurnState::Finished || status != HerdStatus::Working {
+        return status;
+    }
+    // The parent signs off its own turn while a subagent it spawned is still
+    // running, so a live subagent has to survive the veto or the row goes quiet
+    // in the middle of the work it is reporting.
+    if subagents.iter().any(|sub| subagent_is_working(sub, now)) {
+        return HerdStatus::Working;
+    }
+    HerdStatus::Idle
+}
+
+/// Whether a subagent is working *now*, rather than when the scan ran.
+///
+/// `subagent_status` evaluates [`SUBAGENT_ACTIVITY_WINDOW`] against the clock at
+/// scan time and the result is then cached, so a scan that is slow, or one that
+/// stopped happening at all, kept promoting its parent to `Working` long after
+/// the subagent had gone quiet. Re-checking the timestamp at the point of use
+/// makes the window mean what it says.
+pub fn subagent_is_working(sub: &HerdSubagent, now: SystemTime) -> bool {
+    if sub.status != HerdStatus::Working {
+        return false;
+    }
+    sub.last_activity
+        .and_then(|at| now.duration_since(at).ok())
+        .is_none_or(|age| age < SUBAGENT_ACTIVITY_WINDOW)
 }
 
 /// Join filesystem-discovered Claude sessions to detected panes.
@@ -593,6 +662,10 @@ pub fn join_sessions_with_panes(
     sessions: Vec<VendorSession>,
     panes: Vec<PaneAgentRow>,
 ) -> Vec<HerdAgent> {
+    // Only the freshness guards read this, and both treat an absent timestamp
+    // as "no opinion", so the join stays deterministic for fixtures that do not
+    // set one.
+    let now = SystemTime::now();
     let mut sessions = sessions;
     // Oldest first, so binding is deterministic regardless of readdir order.
     sessions.sort_by(|a, b| {
@@ -635,7 +708,15 @@ pub fn join_sessions_with_panes(
                 // whole time one is working. Without this the pane status wins
                 // and the only signal that anything is happening is a line of
                 // text in the herd section.
-                escalate_for_subagents(resolved, &session.subagents)
+                let escalated = escalate_for_subagents(resolved, &session.subagents, now);
+                // A signed-off turn outranks both of the guesses above. The
+                // pane status is inferred from pixels and the session status is
+                // the agent's own unverifiable self-report; neither can observe
+                // a turn ending, which is why a finished agent used to sit at
+                // `working` indefinitely. The transcript can, so it wins --
+                // except over a subagent we can see is still going, and never
+                // over `Blocked`, where a human is the bottleneck.
+                veto_finished_turn(escalated, session.turn, &session.subagents, now)
             },
             blocked_reason: session.blocked_reason.clone(),
             model: session
@@ -1004,6 +1085,7 @@ mod tests {
             project_root: Some(PathBuf::from(cwd)),
             name: Some(name.to_string()),
             model: None,
+            turn: TurnState::Unknown,
             status: HerdStatus::Working,
             blocked_reason: None,
             started_at: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(pid as u64)),
@@ -1160,6 +1242,82 @@ mod tests {
         assert_eq!(alpha.pane_id, Some(5));
         let beta = agents.iter().find(|a| a.name == "beta").unwrap();
         assert_eq!(beta.pane_id, None);
+    }
+
+    /// A vendor's own `busy` cannot be aged out -- it carries no timestamp we
+    /// can trust -- so the transcript's sign-off is what has to overrule it.
+    #[test]
+    fn a_finished_turn_overrules_a_working_status() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
+        assert_eq!(
+            veto_finished_turn(HerdStatus::Working, TurnState::Finished, &[], now),
+            HerdStatus::Idle,
+            "the agent signed off; `busy` is stale"
+        );
+        assert_eq!(
+            veto_finished_turn(HerdStatus::Working, TurnState::Working, &[], now),
+            HerdStatus::Working
+        );
+        assert_eq!(
+            veto_finished_turn(HerdStatus::Working, TurnState::Unknown, &[], now),
+            HerdStatus::Working,
+            "no boundary read means no opinion, not a demotion"
+        );
+        // A human is the bottleneck; a finished turn does not change that.
+        assert_eq!(
+            veto_finished_turn(HerdStatus::Blocked, TurnState::Finished, &[], now),
+            HerdStatus::Blocked
+        );
+
+        // The parent signs off while a subagent it spawned is still running.
+        let live_sub = HerdSubagent {
+            agent_id: "sub-1".to_string(),
+            agent_type: "Explore".to_string(),
+            description: "read the sidebar".to_string(),
+            status: HerdStatus::Working,
+            depth: 1,
+            last_activity: Some(now),
+        };
+        assert_eq!(
+            veto_finished_turn(
+                HerdStatus::Working,
+                TurnState::Finished,
+                std::slice::from_ref(&live_sub),
+                now
+            ),
+            HerdStatus::Working,
+            "a live subagent survives the veto"
+        );
+    }
+
+    /// The window is 10s of *wall clock*, not 10s measured whenever the scan
+    /// happened to run and then cached indefinitely.
+    #[test]
+    fn a_quiet_subagent_stops_counting_as_working() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
+        let mut sub = HerdSubagent {
+            agent_id: "sub-1".to_string(),
+            agent_type: "Explore".to_string(),
+            description: "read the sidebar".to_string(),
+            status: HerdStatus::Working,
+            depth: 1,
+            last_activity: Some(now),
+        };
+        assert!(subagent_is_working(&sub, now));
+
+        sub.last_activity = Some(now - SUBAGENT_ACTIVITY_WINDOW - Duration::from_secs(1));
+        assert!(
+            !subagent_is_working(&sub, now),
+            "a `Working` status from an old scan is not work now"
+        );
+
+        // No timestamp means no opinion: don't second-guess the status.
+        sub.last_activity = None;
+        assert!(subagent_is_working(&sub, now));
+
+        sub.last_activity = Some(now);
+        sub.status = HerdStatus::Done;
+        assert!(!subagent_is_working(&sub, now));
     }
 
     #[test]

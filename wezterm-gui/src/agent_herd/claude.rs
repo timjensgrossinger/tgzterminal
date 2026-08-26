@@ -257,7 +257,10 @@ fn read_subagent(transcript: &Path, agent_id: &str, now: SystemTime) -> HerdSuba
     let mtime = std::fs::metadata(transcript)
         .and_then(|meta| meta.modified())
         .ok();
-    let (last_type, stop_reason) = match last_complete_line(transcript) {
+    // The last *message*, not the last line: a subagent transcript can pick up
+    // trailing bookkeeping too, and reading that instead of the sign-off left
+    // the subagent pinned at `Working` on transcript freshness alone.
+    let (last_type, stop_reason) = match last_message_line(transcript) {
         Some(line) => parse_tail_line(&line),
         None => (None, None),
     };
@@ -295,6 +298,64 @@ fn parse_tail_line(line: &str) -> (Option<String>, Option<String>) {
 /// tail-reading machinery this and the activity reader both need.
 pub fn last_complete_line(path: &Path) -> Option<String> {
     super::transcript::tail_lines(path, 1).pop()
+}
+
+/// How many trailing JSONL records to search for the last real message.
+///
+/// Claude Code appends bookkeeping records after a turn ends -- `ai-title`,
+/// `mode`, `atis-latch`, `last-prompt`, `file-history-snapshot`, and one
+/// `attachment` per attached file -- and it appends some of them while the
+/// session sits idle at its prompt. Reading only the final line therefore lands
+/// on bookkeeping far more often than on the `end_turn` that is a few lines
+/// above it, which is what made a finished session look like a working one.
+const TURN_SEARCH_LINES: usize = 24;
+
+/// The last line that carries a `message`, skipping bookkeeping records.
+pub fn last_message_line(path: &Path) -> Option<String> {
+    super::transcript::tail_lines(path, TURN_SEARCH_LINES)
+        .into_iter()
+        .rev()
+        .find(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .ok()
+                .is_some_and(|value| value.get("message").is_some())
+        })
+}
+
+/// What Claude's transcript says about whether the turn is over.
+///
+/// `end_turn` (and its rarer siblings) is the agent signing off: it has stopped
+/// and is waiting for a human. A `tool_use` stop, or a `user` record carrying a
+/// `tool_result`, is the middle of a turn. Anything else is not something to
+/// guess from.
+pub fn turn_state_from_transcript(path: &Path) -> super::TurnState {
+    match last_message_line(path) {
+        Some(line) => turn_state_from_line(&line),
+        None => super::TurnState::Unknown,
+    }
+}
+
+fn turn_state_from_line(line: &str) -> super::TurnState {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+        return super::TurnState::Unknown;
+    };
+    let Some(message) = value.get("message") else {
+        return super::TurnState::Unknown;
+    };
+    match message.get("role").and_then(|v| v.as_str()) {
+        Some("assistant") => match message.get("stop_reason").and_then(|v| v.as_str()) {
+            Some("end_turn") | Some("stop_sequence") | Some("max_tokens") => {
+                super::TurnState::Finished
+            }
+            // `tool_use` means a call is outstanding. A null stop reason means
+            // the record was written mid-stream.
+            _ => super::TurnState::Working,
+        },
+        // A tool result being fed back, or a prompt just submitted: either way
+        // the agent is about to be, or already is, busy.
+        Some("user") => super::TurnState::Working,
+        _ => super::TurnState::Unknown,
+    }
 }
 
 /// Path to a session's own transcript.
@@ -638,6 +699,68 @@ mod tests {
         assert_eq!(last_complete_line(&path), None);
     }
 
+    /// The regression that made every finished Claude session look busy: the
+    /// sign-off is not the last line, because bookkeeping records follow it --
+    /// and some of them are written while the session sits idle.
+    #[test]
+    fn the_turn_boundary_is_found_behind_trailing_bookkeeping() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        write(
+            &path,
+            "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\"}]}}\n\
+             {\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"stop_reason\":\"end_turn\"}}\n\
+             {\"type\":\"last-prompt\",\"sessionId\":\"x\"}\n\
+             {\"type\":\"ai-title\",\"aiTitle\":\"something\"}\n\
+             {\"type\":\"mode\",\"mode\":\"plan\"}\n\
+             {\"type\":\"atis-latch\",\"atis\":true}\n",
+        );
+        assert_eq!(
+            turn_state_from_transcript(&path),
+            crate::agent_herd::TurnState::Finished,
+            "four bookkeeping lines must not hide the end_turn above them"
+        );
+    }
+
+    #[test]
+    fn a_turn_mid_tool_call_is_working() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let pending = dir.path().join("pending.jsonl");
+        write(
+            &pending,
+            "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"stop_reason\":\"tool_use\"}}\n",
+        );
+        assert_eq!(
+            turn_state_from_transcript(&pending),
+            crate::agent_herd::TurnState::Working
+        );
+
+        // A tool result feeding back is still mid-turn.
+        let feeding_back = dir.path().join("result.jsonl");
+        write(
+            &feeding_back,
+            "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"stop_reason\":\"tool_use\"}}\n\
+             {\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\"}]}}\n",
+        );
+        assert_eq!(
+            turn_state_from_transcript(&feeding_back),
+            crate::agent_herd::TurnState::Working
+        );
+
+        // Nothing readable: say so rather than guess either way.
+        let bookkeeping_only = dir.path().join("meta.jsonl");
+        write(&bookkeeping_only, "{\"type\":\"mode\",\"mode\":\"plan\"}\n");
+        assert_eq!(
+            turn_state_from_transcript(&bookkeeping_only),
+            crate::agent_herd::TurnState::Unknown
+        );
+        assert_eq!(
+            turn_state_from_transcript(&dir.path().join("absent.jsonl")),
+            crate::agent_herd::TurnState::Unknown
+        );
+    }
+
     #[test]
     fn tail_line_parses_type_and_stop_reason() {
         let (ty, stop) = parse_tail_line(
@@ -717,6 +840,10 @@ impl crate::agent_herd::vendor::SessionSource for ClaudeDetector {
             .into_iter()
             .map(|s| {
                 let activity = activity_for_session(home, &s);
+                // Read before the fields below move out of `s`.
+                let turn = session_transcript_path(home, &s.cwd, &s.session_id)
+                    .map(|path| turn_state_from_transcript(&path))
+                    .unwrap_or_default();
                 crate::agent_herd::vendor::VendorSession {
                     pid: s.pid,
                     interactive: s.interactive,
@@ -727,6 +854,10 @@ impl crate::agent_herd::vendor::SessionSource for ClaudeDetector {
                     name: s.name,
                     model: None,
                     status: s.status,
+                    // `sessions/<pid>.json` is the agent's own self-report and
+                    // carries no way to tell a stale `busy` from a live one, so
+                    // the transcript's turn boundary is what can contradict it.
+                    turn,
                     blocked_reason: s.blocked_reason,
                     started_at: s.started_at,
                     status_changed_at: s.status_changed_at,

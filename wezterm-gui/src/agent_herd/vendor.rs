@@ -100,6 +100,10 @@ pub struct VendorSession {
     pub name: Option<String>,
     pub model: Option<String>,
     pub status: HerdStatus,
+    /// What the transcript's turn structure says, where the vendor writes one.
+    /// Outranks `status` when it says the turn is over -- see
+    /// [`super::TurnState`].
+    pub turn: super::TurnState,
     pub blocked_reason: Option<String>,
     pub started_at: Option<SystemTime>,
     pub status_changed_at: Option<SystemTime>,

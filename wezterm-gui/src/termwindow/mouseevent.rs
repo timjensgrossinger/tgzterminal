@@ -2407,8 +2407,13 @@ impl super::TermWindow {
                         ));
                         self.resume_agent_session_by_id(&agent.provider, &session_id, cwd, None);
                         // Force a re-scan so the new pane binds to the agent
-                        // and the Resume button flips to Focus.
-                        self.agent_herd_scan_pending = true;
+                        // and the Resume button flips to Focus. Invalidating
+                        // the cache is what does that; setting the in-flight
+                        // marker instead -- which is what this used to do --
+                        // suppressed `kick_agent_herd_scan` on every later
+                        // frame, freezing every filesystem-derived status,
+                        // including `Working`, for the life of the window.
+                        self.agent_herd_session_cache = None;
                     }
                     // Without both an id and a directory the resume command
                     // cannot be built; saying so beats spawning something wrong.
