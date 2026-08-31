@@ -1196,7 +1196,7 @@ impl TermWindow {
                 terminal_size,
             );
             if let Some(window) = mux.get_window(mux_window_id) {
-                for tab in window.iter() {
+                for tab in window.iter_tabs() {
                     tab.resize(terminal_size);
                 }
             };
@@ -1955,7 +1955,7 @@ impl TermWindow {
 
                 let mux = Mux::get();
                 if let Some(window) = mux.get_window(self.mux_window_id) {
-                    for tab in window.iter() {
+                    for tab in window.iter_tabs() {
                         tab.resize(self.terminal_size);
                     }
                 };
@@ -2357,7 +2357,7 @@ impl TermWindow {
             Some(window) => window,
             _ => return,
         };
-        if window.len() == 1 {
+        if window.count_tabs() == 1 {
             self.show_tab_bar = config.enable_tab_bar && !config.hide_tab_bar_if_only_one_tab;
         } else {
             self.show_tab_bar = config.enable_tab_bar;
@@ -2411,7 +2411,7 @@ impl TermWindow {
         if let Some(window) = mux.get_window(self.mux_window_id) {
             let term_config: Arc<dyn TerminalConfiguration> =
                 Arc::new(TermConfig::with_config(config.clone()));
-            for tab in window.iter() {
+            for tab in window.iter_tabs() {
                 for pane in tab.iter_panes_ignoring_zoom() {
                     pane.pane.set_config(Arc::clone(&term_config));
                 }
@@ -2622,8 +2622,8 @@ impl TermWindow {
             }
         }
 
-        let num_tabs = window.len();
-        if num_tabs == 0 {
+        let tabs_count = window.count_tabs();
+        if tabs_count == 0 {
             return;
         }
         drop(window);
@@ -2665,14 +2665,14 @@ impl TermWindow {
             Some(title) => title,
             None => {
                 if let (Some(pos), Some(tab)) = (active_pane, active_tab) {
-                    if num_tabs == 1 {
+                    if tabs_count == 1 {
                         format!("{}{}", if pos.is_zoomed { "[Z] " } else { "" }, pos.title)
                     } else {
                         format!(
                             "{}[{}/{}] {}",
                             if pos.is_zoomed { "[Z] " } else { "" },
                             tab.tab_index + 1,
-                            num_tabs,
+                            tabs_count,
                             pos.title
                         )
                     }
@@ -2685,7 +2685,7 @@ impl TermWindow {
         if let Some(window) = self.window.as_ref() {
             window.set_title(&title);
 
-            let show_tab_bar = if num_tabs == 1 {
+            let show_tab_bar = if tabs_count == 1 {
                 self.config.enable_tab_bar && !self.config.hide_tab_bar_if_only_one_tab
             } else {
                 self.config.enable_tab_bar
@@ -2796,8 +2796,8 @@ impl TermWindow {
                 .get_window(self.mux_window_id)
                 .ok_or_else(|| anyhow!("no such window"))?;
             let mut found = None;
-            for tab_idx in 0..window.len() {
-                if let Some(tab) = window.get_by_idx(tab_idx) {
+            for tab_idx in 0..window.count_tabs() {
+                if let Some(tab) = window.get_tab_at_idx(tab_idx) {
                     if let Some(pane) = tab.get_active_pane() {
                         if pane.pane_id() == pane_id {
                             found = Some(tab_idx);
@@ -2815,8 +2815,8 @@ impl TermWindow {
         let mut window = mux
             .get_window_mut(self.mux_window_id)
             .ok_or_else(|| anyhow!("no such window"))?;
-        if tab_idx != window.get_active_idx() {
-            window.save_and_then_set_active(tab_idx);
+        if tab_idx != window.get_active_tab_idx() {
+            window.remember_and_set_active_tab_idx(tab_idx);
         }
         drop(window);
         if let Some(pane) = self.get_active_pane_or_overlay() {
@@ -2835,7 +2835,7 @@ impl TermWindow {
 
         // This logic is coupled with the CliSubCommand::ActivateTab
         // logic in wezterm/src/main.rs. If you update this, update that!
-        let max = window.len();
+        let max = window.count_tabs();
 
         let tab_idx = if tab_idx < 0 {
             max.saturating_sub(tab_idx.abs() as usize)
@@ -2844,7 +2844,7 @@ impl TermWindow {
         };
 
         if tab_idx < max {
-            window.save_and_then_set_active(tab_idx);
+            window.remember_and_set_active_tab_idx(tab_idx);
 
             drop(window);
 
@@ -2864,12 +2864,12 @@ impl TermWindow {
             .get_window(self.mux_window_id)
             .ok_or_else(|| anyhow!("no such window"))?;
 
-        let max = window.len();
+        let max = window.count_tabs();
         ensure!(max > 0, "no more tabs");
 
         // This logic is coupled with the CliSubCommand::ActivateTab
         // logic in wezterm/src/main.rs. If you update this, update that!
-        let active = window.get_active_idx() as isize;
+        let active = window.get_active_tab_idx() as isize;
         let tab = active + delta;
         let tab = if wrap {
             let tab = if tab < 0 { max as isize + tab } else { tab };
@@ -2893,7 +2893,7 @@ impl TermWindow {
             .get_window(self.mux_window_id)
             .ok_or_else(|| anyhow!("no such window"))?;
 
-        let last_idx = window.get_last_active_idx();
+        let last_idx = window.get_last_active_tab_idx();
         drop(window);
         match last_idx {
             Some(idx) => self.activate_tab(idx as isize),
@@ -2907,16 +2907,16 @@ impl TermWindow {
             .get_window_mut(self.mux_window_id)
             .ok_or_else(|| anyhow!("no such window"))?;
 
-        let max = window.len();
+        let max = window.count_tabs();
         ensure!(max > 0, "no more tabs");
 
-        let active = window.get_active_idx();
+        let active_tab_idx = window.get_active_tab_idx();
 
         ensure!(tab_idx < max, "cannot move a tab out of range");
 
-        let tab_inst = window.remove_by_idx(active);
-        window.insert(tab_idx, &tab_inst);
-        window.set_active_without_saving(tab_idx);
+        let tab = window.remove_tab_idx(active_tab_idx);
+        window.insert_tab_at_idx(tab_idx, &tab);
+        window.set_active_tab_idx_without_saving(tab_idx);
 
         drop(window);
         self.update_title();
@@ -3156,7 +3156,7 @@ impl TermWindow {
     fn show_tab_navigator(&mut self) {
         let mux = Mux::get();
         let active_tab_idx = match mux.get_window(self.mux_window_id) {
-            Some(mux_window) => mux_window.get_active_idx(),
+            Some(mux_window) => mux_window.get_active_tab_idx(),
             None => return,
         };
         let title = "Tab Navigator".to_string();
@@ -3339,10 +3339,10 @@ impl TermWindow {
             .get_window(self.mux_window_id)
             .ok_or_else(|| anyhow!("no such window"))?;
 
-        let max = window.len();
+        let max = window.count_tabs();
         ensure!(max > 0, "no more tabs");
 
-        let active = window.get_active_idx();
+        let active = window.get_active_tab_idx();
         let tab = active as isize + delta;
         let tab = if tab < 0 {
             0usize
@@ -3595,8 +3595,8 @@ impl TermWindow {
 
         // Active tab first, then the rest, so the answer tracks where the user
         // most plausibly just was.
-        let active_idx = window.get_active_idx();
-        let tabs: Vec<_> = window.iter().cloned().collect();
+        let active_idx = window.get_active_tab_idx();
+        let tabs: Vec<_> = window.iter_tabs().cloned().collect();
         let ordered = std::iter::once(active_idx)
             .chain((0..tabs.len()).filter(|idx| *idx != active_idx))
             .filter_map(|idx| tabs.get(idx));
@@ -5221,7 +5221,7 @@ done
         let Some(window) = mux.get_window(self.mux_window_id) else {
             return false;
         };
-        let Some((tab_idx, tab, pane)) = window.iter().enumerate().find_map(|(idx, tab)| {
+        let Some((tab_idx, tab, pane)) = window.iter_tabs().enumerate().find_map(|(idx, tab)| {
             tab.iter_panes_ignoring_zoom()
                 .iter()
                 .find(|pos| pos.pane.pane_id() == pane_id)
@@ -5268,7 +5268,7 @@ done
         if panes.len() <= 1 {
             let tab_idx = mux.get_window(self.mux_window_id).and_then(|window| {
                 window
-                    .iter()
+                    .iter_tabs()
                     .position(|candidate| candidate.tab_id() == tab_id)
             });
             if let Some(tab_idx) = tab_idx {
@@ -5327,9 +5327,9 @@ done
             None => return,
         };
 
-        let is_last_tab = mux_window.len() <= 1;
+        let is_last_tab = mux_window.count_tabs() <= 1;
 
-        let tab = match mux_window.get_by_idx(tab_idx) {
+        let tab = match mux_window.get_tab_at_idx(tab_idx) {
             Some(tab) => Arc::clone(tab),
             None => return,
         };
@@ -5389,7 +5389,7 @@ done
         };
         let mut tab_ids: Vec<TabId> = Vec::new();
         for i in range {
-            if let Some(tab) = mux_window.get_by_idx(i) {
+            if let Some(tab) = mux_window.get_tab_at_idx(i) {
                 tab_ids.push(tab.tab_id());
             }
         }
@@ -5411,7 +5411,7 @@ done
     pub fn close_tabs_below(&mut self, anchor_tab_idx: usize) {
         let mux = Mux::get();
         let len = match mux.get_window(self.mux_window_id) {
-            Some(w) => w.len(),
+            Some(w) => w.count_tabs(),
             None => return,
         };
         drop(mux);
@@ -5432,14 +5432,14 @@ done
             Some(w) => w,
             None => return,
         };
-        let len = mux_window.len();
+        let len = mux_window.count_tabs();
         if len <= 1 {
             return;
         }
         let mut tab_ids: Vec<TabId> = Vec::new();
         for i in 0..len {
             if i != anchor_tab_idx {
-                if let Some(tab) = mux_window.get_by_idx(i) {
+                if let Some(tab) = mux_window.get_tab_at_idx(i) {
                     tab_ids.push(tab.tab_id());
                 }
             }
@@ -5625,10 +5625,10 @@ done
             Some(window) => window,
             _ => return vec![],
         };
-        let tab_index = window.get_active_idx();
+        let tab_index = window.get_active_tab_idx();
 
         window
-            .iter()
+            .iter_tabs()
             .enumerate()
             .map(|(idx, tab)| {
                 let panes = self.get_pos_panes_for_tab(tab);
@@ -5638,7 +5638,7 @@ done
                     tab_id: tab.tab_id(),
                     is_active: tab_index == idx,
                     is_last_active: window
-                        .get_last_active_idx()
+                        .get_last_active_tab_idx()
                         .map(|last_active| last_active == idx)
                         .unwrap_or(false),
                     window_id: self.mux_window_id,

@@ -307,7 +307,7 @@ impl super::TermWindow {
         if terminal_cells_changed {
             let mux = Mux::get();
             if let Some(window) = mux.get_window(self.mux_window_id) {
-                for tab in window.iter() {
+                for tab in window.iter_tabs() {
                     tab.resize(size);
                 }
             };

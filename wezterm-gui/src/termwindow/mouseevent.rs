@@ -6,7 +6,7 @@ use crate::termwindow::{
     PositionedSplit, ScrollHit, SshLaunchMenuState, TermWindowNotif, UIItem, UIItemType, TMB,
 };
 use ::window::{
-    MouseButtons as WMB, MouseCursor, MouseEvent, MouseEventKind as WMEK, MousePress,
+    CursorIcon, MouseButtons as WMB, MouseEvent, MouseEventKind as WMEK, MousePress,
     WindowDecorations, WindowOps, WindowState,
 };
 use config::keyassignment::{
@@ -471,7 +471,7 @@ impl super::TermWindow {
             context.invalidate();
         }
         self.update_title();
-        context.set_cursor(Some(MouseCursor::Arrow));
+        context.set_cursor(Some(CursorIcon::Default));
         context.invalidate();
     }
 
@@ -765,7 +765,7 @@ impl super::TermWindow {
                 .saturating_sub(event.coords.x),
         };
         let width = raw_width.clamp(min_width, max_width).max(0) as usize;
-        context.set_cursor(Some(MouseCursor::SizeLeftRight));
+        context.set_cursor(Some(CursorIcon::EwResize));
         if self.sidebar_drag_width == Some(width) {
             self.dragging.replace((
                 UIItem {
@@ -801,7 +801,7 @@ impl super::TermWindow {
         event: MouseEvent,
         context: &dyn WindowOps,
     ) {
-        context.set_cursor(Some(MouseCursor::SizeLeftRight));
+        context.set_cursor(Some(CursorIcon::EwResize));
         if event.kind == WMEK::Press(MousePress::Left) {
             self.dragging.replace((item, event));
         }
@@ -1173,7 +1173,7 @@ impl super::TermWindow {
             }
         }
 
-        context.set_cursor(Some(MouseCursor::Arrow));
+        context.set_cursor(Some(CursorIcon::Default));
         self.dragging.replace((item, start_event));
     }
 
@@ -1206,7 +1206,7 @@ impl super::TermWindow {
             }
             _ => {}
         }
-        context.set_cursor(Some(MouseCursor::Arrow));
+        context.set_cursor(Some(CursorIcon::Default));
     }
 
     fn mouse_event_sidebar_tab_list(&mut self, event: MouseEvent, context: &dyn WindowOps) {
@@ -1215,7 +1215,7 @@ impl super::TermWindow {
                 context.invalidate();
             }
         }
-        context.set_cursor(Some(MouseCursor::Arrow));
+        context.set_cursor(Some(CursorIcon::Default));
     }
 
     fn drag_sidebar_scroll_thumb(
@@ -1253,7 +1253,7 @@ impl super::TermWindow {
             _ => {}
         }
         self.pressed_ui_item.replace(item.item_type);
-        context.set_cursor(Some(MouseCursor::Arrow));
+        context.set_cursor(Some(CursorIcon::Default));
     }
 
     fn mouse_event_sidebar_scroll_thumb(
@@ -1274,7 +1274,7 @@ impl super::TermWindow {
             }
             _ => {}
         }
-        context.set_cursor(Some(MouseCursor::Arrow));
+        context.set_cursor(Some(CursorIcon::Default));
     }
 
     fn mouse_event_sidebar_search(&mut self, event: MouseEvent, context: &dyn WindowOps) {
@@ -1282,7 +1282,7 @@ impl super::TermWindow {
             self.sidebar_search.get_or_insert_with(Default::default);
             context.invalidate();
         }
-        context.set_cursor(Some(MouseCursor::Text));
+        context.set_cursor(Some(CursorIcon::Text));
     }
 
     fn mouse_event_sidebar_autohide_toggle(&mut self, event: MouseEvent, context: &dyn WindowOps) {
@@ -1323,7 +1323,7 @@ impl super::TermWindow {
             }
             _ => {}
         }
-        context.set_cursor(Some(MouseCursor::Arrow));
+        context.set_cursor(Some(CursorIcon::Default));
     }
 
     fn mouse_event_agent_toolbelt_button(
@@ -1408,7 +1408,7 @@ impl super::TermWindow {
             }
             _ => {}
         }
-        context.set_cursor(Some(MouseCursor::Arrow));
+        context.set_cursor(Some(CursorIcon::Default));
     }
 
     fn mouse_event_agent_copy_menu_item(
@@ -1456,7 +1456,7 @@ impl super::TermWindow {
             }
             _ => {}
         }
-        context.set_cursor(Some(MouseCursor::Arrow));
+        context.set_cursor(Some(CursorIcon::Default));
     }
 
     pub fn mouse_event_close_tab(
@@ -1495,7 +1495,7 @@ impl super::TermWindow {
             }
             _ => {}
         }
-        context.set_cursor(Some(MouseCursor::Arrow));
+        context.set_cursor(Some(CursorIcon::Default));
     }
 
     pub fn mouse_event_close_tab_menu_item(
@@ -1530,7 +1530,7 @@ impl super::TermWindow {
             }
             _ => {}
         }
-        context.set_cursor(Some(MouseCursor::Arrow));
+        context.set_cursor(Some(CursorIcon::Default));
     }
 
     fn do_new_tab_button_click(&mut self, button: MousePress) {
@@ -1692,7 +1692,7 @@ impl super::TermWindow {
             }
             _ => {}
         }
-        context.set_cursor(Some(MouseCursor::Arrow));
+        context.set_cursor(Some(CursorIcon::Default));
     }
 
     pub fn mouse_event_above_scroll_thumb(
@@ -1716,7 +1716,7 @@ impl super::TermWindow {
                 dims,
             );
         }
-        context.set_cursor(Some(MouseCursor::Arrow));
+        context.set_cursor(Some(CursorIcon::Default));
     }
 
     pub fn mouse_event_below_scroll_thumb(
@@ -1740,7 +1740,7 @@ impl super::TermWindow {
                 dims,
             );
         }
-        context.set_cursor(Some(MouseCursor::Arrow));
+        context.set_cursor(Some(CursorIcon::Default));
     }
 
     pub fn mouse_event_scroll_thumb(
@@ -1755,7 +1755,7 @@ impl super::TermWindow {
             // self.scroll_drag_start = Some(from_top);
             self.dragging = Some((item, event));
         }
-        context.set_cursor(Some(MouseCursor::Arrow));
+        context.set_cursor(Some(CursorIcon::Default));
     }
 
     pub fn mouse_event_split(
@@ -1766,8 +1766,8 @@ impl super::TermWindow {
         context: &dyn WindowOps,
     ) {
         context.set_cursor(Some(match &split.direction {
-            SplitDirection::Horizontal => MouseCursor::SizeLeftRight,
-            SplitDirection::Vertical => MouseCursor::SizeUpDown,
+            SplitDirection::Horizontal => CursorIcon::EwResize,
+            SplitDirection::Vertical => CursorIcon::NsResize,
         }));
 
         if event.kind == WMEK::Press(MousePress::Left) {
@@ -1966,11 +1966,11 @@ impl super::TermWindow {
         context.set_cursor(Some(if self.current_highlight.is_some() {
             // When hovering over a hyperlink, show an appropriate
             // mouse cursor to give the cue that it is clickable
-            MouseCursor::Hand
+            CursorIcon::Pointer
         } else if pane.is_mouse_grabbed() || outside_window {
-            MouseCursor::Arrow
+            CursorIcon::Default
         } else {
-            MouseCursor::Text
+            CursorIcon::Text
         }));
 
         let event_trigger_type = match &event.kind {

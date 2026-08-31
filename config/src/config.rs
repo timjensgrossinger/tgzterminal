@@ -458,6 +458,19 @@ pub struct AgentAdapterConfig {
     #[dynamic(default)]
     pub waiting_patterns: Vec<String>,
 
+    /// Treat a pane running this adapter as waiting for input whenever no
+    /// running or waiting evidence is on screen.
+    ///
+    /// For adapters whose idle prompt is a featureless input box (no prompt
+    /// glyph, no placeholder), the idle screen carries no text a pattern could
+    /// match, so the pane would otherwise decay to `Unknown` and never join the
+    /// waiting queue. Only honoured when the pane's identity is strong (process
+    /// or title match): visible-text identity alone can badge a pane that is
+    /// merely *displaying* adapter-related text, and a plain shell must never
+    /// read as waiting.
+    #[dynamic(default)]
+    pub waiting_when_quiet: bool,
+
     /// Visible text fragments belonging to this adapter's own TUI furniture —
     /// its footer, hint line or status bar. Identity evidence only, never
     /// status: they are on screen whether or not the agent is busy.
@@ -516,6 +529,7 @@ impl Default for AgentAdapterConfig {
             visible_patterns: Vec::new(),
             running_patterns: Vec::new(),
             waiting_patterns: Vec::new(),
+            waiting_when_quiet: false,
             chrome_patterns: Vec::new(),
             strip_patterns: Vec::new(),
             model_patterns: Vec::new(),
@@ -556,6 +570,7 @@ impl AgentAdapterConfig {
                 .collect(),
             running_patterns: Vec::new(),
             waiting_patterns: Vec::new(),
+            waiting_when_quiet: false,
             chrome_patterns: Vec::new(),
             strip_patterns: strip_patterns
                 .iter()
@@ -744,7 +759,14 @@ pub fn default_agent_adapters() -> AgentAdaptersConfig {
         "{home}/.local/share/opencode/storage".to_string(),
     ]);
     opencode.launch_command = Some(vec!["opencode".to_string()]);
-    opencode.running_patterns = vec!["esc to interrupt".to_string()];
+    // OpenCode 1.18's busy footer renders `Working...` (its `busyText`
+    // default); the older `esc to interrupt` footer is kept for older builds.
+    opencode.running_patterns = vec!["esc to interrupt".to_string(), "working...".to_string()];
+    // A permission dialog is the one in-session waiting state opencode renders
+    // as text; the plain idle prompt is a featureless input box, which is why
+    // `waiting_when_quiet` covers the rest.
+    opencode.waiting_patterns = vec!["permission required".to_string()];
+    opencode.waiting_when_quiet = true;
     opencode.chrome_patterns = vec!["opencode v".to_string()];
     adapters.insert("opencode".to_string(), opencode);
 
@@ -801,11 +823,18 @@ pub fn default_agent_adapters() -> AgentAdaptersConfig {
         &["gemini", "claude", "gpt"],
     );
     antigravity.launch_command = Some(vec!["antigravity".to_string()]);
+    // agy's processing footer is `esc to cancel` (not `interrupt`), and its
+    // braille spinner line reads `⣽ Working...`.
     antigravity.running_patterns = vec![
         "esc to interrupt".to_string(),
         "esc to stop".to_string(),
         "ctrl+c to interrupt".to_string(),
+        "esc to cancel".to_string(),
+        "esc to interrupt generation.".to_string(),
     ];
+    // agy's idle footer is `? for shortcuts`; while processing the footer
+    // flips to `esc to cancel`, so this never fires on a busy agent.
+    antigravity.waiting_patterns = vec!["? for shortcuts".to_string()];
     antigravity.chrome_patterns = vec![
         "antigravity cli".to_string(),
         "antigravity agent".to_string(),
@@ -1464,6 +1493,12 @@ pub struct Config {
 
     #[dynamic(default = "default_command_palette_font_size")]
     pub command_palette_font_size: f64,
+
+    #[dynamic(
+        default = "default_one_point_oh_f64",
+        validate = "validate_line_height"
+    )]
+    pub command_palette_line_height: f64,
 
     pub command_palette_rows: Option<usize>,
     #[dynamic(default = "default_command_palette_fg_color")]
@@ -3558,22 +3593,63 @@ mod agent_ui_tests {
     }
 
     #[test]
-    fn waiting_patterns_are_empty_except_for_gemini() {
+    fn waiting_patterns_are_empty_except_for_gemini_opencode_antigravity() {
         let adapters = default_agent_adapters();
-        for name in [
-            "claude",
-            "codex",
-            "opencode",
-            "copilot",
-            "cursor",
-            "amp",
-            "antigravity",
-        ] {
+        for name in ["claude", "codex", "copilot", "cursor", "amp"] {
             assert!(
                 adapters[name].waiting_patterns.is_empty(),
                 "expected {name} to have no waiting_patterns"
             );
+            assert!(
+                !adapters[name].waiting_when_quiet,
+                "expected {name} to not wait when quiet"
+            );
         }
+    }
+
+    #[test]
+    fn opencode_detects_118_busy_and_permission_dialogs() {
+        let adapters = default_agent_adapters();
+        let opencode = &adapters["opencode"];
+        // OpenCode 1.18's busy footer prints `Working...`; the older
+        // `esc to interrupt` footer stays for pre-1.18 builds.
+        assert!(opencode
+            .running_patterns
+            .iter()
+            .any(|pattern| pattern == "working..."));
+        assert!(opencode
+            .running_patterns
+            .iter()
+            .any(|pattern| pattern == "esc to interrupt"));
+        // The permission dialog is the only textual in-session waiting state.
+        assert!(opencode
+            .waiting_patterns
+            .iter()
+            .any(|pattern| pattern == "permission required"));
+        // The idle input box renders no glyph or placeholder, so a quiet
+        // OpenCode pane is waiting by construction.
+        assert!(opencode.waiting_when_quiet);
+    }
+
+    #[test]
+    fn antigravity_patterns_match_agy_footers() {
+        let adapters = default_agent_adapters();
+        let antigravity = &adapters["antigravity"];
+        // agy's processing footer is `esc to cancel`, not `interrupt`.
+        assert!(antigravity
+            .running_patterns
+            .iter()
+            .any(|pattern| pattern == "esc to cancel"));
+        assert!(antigravity
+            .running_patterns
+            .iter()
+            .any(|pattern| pattern == "esc to interrupt generation."));
+        // The idle footer; flips to `esc to cancel` while busy.
+        assert!(antigravity
+            .waiting_patterns
+            .iter()
+            .any(|pattern| pattern == "? for shortcuts"));
+        assert!(!antigravity.waiting_when_quiet);
     }
 
     #[test]
@@ -4571,7 +4647,7 @@ fn validate_row_or_col(value: &u16) -> Result<(), String> {
 fn validate_line_height(value: &f64) -> Result<(), String> {
     if *value <= 0.0 {
         Err(format!(
-            "Illegal value {value} for line_height; it must be positive and greater than zero!"
+            "Illegal value {value}; it must be positive and greater than zero!"
         ))
     } else {
         Ok(())
