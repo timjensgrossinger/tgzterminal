@@ -214,11 +214,20 @@ config.agent_ui = {
       resume_latest_command = { "codex", "resume", "--last" },
       detail_paths = { "{home}/.codex/sessions", "{home}/.codex/log" },
     },
-    -- Gemini prints an idle hint rather than a prompt glyph, so it is the one
-    -- built-in adapter that ships a waiting pattern.
+    -- Gemini prints an idle hint rather than a prompt glyph; OpenCode's idle
+    -- input box is featureless and agy's idle footer changes while busy, so
+    -- these three built-in adapters ship waiting signals.
     gemini = { enabled = true, waiting_patterns = { "type your message" } },
     opencode = {
       enabled = true,
+      -- OpenCode 1.18 prints `Working...` while busy (the older
+      -- `esc to interrupt` footer is kept for older builds), and its
+      -- permission dialog reads as waiting. Because the idle input box
+      -- renders no glyph or placeholder, a quiet pane whose identity is
+      -- strong (process/title/visible-chrome match) also reads as waiting.
+      running_patterns = { "esc to interrupt", "working..." },
+      waiting_patterns = { "permission required" },
+      waiting_when_quiet = true,
       resume_command = { "opencode", "-s", "{session_id}" },
       resume_latest_command = { "opencode", "-c" },
       attach_command = { "opencode", "attach", "{attach_url}" },
@@ -241,6 +250,16 @@ config.agent_ui = {
       launch_command = { "antigravity" },
       process_names = { "antigravity", "antigravity-cli", "agy" },
       title_patterns = { "antigravity", "antigravity cli", "agy" },
+      -- agy's processing footer is `esc to cancel`; the idle footer
+      -- `? for shortcuts` flips to it while busy.
+      running_patterns = {
+        "esc to interrupt",
+        "esc to stop",
+        "ctrl+c to interrupt",
+        "esc to cancel",
+        "esc to interrupt generation.",
+      },
+      waiting_patterns = { "? for shortcuts" },
     },
     cursor = { enabled = true },
     amp = { enabled = true },
@@ -317,15 +336,23 @@ vendor-neutral agent.
 
 Each adapter accepts `enabled`, `label`, `short_label`, `color`,
 `process_names`, `title_patterns`, `visible_patterns`, `running_patterns`,
-`waiting_patterns`, `chrome_patterns`, `strip_patterns`, and
-`model_patterns`. It may also accept action templates: `resume_command`,
-`resume_latest_command`, `attach_command`, `detail_paths`,
+`waiting_patterns`, `waiting_when_quiet`, `chrome_patterns`,
+`strip_patterns`, and `model_patterns`. It may also accept action templates:
+`resume_command`, `resume_latest_command`, `attach_command`, `detail_paths`,
 `launch_command`, and `launch_domain`. Pattern entries
 are literal case-insensitive fragments by default. Entries prefixed with `re:`
 are treated as regexes, but long or invalid regexes are ignored to keep passive
 detection bounded. Built-in detection defaults cover Claude, Codex, Gemini,
 OpenCode, Copilot CLI, Antigravity CLI, Cursor, and Amp; partial adapter configs
 merge with those defaults.
+
+`waiting_when_quiet` (default `false`) marks a pane as waiting for input
+whenever its adapter is identified but no running or waiting evidence is on
+screen. It exists for adapters whose idle prompt is a featureless input box —
+OpenCode draws no glyph or placeholder in-session — and is only honoured when
+the pane's identity is strong (user variable, process name, title phrase or
+visible chrome match). A pane that merely *displays* adapter-related text
+never qualifies, and a plain shell is never affected.
 
 Action templates are argv/path arrays expanded only when the user clicks a
 toolbelt action. Supported variables are `{session_id}`, `{cwd}`, `{home}`,
@@ -521,10 +548,13 @@ Pattern conventions, which the built-in defaults follow:
   queue, the row glow and the dock badge. Never identity: a prompt glyph is not
   a brand, and treating one as identity would badge every plain shell. They are
   consulted only after the running checks have already declined, so a busy agent
-  is never read as waiting. Leave the list empty — as every built-in adapter
-  except Gemini does — to fall back to the built-in generic prompt-glyph scan
+  is never read as waiting. Leave the list empty — as most built-in adapters
+  do — to fall back to the built-in generic prompt-glyph scan
   (`>`, `❯`, `›`, and the boxed `│ >` form), which is what all adapters relied
-  on before this key existed.
+  on before this key existed. Gemini (`type your message`), OpenCode
+  (`permission required`) and Antigravity (`? for shortcuts`) are the built-in
+  exceptions. When no pattern can exist at all — OpenCode's idle input box is a
+  featureless textarea — set `waiting_when_quiet = true` instead.
 - **`chrome_patterns`** are the adapter's permanent TUI furniture (footer, hint
   line). Identity only, never status.
 - **`strip_patterns`** are never identity. They are deliberately short and

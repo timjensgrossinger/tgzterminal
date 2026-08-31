@@ -541,6 +541,17 @@ const RAIL_GRADIENT_BANDS: usize = 5;
 /// segments per edge left ~48px of one flat colour on a full-width row. Below
 /// 1.0 the tiles overlap, which also closes the seams between them.
 const THROBBER_TILE_PITCH: f32 = 0.6;
+/// Outlines at or below this perimeter sample the ramp at a sub-pixel pitch.
+///
+/// The collapsed rail's icon tile wraps the same conic gradient into ~90px of
+/// outline where a full-width row gives it ~600px, so at the straight-edge
+/// pitch the whole ramp crosses in a few dozen tiles and bands into visible
+/// steps — the "low-res" look. Halving the pitch there doubles the ramp's
+/// colour steps; the straight spans of a big row keep the cheap pitch.
+const THROBBER_FINE_PITCH_MAX_PERIMETER: f32 = 220.;
+/// Pitch floor on those small outlines. Overlapping tiles already close the
+/// seams, so going below half a pixel buys nothing but quad count.
+const THROBBER_FINE_PITCH_FLOOR: f32 = 0.5;
 const DONE_RING_IN_MS: u64 = 260;
 const DONE_RING_OUT_MS: u64 = 1100;
 /// How far the resolve ring expands past the row as it fades out.
@@ -632,8 +643,17 @@ fn throbber_outline(rect: RectF, radius: f32, stroke: f32) -> Vec<(f32, f32)> {
     // decides whether it reads as a gradient or as bars. Advancing by a
     // fraction of the stroke keeps each colour step under a pixel or two
     // and overlaps neighbours, which also hides the seams between them.
-    let advance = (stroke * THROBBER_TILE_PITCH).max(1.);
+    // A small outline gets the finer pitch: with the perimeter shortened,
+    // the fixed pitch starves the ramp of tiles and it bands.
     let mid = (radius - stroke * 0.5).max(0.);
+    let perimeter = 2. * (w - 2. * radius).max(0.)
+        + 2. * (h - 2. * radius).max(0.)
+        + 2. * std::f32::consts::PI * mid;
+    let advance = if perimeter <= THROBBER_FINE_PITCH_MAX_PERIMETER {
+        (stroke * THROBBER_TILE_PITCH).max(THROBBER_FINE_PITCH_FLOOR)
+    } else {
+        (stroke * THROBBER_TILE_PITCH).max(1.)
+    };
     let inset = stroke * 0.5;
     let quarter = std::f32::consts::FRAC_PI_2;
     let corner_steps = if mid > 0. {
@@ -3288,6 +3308,9 @@ fn merge_agent_adapter_config(
         } else {
             configured.waiting_patterns.clone()
         },
+        // Merge pattern-style: a user override wins outright, so a user who
+        // names the key at all (true or false) takes control of the behavior.
+        waiting_when_quiet: configured.waiting_when_quiet || base.waiting_when_quiet,
         chrome_patterns: if configured.chrome_patterns.is_empty() {
             base.chrome_patterns.clone()
         } else {
@@ -4189,6 +4212,9 @@ const GENERIC_AGENT_RUNNING_MARKERS: &[&str] = &[
 const AGENT_SPINNER_GLYPHS: &[char] = &[
     '✻', '✽', '✶', '✷', '✳', '✢', '∗', '⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏', '◐', '◓',
     '◑', '◒',
+    // Half/full-block braille frames: Antigravity CLI draws `⣽ Working...`
+    // with a briandowns-style spinner from the 0x28F0+ range.
+    '⣯', '⣟', '⡿', '⢿', '⣻', '⣽', '⣷', '⣾', '⣿',
 ];
 
 /// How far into a line a spinner glyph may sit and still count.
@@ -4373,6 +4399,7 @@ fn infer_agent_status_from_visible_text(
     text: &str,
     adapter: Option<&AgentAdapterConfig>,
     spinner: SpinnerMotion,
+    strong_identity: bool,
 ) -> AgentStatus {
     let tail = agent_status_tail(text);
     // Markers are matched against the whole visible region, not the tail. An
@@ -4425,6 +4452,16 @@ fn infer_agent_status_from_visible_text(
                 .take(AGENT_PROMPT_TAIL_LINES)
                 .any(|line| agent_pattern_matches(line, pattern))
         }) {
+            return AgentStatus::WaitingForInput;
+        }
+        // Some adapters (OpenCode's input box, say) draw no prompt glyph and no
+        // placeholder when idle, so no textual waiting signal exists. If the
+        // pane's identity is strong — process or title match, not just visible
+        // text that could belong to a pane merely displaying adapter-related
+        // output — then a live adapter with nothing to do is waiting for
+        // input. Running has already declined above, so a busy pane is never
+        // misread; the gate keeps ordinary shell panes out of the queue.
+        if adapter.waiting_when_quiet && strong_identity {
             return AgentStatus::WaitingForInput;
         }
     }
@@ -6357,7 +6394,21 @@ impl crate::TermWindow {
             (AgentStatus::from_hint(explicit_status), false)
         } else {
             let inferred = if visible_text_loaded {
-                infer_agent_status_from_visible_text(&visible_text, adapter.as_ref(), spinner)
+                // `waiting_when_quiet` reclassifies a quiet adapter pane as
+                // waiting, so it must only fire on identity evidence that
+                // proves the agent binary really owns the pane. Visible-text
+                // evidence would badge a pane that is merely *displaying*
+                // adapter-related text; a title could just be prose.
+                let strong_identity = matches!(
+                    evidence,
+                    AgentEvidence::UserVar | AgentEvidence::Process | AgentEvidence::VisibleChrome
+                );
+                infer_agent_status_from_visible_text(
+                    &visible_text,
+                    adapter.as_ref(),
+                    spinner,
+                    strong_identity,
+                )
             } else {
                 AgentStatus::Unknown
             };
@@ -6683,8 +6734,8 @@ impl crate::TermWindow {
             return;
         };
         let mut live = HashSet::new();
-        for tab_idx in 0..window.len() {
-            if let Some(tab) = window.get_by_idx(tab_idx) {
+        for tab_idx in 0..window.count_tabs() {
+            if let Some(tab) = window.get_tab_at_idx(tab_idx) {
                 if let Some(pane) = tab.get_active_pane() {
                     live.insert(pane.pane_id());
                 }
@@ -7353,7 +7404,7 @@ impl crate::TermWindow {
         let fallback = line_to_string(fallback_title).trim().to_string();
         let Some(tab) = Mux::get()
             .get_window(self.mux_window_id)
-            .and_then(|window| window.get_by_idx(tab_idx).cloned())
+            .and_then(|window| window.get_tab_at_idx(tab_idx).cloned())
         else {
             return (fallback, Vec::new());
         };
@@ -7445,7 +7496,7 @@ impl crate::TermWindow {
     fn sidebar_pane_rows_for_tab_idx(&self, tab_idx: usize) -> Vec<SidebarRow> {
         let Some(tab) = Mux::get()
             .get_window(self.mux_window_id)
-            .and_then(|window| window.get_by_idx(tab_idx).cloned())
+            .and_then(|window| window.get_tab_at_idx(tab_idx).cloned())
         else {
             return Vec::new();
         };
@@ -7561,7 +7612,7 @@ impl crate::TermWindow {
         }
         let Some(tab) = Mux::get()
             .get_window(self.mux_window_id)
-            .and_then(|window| window.get_by_idx(tab_idx).cloned())
+            .and_then(|window| window.get_tab_at_idx(tab_idx).cloned())
         else {
             return Vec::new();
         };
@@ -7797,7 +7848,7 @@ impl crate::TermWindow {
     fn sidebar_primary_pane_for_tab_idx(&self, tab_idx: usize) -> Option<Arc<dyn Pane>> {
         let tab = Mux::get()
             .get_window(self.mux_window_id)
-            .and_then(|window| window.get_by_idx(tab_idx).cloned())?;
+            .and_then(|window| window.get_tab_at_idx(tab_idx).cloned())?;
         let active_pane = tab.get_active_pane();
         let panes = tab.iter_panes_ignoring_zoom();
         active_pane
@@ -7815,26 +7866,26 @@ impl crate::TermWindow {
 
     /// Icon, colour, and the agent behind them, for one collapsed-rail tab.
     ///
-    /// The agent is returned rather than discarded so the rail can show the same
-    /// status dot the expanded rows do: with the sidebar narrowed there is no
-    /// title and no badge column, so without this the rail was the one place
-    /// where a working agent looked exactly like an idle one.
+    /// The agent is returned — with the pane it was detected on — rather than
+    /// discarded so the rail can show the same ring treatments and status dot
+    /// the expanded rows do: with the sidebar narrowed there is no title and no
+    /// badge column, so without this the rail was the one place where a working
+    /// agent looked exactly like an idle one. The pane id keys the per-row
+    /// animation state (`agent_row_animation`), same as a tab row.
     fn sidebar_compact_tab_icon(
         &self,
         tab_idx: usize,
         title: &str,
-    ) -> (String, LinearRgba, Option<AgentPaneState>) {
+    ) -> (String, LinearRgba, Option<(PaneId, AgentPaneState)>) {
         let pane = self.sidebar_primary_pane_for_tab_idx(tab_idx);
         // Same resolution the expanded row uses, so a tab whose agent is
         // working in a background split spins on the rail too. The symbol and
         // colour below still key off the primary pane, which is what the tab
         // is named after.
-        let agent = self
-            .sidebar_agent_row_for_tab_idx(tab_idx)
-            .map(|(_, state)| state);
+        let agent = self.sidebar_agent_row_for_tab_idx(tab_idx);
         let adapter = agent
             .as_ref()
-            .and_then(|agent| self.agent_adapter_config_by_id(agent.adapter_id.as_deref()));
+            .and_then(|(_, state)| self.agent_adapter_config_by_id(state.adapter_id.as_deref()));
         let command = pane
             .as_ref()
             .and_then(|pane| pane.get_foreground_process_name(CachePolicy::AllowStale))
@@ -7843,7 +7894,7 @@ impl crate::TermWindow {
         let symbol = compact_tab_symbol(
             title,
             tab_idx,
-            agent.as_ref().map(|agent| &agent.kind),
+            agent.as_ref().map(|(_, state)| &state.kind),
             adapter.as_ref(),
             command.as_deref(),
             pane_title.as_deref(),
@@ -7851,7 +7902,7 @@ impl crate::TermWindow {
         let color = compact_tab_color(
             title,
             tab_idx,
-            agent.as_ref().map(|agent| &agent.kind),
+            agent.as_ref().map(|(_, state)| &state.kind),
             adapter.as_ref(),
             command.as_deref(),
             pane_title.as_deref(),
@@ -9536,7 +9587,7 @@ impl crate::TermWindow {
                     let mux = Mux::get();
                     let mut unseen = false;
                     if let Some(window) = mux.get_window(self.mux_window_id) {
-                        if let Some(tab) = window.get_by_idx(tab_idx) {
+                        if let Some(tab) = window.get_tab_at_idx(tab_idx) {
                             if let Some(pane) = tab.get_active_pane() {
                                 unseen = self.pane_queue_state(pane.pane_id()).1;
                             }
@@ -9559,22 +9610,55 @@ impl crate::TermWindow {
                     tab_bg
                 };
                 let tab_offset = if tab_pressed { 1. } else { 0. };
-                let tile_rect = euclid::rect(rail_x, rail_y + tab_offset, rail_side, rail_side);
-                let tile_spin = rail_agent
+                // Same per-row animation the expanded tab row derives, keyed on
+                // the agent's pane: spin, the one-shot resolve ripple, the
+                // standing waiting glow and the enter fade. The rail used to
+                // draw only the raw spin, so a finished or blocked agent's tile
+                // lost the marks its full-width row still carried.
+                let anim = rail_agent
                     .as_ref()
-                    .and_then(|agent| self.agent_spin_phase(&agent.status));
-                match tile_spin {
-                    Some(phase) => self.paint_agent_working_ring(
+                    .map(|(pane_id, agent)| self.agent_row_animation(*pane_id, &agent.status))
+                    .unwrap_or_else(AgentRowAnimation::still);
+                // Only the flat fills and the text ride the enter fade; the ring
+                // painters punch their own interior back out, so they need the
+                // unfaded tile colour, exactly as the expanded row does it.
+                let faded_tab_bg = tab_bg.mul_alpha(anim.enter);
+                let tile_rect = euclid::rect(rail_x, rail_y + tab_offset, rail_side, rail_side);
+                let ring_stroke = (2. * dpi_scale).max(2.);
+                let tile_hairline = dpi_scale.max(1.);
+                match anim.ring_treatment() {
+                    AgentRowRing::Spin(phase) => self.paint_agent_working_ring(
                         layers,
                         1,
                         tile_rect,
                         (RING_RADIUS * dpi_scale).min(rail_side * 0.5),
                         sb.ring,
                         tab_bg,
-                        (2. * dpi_scale).max(2.),
+                        ring_stroke,
                         phase,
                     )?,
-                    None => self.sidebar_rounded_fill(layers, 1, tile_rect, rail_radius, tab_bg)?,
+                    AgentRowRing::Waiting => self.paint_agent_waiting_glow(
+                        layers,
+                        1,
+                        tile_rect,
+                        rail_radius,
+                        sb.ring,
+                        tab_bg,
+                        tile_hairline,
+                    )?,
+                    AgentRowRing::Resolve(intensity) => self.paint_agent_resolve_ring(
+                        layers,
+                        1,
+                        tile_rect,
+                        rail_radius,
+                        sb.ring,
+                        tab_bg,
+                        tile_hairline,
+                        intensity,
+                    )?,
+                    AgentRowRing::None => {
+                        self.sidebar_rounded_fill(layers, 1, tile_rect, rail_radius, faded_tab_bg)?
+                    }
                 }
                 if active {
                     let rail_w = 3.;
@@ -9606,7 +9690,7 @@ impl crate::TermWindow {
                     symbol_cols = 1;
                     symbol_pixel_width = cell_width as f32;
                 }
-                let label_fg = contrast_label_color(tab_bg, sb.text_active);
+                let label_fg = contrast_label_color(faded_tab_bg, sb.text_active);
                 let mut symbol_attrs = CellAttributes::default();
                 symbol_attrs
                     .set_foreground(ColorAttribute::TrueColorWithDefaultFallback(
@@ -9622,33 +9706,39 @@ impl crate::TermWindow {
                     rail_y + tab_offset + (rail_side - cell_height as f32) * 0.5,
                     symbol_pixel_width,
                     label_fg,
-                    tab_bg,
+                    faded_tab_bg,
                 )?;
                 // Agent status dot, tucked into the icon box's top corner on the
                 // side away from the active-tab rail so the two never collide.
                 // Follows `tab_offset` so it stays put when the tab is pressed.
-                if let Some(agent) = &rail_agent {
-                    let dot_size = sidebar_status_dot_size(cell_height as f32);
-                    let inset = 1.5;
-                    let dot_x = match self.config.sidebar_position {
-                        SidebarPosition::Left => rail_x + rail_side - dot_size - inset,
-                        SidebarPosition::Right => rail_x + inset,
-                    };
-                    let dot_color = agent_status_dot_accent(
-                        &agent.status,
-                        if active { accent } else { icon_color },
-                        tab_bg,
-                        self.agent_dot_pulse(agent),
-                        sb.ring.pulse,
-                        sb.ring.waiting,
-                    );
-                    self.sidebar_pill_fill(
-                        layers,
-                        2,
-                        euclid::rect(dot_x, rail_y + tab_offset + inset, dot_size, dot_size),
-                        dot_size * 0.5,
-                        dot_color,
-                    )?;
+                // Hidden while the ring turns — it would read as a static pip
+                // come loose from the moving outline, same call the expanded
+                // row makes — and it rides the enter fade with the tile.
+                if let Some((_, agent)) = &rail_agent {
+                    if anim.shows_status_dot() {
+                        let dot_size = sidebar_status_dot_size(cell_height as f32);
+                        let inset = 1.5;
+                        let dot_x = match self.config.sidebar_position {
+                            SidebarPosition::Left => rail_x + rail_side - dot_size - inset,
+                            SidebarPosition::Right => rail_x + inset,
+                        };
+                        let dot_color = agent_status_dot_accent(
+                            &agent.status,
+                            if active { accent } else { icon_color },
+                            faded_tab_bg,
+                            self.agent_dot_pulse(agent),
+                            sb.ring.pulse,
+                            sb.ring.waiting,
+                        )
+                        .mul_alpha(anim.enter);
+                        self.sidebar_pill_fill(
+                            layers,
+                            2,
+                            euclid::rect(dot_x, rail_y + tab_offset + inset, dot_size, dot_size),
+                            dot_size * 0.5,
+                            dot_color,
+                        )?;
+                    }
                 }
 
                 self.ui_items.push(UIItem {
@@ -11100,7 +11190,7 @@ impl crate::TermWindow {
         };
         let mut panes: Vec<PaneAgentRow> = Vec::new();
 
-        let tab_count = window.len();
+        let tab_count = window.count_tabs();
         // The mux borrow has to go before `detect_agent_pane`, which reaches
         // back into the mux for each pane.
         drop(window);
@@ -12910,7 +13000,7 @@ mod tests {
              11% used · 89% left (110k/1000k tokens) · tgzterminal main\n\
              ▶▶ auto mode on (shift+tab to cycle)\n";
         assert_eq!(
-            infer_agent_status_from_visible_text(screen, None, SpinnerMotion::Live),
+            infer_agent_status_from_visible_text(screen, None, SpinnerMotion::Live, false),
             AgentStatus::WaitingForInput
         );
 
@@ -12944,7 +13034,7 @@ mod tests {
              11% used · 89% left (110k/1000k tokens) · tgzterminal main\n\
              ▶▶ auto mode on (shift+tab to cycle)\n";
         assert_eq!(
-            infer_agent_status_from_visible_text(screen, None, SpinnerMotion::Live),
+            infer_agent_status_from_visible_text(screen, None, SpinnerMotion::Live, false),
             AgentStatus::Running
         );
         let depth = screen
@@ -13350,7 +13440,7 @@ mod tests {
              11% used · 89% left (110k/1000k tokens) · tgzterminal main\n\
              ▶▶ auto mode on (shift+tab to cycle)\n";
         assert_eq!(
-            infer_agent_status_from_visible_text(screen, None, SpinnerMotion::Live),
+            infer_agent_status_from_visible_text(screen, None, SpinnerMotion::Live, false),
             AgentStatus::Running
         );
     }
@@ -13365,7 +13455,7 @@ mod tests {
              │ > \n\
              ▶▶ auto mode on (shift+tab to cycle)\n";
         assert_ne!(
-            infer_agent_status_from_visible_text(screen, None, SpinnerMotion::Live),
+            infer_agent_status_from_visible_text(screen, None, SpinnerMotion::Live, false),
             AgentStatus::Running
         );
     }
@@ -13428,7 +13518,7 @@ mod tests {
              │ > we still have the issue\n\
              plan mode on (shift+tab to cycle)\n";
         assert_eq!(
-            infer_agent_status_from_visible_text(screen, None, SpinnerMotion::Live),
+            infer_agent_status_from_visible_text(screen, None, SpinnerMotion::Live, false),
             AgentStatus::WaitingForInput,
             "a decorated summary above a prompt is a finished agent"
         );
@@ -13463,12 +13553,12 @@ mod tests {
              \n\
              │ > \n";
         assert_eq!(
-            infer_agent_status_from_visible_text(screen, None, SpinnerMotion::Live),
+            infer_agent_status_from_visible_text(screen, None, SpinnerMotion::Live, false),
             AgentStatus::Running,
             "a moving spinner is work"
         );
         assert_eq!(
-            infer_agent_status_from_visible_text(screen, None, SpinnerMotion::Frozen),
+            infer_agent_status_from_visible_text(screen, None, SpinnerMotion::Frozen, false),
             AgentStatus::WaitingForInput,
             "the same line, no longer moving, is not"
         );
@@ -13518,7 +13608,7 @@ mod tests {
              │ > \n\
              ╰──────────────╯\n";
         assert_eq!(
-            infer_agent_status_from_visible_text(screen, None, SpinnerMotion::Live),
+            infer_agent_status_from_visible_text(screen, None, SpinnerMotion::Live, false),
             AgentStatus::WaitingForInput
         );
     }
@@ -16355,7 +16445,8 @@ mod tests {
                 infer_agent_status_from_visible_text(
                     &format!("Thinking\n{line}"),
                     None,
-                    SpinnerMotion::Live
+                    SpinnerMotion::Live,
+                    false
                 ),
                 AgentStatus::Running,
                 "{line:?} should read as running"
@@ -16366,7 +16457,8 @@ mod tests {
             infer_agent_status_from_visible_text(
                 "the file uses a ✻ marker here",
                 None,
-                SpinnerMotion::Live
+                SpinnerMotion::Live,
+                false
             ),
             AgentStatus::Unknown
         );
@@ -16403,7 +16495,8 @@ mod tests {
             infer_agent_status_from_visible_text(
                 "· Herding (12s · ↑ 1.2k tokens · esc to interrupt)",
                 None,
-                SpinnerMotion::Live
+                SpinnerMotion::Live,
+                false
             ),
             AgentStatus::Running
         );
@@ -16412,15 +16505,25 @@ mod tests {
     #[test]
     fn status_inference_detects_running_and_waiting() {
         assert_eq!(
-            infer_agent_status_from_visible_text("Thinking\n✻ Brewing", None, SpinnerMotion::Live),
+            infer_agent_status_from_visible_text(
+                "Thinking\n✻ Brewing",
+                None,
+                SpinnerMotion::Live,
+                false
+            ),
             AgentStatus::Running
         );
         assert_eq!(
-            infer_agent_status_from_visible_text("Done\n\n❯", None, SpinnerMotion::Live),
+            infer_agent_status_from_visible_text("Done\n\n❯", None, SpinnerMotion::Live, false),
             AgentStatus::WaitingForInput
         );
         assert_eq!(
-            infer_agent_status_from_visible_text("Here is the answer.", None, SpinnerMotion::Live),
+            infer_agent_status_from_visible_text(
+                "Here is the answer.",
+                None,
+                SpinnerMotion::Live,
+                false
+            ),
             AgentStatus::Unknown
         );
     }
@@ -16966,7 +17069,7 @@ gemini is a constellation\n";
         );
         assert!(visible_agent_candidates(text, &adapters, &ambiguous, 2).is_empty());
         assert_eq!(
-            infer_agent_status_from_visible_text(text, None, SpinnerMotion::Live),
+            infer_agent_status_from_visible_text(text, None, SpinnerMotion::Live, false),
             AgentStatus::Running
         );
     }
@@ -17141,7 +17244,7 @@ gemini is a constellation\n";
         lines.push("╰──────────────╯".to_string());
         let text = lines.join("\n");
         assert_eq!(
-            infer_agent_status_from_visible_text(&text, None, SpinnerMotion::Live),
+            infer_agent_status_from_visible_text(&text, None, SpinnerMotion::Live, false),
             AgentStatus::Running
         );
     }
@@ -17154,11 +17257,11 @@ gemini is a constellation\n";
         };
         let text = "crunching numbers\nplease hold\n";
         assert_eq!(
-            infer_agent_status_from_visible_text(text, Some(&adapter), SpinnerMotion::Live),
+            infer_agent_status_from_visible_text(text, Some(&adapter), SpinnerMotion::Live, false),
             AgentStatus::Running
         );
         assert_eq!(
-            infer_agent_status_from_visible_text(text, None, SpinnerMotion::Live),
+            infer_agent_status_from_visible_text(text, None, SpinnerMotion::Live, false),
             AgentStatus::Unknown
         );
     }
@@ -17171,7 +17274,7 @@ gemini is a constellation\n";
         let adapter = AgentAdapterConfig::default();
         let text = "Here is my answer.\n╭──────────────╮\n│ >            │\n╰──────────────╯";
         assert_eq!(
-            infer_agent_status_from_visible_text(text, Some(&adapter), SpinnerMotion::Live),
+            infer_agent_status_from_visible_text(text, Some(&adapter), SpinnerMotion::Live, false),
             AgentStatus::WaitingForInput
         );
     }
@@ -17184,7 +17287,7 @@ gemini is a constellation\n";
         };
         let text = "Here is my answer.\n╭──────────────╮\n│ >            │\n╰──────────────╯";
         assert_eq!(
-            infer_agent_status_from_visible_text(text, Some(&adapter), SpinnerMotion::Live),
+            infer_agent_status_from_visible_text(text, Some(&adapter), SpinnerMotion::Live, false),
             AgentStatus::WaitingForInput
         );
     }
@@ -17199,7 +17302,7 @@ gemini is a constellation\n";
         };
         let text = "Here is my answer.\nType your message here...";
         assert_eq!(
-            infer_agent_status_from_visible_text(text, Some(&adapter), SpinnerMotion::Live),
+            infer_agent_status_from_visible_text(text, Some(&adapter), SpinnerMotion::Live, false),
             AgentStatus::WaitingForInput
         );
     }
@@ -17212,7 +17315,7 @@ gemini is a constellation\n";
         };
         let text = "Working... (esc to interrupt)\nType your message here...";
         assert_eq!(
-            infer_agent_status_from_visible_text(text, Some(&adapter), SpinnerMotion::Live),
+            infer_agent_status_from_visible_text(text, Some(&adapter), SpinnerMotion::Live, false),
             AgentStatus::Running
         );
     }
@@ -17225,8 +17328,145 @@ gemini is a constellation\n";
         };
         let text = "Here is my answer.\nType your message here...";
         assert_eq!(
-            infer_agent_status_from_visible_text(text, Some(&adapter), SpinnerMotion::Live),
+            infer_agent_status_from_visible_text(text, Some(&adapter), SpinnerMotion::Live, false),
             AgentStatus::WaitingForInput
+        );
+    }
+
+    #[test]
+    fn status_opencode_working_marker_reads_as_running() {
+        // OpenCode 1.18 dropped the `esc to interrupt` footer; the busy footer
+        // now prints its `busyText` default instead.
+        let adapter = AgentAdapterConfig {
+            running_patterns: vec!["working...".to_string()],
+            waiting_when_quiet: true,
+            ..Default::default()
+        };
+        let text = "Here is my answer.\nWorking...";
+        assert_eq!(
+            infer_agent_status_from_visible_text(text, Some(&adapter), SpinnerMotion::Frozen, true),
+            AgentStatus::Running
+        );
+    }
+
+    #[test]
+    fn status_opencode_quiet_repl_waits_only_with_strong_identity() {
+        // An idle OpenCode pane is a featureless input box: no glyph, no
+        // placeholder. `waiting_when_quiet` reclassifies it as waiting, but
+        // only when the pane's identity is strong — visible-text evidence
+        // alone could be a pane merely displaying OpenCode-related output.
+        let adapter = AgentAdapterConfig {
+            waiting_when_quiet: true,
+            ..Default::default()
+        };
+        let text = "Fixed the sidebar tests.\n  2 passed";
+        assert_eq!(
+            infer_agent_status_from_visible_text(text, Some(&adapter), SpinnerMotion::Frozen, true),
+            AgentStatus::WaitingForInput
+        );
+        assert_eq!(
+            infer_agent_status_from_visible_text(
+                text,
+                Some(&adapter),
+                SpinnerMotion::Frozen,
+                false
+            ),
+            AgentStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn status_opencode_quiet_repl_running_beats_waiting() {
+        // Running evidence is checked first, so a busy pane is never reclassified
+        // by the quiet fallback even with strong identity.
+        let adapter = AgentAdapterConfig {
+            running_patterns: vec!["working...".to_string()],
+            waiting_when_quiet: true,
+            ..Default::default()
+        };
+        let text = "Working...\nstreaming tool output";
+        assert_eq!(
+            infer_agent_status_from_visible_text(text, Some(&adapter), SpinnerMotion::Frozen, true),
+            AgentStatus::Running
+        );
+    }
+
+    #[test]
+    fn status_opencode_permission_dialog_reads_as_waiting() {
+        // The permission dialog is the one in-session waiting state opencode
+        // renders as text; it must read as waiting on weak identity too, since
+        // the pattern itself is vendor-specific.
+        let adapter = AgentAdapterConfig {
+            waiting_patterns: vec!["permission required".to_string()],
+            waiting_when_quiet: true,
+            ..Default::default()
+        };
+        let text = "I need to run a command.\nPermission required: bash git status";
+        assert_eq!(
+            infer_agent_status_from_visible_text(
+                text,
+                Some(&adapter),
+                SpinnerMotion::Frozen,
+                false
+            ),
+            AgentStatus::WaitingForInput
+        );
+    }
+
+    #[test]
+    fn status_antigravity_idle_footer_reads_as_waiting() {
+        // agy's idle footer is `? for shortcuts`; it stays readable even when
+        // the bare `>` prompt scrolled out of the tail after a long answer.
+        let adapter = AgentAdapterConfig {
+            waiting_patterns: vec!["? for shortcuts".to_string()],
+            ..Default::default()
+        };
+        let text = "Long answer body\n───────────────\n? for shortcuts   gemini-2.5";
+        assert_eq!(
+            infer_agent_status_from_visible_text(
+                text,
+                Some(&adapter),
+                SpinnerMotion::Frozen,
+                false
+            ),
+            AgentStatus::WaitingForInput
+        );
+    }
+
+    #[test]
+    fn status_antigravity_processing_footer_beats_idle_footer() {
+        // While busy the footer flips to `esc to cancel`; if both strings are
+        // somehow present, running must win over waiting.
+        let adapter = AgentAdapterConfig {
+            running_patterns: vec!["esc to cancel".to_string()],
+            waiting_patterns: vec!["? for shortcuts".to_string()],
+            ..Default::default()
+        };
+        let text = "⣽ Working...\nesc to cancel\n? for shortcuts";
+        assert_eq!(
+            infer_agent_status_from_visible_text(
+                text,
+                Some(&adapter),
+                SpinnerMotion::Frozen,
+                false
+            ),
+            AgentStatus::Running
+        );
+    }
+
+    #[test]
+    fn status_antigravity_braille_spinner_line_counts() {
+        // agy draws `⣽ Working...` with half-block braille frames from the
+        // 0x28F0+ range, which the old glyph table never covered.
+        let text = "Generating a reply\n⣽ Working...";
+        assert_eq!(
+            infer_agent_status_from_visible_text(text, None, SpinnerMotion::Live, false),
+            AgentStatus::Running
+        );
+        // The same glyph frozen on screen is a summary, not a spinner.
+        assert_eq!(
+            infer_agent_status_from_visible_text(text, None, SpinnerMotion::Frozen, false),
+            AgentStatus::Unknown
         );
     }
 
@@ -17236,7 +17476,7 @@ gemini is a constellation\n";
         // is not reliably the final line.
         let text = "✻ Thinking\n\n> \n";
         assert_eq!(
-            infer_agent_status_from_visible_text(text, None, SpinnerMotion::Live),
+            infer_agent_status_from_visible_text(text, None, SpinnerMotion::Live, false),
             AgentStatus::Running
         );
     }

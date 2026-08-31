@@ -50,6 +50,11 @@ impl SessionSource for AntigravityDetector {
         };
 
         let mut history_by_id: HashMap<String, HistoryEntry> = HashMap::new();
+        // Newer agy builds sometimes omit `conversationId` from a history
+        // entry — including, in practice, the newest line for a fresh
+        // conversation. Keep the newest such entry per workspace so the
+        // `last_conversations.json` id can still be matched by cwd.
+        let mut fallback_by_workspace: HashMap<PathBuf, HistoryEntry> = HashMap::new();
         let history_path = root.join("history.jsonl");
         let Ok(history) = std::fs::read_to_string(history_path) else {
             return Vec::new();
@@ -58,23 +63,39 @@ impl SessionSource for AntigravityDetector {
             let Ok(entry) = serde_json::from_str::<HistoryEntry>(line) else {
                 continue;
             };
-            let Some(id) = entry.conversation_id.clone() else {
-                continue;
-            };
-            let replace = history_by_id
-                .get(&id)
-                .and_then(|old| old.timestamp)
-                .unwrap_or_default()
-                <= entry.timestamp.unwrap_or_default();
-            if replace {
-                history_by_id.insert(id, entry);
+            match entry.conversation_id.clone() {
+                Some(id) => {
+                    let replace = history_by_id
+                        .get(&id)
+                        .and_then(|old| old.timestamp)
+                        .unwrap_or_default()
+                        <= entry.timestamp.unwrap_or_default();
+                    if replace {
+                        history_by_id.insert(id, entry);
+                    }
+                }
+                None => {
+                    let Some(workspace) = entry.workspace.clone() else {
+                        continue;
+                    };
+                    let replace = fallback_by_workspace
+                        .get(&workspace)
+                        .and_then(|old| old.timestamp)
+                        .unwrap_or_default()
+                        <= entry.timestamp.unwrap_or_default();
+                    if replace {
+                        fallback_by_workspace.insert(workspace, entry);
+                    }
+                }
             }
         }
 
         let now = SystemTime::now();
         last.into_iter()
             .filter_map(|(cwd, session_id)| {
-                let entry = history_by_id.get(&session_id)?;
+                let entry = history_by_id
+                    .get(&session_id)
+                    .or_else(|| fallback_by_workspace.get(&cwd))?;
                 let updated_at = epoch_millis(entry.timestamp?)?;
                 let age = now.duration_since(updated_at).ok()?;
                 if age > AGY_ACTIVE_WINDOW {
@@ -172,5 +193,66 @@ mod tests {
         assert_eq!(sessions[0].cwd, PathBuf::from("/repo"));
         assert_eq!(sessions[0].name.as_deref(), Some("Fix sidebar actions"));
         assert_eq!(sessions[0].status, HerdStatus::Working);
+    }
+
+    #[test]
+    fn history_entry_without_conversation_id_falls_back_to_workspace() {
+        // Newer agy builds sometimes omit `conversationId` — including for the
+        // newest line of a fresh conversation. The `last_conversations.json` id
+        // must still resolve through a workspace match, or the session vanishes.
+        let temp = tempfile::tempdir().unwrap();
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let id = "conversation-live";
+        write(
+            &temp
+                .path()
+                .join(".gemini/antigravity-cli/cache/last_conversations.json"),
+            &format!(r#"{{"/repo":"{id}"}}"#),
+        );
+        write(
+            &temp.path().join(".gemini/antigravity-cli/history.jsonl"),
+            // No entry carries the conversation id at all.
+            &format!(r#"{{"display":"hello","timestamp":{now},"workspace":"/repo"}}"#),
+        );
+
+        let sessions = AntigravityDetector.collect_sessions(temp.path());
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, id);
+        assert_eq!(sessions[0].cwd, PathBuf::from("/repo"));
+        assert_eq!(sessions[0].name.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn workspace_fallback_loses_to_id_match() {
+        // When both an id match and a workspace fallback exist, the id match
+        // must win even if its entry is older.
+        let temp = tempfile::tempdir().unwrap();
+        let now: u128 = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let id = "conversation-live";
+        write(
+            &temp
+                .path()
+                .join(".gemini/antigravity-cli/cache/last_conversations.json"),
+            &format!(r#"{{"/repo":"{id}"}}"#),
+        );
+        write(
+            &temp.path().join(".gemini/antigravity-cli/history.jsonl"),
+            &format!(
+                r#"{{"display":"older but identified","timestamp":{now},"workspace":"/other","conversationId":"{id}"}}
+{{"display":"newest but anonymous","timestamp":{},"workspace":"/repo"}}"#,
+                now + 1000
+            ),
+        );
+
+        let sessions = AntigravityDetector.collect_sessions(temp.path());
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].name.as_deref(), Some("older but identified"));
+        assert_eq!(sessions[0].cwd, PathBuf::from("/other"));
     }
 }
