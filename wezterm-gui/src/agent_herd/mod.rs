@@ -205,6 +205,12 @@ pub enum TurnState {
     Working,
     /// The agent signed off. It is waiting for a human, not working.
     Finished,
+    /// A call the agent cannot answer itself is outstanding: it asked the human
+    /// a question, or asked to be let out of plan mode. Stronger than
+    /// `Finished` -- the turn is not over, it is *held*, and a human is the
+    /// bottleneck -- so it resolves to [`HerdStatus::Blocked`] rather than
+    /// `Idle`. See `promote_awaiting_human`.
+    AwaitingHuman,
     /// No turn boundary this vendor exposes, or nothing readable.
     #[default]
     Unknown,
@@ -547,6 +553,11 @@ pub struct ClaudeSession {
     pub cwd: PathBuf,
     pub project_root: Option<PathBuf>,
     pub name: Option<String>,
+    /// Whether `name` is Claude's own `nameSource: "derived"` — a slug of the
+    /// working directory plus a short hash, e.g. `tgzterminal-72`. It says
+    /// nothing the project column does not already say, so the transcript's
+    /// `ai-title` is preferred over it.
+    pub name_is_derived: bool,
     pub status: HerdStatus,
     pub blocked_reason: Option<String>,
     pub started_at: Option<SystemTime>,
@@ -636,6 +647,26 @@ fn veto_finished_turn(
     HerdStatus::Idle
 }
 
+/// Promote a row to `Blocked` when the transcript shows a human-gated call
+/// outstanding.
+///
+/// `Blocked` is the top of `HerdStatus`, so `Working`, `Idle` and `Unknown` all
+/// yield to it. `Done` is left alone: a row the view has already retired should
+/// not come back to life, and an already-`Blocked` row has nothing to gain.
+///
+/// Unlike `veto_finished_turn` there is no subagent exemption. A parent that is
+/// holding a question in front of the human is blocked whatever its subagents
+/// are doing -- nothing progresses until the human answers.
+fn promote_awaiting_human(status: HerdStatus, turn: TurnState) -> HerdStatus {
+    if turn != TurnState::AwaitingHuman {
+        return status;
+    }
+    match status {
+        HerdStatus::Working | HerdStatus::Idle | HerdStatus::Unknown => HerdStatus::Blocked,
+        HerdStatus::Blocked | HerdStatus::Done => status,
+    }
+}
+
 /// Whether a subagent is working *now*, rather than when the scan ran.
 ///
 /// `subagent_status` evaluates [`SUBAGENT_ACTIVITY_WINDOW`] against the clock at
@@ -716,7 +747,12 @@ pub fn join_sessions_with_panes(
                 // `working` indefinitely. The transcript can, so it wins --
                 // except over a subagent we can see is still going, and never
                 // over `Blocked`, where a human is the bottleneck.
-                veto_finished_turn(escalated, session.turn, &session.subagents, now)
+                let vetoed = veto_finished_turn(escalated, session.turn, &session.subagents, now);
+                // Last, and above everything: a question or a plan waiting to
+                // be approved is not a turn that ended, it is a turn that is
+                // held open on the human. Nothing the screen or the session
+                // file says can outrank that.
+                promote_awaiting_human(vetoed, session.turn)
             },
             blocked_reason: session.blocked_reason.clone(),
             model: session
@@ -1290,6 +1326,36 @@ mod tests {
         );
     }
 
+    /// A held turn outranks everything the screen or the session file can say:
+    /// the agent is not working and it is not idle, it is standing in front of a
+    /// question nobody has answered.
+    #[test]
+    fn awaiting_human_promotes_to_blocked() {
+        for status in [HerdStatus::Working, HerdStatus::Idle, HerdStatus::Unknown] {
+            assert_eq!(
+                promote_awaiting_human(status, TurnState::AwaitingHuman),
+                HerdStatus::Blocked,
+                "{status:?} yields to a pending human-gated call"
+            );
+        }
+        // Already there, or already retired by the view.
+        assert_eq!(
+            promote_awaiting_human(HerdStatus::Blocked, TurnState::AwaitingHuman),
+            HerdStatus::Blocked
+        );
+        assert_eq!(
+            promote_awaiting_human(HerdStatus::Done, TurnState::AwaitingHuman),
+            HerdStatus::Done
+        );
+        // Every other turn state leaves the status exactly as it found it.
+        for turn in [TurnState::Working, TurnState::Finished, TurnState::Unknown] {
+            assert_eq!(
+                promote_awaiting_human(HerdStatus::Working, turn),
+                HerdStatus::Working
+            );
+        }
+    }
+
     /// The window is 10s of *wall clock*, not 10s measured whenever the scan
     /// happened to run and then cached indefinitely.
     #[test]
@@ -1318,6 +1384,37 @@ mod tests {
         sub.last_activity = Some(now);
         sub.status = HerdStatus::Done;
         assert!(!subagent_is_working(&sub, now));
+    }
+
+    /// The end of the chain the sidebar bug ran through: the pane's screen said
+    /// `Working` (its dialog footer says `Esc to cancel`), and the pane wins in
+    /// the join -- so only the transcript could correct it.
+    #[test]
+    fn a_pending_question_blocks_a_row_the_pane_calls_working() {
+        let mut busy_pane = pane(7, "claude", &[4242]);
+        busy_pane.status = HerdStatus::Working;
+        let mut held = session(4242, "alpha", "/repo");
+        held.turn = TurnState::AwaitingHuman;
+
+        let agents = join_sessions_with_panes(vec![held.clone()], vec![busy_pane.clone()]);
+        assert_eq!(agents[0].status, HerdStatus::Blocked);
+        assert_eq!(
+            agents[0].display_status(SystemTime::now()),
+            HerdDisplayStatus::NeedsApproval
+        );
+
+        // A working subagent does not rescue it, unlike the finished-turn veto:
+        // nothing the children do can answer the question for the human.
+        held.subagents = vec![HerdSubagent {
+            agent_id: "sub-1".to_string(),
+            agent_type: "Explore".to_string(),
+            description: "still reading".to_string(),
+            status: HerdStatus::Working,
+            depth: 1,
+            last_activity: None,
+        }];
+        let agents = join_sessions_with_panes(vec![held], vec![busy_pane]);
+        assert_eq!(agents[0].status, HerdStatus::Blocked);
     }
 
     #[test]

@@ -64,9 +64,10 @@ const RADIUS: f32 = 10.;
 /// [`RADIUS`] so the ring reads as sitting around the row rather than on it.
 const RING_RADIUS: f32 = 11.;
 const CLOSE_ZONE_W: f32 = 34.;
-/// Gap between the close `×` glyph and the right edge of its zone. The text
-/// reserve is derived from it in `sidebar_close_text_reserve`.
-const CLOSE_GLYPH_INSET: f32 = 6.;
+/// Gap between the close button's right edge and the right edge of its zone.
+/// Both the hover button and the `×` inside it derive from this, and so does the
+/// text reserve — see [`sidebar_close_geometry`].
+const CLOSE_BUTTON_INSET: f32 = 3.;
 const SIDEBAR_SCROLLBAR_GUTTER_W: f32 = 30.;
 const SIDEBAR_SCROLLBAR_W: f32 = 10.;
 const SIDEBAR_SCROLLBAR_INSET_Y: f32 = 12.;
@@ -1936,15 +1937,76 @@ fn sidebar_agent_badge_w(cell_height: f32) -> f32 {
     sidebar_status_dot_size(cell_height) + GAP
 }
 
-/// Horizontal space a row reserves for the close `×` when laying out text.
+/// Where a row's close control sits, as offsets from the close zone's left edge.
 ///
-/// Smaller than `CLOSE_ZONE_W` (the hit target) because the glyph is
-/// right-aligned inside that zone, so text may run closer before truncating.
-/// Derived from `cell_width` because the glyph's left edge moves with DPI — the
-/// previous fixed 22px was calibrated for one cell size and under-reserved on
-/// hidpi while wasting room at 1x.
-fn sidebar_close_text_reserve(cell_width: f32) -> f32 {
-    (cell_width + CLOSE_GLYPH_INSET + GAP).min(CLOSE_ZONE_W)
+/// The `×` is centred *on* the hover button rather than right-aligned on the
+/// cell grid. The two used to be positioned by independent expressions off the
+/// zone's right edge, which left the button up to 4px left of its glyph and only
+/// looked centred around a 20px cell width — the button's side saturates at
+/// `CLOSE_ZONE_W - 8`, while `cell_width` keeps growing with DPI. Returning both
+/// from one function is what stops them drifting apart again.
+struct SidebarCloseGeometry {
+    /// Side of the rounded hover button.
+    side: f32,
+    /// Left edge of the hover button.
+    button_dx: f32,
+    /// Left edge of the one-cell glyph.
+    glyph_dx: f32,
+}
+
+/// `inset` is the gap to the zone's right edge. It is a parameter rather than
+/// `CLOSE_BUTTON_INSET` outright because the button also has to clear the agent
+/// ring, whose stroke scales with DPI and whose right edge coincides with the
+/// close zone's when the sidebar sits on the right.
+fn sidebar_close_geometry(
+    cell_width: f32,
+    cell_height: f32,
+    row_height: f32,
+    inset: f32,
+) -> SidebarCloseGeometry {
+    let side = (cell_height + 4.)
+        .min(CLOSE_ZONE_W - 8.)
+        .min(row_height - 6.)
+        .max(18.);
+    let button_dx = (CLOSE_ZONE_W - side - inset).max(0.);
+    SidebarCloseGeometry {
+        side,
+        button_dx,
+        glyph_dx: (button_dx + side * 0.5 - cell_width * 0.5).max(0.),
+    }
+}
+
+/// Horizontal space a row reserves for the close control when laying out text.
+///
+/// Measured to the **button's** left edge, not the glyph's: the hover button is
+/// an opaque fill drawn after the label on the same layer, so a reserve that
+/// only cleared the glyph let the button paint over the tail of its own title.
+/// Smaller than `CLOSE_ZONE_W` (the hit target), which spans the whole row
+/// height and extends past the button on both sides.
+fn sidebar_close_text_reserve(
+    cell_width: f32,
+    cell_height: f32,
+    row_height: f32,
+    inset: f32,
+) -> f32 {
+    let geometry = sidebar_close_geometry(cell_width, cell_height, row_height, inset);
+    (CLOSE_ZONE_W - geometry.button_dx + GAP).min(CLOSE_ZONE_W)
+}
+
+/// Stroke width of the agent throbber ring, which is also how far it intrudes
+/// from a row's edge.
+fn sidebar_ring_stroke(dpi_scale: f32) -> f32 {
+    (2. * dpi_scale).max(2.)
+}
+
+/// Gap between the close button and the right edge of its zone.
+///
+/// Wider than [`CLOSE_BUTTON_INSET`] on hidpi so the opaque button clears the
+/// agent ring: with the sidebar on the right the close zone's right edge is
+/// exactly the ring rect's, and the button is drawn after the ring on the same
+/// layer, so a bare 3px inset would eat a slice of the throbber.
+fn sidebar_close_inset(dpi_scale: f32) -> f32 {
+    CLOSE_BUTTON_INSET.max(sidebar_ring_stroke(dpi_scale) + 1.)
 }
 
 /// Horizontal composition of a sidebar row's leading decorations.
@@ -2661,6 +2723,30 @@ fn agent_launch_forced_local(behavior: AgentRemoteBehavior, pane_looks_remote: b
 fn is_worktree_pane(pane: &Arc<dyn Pane>) -> bool {
     pane.copy_user_vars().contains_key("tgzterminal.worktree")
         || pane.get_title().trim() == "Worktree"
+}
+
+/// Whether a herd agent's name says anything a pane row does not already show.
+///
+/// `join_sessions_with_panes` falls back to the session id and pane detection
+/// falls back to the model string or the vendor word, so those three are noise
+/// on a row that already carries a vendor dot. Claude's `nameSource: "derived"`
+/// slugs are filtered upstream, in `agent_herd::claude`, where the `ai-title`
+/// that replaces them is readable.
+fn herd_session_name(
+    name: &str,
+    session_id: Option<&str>,
+    vendor_label: &str,
+    model: Option<&str>,
+) -> Option<String> {
+    let name = name.trim();
+    if name.is_empty()
+        || Some(name) == session_id
+        || name.eq_ignore_ascii_case(vendor_label)
+        || Some(name) == model
+    {
+        return None;
+    }
+    Some(name.to_string())
 }
 
 fn clean_live_title(title: &str, fallback: &str, command: Option<&str>) -> Option<String> {
@@ -4245,6 +4331,22 @@ const AGENT_PROMPT_TAIL_LINES: usize = AGENT_STATUS_TAIL_LINES;
 /// Claude Code renders `│ > …`, which no bare-glyph check ever matched.
 const AGENT_BOXED_PROMPT_PREFIXES: &[&str] = &["│ >", "│ ❯", "│ ›", "┃ >", "┃ ❯", "┃ ›"];
 
+/// Leading borders of a boxed line, without the prompt glyph that
+/// [`AGENT_BOXED_PROMPT_PREFIXES`] pins to it. A dialog draws its options
+/// inside the same box, so the caret test has to strip the border first.
+const AGENT_BOX_BORDERS: &[&str] = &["│", "┃"];
+
+/// Carets a selection dialog leads its highlighted option with.
+const AGENT_CHOICE_CARETS: &[&str] = &["❯", ">", "›"];
+
+/// Key hints a selection dialog prints beneath its options.
+///
+/// Observed strings only. Claude Code's footer is `Enter to select · Tab/Arrow
+/// keys to navigate · Esc to cancel`, which is also where this whole bug came
+/// from: `esc to cancel` is a [`GENERIC_AGENT_RUNNING_MARKERS`] entry, so the
+/// dialog announced itself as *working*.
+const AGENT_CHOICE_HINT_MARKERS: &[&str] = &["to select", "arrow keys", "to cancel", "to confirm"];
+
 /// How long a `Running` status is held after its marker disappears.
 const AGENT_RUNNING_GRACE: Duration = Duration::from_secs(3);
 
@@ -4350,6 +4452,71 @@ fn agent_status_tail(text: &str) -> Vec<&str> {
         .collect()
 }
 
+/// The digit of a numbered option line, e.g. `1. Yes` or `2) No`.
+///
+/// The digit is returned rather than a bool so a corroborating option can be
+/// required to be a *different* one, which is what stops a single stray `1.`
+/// from looking like a menu.
+fn choice_option_digit(line: &str) -> Option<char> {
+    let mut chars = line.chars();
+    let digit = chars.next().filter(|c| c.is_ascii_digit())?;
+    if !matches!(chars.next(), Some('.') | Some(')')) {
+        return None;
+    }
+    // `1.` with nothing after it is an ordered-list marker in prose, not an
+    // option a caret can sit on.
+    matches!(chars.next(), Some(' ')).then_some(digit)
+}
+
+/// A boxed dialog draws every row as `│ ❯ 1. Yes` / `│   2. No`, so the border
+/// comes off before any of the option tests run -- on the corroborating rows as
+/// much as on the caret row, which is what a bare `strip_prefix` on the caret
+/// alone missed.
+fn strip_box_border(line: &str) -> &str {
+    AGENT_BOX_BORDERS
+        .iter()
+        .find_map(|border| line.strip_prefix(border))
+        .map_or(line, str::trim_start)
+}
+
+/// The option this line's selection caret is sitting on, if it is one.
+fn caret_option_digit(line: &str) -> Option<char> {
+    let rest = AGENT_CHOICE_CARETS
+        .iter()
+        .find_map(|caret| strip_box_border(line).strip_prefix(caret))?;
+    choice_option_digit(rest.trim_start())
+}
+
+/// Whether the tail shows a modal choice dialog: an agent asking the human to
+/// pick something, which is the opposite of working.
+///
+/// Two independent signals are required -- a caret-led numbered option *and*
+/// either a second, differently-numbered option or a key-hint line -- because
+/// streamed prose containing an ordered list must not read as a prompt.
+fn agent_awaiting_choice(tail: &[&str]) -> bool {
+    let Some(selected) = tail.iter().find_map(|line| caret_option_digit(line)) else {
+        return false;
+    };
+    tail.iter().any(|line| {
+        choice_option_digit(strip_box_border(line)).is_some_and(|digit| digit != selected) || {
+            let lower = line.to_ascii_lowercase();
+            AGENT_CHOICE_HINT_MARKERS
+                .iter()
+                .any(|marker| lower.contains(marker))
+        }
+    })
+}
+
+/// [`agent_awaiting_choice`] against a whole visible region.
+///
+/// The status inference works on the tail it already built; the detection call
+/// site needs the same answer to decide whether the reading may be escalated,
+/// and re-walking 16 trimmed lines is cheaper than threading a second return
+/// value through every caller and test of the inference.
+fn visible_text_awaits_choice(text: &str) -> bool {
+    agent_awaiting_choice(&agent_status_tail(text))
+}
+
 /// The spinner-led line in the pane's status tail, if there is one.
 ///
 /// Shared by the status inference and by the hash the caller carries between
@@ -4402,6 +4569,17 @@ fn infer_agent_status_from_visible_text(
     strong_identity: bool,
 ) -> AgentStatus {
     let tail = agent_status_tail(text);
+    // A modal choice dialog is resolved before the two *guessed* running
+    // signals below, and is the one documented exception to "running wins over
+    // waiting": while a dialog is up the agent's turn is suspended by
+    // construction, so it cannot be working. It has to come first because
+    // Claude Code's dialog footer -- `Enter to select · Tab/Arrow keys to
+    // navigate · Esc to cancel` -- contains `esc to cancel`, itself a
+    // `GENERIC_AGENT_RUNNING_MARKERS` entry, so the most unambiguous
+    // waiting-on-the-human screen in the product used to read as `Running` and
+    // spin for as long as the dialog stood. An adapter's own `running_patterns`
+    // still win over it: those are user config, and config beats inference.
+    let awaiting_choice = agent_awaiting_choice(&tail);
     // Markers are matched against the whole visible region, not the tail. An
     // agent prints its working line once and then streams tool output below it,
     // so by mid-turn the marker is dozens of lines above the prompt box -- see
@@ -4419,9 +4597,10 @@ fn infer_agent_status_from_visible_text(
     {
         return AgentStatus::Running;
     }
-    if GENERIC_AGENT_RUNNING_MARKERS
-        .iter()
-        .any(|marker| lower.contains(marker))
+    if !awaiting_choice
+        && GENERIC_AGENT_RUNNING_MARKERS
+            .iter()
+            .any(|marker| lower.contains(marker))
     {
         return AgentStatus::Running;
     }
@@ -4434,14 +4613,22 @@ fn infer_agent_status_from_visible_text(
     // catches the shapes we know; `spinner` catches the rest, because a line
     // that has not changed in `AGENT_SPINNER_STALE_AFTER` is not a spinner
     // whatever it says.
-    if spinner == SpinnerMotion::Live && spinner_line(text).is_some() {
+    if !awaiting_choice && spinner == SpinnerMotion::Live && spinner_line(text).is_some() {
         return AgentStatus::Running;
+    }
+    // A dialog hides the vendor's own status line, so in practice this and the
+    // spinner check above are mutually exclusive; the gate is there for the
+    // pane that manages to show both.
+    if awaiting_choice {
+        return AgentStatus::WaitingForInput;
     }
     // An adapter-declared waiting pattern (e.g. Gemini's "type your message")
     // is checked next, after every `Running` signal and before the generic
-    // glyph-based prompt check below. Running must always win over waiting --
-    // a vendor whose spinner line also happens to contain a waiting phrase
-    // should still read as busy -- so this sits strictly after step 3. It also
+    // glyph-based prompt check below. Running must win over waiting for every
+    // signal that is a *guess* -- a vendor whose spinner line also happens to
+    // contain a waiting phrase should still read as busy -- so this sits
+    // strictly after step 3. A modal dialog is the one exception, and it is
+    // resolved above rather than here, because it is not a guess. It also
     // has to run *before* the generic glyph check rather than replace it: an
     // adapter that declares nothing here (the common case) must fall through
     // untouched, so the glyph scan remains the floor for every vendor that has
@@ -4641,13 +4828,24 @@ fn output_activity_is_busy(
 /// it.
 ///
 /// Deliberately only ever escalates, and never touches `Exited`: a dead pane
-/// must not spin however recently it wrote its last line.
+/// must not spin however recently it wrote its last line -- nor a pane holding a
+/// dialog open, which is the one waiting reading that is not a guess.
 fn escalate_agent_status(
     inferred: AgentStatus,
     output_busy: bool,
     subagent_working: bool,
+    awaiting_choice: bool,
 ) -> AgentStatus {
     if agent_is_working(&inferred) || inferred == AgentStatus::Exited {
+        return inferred;
+    }
+    // A modal dialog is not the weak signal this function exists to correct. A
+    // working subagent cannot answer the question for the human, and the burst
+    // of output that paints the dialog is the dialog appearing, not work
+    // continuing -- so neither may promote it back to `Running`. Same reasoning
+    // as `agent_herd::promote_awaiting_human`, which also grants no subagent
+    // exemption.
+    if awaiting_choice {
         return inferred;
     }
     if subagent_working {
@@ -6416,6 +6614,7 @@ impl crate::TermWindow {
                 inferred.clone(),
                 activity.busy,
                 self.pane_has_working_subagent(pane.pane_id()),
+                visible_text_loaded && visible_text_awaits_choice(&visible_text),
             );
             let changed = escalated != inferred;
             (escalated, changed)
@@ -7524,30 +7723,79 @@ impl crate::TermWindow {
         is_worktree_pane(pane)
     }
 
-    /// Short human label for a pane row: the agent name when one is detected,
-    /// otherwise the foreground command, otherwise the pane title.
+    /// Short human label for a pane row.
+    ///
+    /// An agent pane is named by its *session* — Claude's own `ai-title`, read
+    /// off the herd — because the vendor is already spoken for by the row's
+    /// coloured dot, and two Claude panes in one repo are otherwise identical.
+    /// Everything else falls back through the same live-title chain the tab row
+    /// uses. Nothing here may touch the disk: this runs per pane per frame,
+    /// which is why the git branch (two file reads per ancestor directory) is
+    /// deliberately absent.
     fn sidebar_pane_label(&self, pane: &Arc<dyn Pane>) -> String {
         if is_worktree_pane(pane) {
             return "Worktree".to_string();
         }
-        if self.config.agent_ui.enabled {
-            if let Some(agent) = self.detect_agent_pane(pane) {
-                return agent.kind.label().to_string();
-            }
-        }
-        if let Some(command) = pane
+        let command = pane
             .get_foreground_process_name(CachePolicy::AllowStale)
             .map(|name| basename(&name))
-            .filter(|name| !name.is_empty())
+            .filter(|name| !name.is_empty());
+        if self.config.agent_ui.enabled {
+            if let Some(agent) = self.detect_agent_pane(pane) {
+                let vendor_label = agent.kind.label();
+                // `None` for the command: `pane_app_title` title-cases it as a
+                // last resort, which would answer "Vim" for a pane whose live
+                // title is the informative part.
+                return self
+                    .sidebar_herd_session_name(pane.pane_id(), vendor_label)
+                    .or_else(|| pane_app_title(pane, None))
+                    .unwrap_or_else(|| vendor_label.to_string());
+            }
+        }
+        let fallback = format!("pane {}", pane.pane_id());
+        if let Some(title) = clean_live_title(&pane.get_title(), &fallback, command.as_deref()) {
+            return title;
+        }
+        if let Some(cwd) = pane_working_dir(pane)
+            .map(|cwd| path_label(&cwd))
+            .filter(|cwd| !cwd.is_empty())
         {
+            return cwd;
+        }
+        if let Some(command) = command {
             return command;
         }
         let title = pane.get_title();
         if title.trim().is_empty() {
-            format!("pane {}", pane.pane_id())
+            fallback
         } else {
             title
         }
+    }
+
+    /// The herd's name for the agent bound to `pane_id`.
+    ///
+    /// Looked up by pane id, never by position: the herd list is re-sorted
+    /// attention-first and scoped to the active pane's project, so an index
+    /// addresses a different agent from one frame to the next. A name that is
+    /// only the session id or the vendor word is rejected — those are
+    /// `join_sessions_with_panes`' own fallbacks and say nothing the row does
+    /// not already say.
+    ///
+    /// Empty whenever the herd section is disabled, since that is what gates
+    /// the refresh; the caller's remaining rungs cover it.
+    fn sidebar_herd_session_name(&self, pane_id: PaneId, vendor_label: &str) -> Option<String> {
+        let state = self.agent_herd_state.borrow();
+        let agent = state
+            .agents
+            .iter()
+            .find(|agent| agent.pane_id == Some(pane_id))?;
+        herd_session_name(
+            &agent.name,
+            agent.session_id.as_deref(),
+            vendor_label,
+            agent.model.as_deref(),
+        )
     }
 
     /// Remote check for pane rows, which run every frame.
@@ -9329,6 +9577,15 @@ impl crate::TermWindow {
         // from cell_height directly so it does not need this adjustment.
         let dpi_scale = (self.dimensions.dpi as f32 / 96.).clamp(1., 2.5);
         let row_height = self.sidebar_row_height();
+        // Every close control on every row shares one inset, so the tab and
+        // pane buttons line up in a single column.
+        let close_inset = sidebar_close_inset(dpi_scale);
+        let close_reserve = sidebar_close_text_reserve(
+            cell_width as f32,
+            cell_height as f32,
+            row_height as f32,
+            close_inset,
+        );
         let resize_gap = RESIZE_GRIP_W as f32;
         let item_x = left + INSET;
         let item_w = (width as f32 - INSET * 2.).max(1.);
@@ -9363,11 +9620,7 @@ impl crate::TermWindow {
         let text_x = content_x + PAD_X + ACTIVE_TEXT_GAP;
         // Title width runs from the label column to the (reduced) close reserve
         // on the right.
-        let text_w = (content_w
-            - PAD_X * 2.
-            - ACTIVE_TEXT_GAP
-            - sidebar_close_text_reserve(cell_width as f32))
-        .max(0.);
+        let text_w = (content_w - PAD_X * 2. - ACTIVE_TEXT_GAP - close_reserve).max(0.);
         let palette = self.palette().clone();
         let gl_state = self.render_state.as_ref().unwrap();
         let white_space = gl_state.util_sprites.white_space.texture_coords();
@@ -10186,7 +10439,7 @@ impl crate::TermWindow {
         // dpi_scale applied.
         let tab_row_radius = (RADIUS * dpi_scale).min(row_height as f32 * 0.5);
         let ring_radius = (RING_RADIUS * dpi_scale).min(row_height as f32 * 0.5);
-        let ring_stroke = (2. * dpi_scale).max(2.);
+        let ring_stroke = sidebar_ring_stroke(dpi_scale);
         let hairline = dpi_scale.max(1.);
         let new_tab_y = top + height - INSET - row_height as f32;
         let tab_list_bottom = self.sidebar_tab_list_bottom(top, height, row_height as f32);
@@ -10368,8 +10621,8 @@ impl crate::TermWindow {
                         - PAD_X * 2.
                         - ACTIVE_TEXT_GAP
                         - badge_w
-                        - sidebar_close_text_reserve(cell_width as f32))
-                    .max(0.);
+                        - close_reserve)
+                        .max(0.);
                     if let Some((size, color)) = badge {
                         let badge_x = content_x + indent + PAD_X + ACTIVE_TEXT_GAP;
                         let badge_y = y + row_offset + (row_height as f32 - size) * 0.5;
@@ -10381,6 +10634,11 @@ impl crate::TermWindow {
                             color,
                         )?;
                     }
+                    // Session titles are sentences, not command names, so say
+                    // when one is cut instead of letting `render_text` drop the
+                    // tail silently.
+                    let label =
+                        truncate_with_ellipsis(&label, sidebar_text_cols(label_w, cell_width));
                     render_text(
                         self,
                         layers,
@@ -10405,18 +10663,49 @@ impl crate::TermWindow {
                     });
 
                     let close_x = content_x + content_w - CLOSE_ZONE_W;
-                    // Only drawn on hover: a persistent × on every pane row
-                    // would crowd an already indented line.
+                    let close_geometry = sidebar_close_geometry(
+                        cell_width as f32,
+                        cell_height as f32,
+                        row_height as f32,
+                        close_inset,
+                    );
+                    let close_press_offset = if close_pressed { 1. } else { 0. };
+                    // The same button the tab row draws. It has to come after
+                    // the ring painters above, which punch their own interior
+                    // back out on this layer and would erase it.
+                    if close_hovered {
+                        self.sidebar_rounded_fill(
+                            layers,
+                            1,
+                            euclid::rect(
+                                close_x + close_geometry.button_dx,
+                                y + row_offset
+                                    + (row_height as f32 - close_geometry.side) * 0.5
+                                    + close_press_offset,
+                                close_geometry.side,
+                                close_geometry.side,
+                            ),
+                            close_geometry.side * 0.38,
+                            if close_pressed {
+                                lerp_rgba(surface, active_fg, 0.38)
+                            } else {
+                                lerp_rgba(surface, active_fg, 0.22)
+                            },
+                        )?;
+                    }
+                    // The glyph shows on row hover too, but the button only on
+                    // its own: crossing a pane row should not look like an armed
+                    // close button. A persistent × would crowd the indent.
                     if row_hovered || close_hovered {
                         render_text(
                             self,
                             layers,
                             "×",
                             &CellAttributes::default(),
-                            close_x + CLOSE_ZONE_W - cell_width as f32 - CLOSE_GLYPH_INSET,
+                            close_x + close_geometry.glyph_dx,
                             y + row_offset
                                 + (row_height as f32 - cell_height as f32) * 0.5
-                                + if close_pressed { 1. } else { 0. },
+                                + close_press_offset,
                             cell_width as f32,
                             if close_hovered {
                                 hover_fg
@@ -10705,29 +10994,30 @@ impl crate::TermWindow {
             } else {
                 row_bg
             };
+            let close_geometry = sidebar_close_geometry(
+                cell_width as f32,
+                cell_height as f32,
+                row_height as f32,
+                close_inset,
+            );
+            let close_glyph_offset = if close_pressed { 1. } else { 0. };
             if close_hovered {
-                let close_button_side = (cell_height as f32 + 4.)
-                    .min(CLOSE_ZONE_W - 8.)
-                    .min(row_height as f32 - 6.)
-                    .max(18.);
-                let close_button_offset = if close_pressed { 1. } else { 0. };
                 self.sidebar_rounded_fill(
                     layers,
                     1,
                     euclid::rect(
-                        close_x + CLOSE_ZONE_W - close_button_side - 3.,
+                        close_x + close_geometry.button_dx,
                         y + row_offset
-                            + (row_height as f32 - close_button_side) * 0.5
-                            + close_button_offset,
-                        close_button_side,
-                        close_button_side,
+                            + (row_height as f32 - close_geometry.side) * 0.5
+                            + close_glyph_offset,
+                        close_geometry.side,
+                        close_geometry.side,
                     ),
-                    close_button_side * 0.38,
+                    close_geometry.side * 0.38,
                     close_bg,
                 )?;
             }
-            let close_glyph_x = close_x + CLOSE_ZONE_W - cell_width as f32 - CLOSE_GLYPH_INSET;
-            let close_glyph_offset = if close_pressed { 1. } else { 0. };
+            let close_glyph_x = close_x + close_geometry.glyph_dx;
             render_text(
                 self,
                 layers,
@@ -13144,45 +13434,45 @@ mod tests {
         // The two cases the screen cannot see: a tool call running behind a
         // redrawn prompt box, and a subagent working while the parent is quiet.
         assert_eq!(
-            escalate_agent_status(AgentStatus::WaitingForInput, true, false),
+            escalate_agent_status(AgentStatus::WaitingForInput, true, false, false),
             AgentStatus::Running
         );
         assert_eq!(
-            escalate_agent_status(AgentStatus::WaitingForInput, false, true),
+            escalate_agent_status(AgentStatus::WaitingForInput, false, true, false),
             AgentStatus::Running
         );
         assert_eq!(
-            escalate_agent_status(AgentStatus::Unknown, true, false),
+            escalate_agent_status(AgentStatus::Unknown, true, false, false),
             AgentStatus::Running
         );
 
         // A subagent outranks the output signal's own gating: it is evidence
         // about the agent, not about the screen.
         assert_eq!(
-            escalate_agent_status(AgentStatus::Idle, false, true),
+            escalate_agent_status(AgentStatus::Idle, false, true, false),
             AgentStatus::Running
         );
         // ... whereas output alone is too weak to overrule a positive reading
         // of idleness.
         assert_eq!(
-            escalate_agent_status(AgentStatus::Idle, true, false),
+            escalate_agent_status(AgentStatus::Idle, true, false, false),
             AgentStatus::Idle
         );
 
         // A dead pane must not spin however recently it wrote its last line.
         assert_eq!(
-            escalate_agent_status(AgentStatus::Exited, true, true),
+            escalate_agent_status(AgentStatus::Exited, true, true, false),
             AgentStatus::Exited
         );
 
         // Nothing to escalate.
         assert_eq!(
-            escalate_agent_status(AgentStatus::WaitingForInput, false, false),
+            escalate_agent_status(AgentStatus::WaitingForInput, false, false, false),
             AgentStatus::WaitingForInput
         );
         for working in [AgentStatus::Running, AgentStatus::Streaming] {
             assert_eq!(
-                escalate_agent_status(working.clone(), false, false),
+                escalate_agent_status(working.clone(), false, false, false),
                 working
             );
         }
@@ -13542,6 +13832,169 @@ mod tests {
         ] {
             assert!(!is_completed_summary_line(line), "{line} is not a summary");
         }
+    }
+
+    /// Captured live from a Claude Code 2.1.247 pane while an `AskUserQuestion`
+    /// dialog stood open, trimmed only of path noise.
+    ///
+    /// The last line is the whole bug: `Esc to cancel` is a
+    /// [`GENERIC_AGENT_RUNNING_MARKERS`] entry, matched against the whole
+    /// viewport, so the one screen that unambiguously means "waiting on the
+    /// human" announced itself as working and the ring spun for as long as the
+    /// dialog stood.
+    fn choice_dialog_screen() -> &'static str {
+        r#"
+⏺ Captures scheduled. Now a real scope question.
+──────────
+Planning: /plans/when-planning.md
+──────────
+←  ☐ Scope  ☐ Detection  ✔ Submit  →
+
+│ When an agent is blocked on your answer, what should the sidebar do?
+
+❯ 1. Glow + join waiting queue
+     Ring stops spinning and glows in the attention colour.
+  2. Glow only
+  3. Distinct 'needs approval' look
+  4. Type something.
+──────────
+  5. Chat about this
+
+Enter to select · Tab/Arrow keys to navigate · Esc to cancel
+"#
+    }
+
+    /// Captured from the same pane while it was genuinely working. Note there is
+    /// no interrupt hint anywhere: Claude Code 2.1.247 dropped `esc to
+    /// interrupt`, so spinner motion is the only running signal left for it.
+    fn working_screen() -> &'static str {
+        r#"
+⏺ Modern Claude Code has no interrupt hint in its status line.
+
+✶ Philosophising… (3m 51s · ↓ 13.9k tokens)
+
+──────────
+❯
+──────────
+  13% used · 87% left (130k/1000k tokens) · tgzterminal main
+  ⏸ plan mode on (shift+tab to cycle) · ← for agents
+"#
+    }
+
+    /// The second latch behind the same symptom: a plan or question dialog put up
+    /// *while a subagent is still running* used to be escalated straight back to
+    /// `Running`. A live subagent cannot answer the human's question, so it does
+    /// not get a vote here.
+    #[test]
+    fn a_dialog_is_not_escalated_back_to_running() {
+        for (busy, subagent) in [(true, false), (false, true), (true, true)] {
+            assert_eq!(
+                escalate_agent_status(AgentStatus::WaitingForInput, busy, subagent, true),
+                AgentStatus::WaitingForInput,
+                "output_busy={busy} subagent_working={subagent} must not outrank a dialog"
+            );
+        }
+        // Without a dialog on screen the escalation is still the right call: a
+        // bare prompt between two steps of one turn is exactly what it is for.
+        assert_eq!(
+            escalate_agent_status(AgentStatus::WaitingForInput, false, true, false),
+            AgentStatus::Running
+        );
+    }
+
+    #[test]
+    fn a_choice_dialog_is_waiting_not_running() {
+        for spinner in [SpinnerMotion::Live, SpinnerMotion::Frozen] {
+            assert_eq!(
+                infer_agent_status_from_visible_text(choice_dialog_screen(), None, spinner, false),
+                AgentStatus::WaitingForInput,
+                "a dialog asking the human to choose is not work ({spinner:?})"
+            );
+        }
+    }
+
+    /// The ordering that fixes it: a modal dialog outranks both *guessed*
+    /// running signals, so neither a leftover interrupt hint nor a spinner the
+    /// vendor forgot to clear can pin the row at `working`.
+    #[test]
+    fn a_choice_dialog_outranks_a_generic_running_marker() {
+        let screen = format!(
+            "✻ Deliberating… (esc to interrupt){}",
+            choice_dialog_screen()
+        );
+        assert_eq!(
+            infer_agent_status_from_visible_text(&screen, None, SpinnerMotion::Live, false),
+            AgentStatus::WaitingForInput
+        );
+    }
+
+    /// An adapter's own `running_patterns` are user config, and config beats
+    /// inference -- including this one.
+    #[test]
+    fn an_adapter_running_pattern_still_beats_a_dialog() {
+        let adapter = AgentAdapterConfig {
+            running_patterns: vec!["deliberating".to_string()],
+            ..Default::default()
+        };
+        let screen = format!("Deliberating…{}", choice_dialog_screen());
+        assert_eq!(
+            infer_agent_status_from_visible_text(
+                &screen,
+                Some(&adapter),
+                SpinnerMotion::Live,
+                false
+            ),
+            AgentStatus::Running
+        );
+    }
+
+    /// Two signals are required, so an ordered list in streamed output is not a
+    /// menu and does not suppress the running signals around it.
+    #[test]
+    fn a_streamed_numbered_list_is_not_a_dialog() {
+        let screen = "⏺ Three ways to do this:\n\
+             1. First\n\
+             2. Second\n\
+             ✻ Deliberating (esc to interrupt)\n";
+        assert!(!agent_awaiting_choice(&agent_status_tail(screen)));
+        assert_eq!(
+            infer_agent_status_from_visible_text(screen, None, SpinnerMotion::Live, false),
+            AgentStatus::Running,
+            "a numbered list must not mute a real running marker"
+        );
+    }
+
+    /// Guards the 2.1.247 reality: with no interrupt hint on screen, spinner
+    /// motion is the only thing left that says "working".
+    #[test]
+    fn a_working_pane_still_spins_without_an_interrupt_hint() {
+        assert!(!agent_awaiting_choice(&agent_status_tail(working_screen())));
+        assert_eq!(
+            infer_agent_status_from_visible_text(
+                working_screen(),
+                None,
+                SpinnerMotion::Live,
+                false
+            ),
+            AgentStatus::Running
+        );
+        assert_eq!(
+            infer_agent_status_from_visible_text(
+                working_screen(),
+                None,
+                SpinnerMotion::Frozen,
+                false
+            ),
+            AgentStatus::WaitingForInput,
+            "the same screen, spinner no longer moving, is a finished agent"
+        );
+    }
+
+    #[test]
+    fn a_boxed_dialog_option_is_still_a_dialog() {
+        let screen = "│ ❯ 1. Yes\n\
+             │   2. No\n";
+        assert!(agent_awaiting_choice(&agent_status_tail(screen)));
     }
 
     /// A spinner is a moving thing. Whatever the wording, a line that has not
@@ -14813,16 +15266,179 @@ mod tests {
         assert_eq!(sidebar_text_cols(cols.text_w, 14), 0);
     }
 
-    #[test]
-    fn close_text_reserve_clears_the_close_glyph() {
-        for cell_width in [7., 14., 20.] {
-            let reserve = sidebar_close_text_reserve(cell_width);
-            assert!(
-                reserve >= (cell_width + CLOSE_GLYPH_INSET).min(CLOSE_ZONE_W),
-                "reserve {reserve} must clear the glyph at cell width {cell_width}"
-            );
-            assert!(reserve <= CLOSE_ZONE_W);
+    /// Cell sizes from 1x through a large 4k font, each with the row heights
+    /// both densities derive from them.
+    fn close_geometry_matrix() -> Vec<(f32, f32, f32)> {
+        let mut matrix = Vec::new();
+        for (cell_width, cell_height) in [
+            (7f32, 17f32),
+            (8., 18.),
+            (14., 34.),
+            (19., 40.),
+            (24., 48.),
+            (26., 26.),
+        ] {
+            // Mirrors `sidebar_row_height`: comfortable with and without the
+            // metadata line, then compact.
+            for row_height in [
+                (cell_height * 2. + 8.).max(44.),
+                (cell_height + 10.).max(34.),
+                (cell_height + 6.).max(28.),
+            ] {
+                matrix.push((cell_width, cell_height, row_height));
+            }
         }
+        matrix
+    }
+
+    /// The regression the −4px drift shipped without: the hover button and the
+    /// glyph it sits behind must share a centre at every cell size.
+    #[test]
+    fn close_button_is_concentric_with_its_glyph() {
+        for (cell_width, cell_height, row_height) in close_geometry_matrix() {
+            for inset in [CLOSE_BUTTON_INSET, sidebar_close_inset(2.5)] {
+                let geometry = sidebar_close_geometry(cell_width, cell_height, row_height, inset);
+                let button_centre = geometry.button_dx + geometry.side * 0.5;
+                let glyph_centre = geometry.glyph_dx + cell_width * 0.5;
+                assert!(
+                    (button_centre - glyph_centre).abs() < 1e-4,
+                    "button centre {} vs glyph centre {} at cell {}x{}, row {}, inset {}",
+                    button_centre,
+                    glyph_centre,
+                    cell_width,
+                    cell_height,
+                    row_height,
+                    inset
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn close_control_stays_inside_its_zone_and_row() {
+        for (cell_width, cell_height, row_height) in close_geometry_matrix() {
+            for inset in [CLOSE_BUTTON_INSET, sidebar_close_inset(2.5)] {
+                let geometry = sidebar_close_geometry(cell_width, cell_height, row_height, inset);
+                assert!(geometry.side >= 18. && geometry.side <= CLOSE_ZONE_W - 8.);
+                assert!(geometry.side <= row_height);
+                assert!(geometry.button_dx >= 0.);
+                assert!(geometry.button_dx + geometry.side <= CLOSE_ZONE_W + 1e-4);
+                assert!(geometry.glyph_dx >= 0.);
+            }
+        }
+    }
+
+    /// The button is an opaque fill drawn after the label on the same layer, so
+    /// the reserve has to clear its left edge, not merely the glyph's.
+    #[test]
+    fn close_text_reserve_clears_the_close_button() {
+        for (cell_width, cell_height, row_height) in close_geometry_matrix() {
+            for inset in [CLOSE_BUTTON_INSET, sidebar_close_inset(2.5)] {
+                let geometry = sidebar_close_geometry(cell_width, cell_height, row_height, inset);
+                let reserve =
+                    sidebar_close_text_reserve(cell_width, cell_height, row_height, inset);
+                // Text must end at or before the button starts.
+                assert!(
+                    CLOSE_ZONE_W - reserve <= geometry.button_dx + 1e-4,
+                    "reserve {} leaves text under the button at cell {}x{}, row {}",
+                    reserve,
+                    cell_width,
+                    cell_height,
+                    row_height
+                );
+                // And it keeps a full gap unless the reserve has saturated at
+                // the whole zone, where there is no room left to give.
+                assert!(
+                    reserve == CLOSE_ZONE_W
+                        || CLOSE_ZONE_W - reserve + GAP <= geometry.button_dx + 1e-4,
+                    "reserve {} crowds the button at cell {}x{}, row {}",
+                    reserve,
+                    cell_width,
+                    cell_height,
+                    row_height
+                );
+                assert!(reserve <= CLOSE_ZONE_W);
+            }
+        }
+    }
+
+    /// The reserve grew when it moved to the button's edge, so pin the default
+    /// sidebar width away from the point where a row would paint no text at all.
+    #[test]
+    fn close_reserve_leaves_room_for_text_at_the_default_width() {
+        let default_width = config::Config::default_config().sidebar_width_px as f32;
+        for (cell_width, cell_height, row_height) in close_geometry_matrix() {
+            for dpi in [72., 96., 144., 192., 240.] {
+                let dpi_scale = (dpi as f32 / 96.).clamp(1., 2.5);
+                let width = default_width * sidebar_width_scale_for_dpi(dpi);
+                // Mirrors `paint_sidebar`: the scrollbar gutter is the worst
+                // case, and a pane row is indented on top of that.
+                let content_w =
+                    width - INSET * 2. - RESIZE_GRIP_W as f32 - SIDEBAR_SCROLLBAR_GUTTER_W;
+                let reserve = sidebar_close_text_reserve(
+                    cell_width,
+                    cell_height,
+                    row_height,
+                    sidebar_close_inset(dpi_scale),
+                );
+                let label_w = content_w
+                    - PANE_ROW_INDENT
+                    - PAD_X * 2.
+                    - ACTIVE_TEXT_GAP
+                    - sidebar_agent_badge_w(cell_height)
+                    - reserve;
+                assert!(
+                    sidebar_text_cols(label_w.max(0.), cell_width as usize) >= 1,
+                    "no room for a single column at cell {}x{}, dpi {} \
+                     (label_w {}, reserve {})",
+                    cell_width,
+                    cell_height,
+                    dpi,
+                    label_w,
+                    reserve
+                );
+            }
+        }
+    }
+
+    /// A session title is a sentence, so a cut has to be visible. Sized the way
+    /// the pane row sizes it, from the label's pixel budget.
+    #[test]
+    fn a_long_session_title_is_elided_within_its_budget() {
+        let title = "model-quality-competence-matrix";
+        for (label_w, cell_width) in [(210., 7usize), (60., 7), (7., 7), (140., 14)] {
+            let cols = sidebar_text_cols(label_w, cell_width);
+            let shown = truncate_with_ellipsis(title, cols);
+            assert!(unicode_column_width(&shown, None) <= cols);
+            if cols < unicode_column_width(title, None) {
+                assert!(shown.ends_with('…'), "{} should say it was cut", shown);
+            }
+        }
+        assert_eq!(truncate_with_ellipsis(title, 1).as_ref(), "…");
+        assert_eq!(truncate_with_ellipsis(title, 0).as_ref(), "");
+    }
+
+    #[test]
+    fn herd_session_name_rejects_its_own_fallbacks() {
+        // A real title survives.
+        assert_eq!(
+            herd_session_name("Fix sidebar close hover", Some("abc-123"), "Claude", None)
+                .as_deref(),
+            Some("Fix sidebar close hover")
+        );
+        // `join_sessions_with_panes` falls back to the session id...
+        assert_eq!(
+            herd_session_name("abc-123", Some("abc-123"), "Claude", None),
+            None
+        );
+        // ...pane detection falls back to the vendor word...
+        assert_eq!(herd_session_name("claude", None, "Claude", None), None);
+        // ...or to the model string.
+        assert_eq!(
+            herd_session_name("opus-5", None, "Claude", Some("opus-5")),
+            None
+        );
+        assert_eq!(herd_session_name("   ", None, "Claude", None), None);
     }
 
     #[test]
