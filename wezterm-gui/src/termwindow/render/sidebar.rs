@@ -894,17 +894,32 @@ fn default_attention() -> LinearRgba {
     srgb8_to_linear_tuple(crate::agent_herd::ATTENTION_RGB)
 }
 
+/// Near-black label colour, for fills no scheme foreground can sit on.
+const LABEL_INK: LinearRgba = LinearRgba(0.03, 0.03, 0.035, 1.0);
+
+/// WCAG-style contrast ratio between two relative luminances.
+fn contrast_ratio(a: f32, b: f32) -> f32 {
+    let (hi, lo) = if a > b { (a, b) } else { (b, a) };
+    (hi + 0.05) / (lo + 0.05)
+}
+
 /// Label colour for a chip or row whose fill is `bg`.
 ///
-/// `fg` is the palette's own foreground and is what a dark fill gets, so these
-/// labels follow the configured colour scheme rather than being forced to pure
-/// white. A light fill still falls back to near-black, since no dark-scheme
-/// foreground would be readable on it.
+/// `fg` is the palette's own foreground, so these labels follow the configured
+/// colour scheme rather than being forced to pure white. It only wins while it
+/// is actually the more readable of the two candidates: a fixed luminance
+/// threshold used to hand a mid-grey fill (the active rail tile, luminance
+/// ~0.41) a near-white scheme foreground, painting the tab glyph light on
+/// light and all but erasing it. Comparing both candidates' contrast against
+/// the fill has no such blind band — mid-grey now takes the ink.
 fn contrast_label_color(bg: LinearRgba, fg: LinearRgba) -> LinearRgba {
-    if bg.relative_luminance() > 0.46 {
-        LinearRgba(0.03, 0.03, 0.035, 1.0)
-    } else {
+    let bg_lum = bg.relative_luminance();
+    if contrast_ratio(bg_lum, fg.relative_luminance())
+        >= contrast_ratio(bg_lum, LABEL_INK.relative_luminance())
+    {
         fg
+    } else {
+        LABEL_INK
     }
 }
 
@@ -16918,10 +16933,11 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
         // A light fill still needs near-black: no dark-scheme foreground would
         // be readable on it.
         let light_fill = srgb8_to_linear(0xf0, 0xf0, 0xf0);
-        assert_eq!(
-            contrast_label_color(light_fill, fg),
-            LinearRgba(0.03, 0.03, 0.035, 1.0)
-        );
+        assert_eq!(contrast_label_color(light_fill, fg), LABEL_INK);
+        // A mid-grey fill is the case a luminance threshold got wrong: the
+        // scheme foreground is nearly the same colour as the fill there.
+        let mid_fill = srgb8_to_linear(0xa6, 0xab, 0xb1);
+        assert_eq!(contrast_label_color(mid_fill, fg), LABEL_INK);
     }
 
     #[test]
