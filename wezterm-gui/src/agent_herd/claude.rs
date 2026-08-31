@@ -114,6 +114,11 @@ fn parse_session_file(path: &Path) -> Option<ClaudeSession> {
             .and_then(|v| v.as_str())
             .filter(|name| !name.is_empty())
             .map(str::to_string),
+        name_is_derived: value
+            .get("nameSource")
+            .and_then(|v| v.as_str())
+            .map(|source| source == "derived")
+            .unwrap_or(false),
         status,
         blocked_reason,
         started_at: epoch_millis(value.get("startedAt")),
@@ -322,6 +327,33 @@ pub fn last_message_line(path: &Path) -> Option<String> {
         })
 }
 
+/// Tools that cannot complete without a human touching the keyboard.
+///
+/// Deliberately not every outstanding `tool_use`: a pending `Bash` looks
+/// identical in the transcript whether it is executing or sitting behind a
+/// permission prompt, so guessing there would pin working agents at `Blocked`.
+/// These two are unambiguous -- neither can ever resolve on its own.
+const CLAUDE_HUMAN_GATED_TOOLS: &[&str] = &["ExitPlanMode", "AskUserQuestion"];
+
+/// Whether any `tool_use` block in this message names a human-gated tool.
+///
+/// Any, not the last: a message can carry several calls, and one of them
+/// standing in front of the human is enough to hold the whole turn.
+fn has_human_gated_tool_use(message: &serde_json::Value) -> bool {
+    message
+        .get("content")
+        .and_then(|content| content.as_array())
+        .is_some_and(|blocks| {
+            blocks.iter().any(|block| {
+                block.get("type").and_then(|v| v.as_str()) == Some("tool_use")
+                    && block
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|name| CLAUDE_HUMAN_GATED_TOOLS.contains(&name))
+            })
+        })
+}
+
 /// What Claude's transcript says about whether the turn is over.
 ///
 /// `end_turn` (and its rarer siblings) is the agent signing off: it has stopped
@@ -347,8 +379,16 @@ fn turn_state_from_line(line: &str) -> super::TurnState {
             Some("end_turn") | Some("stop_sequence") | Some("max_tokens") => {
                 super::TurnState::Finished
             }
-            // `tool_use` means a call is outstanding. A null stop reason means
-            // the record was written mid-stream.
+            // `tool_use` means a call is outstanding -- either a tool that is
+            // running, or one that cannot finish until the human answers. Only
+            // the latter means the agent is blocked, and no lookahead is needed
+            // to tell whether it is still outstanding: the `tool_result` is
+            // written as the very next record, so once it exists it *is* the
+            // last message line and the `user` arm below claims it.
+            Some("tool_use") if has_human_gated_tool_use(message) => {
+                super::TurnState::AwaitingHuman
+            }
+            // A null stop reason means the record was written mid-stream.
             _ => super::TurnState::Working,
         },
         // A tool result being fed back, or a prompt just submitted: either way
@@ -366,6 +406,28 @@ pub fn session_transcript_path(home: &Path, cwd: &Path, session_id: &str) -> Opt
     let project_dir = resolve_project_dir(home, cwd).ok()?;
     let path = project_dir.join(format!("{session_id}.jsonl"));
     path.is_file().then_some(path)
+}
+
+/// The most informative name a session has.
+///
+/// `sessions/<pid>.json` carries a `name`, but with `nameSource: "derived"` it
+/// is only a slug of the working directory plus a hash (`tgzterminal-72`) —
+/// which repeats what the project column already shows. Claude's own `ai-title`
+/// lives in the transcript instead, so a derived name is replaced by it and only
+/// falls back when the transcript has neither a title nor a first prompt.
+///
+/// A name the user or the SDK actually set is never second-guessed.
+fn session_name(
+    transcript: Option<&Path>,
+    name: Option<String>,
+    name_is_derived: bool,
+) -> Option<String> {
+    if name.is_some() && !name_is_derived {
+        return name;
+    }
+    transcript
+        .and_then(super::sessions::claude_transcript_label)
+        .or(name)
 }
 
 #[cfg(test)]
@@ -722,6 +784,61 @@ mod tests {
         );
     }
 
+    /// A question or a plan waiting to be approved is not a turn in progress:
+    /// nothing moves until the human answers. Record shapes taken from a real
+    /// `~/.claude/projects/<slug>/<session>.jsonl`.
+    #[test]
+    fn a_pending_human_gated_call_is_awaiting_the_human() {
+        let dir = tempfile::tempdir().unwrap();
+
+        for tool in ["AskUserQuestion", "ExitPlanMode"] {
+            let path = dir.path().join(format!("{tool}.jsonl"));
+            write(
+                &path,
+                &format!(
+                    "{{\"type\":\"assistant\",\"message\":{{\"role\":\"assistant\",\
+                     \"stop_reason\":\"tool_use\",\"content\":[{{\"type\":\"text\"}},\
+                     {{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"{tool}\"}}]}}}}\n"
+                ),
+            );
+            assert_eq!(
+                turn_state_from_transcript(&path),
+                crate::agent_herd::TurnState::AwaitingHuman,
+                "a pending {tool} call is the human being the bottleneck"
+            );
+        }
+
+        // Answered: the `tool_result` is written as the very next record, so it
+        // becomes the last message line and the turn is moving again. This is
+        // why no lookahead is needed.
+        let answered = dir.path().join("answered.jsonl");
+        write(
+            &answered,
+            "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"stop_reason\":\"tool_use\",\
+             \"content\":[{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"AskUserQuestion\"}]}}\n\
+             {\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\
+             \"tool_use_id\":\"toolu_1\"}]}}\n",
+        );
+        assert_eq!(
+            turn_state_from_transcript(&answered),
+            crate::agent_herd::TurnState::Working
+        );
+
+        // An ordinary tool looks the same whether it is running or sitting
+        // behind a permission prompt, so it stays `Working` and the screen
+        // decides.
+        let ordinary = dir.path().join("bash.jsonl");
+        write(
+            &ordinary,
+            "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"stop_reason\":\"tool_use\",\
+             \"content\":[{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"Bash\"}]}}\n",
+        );
+        assert_eq!(
+            turn_state_from_transcript(&ordinary),
+            crate::agent_herd::TurnState::Working
+        );
+    }
+
     #[test]
     fn a_turn_mid_tool_call_is_working() {
         let dir = tempfile::tempdir().unwrap();
@@ -772,6 +889,74 @@ mod tests {
         let (ty, stop) = parse_tail_line(r#"{"type":"user"}"#);
         assert_eq!(ty.as_deref(), Some("user"));
         assert_eq!(stop, None);
+    }
+
+    #[test]
+    fn a_derived_name_is_replaced_by_the_transcripts_own_title() {
+        let temp = tempfile::tempdir().unwrap();
+        let transcript = temp.path().join("sess-1.jsonl");
+        write(
+            &transcript,
+            concat!(
+                r#"{"type":"user","cwd":"/repo","message":{"role":"user","content":"hi"}}"#,
+                "\n",
+                r#"{"type":"ai-title","aiTitle":"Fix sidebar close hover"}"#,
+                "\n"
+            ),
+        );
+
+        // `nameSource: "derived"` means the name is only a slug of the cwd.
+        assert_eq!(
+            session_name(Some(&transcript), Some("tgzterminal-72".to_string()), true).as_deref(),
+            Some("Fix sidebar close hover")
+        );
+        // A name the user or the SDK set is never second-guessed.
+        assert_eq!(
+            session_name(Some(&transcript), Some("release-prep".to_string()), false).as_deref(),
+            Some("release-prep")
+        );
+    }
+
+    #[test]
+    fn a_derived_name_survives_a_transcript_with_no_title() {
+        let temp = tempfile::tempdir().unwrap();
+        let transcript = temp.path().join("sess-2.jsonl");
+        // No `ai-title`, and the only user record is injected context.
+        write(
+            &transcript,
+            concat!(
+                r#"{"type":"user","isMeta":true,"cwd":"/repo","#,
+                r#""message":{"role":"user","content":"<system>"}}"#,
+                "\n"
+            ),
+        );
+
+        assert_eq!(
+            session_name(Some(&transcript), Some("tgzterminal-72".to_string()), true).as_deref(),
+            Some("tgzterminal-72")
+        );
+        assert_eq!(session_name(None, None, false), None);
+        assert_eq!(session_name(Some(&transcript), None, false), None);
+    }
+
+    #[test]
+    fn name_source_is_read_off_the_session_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let derived = temp.path().join("derived.json");
+        write(
+            &derived,
+            r#"{"pid":1,"sessionId":"sess-1","cwd":"/repo","status":"idle",
+                "name":"tgzterminal-72","nameSource":"derived"}"#,
+        );
+        assert!(parse_session_file(&derived).unwrap().name_is_derived);
+
+        let explicit = temp.path().join("explicit.json");
+        write(
+            &explicit,
+            r#"{"pid":2,"sessionId":"sess-2","cwd":"/repo","status":"idle",
+                "name":"release-prep"}"#,
+        );
+        assert!(!parse_session_file(&explicit).unwrap().name_is_derived);
     }
 
     #[test]
@@ -841,9 +1026,12 @@ impl crate::agent_herd::vendor::SessionSource for ClaudeDetector {
             .map(|s| {
                 let activity = activity_for_session(home, &s);
                 // Read before the fields below move out of `s`.
-                let turn = session_transcript_path(home, &s.cwd, &s.session_id)
-                    .map(|path| turn_state_from_transcript(&path))
+                let transcript = session_transcript_path(home, &s.cwd, &s.session_id);
+                let turn = transcript
+                    .as_deref()
+                    .map(turn_state_from_transcript)
                     .unwrap_or_default();
+                let name = session_name(transcript.as_deref(), s.name, s.name_is_derived);
                 crate::agent_herd::vendor::VendorSession {
                     pid: s.pid,
                     interactive: s.interactive,
@@ -851,7 +1039,7 @@ impl crate::agent_herd::vendor::SessionSource for ClaudeDetector {
                     session_id: s.session_id,
                     cwd: s.cwd,
                     project_root: s.project_root,
-                    name: s.name,
+                    name,
                     model: None,
                     status: s.status,
                     // `sessions/<pid>.json` is the agent's own self-report and

@@ -344,6 +344,33 @@ fn collect_claude_candidates(home: &Path, out: &mut Vec<Candidate>) {
 /// first prompt the user actually typed. There is deliberately no search for a
 /// `"type":"summary"` entry: current Claude Code does not write one.
 fn read_claude_details(path: &Path) -> Option<SessionDetails> {
+    let head = claude_head_scan(path);
+    Some(SessionDetails {
+        cwd: head.cwd?,
+        git_branch: head.git_branch,
+        label: head.label,
+        session_id: None,
+    })
+}
+
+/// What one head scan of a Claude transcript yields.
+struct ClaudeHead {
+    cwd: Option<PathBuf>,
+    git_branch: Option<String>,
+    label: Option<String>,
+}
+
+/// Claude's own short description of a session, read from its transcript head.
+///
+/// The live `sessions/<pid>.json` also carries a `name`, but when its
+/// `nameSource` is `derived` that name is only a slug of the working directory —
+/// which is why the herd asks here instead. Bounded head read with an early
+/// break, and it runs on the herd's scan thread, never on the paint path.
+pub fn claude_transcript_label(path: &Path) -> Option<String> {
+    claude_head_scan(path).label
+}
+
+fn claude_head_scan(path: &Path) -> ClaudeHead {
     let mut cwd = None;
     let mut git_branch = None;
     let mut title = None;
@@ -401,12 +428,11 @@ fn read_claude_details(path: &Path) -> Option<SessionDetails> {
         }
     }
 
-    Some(SessionDetails {
-        cwd: cwd?,
+    ClaudeHead {
+        cwd,
         git_branch,
         label: title.or(prompt),
-        session_id: None,
-    })
+    }
 }
 
 /// Flatten a Claude `message.content` into plain text.
