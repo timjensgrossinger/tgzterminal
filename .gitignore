@@ -85,3 +85,8 @@ CONVENTIONS.md
 # see the Build flavours section of docs/TGZTERMINAL_CONFIG.md)
 /target-*
 assets/branding/**/*.icns
+
+# Internal planning docs and design artifacts (kept locally, never committed)
+/testhuman.md
+/docs/*_PLAN.md
+/docs/design/

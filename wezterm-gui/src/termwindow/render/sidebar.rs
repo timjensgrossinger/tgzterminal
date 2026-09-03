@@ -344,8 +344,7 @@ struct SidebarPalette {
     ///
     /// Palette-sourced rather than read straight from
     /// [`agent_herd::ATTENTION_RGB`] so a branded theme can speak its own
-    /// attention colour without four literals drifting apart — the note in
-    /// `docs/AGENT_QUEUE_PLAN.md` asked for exactly this.
+    /// attention colour without four literals drifting apart.
     attention: LinearRgba,
     ring: RingColors,
 }
@@ -5191,7 +5190,7 @@ impl crate::TermWindow {
     ///
     /// Building this probes `$PATH` with filesystem metadata calls, so the
     /// result is cached per config generation and must never be rebuilt per
-    /// frame — see the P1 finding in `docs/REPO_AUDIT_FIX_PLAN.md`.
+    /// frame.
     pub fn agent_launcher_entries(&self) -> Arc<Vec<AgentLauncherEntry>> {
         let gen = self.config.generation();
         {

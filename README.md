@@ -412,11 +412,9 @@ WEZTERM_LOG=wezterm_gui::termwindow::render::sidebar=debug tgzterminal
 whether an animation actually fired and, if not, which gate stopped it.
 
 Further reading, for when "read the code" isn't fast enough:
-[`docs/TGZTERMINAL_REBUILD_SPEC.md`](docs/TGZTERMINAL_REBUILD_SPEC.md),
-[`docs/AGENT_TOOLBELT_PLAN.md`](docs/AGENT_TOOLBELT_PLAN.md),
-[`docs/RICH_INPUT_PLAN.md`](docs/RICH_INPUT_PLAN.md), and
-[`docs/REPO_AUDIT_FIX_PLAN.md`](docs/REPO_AUDIT_FIX_PLAN.md) — the last one is the honest
-list of what's still rough, kept up to date instead of pretending everything's fine.
+[`docs/TGZTERMINAL_REBUILD_SPEC.md`](docs/TGZTERMINAL_REBUILD_SPEC.md) for the
+behaviour-level spec of every fork surface, and
+[`docs/TGZTERMINAL_CONFIG.md`](docs/TGZTERMINAL_CONFIG.md) for the key-by-key reference.
 
 ## Cutting a release
 
