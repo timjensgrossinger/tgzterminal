@@ -94,7 +94,7 @@ jobs:
       - name: Install Inno Setup
         shell: pwsh
         run: |
-          choco install innosetup --version=6.3.3 --no-progress -y
+          choco install innosetup --version=6.3.3 --no-progress -y --allow-downgrade --force
           "ISCC=C:\Program Files (x86)\Inno Setup 6\ISCC.exe" >> $env:GITHUB_ENV
 
       - name: Compile the installer script
