@@ -125,6 +125,13 @@ winapi = { workspace=true, features = [
     "namedpipeapi",
     "synchapi",
     "winsock2",
+    # Process liveness for agent_herd: OpenProcess / GetExitCodeProcess, plus
+    # the access-denied path that stands in for unix's EPERM.
+    "processthreadsapi",
+    "errhandlingapi",
+    "minwinbase",
+    "winnt",
+    "winerror",
 ]}
 windows = { workspace=true, features = [
     "Win32_UI_Shell",

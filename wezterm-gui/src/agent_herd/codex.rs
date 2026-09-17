@@ -1,5 +1,7 @@
-use crate::agent_herd::claude::process_is_alive;
-use crate::agent_herd::vendor::{AgentVendor, SessionSource, VendorSession};
+use crate::agent_herd::claude::session_is_live;
+use crate::agent_herd::vendor::{
+    AgentVendor, SessionOrigin, SessionRoot, SessionSource, VendorSession,
+};
 use crate::agent_herd::HerdStatus;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -88,7 +90,8 @@ impl SessionSource for CodexDetector {
         AgentVendor::Codex
     }
 
-    fn collect_sessions(&self, home: &Path) -> Vec<VendorSession> {
+    fn collect_sessions(&self, root: &SessionRoot) -> Vec<VendorSession> {
+        let home = root.home.as_path();
         let mut sessions = collect_rollout_sessions(home);
         if !sessions.is_empty() {
             return sessions;
@@ -107,7 +110,7 @@ impl SessionSource for CodexDetector {
                         // this session rather than show a phantom row.
                         _ => continue,
                     };
-                    if !process_is_alive(pid) {
+                    if !session_is_live(&root.origin, pid, &file) {
                         continue;
                     }
                     let session_id = json
@@ -140,6 +143,7 @@ impl SessionSource for CodexDetector {
                         })
                         .unwrap_or(HerdStatus::Unknown);
                     sessions.push(VendorSession {
+                        origin: SessionOrigin::Host,
                         pid,
                         // This store does not distinguish harness-spawned
                         // sessions from interactive ones.
@@ -214,6 +218,7 @@ fn collect_rollout_sessions(home: &Path) -> Vec<VendorSession> {
             let activity =
                 crate::agent_herd::sessions::activity_from_session_files(&path, &root, &session_id);
             sessions.push(VendorSession {
+                origin: SessionOrigin::Host,
                 // Rollout metadata has no process id. Herd binding falls back
                 // to a unique cwd match against the live pane.
                 pid: 0,
@@ -316,7 +321,7 @@ mod tests {
             ),
         );
 
-        let sessions = CodexDetector.collect_sessions(temp.path());
+        let sessions = CodexDetector.collect_sessions(&SessionRoot::host(temp.path()));
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].session_id, "sess-live");
         assert_eq!(sessions[0].cwd, PathBuf::from("/repo"));
@@ -333,7 +338,9 @@ mod tests {
             &temp.path().join(".codex").join("dead.json"),
             &session_json(dead),
         );
-        assert!(CodexDetector.collect_sessions(temp.path()).is_empty());
+        assert!(CodexDetector
+            .collect_sessions(&SessionRoot::host(temp.path()))
+            .is_empty());
     }
 
     #[test]
@@ -344,7 +351,7 @@ mod tests {
             &temp.path().join(".codex").join("live.json"),
             &session_json(me),
         );
-        let sessions = CodexDetector.collect_sessions(temp.path());
+        let sessions = CodexDetector.collect_sessions(&SessionRoot::host(temp.path()));
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].pid, me);
     }
@@ -365,7 +372,7 @@ mod tests {
             r#"{"type":"function_call","name":"shell","arguments":{"command":"cargo check"}}"#,
         );
 
-        let sessions = CodexDetector.collect_sessions(temp.path());
+        let sessions = CodexDetector.collect_sessions(&SessionRoot::host(temp.path()));
         assert!(sessions[0]
             .activity
             .as_ref()

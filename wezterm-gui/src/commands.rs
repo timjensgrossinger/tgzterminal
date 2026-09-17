@@ -806,6 +806,16 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             menubar: &["View"],
             icon: Some("cod_terminal"),
         },
+        RestoreLastWindowAgents => CommandDef {
+            brief: "Reopen last session's agents".into(),
+            doc: "Reopens the agent sessions that were running when this \
+                  terminal last exited, one tab each"
+                .into(),
+            keys: vec![],
+            args: &[ArgType::ActiveWindow],
+            menubar: &["View"],
+            icon: Some("md_backup_restore"),
+        },
         CheckForUpdates => CommandDef {
             brief: "Check for updates".into(),
             doc: "Asks GitHub for the latest release and offers a download link \
@@ -831,6 +841,35 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             args: &[ArgType::ActiveWindow],
             menubar: &[],
             icon: None,
+        },
+        CopyLastCommandOutput => CommandDef {
+            brief: "Copy last command output".into(),
+            doc: "Copies the output of the most recent command in the active pane. \
+                  Exact with shell integration (wezterm.sh); without it the prompt \
+                  boundary is guessed and the notification says so."
+                .into(),
+            keys: vec![],
+            args: &[ArgType::ActivePane],
+            menubar: &["Edit"],
+            icon: Some("md_content_copy"),
+        },
+        CopyLastCommandWithOutput => CommandDef {
+            brief: "Copy last command and output".into(),
+            doc: "Copies the most recent command line together with its output".into(),
+            keys: vec![],
+            args: &[ArgType::ActivePane],
+            menubar: &["Edit"],
+            icon: Some("md_content_copy"),
+        },
+        CopyPaneScrollback => CommandDef {
+            brief: "Copy pane".into(),
+            doc: "Copies the active pane's scrollback, capped by \
+                  agent_ui.copy_scrollback_lines"
+                .into(),
+            keys: vec![],
+            args: &[ArgType::ActivePane],
+            menubar: &["Edit"],
+            icon: Some("md_content_copy"),
         },
         CycleWaitingAgent => CommandDef {
             brief: "Cycle to next waiting agent".into(),
@@ -2101,6 +2140,9 @@ fn compute_default_actions() -> Vec<KeyAssignment> {
         #[cfg(not(target_os = "macos"))]
         CopyTo(ClipboardCopyDestination::PrimarySelection),
         CopyTo(ClipboardCopyDestination::Clipboard),
+        CopyLastCommandOutput,
+        CopyLastCommandWithOutput,
+        CopyPaneScrollback,
         PasteFrom(ClipboardPasteSource::Clipboard),
         ClearScrollback(ScrollbackEraseMode::ScrollbackOnly),
         ClearScrollback(ScrollbackEraseMode::ScrollbackAndViewport),
@@ -2194,6 +2236,7 @@ fn compute_default_actions() -> Vec<KeyAssignment> {
         ShowLauncher,
         ShowTabNavigator,
         ActivateAgentSection,
+        RestoreLastWindowAgents,
         // ----------------- Help
         OpenUri("https://wezterm.org/".to_string()),
         OpenUri("https://github.com/wezterm/wezterm/discussions/".to_string()),

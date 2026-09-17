@@ -1,4 +1,4 @@
-use crate::termwindow::TermWindowNotif;
+use crate::termwindow::{PaneCopyAction, TermWindowNotif};
 use crate::TermWindow;
 use config::keyassignment::{ClipboardCopyDestination, ClipboardPasteSource};
 use mux::pane::Pane;
@@ -21,6 +21,29 @@ impl TermWindow {
                 self.window.as_ref().unwrap().set_clipboard(c, text.clone());
             }
         }
+    }
+
+    /// The one place a pane copy reaches the clipboard.
+    ///
+    /// Shared by the toolbelt copy menu and the `CopyLastCommandOutput` family
+    /// of key assignments so the empty-payload guard and the toast can only be
+    /// got right or wrong once.
+    ///
+    /// Never overwrites the clipboard with nothing: an empty copy plus a
+    /// success toast is how this bug hid the first time. The message is built
+    /// from the payload *before* the guard, so the empty case still reports
+    /// itself rather than going silent.
+    pub fn perform_pane_copy(&mut self, pane: &Arc<dyn Pane>, action: &PaneCopyAction) {
+        let result = self.pane_copy_result(pane, action);
+        if !result.text.trim().is_empty() {
+            self.copy_to_clipboard(ClipboardCopyDestination::Clipboard, result.text);
+        }
+        wezterm_toast_notification::show(wezterm_toast_notification::ToastNotification {
+            title: result.title.to_string(),
+            message: result.message,
+            url: None,
+            timeout: Some(std::time::Duration::from_millis(1800)),
+        });
     }
 
     pub fn paste_from_clipboard(&mut self, pane: &Arc<dyn Pane>, clipboard: ClipboardPasteSource) {

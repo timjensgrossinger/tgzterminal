@@ -730,7 +730,33 @@ asked, trimmed to ten words.
 - `resume_menu_sessions` (default `10`, max `25`, `0` hides the row) caps how
   many sessions are offered.
 - `restore_last_window_sessions` (default `8`, max `25`, `0` hides the button)
-  caps how many sessions one "Reopen last window" click may bring back.
+  caps how many sessions one restore click may bring back.
+
+#### Reopening the last session
+
+The agent section header carries a `↺` button that opens a **sessions**
+dropdown: the restore row on top, the recent-session list below. The same
+restore row still appears at the bottom of the launcher dropdown, and the
+`RestoreLastWindowAgents` key assignment (unbound by default, listed in the
+command palette as *Reopen last session's agents*) does the same thing without
+the mouse.
+
+What one click reopens is **the windows that were open when the previous run
+ended** -- not "every window of the last month". The snapshot file records one
+entry per window per run, and the offer is built by taking the newest eligible
+entry, then keeping only entries from that same run that were written within
+five minutes of it. A terminal left up for three weeks writes entries days
+apart; without that band a restore would drag back windows closed a fortnight
+ago.
+
+Retention is a separate, coarser rule: a snapshot older than **30 days** is not
+offered at all. Raising or lowering that changes only how stale a restore point
+may be, never how many windows a restore reopens.
+
+An empty snapshot is never written. A window whose agents have all exited keeps
+the restore point it already had -- otherwise every ordinary shutdown, whose last
+painted frame sees no agents, would erase the thing the feature exists to
+provide.
 
 Only Claude Code and Codex are listed. The other adapters declare resume
 commands, but none of them documents a session store this terminal could
@@ -744,6 +770,32 @@ file dropped into an agent's state directory cannot turn into a command-line
 flag. Because the argv still comes only from config and the row must be clicked,
 this action is not gated by `enable_control_actions` either — unlike the
 toolbelt's Resume button, whose session id *does* come from pane text.
+
+#### Finding agents that run inside WSL
+
+On Windows the agent CLIs are normally installed inside a WSL distro, so they
+write their session files and transcripts to the **distro's** home
+(`\\wsl.localhost\<distro>\home\<user>`), not to `C:\Users\<you>`. Both scans --
+the herd section and the sessions list -- therefore read one root per configured
+`wsl_domains` entry in addition to the Windows home. A domain's `username`, when
+set, is used directly; otherwise the distro's `/home` is listed and every child
+holding a `.claude`, `.codex`, `.copilot`, `.gemini` or `opencode` directory is
+taken. A distro that is not running simply contributes nothing.
+
+Two things work differently for a session found inside a distro:
+
+- **Liveness.** The pid in the session file belongs to the distro's pid
+  namespace and means nothing to Windows, so it is not checked. Recency of the
+  session file stands in for it (15 minutes). That is weaker than a pid check
+  and is the strongest signal available without shelling into the distro on the
+  scan path.
+- **Working directory.** The agent records a Linux path while the pane running
+  `wsl.exe` reports a Windows or UNC one. The pane's cwd is translated back to
+  the distro's view before it is compared, which is what lets a WSL agent bind
+  to its pane instead of rendering detached.
+
+On a native Windows agent (not inside WSL) the pid *is* checked, against the
+Windows process table.
 
 #### Launching into another domain (WSL)
 
@@ -879,6 +931,90 @@ When enabled, the sidebar reads pane user variables named `agent.kind`,
 `agent.model`, `agent.status`, `agent.input_tokens`, `agent.output_tokens`,
 `agent.total_tokens`, `agent.cost`, and `agent.estimated_cost`. Underscore
 forms such as `agent_model` are accepted as a compatibility fallback.
+
+## Pane Toolbelt (shell & ssh Copy)
+
+```lua
+config.pane_toolbelt = {
+  shell_copy = true,
+}
+```
+
+The floating toolbelt strip that agent panes already show is also available on
+plain shell and ssh panes, where it carries a single `Copy` button. On a plain
+pane the strip is **hidden until the pointer enters the pane** and fades in
+there, so it never sits on top of output you are reading; agent panes keep the
+always-visible strip they have today.
+
+| Key | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `shell_copy` | bool | `true` | Show the Copy button on panes with no detected agent. |
+
+The button opens a three-row menu:
+
+| Row | Copies |
+| --- | --- |
+| Copy last command output | The most recent command's output, without the command line. |
+| Copy last command + output | The command line together with its output. |
+| Copy pane | The pane's scrollback, capped as below. |
+
+### Exact vs guessed
+
+Command boundaries come from **OSC 133** semantic marks, which a shell emits
+once it sources shell integration (`wezterm.sh`, shipped inside the app bundle
+at `Contents/Resources/wezterm.sh`). With those marks the copy is exact.
+
+The marks are recorded from the byte stream as it arrives, so they work for
+`ssh` typed into an ordinary pane too — provided the **remote** shell sources
+shell integration.
+
+Without marks nothing is refused: the boundary is instead *guessed* from the
+last prompt-shaped line, and the notification says so in those words. A guessed
+boundary can be wrong, which is exactly why it is labelled rather than presented
+as exact. Sourcing shell integration on the host in question is the fix.
+
+Full-screen programs (vim, less, htop) have no prompts and no meaningful "last
+command", so the strip is hidden while one is running; `Copy pane` remains
+available from the command palette.
+
+### Scrollback cap and secrets
+
+All three actions read at most `agent_ui.copy_scrollback_lines` physical rows
+from the **bottom of the pane buffer, regardless of the current scroll
+position** — the same rule, and the same knob, as the agent copy actions
+described above. When older rows exist but fall outside that window, the copied
+text starts with `[… earlier scrollback not included …]`.
+
+As with any copy action, **copied text may include terminal output or secrets
+printed in that range.**
+
+### Keybindings
+
+No chords are bound by default; the three actions are in the command palette and
+the Edit menu, and can be bound explicitly:
+
+```lua
+config.keys = {
+  { key = 'o', mods = 'SUPER|SHIFT', action = wezterm.action.CopyLastCommandOutput },
+  { key = 'y', mods = 'SUPER|SHIFT', action = wezterm.action.CopyLastCommandWithOutput },
+  { key = 'p', mods = 'SUPER|SHIFT', action = wezterm.action.CopyPaneScrollback },
+}
+```
+
+These work on any pane, agent panes included — the text is just text, and the
+notification still reports how the boundary was found.
+
+### Why this is not under `agent_ui`
+
+A Copy button on a plain shell is not an agent surface. Someone who sets
+`agent_ui.enabled = false` to switch off agent awareness should keep it, and
+someone who switches off `agent_ui.show_pane_toolbelt` should lose the agent
+strip without gaining one on every shell. Placement is still read from
+`agent_ui.toolbelt_position`, so the strip cannot sit in two places at once, and
+the scrollback cap is shared for the same reason.
+
+The fade has no key of its own: it follows the animation master switch, so
+`agent_ui.animations = { enabled = false }` makes the strip snap instead.
 
 ## Rich Input Composer
 

@@ -16,6 +16,7 @@
 //!
 //! All of this runs on the overlay thread. Nothing here may touch the mux.
 
+use super::vendor::{SessionOrigin, SessionRoot};
 use super::{status_from_claude, subagent_status, ClaudeSession, HerdSubagent};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -37,10 +38,16 @@ pub enum ProjectDirError {
     NotDirectory,
 }
 
-/// Collect every live Claude session, newest state first.
+/// Collect every live Claude session under this machine's own home.
 ///
 /// `home` is injectable so this is testable against a fixture tree.
 pub fn collect_sessions(home: &Path, include_subagents: bool) -> Vec<ClaudeSession> {
+    collect_sessions_in(&SessionRoot::host(home), include_subagents)
+}
+
+/// Collect every live Claude session under `root`, newest state first.
+pub fn collect_sessions_in(root: &SessionRoot, include_subagents: bool) -> Vec<ClaudeSession> {
+    let home = root.home.as_path();
     let sessions_dir = home.join(".claude").join("sessions");
     let Ok(entries) = std::fs::read_dir(&sessions_dir) else {
         return Vec::new();
@@ -53,7 +60,7 @@ pub fn collect_sessions(home: &Path, include_subagents: bool) -> Vec<ClaudeSessi
             continue;
         }
         match parse_session_file(&path) {
-            Some(session) if process_is_alive(session.pid) => {
+            Some(session) if session_is_live(&root.origin, session.pid, &path) => {
                 let mut session = session;
                 if include_subagents {
                     session.subagents = collect_subagents(home, &session.cwd, &session.session_id);
@@ -149,11 +156,67 @@ pub(crate) fn process_is_alive(pid: u32) -> bool {
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub(crate) fn process_is_alive(pid: u32) -> bool {
+    use winapi::um::handleapi::CloseHandle;
+    use winapi::um::minwinbase::STILL_ACTIVE;
+    use winapi::um::processthreadsapi::{GetExitCodeProcess, OpenProcess};
+    use winapi::um::winnt::PROCESS_QUERY_LIMITED_INFORMATION;
+
+    if pid == 0 {
+        return false;
+    }
+    // SAFETY: a failed open returns null, which is checked before use, and the
+    // handle is closed on every path out.
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            // Access denied means the process exists but is not ours, which is
+            // the same call `EPERM` gets on unix: alive.
+            return winapi::um::errhandlingapi::GetLastError()
+                == winapi::shared::winerror::ERROR_ACCESS_DENIED;
+        }
+        let mut code = 0u32;
+        let ok = GetExitCodeProcess(handle, &mut code) != 0;
+        CloseHandle(handle);
+        ok && code == STILL_ACTIVE
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 pub(crate) fn process_is_alive(_pid: u32) -> bool {
-    // Claude Code's session registry is a unix-only surface today; without a
-    // liveness check we would show stale sessions, so report none.
     false
+}
+
+/// How recently a WSL session file must have been touched to count as live.
+///
+/// Generous on purpose: this stands in for a pid check, and an agent waiting on
+/// the human writes nothing while it waits.
+const WSL_SESSION_LIVE_WINDOW: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// Is the session described by `session_file` still running?
+///
+/// A pid is only meaningful in its own namespace. A session file found inside a
+/// WSL distro carries a pid from that distro, which on the Windows side either
+/// names nothing or -- worse -- names an unrelated process, so it is not checked
+/// at all: recency of the file stands in for it. That is weaker than a pid
+/// check and it is the strongest signal available without shelling into the
+/// distro on the scan path.
+pub(crate) fn session_is_live(origin: &SessionOrigin, pid: u32, session_file: &Path) -> bool {
+    match origin {
+        SessionOrigin::Host => process_is_alive(pid),
+        SessionOrigin::Wsl(_) => std::fs::metadata(session_file)
+            .and_then(|meta| meta.modified())
+            .map(|modified| {
+                modified
+                    .elapsed()
+                    .map(|age| age <= WSL_SESSION_LIVE_WINDOW)
+                    // A file stamped in the future is a clock skew between the
+                    // distro and the host, not a dead session.
+                    .unwrap_or(true)
+            })
+            .unwrap_or(false),
+    }
 }
 
 /// Encode a working directory the way Claude Code names its project folders:
@@ -529,7 +592,7 @@ mod tests {
             r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","id":"tool-1","input":{"command":"cargo check"}}]}}"#,
         );
 
-        let sessions = ClaudeDetector.collect_sessions(temp.path());
+        let sessions = ClaudeDetector.collect_sessions(&SessionRoot::host(temp.path()));
         let activity = sessions[0].activity.as_ref().expect("activity");
         assert!(activity.current.is_some());
         assert!(activity
@@ -1018,9 +1081,10 @@ impl crate::agent_herd::vendor::SessionSource for ClaudeDetector {
 
     fn collect_sessions(
         &self,
-        home: &std::path::Path,
+        root: &crate::agent_herd::vendor::SessionRoot,
     ) -> Vec<crate::agent_herd::vendor::VendorSession> {
-        let claude_sessions = collect_sessions(home, true);
+        let home = root.home.as_path();
+        let claude_sessions = collect_sessions_in(root, true);
         claude_sessions
             .into_iter()
             .map(|s| {
@@ -1033,6 +1097,7 @@ impl crate::agent_herd::vendor::SessionSource for ClaudeDetector {
                     .unwrap_or_default();
                 let name = session_name(transcript.as_deref(), s.name, s.name_is_derived);
                 crate::agent_herd::vendor::VendorSession {
+                    origin: SessionOrigin::Host,
                     pid: s.pid,
                     interactive: s.interactive,
                     vendor: crate::agent_herd::vendor::AgentVendor::Claude,

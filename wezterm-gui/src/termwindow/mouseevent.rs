@@ -1,9 +1,10 @@
 use crate::agent_herd::AgentKey;
 use crate::tabbar::TabBarItem;
 use crate::termwindow::{
-    AgentCopyAction, AgentCopyMenuState, AgentLaunchMenuState, AgentRowAction, AgentToolbeltAction,
-    CloseTabMenuAction, CloseTabMenuState, CloseTabSource, ExpandedMenuRow, GuiWin, MouseCapture,
-    PositionedSplit, ScrollHit, SshLaunchMenuState, TermWindowNotif, UIItem, UIItemType, TMB,
+    AgentLaunchMenuState, AgentRowAction, CloseTabMenuAction, CloseTabMenuState, CloseTabSource,
+    ExpandedMenuRow, GuiWin, MouseCapture, PaneCopyAction, PaneCopyMenuState, PaneToolbeltAction,
+    PaneToolbeltFade, PositionedSplit, ScrollHit, SshLaunchMenuState, TermWindowNotif, UIItem,
+    UIItemType, TMB,
 };
 use ::window::{
     CursorIcon, MouseButtons as WMB, MouseEvent, MouseEventKind as WMEK, MousePress,
@@ -60,6 +61,7 @@ impl super::TermWindow {
             | UIItemType::SidebarAutoHideToggle
             | UIItemType::SidebarWorktreeButton
             | UIItemType::SidebarAgentLaunchButton
+            | UIItemType::SidebarSessionsButton
             | UIItemType::SidebarAgentMenuItem { .. }
             | UIItemType::SidebarAgentMenuProjectRootToggle
             | UIItemType::SidebarAgentMenuHerd
@@ -75,8 +77,8 @@ impl super::TermWindow {
             | UIItemType::SidebarNewTabMenuItem { .. }
             | UIItemType::SidebarSshLaunchButton
             | UIItemType::SidebarSshMenuItem { .. }
-            | UIItemType::AgentToolbeltButton { .. }
-            | UIItemType::AgentCopyMenuItem { .. }
+            | UIItemType::PaneToolbeltButton { .. }
+            | UIItemType::PaneCopyMenuItem { .. }
             | UIItemType::SidebarWaitingCounter
             | UIItemType::AboveScrollThumb
             | UIItemType::BelowScrollThumb
@@ -103,6 +105,7 @@ impl super::TermWindow {
             | UIItemType::SidebarAutoHideToggle
             | UIItemType::SidebarWorktreeButton
             | UIItemType::SidebarAgentLaunchButton
+            | UIItemType::SidebarSessionsButton
             | UIItemType::SidebarAgentMenuItem { .. }
             | UIItemType::SidebarAgentMenuProjectRootToggle
             | UIItemType::SidebarAgentMenuHerd
@@ -118,8 +121,8 @@ impl super::TermWindow {
             | UIItemType::SidebarNewTabMenuItem { .. }
             | UIItemType::SidebarSshLaunchButton
             | UIItemType::SidebarSshMenuItem { .. }
-            | UIItemType::AgentToolbeltButton { .. }
-            | UIItemType::AgentCopyMenuItem { .. }
+            | UIItemType::PaneToolbeltButton { .. }
+            | UIItemType::PaneCopyMenuItem { .. }
             | UIItemType::SidebarWaitingCounter
             | UIItemType::AboveScrollThumb
             | UIItemType::BelowScrollThumb
@@ -136,6 +139,10 @@ impl super::TermWindow {
         };
 
         self.current_mouse_event.replace(event.clone());
+        // Before every early return below (window drag, item drag, docked
+        // input band): a plain Move invalidates nothing on its own, so the
+        // hover-revealed toolbelt has to notice the transition itself.
+        self.update_pane_toolbelt_hover(context);
         if self.update_sidebar_auto_hide_state() {
             context.invalidate();
         }
@@ -340,20 +347,42 @@ impl super::TermWindow {
             }
         }
 
-        if matches!(&event.kind, WMEK::Press(_)) && self.agent_copy_menu.is_some() {
+        if matches!(&event.kind, WMEK::Press(_)) && self.pane_copy_menu.is_some() {
             let on_copy_menu = matches!(
                 &ui_item,
                 Some(item)
                     if matches!(
                         item.item_type,
-                        UIItemType::AgentToolbeltButton {
-                            action: AgentToolbeltAction::CopyMenu,
+                        UIItemType::PaneToolbeltButton {
+                            action: PaneToolbeltAction::CopyMenu,
                             ..
-                        } | UIItemType::AgentCopyMenuItem { .. }
+                        } | UIItemType::PaneCopyMenuItem { .. }
                     )
             );
             if !on_copy_menu {
-                self.agent_copy_menu = None;
+                self.pane_copy_menu = None;
+                // The menu no longer pins the strip: start a real fade from
+                // what is on screen rather than letting a stale timestamp snap
+                // it off.
+                self.update_pane_toolbelt_hover(context);
+                context.invalidate();
+            }
+        }
+
+        if matches!(&event.kind, WMEK::Press(_)) && self.sessions_menu.is_some() {
+            let on_sessions_menu = matches!(
+                &ui_item,
+                Some(item)
+                    if matches!(
+                        item.item_type,
+                        UIItemType::SidebarSessionsButton
+                            | UIItemType::SidebarAgentMenuResume
+                            | UIItemType::SidebarAgentMenuResumeSession { .. }
+                            | UIItemType::SidebarAgentMenuRestoreLastWindow
+                    )
+            );
+            if !on_sessions_menu {
+                self.sessions_menu = None;
                 context.invalidate();
             }
         }
@@ -467,6 +496,7 @@ impl super::TermWindow {
 
     pub fn mouse_leave_impl(&mut self, context: &dyn WindowOps) {
         self.current_mouse_event = None;
+        self.update_pane_toolbelt_hover(context);
         if self.sidebar_auto_hide_open && self.schedule_sidebar_auto_hide_close() {
             context.invalidate();
         }
@@ -679,6 +709,9 @@ impl super::TermWindow {
             UIItemType::SidebarAgentLaunchButton => {
                 self.mouse_event_sidebar_agent_launch_button(item, event, context);
             }
+            UIItemType::SidebarSessionsButton => {
+                self.mouse_event_sidebar_sessions_button(item, event, context);
+            }
             UIItemType::SidebarAgentMenuItem { adapter_id } => {
                 self.mouse_event_sidebar_agent_menu_item(&adapter_id, event, context);
             }
@@ -730,11 +763,11 @@ impl super::TermWindow {
             UIItemType::SidebarWaitingCounter => {
                 self.mouse_event_sidebar_waiting_counter(event, context);
             }
-            UIItemType::AgentToolbeltButton { pane_id, action } => {
-                self.mouse_event_agent_toolbelt_button(pane_id, action, event, context);
+            UIItemType::PaneToolbeltButton { pane_id, action } => {
+                self.mouse_event_pane_toolbelt_button(pane_id, action, event, context);
             }
-            UIItemType::AgentCopyMenuItem { pane_id, action } => {
-                self.mouse_event_agent_copy_menu_item(pane_id, action, event, context);
+            UIItemType::PaneCopyMenuItem { pane_id, action } => {
+                self.mouse_event_pane_copy_menu_item(pane_id, action, event, context);
             }
         }
     }
@@ -1097,9 +1130,53 @@ impl super::TermWindow {
         context: &dyn WindowOps,
     ) {
         if event.kind == WMEK::Release(MousePress::Left) {
-            self.agent_launch_menu = None;
+            self.close_sidebar_session_menus();
             self.pressed_ui_item = None;
             self.resume_agent_session(index, None);
+        }
+        context.invalidate();
+    }
+
+    /// Close both dropdowns that can host a session row.
+    ///
+    /// The resume and restore rows are painted by the launcher dropdown and by
+    /// the sessions dropdown alike, so their handlers cannot know which one they
+    /// were clicked in. Clearing both is correct either way and keeps a stale
+    /// anchor from painting an empty menu.
+    fn close_sidebar_session_menus(&mut self) {
+        self.agent_launch_menu = None;
+        self.sessions_menu = None;
+    }
+
+    /// Open or close the sessions dropdown.
+    ///
+    /// Left-click, unlike the agent launch button beside it: this button does
+    /// nothing but open a menu, so there is no "act immediately" behaviour for a
+    /// left-click to collide with. Opening also kicks the recent-session scan,
+    /// so the lower group is populated by the time the menu is painted rather
+    /// than sitting on `Scanning…` until something else happens to scan.
+    fn mouse_event_sidebar_sessions_button(
+        &mut self,
+        item: UIItem,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        if event.kind == WMEK::Release(MousePress::Left) {
+            self.pressed_ui_item = None;
+            // The two dropdowns are mutually exclusive; leaving the launcher
+            // open behind this one would paint both.
+            self.agent_launch_menu = None;
+            self.sessions_menu = match self.sessions_menu.take() {
+                Some(_) => None,
+                None => {
+                    self.kick_agent_session_scan();
+                    Some(AgentLaunchMenuState {
+                        x: item.x,
+                        y: item.y,
+                        expanded: None,
+                    })
+                }
+            };
         }
         context.invalidate();
     }
@@ -1112,7 +1189,7 @@ impl super::TermWindow {
     ) {
         if event.kind == WMEK::Release(MousePress::Left) {
             // Acts on the tab layout, so the menu has no reason to stay open.
-            self.agent_launch_menu = None;
+            self.close_sidebar_session_menus();
             self.pressed_ui_item = None;
             self.restore_last_window_agent_sessions();
         }
@@ -1326,14 +1403,14 @@ impl super::TermWindow {
         context.set_cursor(Some(CursorIcon::Default));
     }
 
-    fn mouse_event_agent_toolbelt_button(
+    fn mouse_event_pane_toolbelt_button(
         &mut self,
         pane_id: mux::pane::PaneId,
-        action: AgentToolbeltAction,
+        action: PaneToolbeltAction,
         event: MouseEvent,
         context: &dyn WindowOps,
     ) {
-        let item_type = UIItemType::AgentToolbeltButton {
+        let item_type = UIItemType::PaneToolbeltButton {
             pane_id,
             action: action.clone(),
         };
@@ -1346,7 +1423,7 @@ impl super::TermWindow {
                 if self.pressed_ui_item.as_ref() == Some(&item_type) {
                     if let Some(pane) = Mux::get().get_pane(pane_id) {
                         match action {
-                            AgentToolbeltAction::Interrupt => {
+                            PaneToolbeltAction::Interrupt => {
                                 if let Err(err) =
                                     pane.key_down(KeyCode::Char('c'), KeyModifiers::CTRL)
                                 {
@@ -1363,14 +1440,28 @@ impl super::TermWindow {
                                     );
                                 }
                             }
-                            AgentToolbeltAction::CopyMenu => {
-                                self.agent_copy_menu = Some(AgentCopyMenuState {
-                                    pane_id,
-                                    x: event.coords.x.max(0) as usize,
-                                    y: event.coords.y.max(0) as usize,
-                                });
+                            PaneToolbeltAction::CopyMenu => {
+                                // The one `detect_agent_pane` on this path, and
+                                // it happens on a click, not in paint.
+                                let items = Mux::get()
+                                    .get_pane(pane_id)
+                                    .and_then(|pane| self.pane_toolbelt_kind(&pane))
+                                    .map(|kind| {
+                                        crate::termwindow::render::sidebar::pane_copy_menu_items(
+                                            &kind,
+                                        )
+                                    })
+                                    .unwrap_or_default();
+                                if !items.is_empty() {
+                                    self.pane_copy_menu = Some(PaneCopyMenuState {
+                                        pane_id,
+                                        x: event.coords.x.max(0) as usize,
+                                        y: event.coords.y.max(0) as usize,
+                                        items,
+                                    });
+                                }
                             }
-                            AgentToolbeltAction::Compose => {
+                            PaneToolbeltAction::Compose => {
                                 let already_open = self
                                     .get_modal()
                                     .map(|m| {
@@ -1386,18 +1477,18 @@ impl super::TermWindow {
                                     self.set_modal(std::rc::Rc::new(modal));
                                 }
                             }
-                            AgentToolbeltAction::DockInput => {
+                            PaneToolbeltAction::DockInput => {
                                 // The toolbelt only renders on agent panes, so
                                 // this button is inherently agent-only.
                                 self.toggle_docked_input_pane(pane.pane_id());
                             }
-                            AgentToolbeltAction::Attach => {
+                            PaneToolbeltAction::Attach => {
                                 self.agent_attach_pane(&pane);
                             }
-                            AgentToolbeltAction::Resume => {
+                            PaneToolbeltAction::Resume => {
                                 self.agent_resume_pane(&pane);
                             }
-                            AgentToolbeltAction::OpenLogs => {
+                            PaneToolbeltAction::OpenLogs => {
                                 self.agent_open_logs_for_pane(&pane);
                             }
                         }
@@ -1411,14 +1502,73 @@ impl super::TermWindow {
         context.set_cursor(Some(CursorIcon::Default));
     }
 
-    fn mouse_event_agent_copy_menu_item(
+    /// Update hover state for the hover-revealed pane toolbelt, starting a fade
+    /// if it changed.
+    ///
+    /// Called for every mouse event and from `mouse_leave_impl`, because a
+    /// plain `Move` inside the terminal region invalidates nothing on its own:
+    /// every `context.invalidate()` in `mouse_event_impl` hangs off a
+    /// `last_ui_item` transition. The enter/leave transition is the only thing
+    /// that *starts* the fade, so it cannot depend on some other painter
+    /// happening to ask for a repaint.
+    pub(crate) fn update_pane_toolbelt_hover(&mut self, context: &dyn WindowOps) {
+        let Some(zone) = self.pane_toolbelt_hover_zone else {
+            self.pane_toolbelt_fade = None;
+            return;
+        };
+
+        let mut hovered = self
+            .current_mouse_event
+            .as_ref()
+            .is_some_and(|event| zone.contains(event.coords.x, event.coords.y));
+
+        // An open menu pins its own strip. The menu is clamped into the window,
+        // so reaching its lower rows can take the pointer out of the pane, and
+        // the strip must not start fading out from under the menu it opened.
+        if self
+            .pane_copy_menu
+            .as_ref()
+            .is_some_and(|menu| menu.pane_id == zone.pane_id)
+        {
+            hovered = true;
+        }
+
+        let prior = self.pane_toolbelt_fade;
+        if let Some(prior) = prior {
+            if prior.pane_id == zone.pane_id && prior.hovered == hovered {
+                return;
+            }
+        }
+
+        // Reverse from what is on screen, not from 0/1.
+        let from = match prior {
+            Some(prior) if prior.pane_id == zone.pane_id => {
+                crate::termwindow::render::sidebar::pane_toolbelt_fade_opacity_at(
+                    prior.hovered,
+                    prior.from,
+                    prior.changed_at.elapsed(),
+                )
+            }
+            _ => 0.,
+        };
+
+        self.pane_toolbelt_fade = Some(PaneToolbeltFade {
+            pane_id: zone.pane_id,
+            hovered,
+            changed_at: Instant::now(),
+            from,
+        });
+        context.invalidate();
+    }
+
+    fn mouse_event_pane_copy_menu_item(
         &mut self,
         pane_id: mux::pane::PaneId,
-        action: AgentCopyAction,
+        action: PaneCopyAction,
         event: MouseEvent,
         context: &dyn WindowOps,
     ) {
-        let item_type = UIItemType::AgentCopyMenuItem {
+        let item_type = UIItemType::PaneCopyMenuItem {
             pane_id,
             action: action.clone(),
         };
@@ -1430,27 +1580,12 @@ impl super::TermWindow {
             WMEK::Release(MousePress::Left) => {
                 if self.pressed_ui_item.as_ref() == Some(&item_type) {
                     if let Some(pane) = Mux::get().get_pane(pane_id) {
-                        let payload = self.agent_pane_copy_payload(&pane, &action);
-                        let message = self.agent_copy_toast_message(&action, &payload);
-                        // Never overwrite the clipboard with nothing: an empty
-                        // copy plus a success toast is how this bug hid.
-                        if !payload.text.trim().is_empty() {
-                            self.copy_to_clipboard(
-                                ClipboardCopyDestination::Clipboard,
-                                payload.text,
-                            );
-                        }
-                        wezterm_toast_notification::show(
-                            wezterm_toast_notification::ToastNotification {
-                                title: "Agent copy".to_string(),
-                                message,
-                                url: None,
-                                timeout: Some(Duration::from_millis(1800)),
-                            },
-                        );
+                        self.perform_pane_copy(&pane, &action);
                     }
-                    self.agent_copy_menu = None;
+                    self.pane_copy_menu = None;
                     self.pressed_ui_item.take();
+                    // Unpins the strip; fades out if the pointer ended up away.
+                    self.update_pane_toolbelt_hover(context);
                     context.invalidate();
                 }
             }

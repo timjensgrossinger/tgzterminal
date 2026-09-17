@@ -1,5 +1,7 @@
-use crate::agent_herd::claude::process_is_alive;
-use crate::agent_herd::vendor::{AgentVendor, SessionSource, VendorSession};
+use crate::agent_herd::claude::session_is_live;
+use crate::agent_herd::vendor::{
+    AgentVendor, SessionOrigin, SessionRoot, SessionSource, VendorSession,
+};
 use crate::agent_herd::{HerdActivity, HerdContent, HerdEvent, HerdEventKind, HerdStatus};
 use rusqlite::{Connection, OpenFlags};
 use std::convert::TryFrom;
@@ -39,7 +41,8 @@ impl SessionSource for OpenCodeDetector {
         AgentVendor::OpenCode
     }
 
-    fn collect_sessions(&self, home: &Path) -> Vec<VendorSession> {
+    fn collect_sessions(&self, root: &SessionRoot) -> Vec<VendorSession> {
+        let home = root.home.as_path();
         let mut sessions = collect_database_sessions(home);
         if !sessions.is_empty() {
             return sessions;
@@ -59,7 +62,7 @@ impl SessionSource for OpenCodeDetector {
                         // this session rather than show a phantom row.
                         _ => continue,
                     };
-                    if !process_is_alive(pid) {
+                    if !session_is_live(&root.origin, pid, &file) {
                         continue;
                     }
                     let session_id = json
@@ -92,6 +95,7 @@ impl SessionSource for OpenCodeDetector {
                         })
                         .unwrap_or(HerdStatus::Unknown);
                     sessions.push(VendorSession {
+                        origin: SessionOrigin::Host,
                         pid,
                         // This store does not distinguish harness-spawned
                         // sessions from interactive ones.
@@ -221,6 +225,7 @@ fn collect_database_sessions(home: &Path) -> Vec<VendorSession> {
         let cost = (cost > 0.0).then(|| format!("${cost:.4}"));
         let activity = opencode_activity(&conn, &session_id);
         Some(VendorSession {
+            origin: SessionOrigin::Host,
             // OpenCode's current database has no process id. Binding falls back
             // to the unique cwd match, while pane detection still handles live
             // sessions whose database row is too old.
@@ -471,8 +476,14 @@ fn opencode_all_events(
     Some(events.into_iter().take(max_events).collect())
 }
 
+/// The user's home directory.
+///
+/// `dirs_next::home_dir`, not `$HOME`: that variable is a unix convention and is
+/// normally unset on Windows, where it would make every caller here silently
+/// decide the user has no home -- so transcript lookup returned `None` for every
+/// agent and the Log action was dead on that platform.
 fn dirs_home() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
+    dirs_next::home_dir()
 }
 
 fn clean_title(title: &str) -> Option<String> {
@@ -553,7 +564,7 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let sessions = OpenCodeDetector.collect_sessions(temp.path());
+        let sessions = OpenCodeDetector.collect_sessions(&SessionRoot::host(temp.path()));
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].session_id, "session-1");
         assert_eq!(sessions[0].name.as_deref(), Some("Fix sidebar"));
@@ -617,7 +628,7 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let sessions = OpenCodeDetector.collect_sessions(temp.path());
+        let sessions = OpenCodeDetector.collect_sessions(&SessionRoot::host(temp.path()));
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].status, HerdStatus::Idle);
     }
@@ -635,7 +646,9 @@ mod tests {
                 .join("dead.json"),
             &session_json(dead),
         );
-        assert!(OpenCodeDetector.collect_sessions(temp.path()).is_empty());
+        assert!(OpenCodeDetector
+            .collect_sessions(&SessionRoot::host(temp.path()))
+            .is_empty());
     }
 
     #[test]
@@ -650,7 +663,7 @@ mod tests {
                 .join("live.json"),
             &session_json(me),
         );
-        let sessions = OpenCodeDetector.collect_sessions(temp.path());
+        let sessions = OpenCodeDetector.collect_sessions(&SessionRoot::host(temp.path()));
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].pid, me);
     }
@@ -671,7 +684,7 @@ mod tests {
             r#"{"type":"tool","name":"bash","input":{"command":"cargo check"}}"#,
         );
 
-        let sessions = OpenCodeDetector.collect_sessions(temp.path());
+        let sessions = OpenCodeDetector.collect_sessions(&SessionRoot::host(temp.path()));
         assert!(sessions[0]
             .activity
             .as_ref()

@@ -1,5 +1,5 @@
 use crate::agent_herd::claude::{self, ProjectDirError as ClaudeLogsPathError};
-use crate::agent_herd::vendor::{AgentVendor, VendorSession};
+use crate::agent_herd::vendor::{AgentVendor, SessionRoot, VendorSession};
 use crate::agent_herd::{
     group_by_project, HerdActivity, HerdAgent, HerdContent, HerdDisplayStatus, HerdEvent,
     HerdEventKind, HerdStatus, HerdView, PaneAgentRow,
@@ -13,17 +13,19 @@ use crate::termwindow::render::corners::{
     TOP_RIGHT_ROUNDED_CORNER,
 };
 use crate::termwindow::render::RenderScreenLineParams;
+use crate::termwindow::shell_copy::{shell_copy_toast_message, ShellCopyAction};
 use crate::termwindow::tgz_last_session::{self, SnapshotSession};
 use crate::termwindow::{
-    agent_launch, wsl_paths, AgentCopyAction, AgentLauncherEntry, AgentRowAction,
-    AgentToolbeltAction, CloseTabMenuAction, CloseTabSource, ExpandedMenuRow, NewTabMenuEntry,
-    NewTabTarget, SshQuickLaunchEntry, TermWindowNotif, UIItem, UIItemType,
+    agent_launch, wsl_paths, AgentCopyAction, AgentLaunchMenuState, AgentLauncherEntry,
+    AgentRowAction, CloseTabMenuAction, CloseTabSource, ExpandedMenuRow, NewTabMenuEntry,
+    NewTabTarget, OverlayState, PaneCopyAction, PaneToolbeltAction, PaneToolbeltFade,
+    PaneToolbeltZone, SshQuickLaunchEntry, TermWindowNotif, UIItem, UIItemType,
 };
 use config::keyassignment::{SpawnCommand, SpawnTabDomain};
 use config::{
     brand, default_agent_adapters, dim_srgb, AgentAdapterConfig, AgentAnimationColors,
     AgentLaunchTarget, AgentRemoteBehavior, AgentRingColors, AgentSplitDirection,
-    AgentTelemetryField, AgentToolbeltPosition, AgentUiConfig, ConfigHandle, EasingFunction,
+    AgentTelemetryField, AgentUiConfig, ConfigHandle, EasingFunction, PaneToolbeltPosition,
     SidebarPosition, SidebarTabDensity, SidebarTabMetadata, SidebarTabTitleSource, SidebarTheme,
     TabBarColors,
 };
@@ -38,6 +40,7 @@ use std::collections::{HashMap, HashSet};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 use std::{env, fs};
@@ -77,15 +80,35 @@ const AUTO_HIDE_RETAIN_SLOP: isize = 48;
 const AUTO_HIDE_COLLAPSE_DELAY_MS: u64 = 0;
 const AUTO_HIDE_RESIZE_GRIP_W: usize = 8;
 const MIN_AUTO_HIDE_RAIL_W: usize = 48;
-const AGENT_TOOLBELT_H: f32 = 32.;
-const AGENT_TOOLBELT_GAP: f32 = 6.;
-const AGENT_TOOLBELT_MIN_BUTTON_W: f32 = 88.;
-const AGENT_TOOLBELT_BUTTON_PAD_X: f32 = 24.;
-const AGENT_TOOLBELT_DOT_SIZE: f32 = 7.;
-const AGENT_TOOLBELT_MAX_W: f32 = 760.;
-const AGENT_TOOLBELT_MIN_W: f32 = 360.;
-const AGENT_TOOLBELT_RIGHT_INSET: f32 = 44.;
-const AGENT_COPY_MENU_W: f32 = 360.;
+const PANE_TOOLBELT_H: f32 = 32.;
+const FLOAT_GAP: f32 = 6.;
+const PANE_TOOLBELT_MIN_BUTTON_W: f32 = 88.;
+const PANE_TOOLBELT_BUTTON_PAD_X: f32 = 24.;
+const PANE_TOOLBELT_DOT_SIZE: f32 = 7.;
+const PANE_TOOLBELT_MAX_W: f32 = 760.;
+const PANE_TOOLBELT_MIN_W: f32 = 360.;
+const PANE_TOOLBELT_RIGHT_INSET: f32 = 44.;
+/// How long the plain-pane toolbelt takes to fade in when the pointer enters
+/// the pane. Short: the strip is a control, not an entrance.
+const PANE_TOOLBELT_FADE_IN_MS: u64 = 130;
+/// Fade-out is slower than fade-in. The pointer leaving the pane is often the
+/// pointer on its way somewhere else in the same pane, and a strip that snaps
+/// off and back reads as flicker.
+const PANE_TOOLBELT_FADE_OUT_MS: u64 = 220;
+/// Opacity at or above which the strip takes clicks. One threshold for both
+/// directions: below it the hit rects are not pushed at all, so a nearly
+/// invisible strip can never eat a click meant for the terminal underneath.
+///
+/// Fade-*out* cannot eat a click by construction — the strip is drawn inside
+/// the pane, so a pointer over a button is inside the pane and opacity is 1.
+/// The real cost is a ~45ms dead window at the start of a fade-*in*, which is
+/// below click-after-move latency and far cheaper than an invisible control
+/// swallowing a click meant for the terminal.
+const PANE_TOOLBELT_HIT_MIN_OPACITY: f32 = 0.35;
+/// Opacity below which nothing is drawn at all — skip the quads entirely
+/// rather than emit invisible ones every frame of a fade-out's tail.
+const PANE_TOOLBELT_MIN_VISIBLE_OPACITY: f32 = 0.02;
+const PANE_COPY_MENU_W: f32 = 360.;
 /// Narrower than the copy menu: rows are short agent names, not sentences.
 const AGENT_LAUNCH_MENU_W: f32 = 200.;
 /// Minimum width of the close-tab context submenu. The labels here
@@ -99,21 +122,21 @@ const AGENT_RESUME_MENU_W: f32 = 420.;
 /// Ceiling on `agent_ui.launcher.resume_menu_sessions`. Each row costs a
 /// transcript read, and a dropdown taller than this stops being a menu.
 const MAX_RESUME_MENU_SESSIONS: u8 = 25;
-const AGENT_COPY_MENU_ROW_H: f32 = 28.;
+const PANE_COPY_MENU_ROW_H: f32 = 28.;
 const MAX_AGENT_PATTERN_LEN: usize = 256;
 const AGENT_PATTERN_REGEX_CACHE_LIMIT: usize = 128;
 /// Physical rows read per `get_logical_lines` call when scraping a transcript.
 /// Chunking bounds the peak clone and releases the pane's terminal mutex
 /// between chunks, so copying a multi-thousand-row scrollback never stalls the
 /// pane reader thread inside one long critical section.
-const AGENT_TRANSCRIPT_CHUNK_ROWS: isize = 512;
+pub(crate) const AGENT_TRANSCRIPT_CHUNK_ROWS: isize = 512;
 /// Ceiling on the rows one copy action may read, whatever
 /// `agent_ui.copy_scrollback_lines` says: `scrollback_lines` accepts values up
 /// to 999_999_999 and a mouse click must not try to materialize that.
-const AGENT_TRANSCRIPT_MAX_ROWS: usize = 100_000;
+pub(crate) const AGENT_TRANSCRIPT_MAX_ROWS: usize = 100_000;
 /// Prepended when older rows are still in the pane but fell outside the copy
 /// window, so a partial copy is never presented as a whole conversation.
-const AGENT_TRANSCRIPT_CLIPPED_MARKER: &str = "[… earlier scrollback not included …]";
+pub(crate) const AGENT_TRANSCRIPT_CLIPPED_MARKER: &str = "[… earlier scrollback not included …]";
 const WAITING_NOTIFICATION_THROTTLE: Duration = Duration::from_secs(60);
 const DEFAULT_AGENT_ADAPTER_IDS: [&str; 8] = [
     "claude",
@@ -268,6 +291,12 @@ struct SidebarAnimationGates {
     agent_enter: bool,
     rail_breathe: bool,
     dot_pulse: bool,
+    /// Fade the hover-revealed plain-pane toolbelt rather than snapping it.
+    ///
+    /// Under `master`, so the existing animation kill switch covers it and no
+    /// new config key is needed. Deliberately *not* counted by `any_motion`: a
+    /// fade is a transition to a settled state, not perpetual motion.
+    toolbelt_fade: bool,
     /// Keep asking for frames while the window is unfocused.
     unfocused: bool,
 }
@@ -286,6 +315,7 @@ impl SidebarAnimationGates {
             agent_enter: master && anim.agent_enter,
             rail_breathe: master && anim.rail_breathe,
             dot_pulse: master && anim.dot_pulse && agent_ui.pulse_working_dot,
+            toolbelt_fade: master,
             unfocused: master && anim.unfocused,
         }
     }
@@ -483,6 +513,13 @@ impl SidebarPalette {
 /// tab churn to one write rather than one per frame.
 const SNAPSHOT_WRITE_INTERVAL: Duration = Duration::from_secs(2);
 
+/// Whether this process has already offered to reopen the last session.
+///
+/// Process-wide rather than per-window on purpose: the offer is about the run
+/// that came before this one, so it is answered once, by whichever window paints
+/// its agent section first.
+static RESTORE_PROMPT_SHOWN: AtomicBool = AtomicBool::new(false);
+
 /// Repaint cadence while a status dot is pulsing. ~30fps is ample for a 1.6s
 /// breath and half the cost of the 16ms drop-flash interval.
 const AGENT_PULSE_FRAME_INTERVAL: Duration = Duration::from_millis(33);
@@ -507,6 +544,60 @@ fn next_agent_pulse_frame_due() -> Instant {
     let elapsed = AGENT_PULSE_EPOCH.elapsed().as_nanos();
     let next_frame = elapsed / interval + 1;
     *AGENT_PULSE_EPOCH + Duration::from_nanos((next_frame * interval) as u64)
+}
+
+/// The span a hover-revealed toolbelt fade runs over, per direction.
+fn pane_toolbelt_fade_span(hovered: bool) -> Duration {
+    Duration::from_millis(if hovered {
+        PANE_TOOLBELT_FADE_IN_MS
+    } else {
+        PANE_TOOLBELT_FADE_OUT_MS
+    })
+}
+
+/// Opacity of a hover-revealed toolbelt, `0.0..=1.0`.
+///
+/// Pure function of elapsed time like [`agent_pulse_phase`], so it is
+/// unit-testable and the strip needs no per-row mutable clock. `from` is the
+/// opacity at the moment `hovered` last flipped, so a reversal mid-fade
+/// continues from what is on screen rather than snapping to 0 or 1.
+///
+/// Returns *exactly* the target once the span has run out, which is what
+/// [`pane_toolbelt_fade_is_settled`] tests for: the painter stops asking for
+/// frames the moment this stops changing.
+fn pane_toolbelt_fade_opacity(hovered: bool, from: f32, elapsed: Duration, span: Duration) -> f32 {
+    let target = if hovered { 1. } else { 0. };
+    let span_s = span.as_secs_f32();
+    if span_s <= 0. {
+        return target;
+    }
+    let t = elapsed.as_secs_f32() / span_s;
+    if t >= 1. {
+        return target;
+    }
+    // Same easing the agent row's entry slide uses, so the two fork animations
+    // do not each invent a curve.
+    let eased = EasingFunction::EaseOut
+        .evaluate_at_position(t.max(0.))
+        .clamp(0., 1.);
+    (from + (target - from) * eased).clamp(0., 1.)
+}
+
+/// [`pane_toolbelt_fade_opacity`] with the span implied by the direction.
+///
+/// Exists so `mouseevent` can ask "what is on screen right now?" when reversing
+/// a fade without having to know about spans.
+pub(crate) fn pane_toolbelt_fade_opacity_at(hovered: bool, from: f32, elapsed: Duration) -> f32 {
+    pane_toolbelt_fade_opacity(hovered, from, elapsed, pane_toolbelt_fade_span(hovered))
+}
+
+/// Whether the fade has reached its target and needs no further frames.
+fn pane_toolbelt_fade_is_settled(hovered: bool, opacity: f32) -> bool {
+    if hovered {
+        opacity >= 1.
+    } else {
+        opacity <= 0.
+    }
 }
 
 /// Slow pulse in `0.0..=1.0`, smoothstep-eased.
@@ -1612,14 +1703,18 @@ fn clean_agent_markdown_transcript(raw: &str, adapter: Option<&AgentAdapterConfi
     clean_agent_markdown_transcript_with(raw, adapter, AgentBannerSkip::Allowed)
 }
 
-fn agent_transcript_start(scrollback_top: isize, end: isize, max_rows: isize) -> isize {
+pub(crate) fn agent_transcript_start(scrollback_top: isize, end: isize, max_rows: isize) -> isize {
     scrollback_top.max(end.saturating_sub(max_rows.max(1)))
 }
 
 /// Physical-row windows covering `start..end`, so one copy never asks the pane
 /// for its whole buffer in a single call. Pure, so the coverage/termination
 /// property is unit-testable without a `Pane`.
-fn agent_transcript_chunks(start: isize, end: isize, chunk: isize) -> Vec<std::ops::Range<isize>> {
+pub(crate) fn agent_transcript_chunks(
+    start: isize,
+    end: isize,
+    chunk: isize,
+) -> Vec<std::ops::Range<isize>> {
     let mut chunks = Vec::new();
     if end <= start {
         return chunks;
@@ -1762,31 +1857,31 @@ fn agent_copy_toast_message(action: &AgentCopyAction, payload: &AgentCopyPayload
     }
 }
 
-fn agent_toolbelt_button_width(label: &str, cell_width: usize, dpi_scale: f32) -> f32 {
+fn pane_toolbelt_button_width(label: &str, cell_width: usize, dpi_scale: f32) -> f32 {
     let text_w = label.chars().count() as f32 * cell_width as f32;
-    (text_w + AGENT_TOOLBELT_BUTTON_PAD_X * dpi_scale * 2.)
-        .max(AGENT_TOOLBELT_MIN_BUTTON_W * dpi_scale)
+    (text_w + PANE_TOOLBELT_BUTTON_PAD_X * dpi_scale * 2.)
+        .max(PANE_TOOLBELT_MIN_BUTTON_W * dpi_scale)
 }
 
-fn agent_toolbelt_button_area(buttons: &[(&str, AgentToolbeltAction, f32)]) -> f32 {
+fn pane_toolbelt_button_area(buttons: &[(&str, PaneToolbeltAction, f32)]) -> f32 {
     let widths = buttons.iter().map(|(_, _, width)| *width).sum::<f32>();
-    widths + buttons.len().saturating_sub(1) as f32 * AGENT_TOOLBELT_GAP
+    widths + buttons.len().saturating_sub(1) as f32 * FLOAT_GAP
 }
 
 /// Order buttons are dropped in when the strip is too narrow, first dropped
 /// first. Stop and Copy are absent on purpose: Stop is the only mouse path to
 /// halt a runaway agent, and Copy is the one action that never needs trust.
-const AGENT_TOOLBELT_TRIM_ORDER: &[AgentToolbeltAction] = &[
-    AgentToolbeltAction::DockInput,
-    AgentToolbeltAction::Compose,
-    AgentToolbeltAction::OpenLogs,
-    AgentToolbeltAction::Attach,
-    AgentToolbeltAction::Resume,
+const PANE_TOOLBELT_TRIM_ORDER: &[PaneToolbeltAction] = &[
+    PaneToolbeltAction::DockInput,
+    PaneToolbeltAction::Compose,
+    PaneToolbeltAction::OpenLogs,
+    PaneToolbeltAction::Attach,
+    PaneToolbeltAction::Resume,
 ];
 
-fn trim_agent_toolbelt_buttons(buttons: &mut Vec<(&str, AgentToolbeltAction, f32)>, max_area: f32) {
-    while !buttons.is_empty() && agent_toolbelt_button_area(buttons) > max_area {
-        let remove_idx = AGENT_TOOLBELT_TRIM_ORDER
+fn trim_pane_toolbelt_buttons(buttons: &mut Vec<(&str, PaneToolbeltAction, f32)>, max_area: f32) {
+    while !buttons.is_empty() && pane_toolbelt_button_area(buttons) > max_area {
+        let remove_idx = PANE_TOOLBELT_TRIM_ORDER
             .iter()
             .find_map(|action| {
                 buttons
@@ -1798,7 +1893,7 @@ fn trim_agent_toolbelt_buttons(buttons: &mut Vec<(&str, AgentToolbeltAction, f32
             .or_else(|| {
                 buttons
                     .iter()
-                    .rposition(|(_, action, _)| action != &AgentToolbeltAction::CopyMenu)
+                    .rposition(|(_, action, _)| action != &PaneToolbeltAction::CopyMenu)
             })
             .unwrap_or(buttons.len() - 1);
         buttons.remove(remove_idx);
@@ -3662,6 +3757,79 @@ fn vendor_session_adapter_enabled(
         .unwrap_or(true)
 }
 
+/// Marker directories that prove an agent CLI has run under a home directory.
+///
+/// Used to pick real user homes out of a distro's `/home` without shelling into
+/// it. Cheap: one `exists` per marker until the first hit.
+const AGENT_HOME_MARKERS: [&str; 6] = [
+    ".claude",
+    ".codex",
+    ".copilot",
+    ".gemini",
+    ".config/opencode",
+    ".local/share/opencode",
+];
+
+fn looks_like_an_agent_home(dir: &Path) -> bool {
+    AGENT_HOME_MARKERS
+        .iter()
+        .any(|marker| dir.join(marker).exists())
+}
+
+/// Home directories the agent scans should read session files from.
+///
+/// Always this machine's own home. On Windows also one per configured WSL
+/// distro: the agent CLIs are normally installed *inside* the distro and write
+/// their session files to the distro's home, so a Windows-home-only scan finds
+/// nothing at all and every herd row falls back to the vendor's name.
+///
+/// Does filesystem work (it probes for agent marker directories), so this runs
+/// on the scan worker, never on the paint path.
+///
+/// `distros` is `(distribution, configured username)` pairs, captured from
+/// config on the GUI thread. A configured username is used directly; otherwise
+/// the distro's `/home` is listed and every child that looks like an agent home
+/// is taken, which covers the ordinary single-user distro without a `wsl.exe`
+/// subprocess.
+fn agent_session_roots(home: PathBuf, distros: &[(String, Option<String>)]) -> Vec<SessionRoot> {
+    let mut roots = vec![SessionRoot::host(home)];
+    // The UNC form only resolves on Windows; elsewhere this would stat paths
+    // that cannot exist, so the host home is the whole answer.
+    if !cfg!(windows) {
+        return roots;
+    }
+    let mut seen = HashSet::new();
+    for (distro, user) in distros {
+        if distro.is_empty() {
+            continue;
+        }
+        if let Some(user) = user {
+            if let Some(path) = wsl_paths::wsl_home(distro, user) {
+                if seen.insert(path.clone()) && path.is_dir() {
+                    roots.push(SessionRoot::wsl(path, distro));
+                }
+            }
+            // An explicitly configured user is the answer; do not also guess.
+            continue;
+        }
+        let Some(base) = wsl_paths::wsl_home_base(distro) else {
+            continue;
+        };
+        let Ok(entries) = std::fs::read_dir(&base) else {
+            // A distro that is not running has no filesystem to read. That is
+            // ordinary, not an error.
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() && looks_like_an_agent_home(&path) && seen.insert(path.clone()) {
+                roots.push(SessionRoot::wsl(path, distro));
+            }
+        }
+    }
+    roots
+}
+
 /// The agent sessions running in this window, in tab order, as the snapshot
 /// records them.
 ///
@@ -3687,6 +3855,23 @@ fn window_agent_sessions(agents: &[HerdAgent]) -> Vec<SnapshotSession> {
         })
         .filter(|session| seen.insert((session.adapter_id.clone(), session.session_id.clone())))
         .collect()
+}
+
+/// The restore row's text, e.g. `"Reopen last session (7 agents, 2 windows)"`.
+///
+/// Pure so the pluralisation is testable without a window.
+fn restore_row_label(set: &tgz_last_session::LastWindowSet) -> String {
+    let agents = set.sessions.len();
+    let plural = |n: usize| if n == 1 { "" } else { "s" };
+    if set.window_count <= 1 {
+        format!("Reopen last session ({agents} agent{})", plural(agents))
+    } else {
+        format!(
+            "Reopen last session ({agents} agent{}, {} windows)",
+            plural(agents),
+            set.window_count
+        )
+    }
 }
 
 /// What a restore click will actually do.
@@ -3792,13 +3977,147 @@ fn herd_sessions_for_display(
         .collect()
 }
 
-fn agent_toolbelt_buttons(
+/// Which toolbelt a pane gets.
+///
+/// Resolved once per paint, in one place, and carried into every downstream
+/// decision — buttons, geometry, copy-menu rows — so nothing has to ask "is
+/// this an agent?" a second time. `detect_agent_pane` is the expensive half
+/// (user vars, viewport fingerprint, cache probe), so its result travels here
+/// rather than being recomputed.
+pub(crate) enum PaneToolbeltKind {
+    /// A detected agent pane: the full strip, always visible.
+    Agent(AgentPaneState),
+    /// A plain shell or ssh pane: one Copy button.
+    Shell,
+}
+
+/// What a pane copy put on the clipboard, and what to say about it.
+pub(crate) struct PaneCopyResult {
+    pub text: String,
+    pub message: String,
+    /// Toast title, per pane kind.
+    pub title: &'static str,
+}
+
+/// Rows the copy menu offers on this kind of pane.
+///
+/// Pure and per-kind so the two lists can be tested without a window. Wording
+/// mirrors the toolbelt buttons: short, verb-first, no vendor names.
+pub(crate) fn pane_copy_menu_items(kind: &PaneToolbeltKind) -> Vec<(&'static str, PaneCopyAction)> {
+    match kind {
+        PaneToolbeltKind::Agent(_) => vec![
+            (
+                "Copy conversation",
+                PaneCopyAction::Agent(AgentCopyAction::Conversation),
+            ),
+            (
+                "Copy as Markdown",
+                PaneCopyAction::Agent(AgentCopyAction::Markdown),
+            ),
+            (
+                "Copy last message",
+                PaneCopyAction::Agent(AgentCopyAction::LastAgentMessage),
+            ),
+            (
+                "Copy agent details",
+                PaneCopyAction::Agent(AgentCopyAction::Summary),
+            ),
+        ],
+        PaneToolbeltKind::Shell => vec![
+            (
+                "Copy last command output",
+                PaneCopyAction::Shell(ShellCopyAction::LastCommandOutput),
+            ),
+            (
+                "Copy last command + output",
+                PaneCopyAction::Shell(ShellCopyAction::LastCommandWithOutput),
+            ),
+            (
+                "Copy pane",
+                PaneCopyAction::Shell(ShellCopyAction::WholePane),
+            ),
+        ],
+    }
+}
+
+/// Per-kind strip content and width floor, resolved before any drawing.
+///
+/// Exists so a one-button shell strip is not padded out to the agent strip's
+/// 360px floor with a status dot that means nothing on a shell.
+pub(crate) struct PaneToolbeltLayout {
+    /// Status-dot diameter. Zero on a plain pane: the dot means *agent status*,
+    /// and a dot that means nothing is exactly the drift this split removes.
+    dot_size: f32,
+    /// Label variants, widest first. Empty on a plain pane.
+    label_fallbacks: Vec<String>,
+    /// Width floor. The agent strip keeps its floor so the vendor label has
+    /// room to be readable; a strip with no label is exactly its buttons wide.
+    min_w: f32,
+}
+
+fn pane_toolbelt_layout(kind: &PaneToolbeltKind, dpi_scale: f32) -> PaneToolbeltLayout {
+    let agent = match kind {
+        PaneToolbeltKind::Shell => {
+            return PaneToolbeltLayout {
+                dot_size: 0.,
+                label_fallbacks: Vec::new(),
+                min_w: 0.,
+            };
+        }
+        PaneToolbeltKind::Agent(agent) => agent,
+    };
+
+    let status = if agent.status == AgentStatus::Unknown {
+        String::new()
+    } else {
+        format!(" {}", agent.status.label())
+    };
+    let kind_label = agent.kind.label();
+    // Ordered widest -> narrowest. The render region hard-truncates to whole
+    // cells with no ellipsis, so instead of letting "Claude agent opus" clip
+    // to "Claude agent o", we pick the widest whole variant that fits.
+    let mut label_fallbacks: Vec<String> = Vec::new();
+    match &agent.model {
+        Some(model) => {
+            label_fallbacks.push(format!("{} agent {}{}", kind_label, model, status));
+            label_fallbacks.push(format!("{} agent {}", kind_label, model));
+            if !status.is_empty() {
+                label_fallbacks.push(format!("{} agent{}", kind_label, status));
+            }
+            label_fallbacks.push(format!("{} agent", kind_label));
+        }
+        None => {
+            label_fallbacks.push(format!("{} agent{}", kind_label, status));
+            label_fallbacks.push(format!("{} agent", kind_label));
+        }
+    }
+    label_fallbacks.push(kind_label.to_string());
+
+    PaneToolbeltLayout {
+        dot_size: PANE_TOOLBELT_DOT_SIZE * dpi_scale,
+        label_fallbacks,
+        min_w: PANE_TOOLBELT_MIN_W,
+    }
+}
+
+fn pane_toolbelt_buttons(
     agent_ui: &config::AgentUiConfig,
-    agent: &AgentPaneState,
+    kind: &PaneToolbeltKind,
     adapter: Option<&AgentAdapterConfig>,
     rich_input_enabled: bool,
     rich_input_docked: bool,
-) -> Vec<(&'static str, AgentToolbeltAction)> {
+) -> Vec<(&'static str, PaneToolbeltAction)> {
+    // Nothing below this point consults `agent_ui`: the plain strip is not an
+    // agent surface and must survive `agent_ui.enabled = false`. Copy is also
+    // the one action that never needs a trust gate, so there is nothing to
+    // check beyond the pane kind itself.
+    let agent = match kind {
+        PaneToolbeltKind::Shell => {
+            return vec![("Copy", PaneToolbeltAction::CopyMenu)];
+        }
+        PaneToolbeltKind::Agent(agent) => agent,
+    };
+
     if !agent_ui.enabled
         || !agent_ui.show_pane_toolbelt
         || adapter.map(|adapter| !adapter.enabled).unwrap_or(false)
@@ -3810,30 +4129,30 @@ fn agent_toolbelt_buttons(
     if agent.actions.interrupt
         && matches!(agent.status, AgentStatus::Running | AgentStatus::Streaming)
     {
-        buttons.push(("Stop", AgentToolbeltAction::Interrupt));
+        buttons.push(("Stop", PaneToolbeltAction::Interrupt));
     }
     if agent.actions.copy_summary {
-        buttons.push(("Copy", AgentToolbeltAction::CopyMenu));
+        buttons.push(("Copy", PaneToolbeltAction::CopyMenu));
     }
     if agent.actions.attach {
-        buttons.push(("Attach", AgentToolbeltAction::Attach));
+        buttons.push(("Attach", PaneToolbeltAction::Attach));
     }
     if agent.actions.resume {
-        buttons.push(("Resume", AgentToolbeltAction::Resume));
+        buttons.push(("Resume", PaneToolbeltAction::Resume));
     }
     if agent.actions.open_logs {
         buttons.push((
             agent_detail_button_label(agent.adapter_id.as_deref(), adapter),
-            AgentToolbeltAction::OpenLogs,
+            PaneToolbeltAction::OpenLogs,
         ));
     }
     if rich_input_enabled {
         if rich_input_docked {
             // Button that activates the persistent docked input strip for this
             // agent pane (the strip is not shown until toggled here).
-            buttons.push(("Input", AgentToolbeltAction::DockInput));
+            buttons.push(("Input", PaneToolbeltAction::DockInput));
         } else {
-            buttons.push(("Compose", AgentToolbeltAction::Compose));
+            buttons.push(("Compose", PaneToolbeltAction::Compose));
         }
     }
     buttons
@@ -5850,10 +6169,19 @@ impl crate::TermWindow {
         let Some(window) = self.window.clone() else {
             return;
         };
+        // Read config here; the worker has no handle on it.
+        let distros = self.wsl_distro_specs();
 
         self.agent_session_scan_pending = true;
         let future = promise::spawn::spawn_into_new_thread(move || {
-            let sessions = crate::agent_herd::sessions::collect_recent_sessions(&home, limit);
+            // Same roots the herd scan uses: on Windows the transcripts are
+            // inside the distro, not under the Windows home.
+            let homes: Vec<PathBuf> = agent_session_roots(home, &distros)
+                .into_iter()
+                .map(|root| root.home)
+                .collect();
+            let sessions =
+                crate::agent_herd::sessions::collect_recent_sessions_across(&homes, limit);
             // The scan thread must not touch the mux or any GUI state, so the
             // result is applied back on the GUI thread.
             window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
@@ -5930,8 +6258,8 @@ impl crate::TermWindow {
             .min(MAX_RESUME_MENU_SESSIONS) as usize
     }
 
-    /// Agent sessions offered by the launcher's "Reopen last window" row.
-    pub(crate) fn agent_restore_candidates(&self) -> Option<Arc<Vec<SnapshotSession>>> {
+    /// The restore offer, or `None` when there is nothing to reopen.
+    pub(crate) fn agent_restore_candidates(&self) -> Option<Arc<tgz_last_session::LastWindowSet>> {
         if self.agent_restore_limit() == 0 {
             return None;
         }
@@ -5946,9 +6274,11 @@ impl crate::TermWindow {
     /// would see the pre-restore layout, because the earlier spawns are still in
     /// flight.
     pub fn restore_last_window_agent_sessions(&mut self) {
-        // Taken, not cloned: the row disappears once used, so a double-click
-        // cannot restore everything twice.
-        let Some(entries) = self.last_window_sessions.take() else {
+        // Cloned, not taken: the row is cleared at the end, and only if the
+        // restore actually spawned something. Taking it up front meant a restore
+        // that reopened nothing -- every cwd deleted, the adapter disabled --
+        // still burned the offer, leaving the user with a toast and no way back.
+        let Some(entries) = self.last_window_sessions.clone() else {
             return;
         };
 
@@ -5974,7 +6304,12 @@ impl crate::TermWindow {
             .map(|(id, _)| id.clone())
             .collect();
 
-        let plan = plan_session_restore(&entries, &live, &enabled, self.agent_restore_limit());
+        let plan = plan_session_restore(
+            &entries.sessions,
+            &live,
+            &enabled,
+            self.agent_restore_limit(),
+        );
         let mut skipped = plan.skipped;
         let mut spawns = Vec::with_capacity(plan.spawn.len());
         for entry in plan.spawn {
@@ -5995,6 +6330,12 @@ impl crate::TermWindow {
             }
         }
 
+        // Only now is the offer spent. A double-click cannot restore twice
+        // because the second click finds the row gone; a restore that produced
+        // nothing leaves it in place.
+        if !spawns.is_empty() {
+            self.last_window_sessions = None;
+        }
         self.spawn_agents_in_new_tabs(spawns, skipped);
     }
 
@@ -7069,12 +7410,34 @@ impl crate::TermWindow {
         )
     }
 
-    pub(crate) fn agent_copy_toast_message(
+    /// Text to copy plus the message that describes how it was obtained.
+    ///
+    /// Built per pane kind so the single copy sink stays kind-agnostic and the
+    /// message stays a pure function of the payload.
+    pub(crate) fn pane_copy_result(
         &self,
-        action: &AgentCopyAction,
-        payload: &AgentCopyPayload,
-    ) -> String {
-        agent_copy_toast_message(action, payload)
+        pane: &Arc<dyn Pane>,
+        action: &PaneCopyAction,
+    ) -> PaneCopyResult {
+        match action {
+            PaneCopyAction::Agent(action) => {
+                let payload = self.agent_pane_copy_payload(pane, action);
+                PaneCopyResult {
+                    message: agent_copy_toast_message(action, &payload),
+                    text: payload.text,
+                    // Keeps today's wording on agent panes byte-identical.
+                    title: "Agent copy",
+                }
+            }
+            PaneCopyAction::Shell(action) => {
+                let payload = self.shell_pane_copy_payload(pane, *action);
+                PaneCopyResult {
+                    message: shell_copy_toast_message(*action, &payload),
+                    text: payload.text,
+                    title: "Copy",
+                }
+            }
+        }
     }
 
     pub(crate) fn set_agent_feedback(&self, message: impl Into<String>) {
@@ -7733,6 +8096,63 @@ impl crate::TermWindow {
     ///
     /// Neither one has a working directory, a branch or a command worth
     /// showing, so neither may stand in for a tab in the sidebar.
+    /// The one place that decides which toolbelt a pane gets, or `None` for a
+    /// pane that gets none.
+    ///
+    /// `detect_agent_pane` is called exactly once here and its result travels
+    /// in the returned kind, so no caller has to detect twice.
+    pub(crate) fn pane_toolbelt_kind(&self, pane: &Arc<dyn Pane>) -> Option<PaneToolbeltKind> {
+        // `detect_agent_pane` already returns None when `agent_ui.enabled` is
+        // off, which is correct: with agent awareness switched off every pane
+        // is a plain pane and gets the plain-pane strip.
+        if let Some(agent) = self.detect_agent_pane(pane) {
+            // Deliberate asymmetry: an agent pane with the toolbelt switched
+            // off gets *nothing*, not the shell strip. "Show the agent
+            // toolbelt = off" means off.
+            return self
+                .config
+                .agent_ui
+                .show_pane_toolbelt
+                .then_some(PaneToolbeltKind::Agent(agent));
+        }
+
+        if !self.config.pane_toolbelt.shell_copy {
+            return None;
+        }
+        // An overlay stands in for the real pane in `get_pos_panes_for_tab`,
+        // so without this the Copy strip floats over copy mode, the launcher,
+        // the tab navigator, the debug REPL and the agent log. The agent gate
+        // used to hide this: an overlay never matched as an agent.
+        if self.pane_is_overlay(pane.pane_id()) {
+            return None;
+        }
+        // A worktree/file-browser pane is a fork utility surface, not a shell
+        // whose command output anyone reads.
+        if self.is_sidebar_utility_pane(pane) {
+            return None;
+        }
+        // vim, htop, less: there is no "last command" on the alternate screen,
+        // and a floating button over a full-screen TUI is noise.
+        if pane.is_alt_screen_active() {
+            return None;
+        }
+        Some(PaneToolbeltKind::Shell)
+    }
+
+    /// True when `pane_id` names an overlay pane rather than a real one.
+    fn pane_is_overlay(&self, pane_id: PaneId) -> bool {
+        let is = |state: &OverlayState| state.pane.pane_id() == pane_id;
+        self.tab_state
+            .borrow()
+            .values()
+            .any(|state| state.overlay.as_ref().is_some_and(is))
+            || self
+                .pane_state
+                .borrow()
+                .values()
+                .any(|state| state.overlay.as_ref().is_some_and(is))
+    }
+
     fn is_sidebar_utility_pane(&self, pane: &Arc<dyn Pane>) -> bool {
         is_worktree_pane(pane)
     }
@@ -7985,6 +8405,70 @@ impl crate::TermWindow {
         self.update_next_frame_time(Some(next_due));
     }
 
+    /// Register a next-frame deadline for the toolbelt fade.
+    ///
+    /// Unlike [`Self::schedule_sidebar_frame`] this ignores the `unfocused`
+    /// animation gate. A fade is a transition *to a settled state*, not a loop:
+    /// a window that loses focus mid-fade must still be allowed to finish, or
+    /// it keeps a half-transparent strip on screen until something else
+    /// happens to repaint it.
+    fn schedule_pane_toolbelt_frame(&self) {
+        self.sidebar_wants_animation.set(true);
+        self.update_next_frame_time(Some(next_agent_pulse_frame_due()));
+    }
+
+    /// Opacity the hover-revealed strip should be drawn at, settling the fade
+    /// as a side effect.
+    ///
+    /// Seeds itself *settled* when there is no state, or the state belongs to
+    /// another pane: a tab switch or a split close under a stationary pointer
+    /// changes which pane is under the mouse with no enter and no leave, and
+    /// fading in there would be a lie about a movement that never happened.
+    fn pane_toolbelt_opacity(&mut self, zone: &PaneToolbeltZone) -> f32 {
+        let hovered_now = self
+            .current_mouse_event
+            .as_ref()
+            .is_some_and(|event| zone.contains(event.coords.x, event.coords.y))
+            || self
+                .pane_copy_menu
+                .as_ref()
+                .is_some_and(|menu| menu.pane_id == zone.pane_id);
+
+        let fade = match self.pane_toolbelt_fade {
+            Some(fade) if fade.pane_id == zone.pane_id => fade,
+            _ => {
+                let seeded = PaneToolbeltFade {
+                    pane_id: zone.pane_id,
+                    hovered: hovered_now,
+                    // Far enough in the past that the fade reads as complete.
+                    changed_at: Instant::now() - pane_toolbelt_fade_span(hovered_now),
+                    from: if hovered_now { 1. } else { 0. },
+                };
+                self.pane_toolbelt_fade = Some(seeded);
+                seeded
+            }
+        };
+
+        // Snapping when animations are off is the contract every other fork
+        // animation honours: no phase, no scheduled frame.
+        if !self.sidebar_animation_gates().toolbelt_fade {
+            return if fade.hovered { 1. } else { 0. };
+        }
+
+        let opacity = pane_toolbelt_fade_opacity(
+            fade.hovered,
+            fade.from,
+            fade.changed_at.elapsed(),
+            pane_toolbelt_fade_span(fade.hovered),
+        );
+        // This is why a stationary mouse never leaves a half-faded strip: the
+        // frames come from the painter, not from mouse motion.
+        if !pane_toolbelt_fade_is_settled(fade.hovered, opacity) {
+            self.schedule_pane_toolbelt_frame();
+        }
+        opacity
+    }
+
     /// Rotation of the working-agent throbber, or `None` when this agent is not
     /// working. Registering the next frame here is the cost control: with
     /// nothing working, nothing is scheduled.
@@ -8218,16 +8702,13 @@ impl crate::TermWindow {
         items
     }
 
-    pub fn paint_agent_toolbelt(
+    pub fn paint_pane_toolbelt(
         &mut self,
         layers: &mut TripleLayerQuadAllocator,
         pos: &PositionedPane,
     ) -> anyhow::Result<()> {
-        if !self.config.agent_ui.enabled || !self.config.agent_ui.show_pane_toolbelt {
-            return Ok(());
-        }
         self.prune_agent_detection_cache();
-        let Some(agent) = self.detect_agent_pane(&pos.pane) else {
+        let Some(kind) = self.pane_toolbelt_kind(&pos.pane) else {
             return Ok(());
         };
 
@@ -8242,14 +8723,15 @@ impl crate::TermWindow {
         // used by paint_scrollbar_edge_overlay in paint.rs.
         let dpi_scale = (self.dimensions.dpi as f32 / 96.).clamp(1., 2.5);
         let vpad = 6. * dpi_scale;
-        let strip_h = (cell_h_f + 2. * vpad).max(AGENT_TOOLBELT_H * dpi_scale);
+        let strip_h = (cell_h_f + 2. * vpad).max(PANE_TOOLBELT_H * dpi_scale);
         let button_margin = 5. * dpi_scale;
         let button_inner_vpad = 4. * dpi_scale;
         let button_h = (cell_h_f + button_inner_vpad).min(strip_h - 2. * button_margin);
         let strip_radius = (RADIUS * dpi_scale).min(strip_h * 0.5);
         let button_radius = (5. * dpi_scale).min(button_h * 0.5);
         let pad_x = PAD_X * dpi_scale;
-        let dot_size = AGENT_TOOLBELT_DOT_SIZE * dpi_scale;
+        let layout = pane_toolbelt_layout(&kind, dpi_scale);
+        let dot_size = layout.dot_size;
         let (padding_left, padding_top) = self.padding_left_top();
         let tab_bar_height = if self.show_tab_bar && !self.sidebar_is_active() {
             self.tab_bar_pixel_height().unwrap_or(0.)
@@ -8267,104 +8749,116 @@ impl crate::TermWindow {
             border.top.get() as f32 + top_bar_height + padding_top + pos.top as f32 * cell_h_f;
         let pane_w = pos.pixel_width as f32;
         let pane_h = pos.pixel_height as f32;
-        if pane_w < 140. || pane_h < strip_h + AGENT_TOOLBELT_GAP * 2. {
+        if pane_w < 140. || pane_h < strip_h + FLOAT_GAP * 2. {
             return Ok(());
         }
 
-        let mut buttons: Vec<(&str, AgentToolbeltAction)> = Vec::new();
-        let adapter = self.agent_adapter_config_by_id(agent.adapter_id.as_deref());
-        buttons.extend(agent_toolbelt_buttons(
+        let agent = match &kind {
+            PaneToolbeltKind::Agent(agent) => Some(agent),
+            PaneToolbeltKind::Shell => None,
+        };
+        let adapter =
+            agent.and_then(|agent| self.agent_adapter_config_by_id(agent.adapter_id.as_deref()));
+        let buttons: Vec<(&str, PaneToolbeltAction)> = pane_toolbelt_buttons(
             &self.config.agent_ui,
-            &agent,
+            &kind,
             adapter.as_ref(),
             self.config.rich_input.enabled,
             self.config.rich_input.docked,
-        ));
+        );
         if buttons.is_empty() {
             return Ok(());
         }
 
-        let status = if agent.status == AgentStatus::Unknown {
-            String::new()
-        } else {
-            format!(" {}", agent.status.label())
-        };
-        let kind = agent.kind.label();
-        // Ordered widest -> narrowest. The render region hard-truncates to whole
-        // cells with no ellipsis, so instead of letting "Claude agent opus" clip
-        // to "Claude agent o", we pick the widest whole variant that fits.
-        let mut label_fallbacks: Vec<String> = Vec::new();
-        match &agent.model {
-            Some(model) => {
-                label_fallbacks.push(format!("{} agent {}{}", kind, model, status));
-                label_fallbacks.push(format!("{} agent {}", kind, model));
-                if !status.is_empty() {
-                    label_fallbacks.push(format!("{} agent{}", kind, status));
-                }
-                label_fallbacks.push(format!("{} agent", kind));
-            }
-            None => {
-                label_fallbacks.push(format!("{} agent{}", kind, status));
-                label_fallbacks.push(format!("{} agent", kind));
-            }
-        }
-        label_fallbacks.push(kind.to_string());
-        let label = label_fallbacks[0].clone();
+        let label_fallbacks = &layout.label_fallbacks;
+        let label = label_fallbacks.first().cloned().unwrap_or_default();
 
-        let max_tool_w = (pane_w - AGENT_TOOLBELT_RIGHT_INSET - AGENT_TOOLBELT_GAP)
+        let max_tool_w = (pane_w - PANE_TOOLBELT_RIGHT_INSET - FLOAT_GAP)
             .max(1.)
-            .min(AGENT_TOOLBELT_MAX_W);
-        let fixed_controls_w = pad_x * 2. + dot_size + AGENT_TOOLBELT_GAP;
+            .min(PANE_TOOLBELT_MAX_W);
+        // A shell strip has no dot, so it must not reserve the dot's gap either.
+        let fixed_controls_w = pad_x * 2. + dot_size + if dot_size > 0. { FLOAT_GAP } else { 0. };
         let max_button_area = (max_tool_w - fixed_controls_w).max(0.);
         let mut visible_buttons = buttons
             .into_iter()
             .map(|(label, action)| {
-                let width = agent_toolbelt_button_width(label, cell_width, dpi_scale);
+                let width = pane_toolbelt_button_width(label, cell_width, dpi_scale);
                 (label, action, width)
             })
             .collect::<Vec<_>>();
-        trim_agent_toolbelt_buttons(&mut visible_buttons, max_button_area);
+        trim_pane_toolbelt_buttons(&mut visible_buttons, max_button_area);
         if visible_buttons.is_empty() {
             return Ok(());
         }
 
-        let button_area = agent_toolbelt_button_area(&visible_buttons);
+        let button_area = pane_toolbelt_button_area(&visible_buttons);
         let label_target_w = (label.chars().count() as f32 * cell_w_f).min(280. * dpi_scale);
-        let desired_w = (fixed_controls_w + button_area + AGENT_TOOLBELT_GAP + label_target_w)
-            .max(AGENT_TOOLBELT_MIN_W)
-            .min(AGENT_TOOLBELT_MAX_W);
+        let desired_w = (fixed_controls_w + button_area + FLOAT_GAP + label_target_w)
+            .max(layout.min_w)
+            .min(PANE_TOOLBELT_MAX_W);
         let tool_w = desired_w
             .min(max_tool_w)
             .max(fixed_controls_w + button_area);
-        let tool_x = pane_x + pane_w - tool_w - AGENT_TOOLBELT_RIGHT_INSET;
+        let tool_x = pane_x + pane_w - tool_w - PANE_TOOLBELT_RIGHT_INSET;
         let tool_y = match self.config.agent_ui.toolbelt_position {
-            AgentToolbeltPosition::Top => pane_y + AGENT_TOOLBELT_GAP,
-            AgentToolbeltPosition::Bottom => pane_y + pane_h - strip_h - AGENT_TOOLBELT_GAP,
+            PaneToolbeltPosition::Top => pane_y + FLOAT_GAP,
+            PaneToolbeltPosition::Bottom => pane_y + pane_h - strip_h - FLOAT_GAP,
         };
 
+        // Recorded once the pane has qualified and the geometry is real, so the
+        // rect the mouse tests against is exactly the rect that was painted.
+        let opacity = match &kind {
+            // Today's behaviour, unchanged: always visible, no hover, no fade.
+            PaneToolbeltKind::Agent(_) => 1.,
+            PaneToolbeltKind::Shell => {
+                let zone = PaneToolbeltZone {
+                    pane_id: pos.pane.pane_id(),
+                    x: pane_x,
+                    y: pane_y,
+                    width: pane_w,
+                    height: pane_h,
+                };
+                self.pane_toolbelt_hover_zone = Some(zone);
+                self.pane_toolbelt_opacity(&zone)
+            }
+        };
+        if opacity < PANE_TOOLBELT_MIN_VISIBLE_OPACITY {
+            // Nothing drawn and, crucially, no hit rects pushed.
+            return Ok(());
+        }
+        let takes_clicks = opacity >= PANE_TOOLBELT_HIT_MIN_OPACITY;
+        // Scales whatever alpha the colour already carried, so a settled strip
+        // (`opacity == 1.0`) is bit-identical to what it was before — the same
+        // property the agent row's entry fade relies on.
+        let fade = |color: LinearRgba| color.mul_alpha(opacity);
+
         let sb = self.sidebar_palette();
-        let fg = sb.text_active;
-        let bg = sb.row_fill;
-        let hover_bg = sb.pressed_fill;
-        let pressed_bg = lerp_rgba(bg, fg, 0.28);
-        let accent = agent_status_dot_accent(
-            &agent.status,
-            adapter_color(adapter.as_ref(), &agent.kind),
-            bg,
-            None,
-            sb.ring.pulse,
-            sb.ring.waiting,
-        );
-        // The dot breathes while the agent works; the rest of the strip keeps
-        // the steady accent so button text and borders do not shimmer.
-        let dot_accent = agent_status_dot_accent(
-            &agent.status,
-            accent,
-            bg,
-            self.agent_dot_pulse(&agent),
-            sb.ring.pulse,
-            sb.ring.waiting,
-        );
+        let fg = fade(sb.text_active);
+        let bg = fade(sb.row_fill);
+        let hover_bg = fade(sb.pressed_fill);
+        let pressed_bg = fade(lerp_rgba(sb.row_fill, sb.text_active, 0.28));
+        // The status dot is an agent signal; a plain pane has no status to show,
+        // so `pane_toolbelt_layout` zeroes `dot_size` and the dot is skipped.
+        let dot_accent = agent.map(|agent| {
+            let accent = agent_status_dot_accent(
+                &agent.status,
+                adapter_color(adapter.as_ref(), &agent.kind),
+                bg,
+                None,
+                sb.ring.pulse,
+                sb.ring.waiting,
+            );
+            // The dot breathes while the agent works; the rest of the strip keeps
+            // the steady accent so button text and borders do not shimmer.
+            fade(agent_status_dot_accent(
+                &agent.status,
+                accent,
+                bg,
+                self.agent_dot_pulse(agent),
+                sb.ring.pulse,
+                sb.ring.waiting,
+            ))
+        });
 
         self.sidebar_rounded_fill(
             layers,
@@ -8373,18 +8867,20 @@ impl crate::TermWindow {
             strip_radius,
             bg,
         )?;
-        self.sidebar_pill_fill(
-            layers,
-            1,
-            euclid::rect(
-                tool_x + pad_x,
-                tool_y + (strip_h - dot_size) * 0.5,
-                dot_size,
-                dot_size,
-            ),
-            dot_size * 0.5,
-            dot_accent,
-        )?;
+        if let Some(dot_accent) = dot_accent {
+            self.sidebar_pill_fill(
+                layers,
+                1,
+                euclid::rect(
+                    tool_x + pad_x,
+                    tool_y + (strip_h - dot_size) * 0.5,
+                    dot_size,
+                    dot_size,
+                ),
+                dot_size * 0.5,
+                dot_accent,
+            )?;
+        }
 
         let palette = self.palette().clone();
         let gl_state = self.render_state.as_ref().unwrap();
@@ -8460,8 +8956,8 @@ impl crate::TermWindow {
         };
 
         let button_start_x = tool_x + tool_w - pad_x - button_area;
-        let label_x = tool_x + pad_x + dot_size + AGENT_TOOLBELT_GAP;
-        let label_w = button_start_x - AGENT_TOOLBELT_GAP - label_x;
+        let label_x = tool_x + pad_x + dot_size + if dot_size > 0. { FLOAT_GAP } else { 0. };
+        let label_w = button_start_x - FLOAT_GAP - label_x;
         // Whole cells that fit; pick the widest fallback that fits so the model
         // name never clips mid-word (e.g. "Claude agent opus" -> "Claude agent").
         let label_cols = (label_w / cell_w_f).max(0.) as usize;
@@ -8470,7 +8966,7 @@ impl crate::TermWindow {
             .find(|candidate| candidate.chars().count() <= label_cols)
             .cloned()
             .unwrap_or_else(|| label.clone());
-        if label_w >= (cell_width * 6) as f32 {
+        if !label_fallbacks.is_empty() && label_w >= (cell_width * 6) as f32 {
             render_text(
                 self,
                 layers,
@@ -8495,7 +8991,7 @@ impl crate::TermWindow {
             if button_x + button_w > button_right_limit + 0.5 {
                 break;
             }
-            let item_type = UIItemType::AgentToolbeltButton {
+            let item_type = UIItemType::PaneToolbeltButton {
                 pane_id: pos.pane.pane_id(),
                 action: action.clone(),
             };
@@ -8507,7 +9003,7 @@ impl crate::TermWindow {
             } else if hovered {
                 hover_bg
             } else {
-                lerp_rgba(bg, fg, 0.08)
+                fade(lerp_rgba(sb.row_fill, sb.text_active, 0.08))
             };
             let offset = if pressed { 1. } else { 0. };
             // Button box is centered within the strip and sized to enclose
@@ -8521,8 +9017,8 @@ impl crate::TermWindow {
                 button_radius,
                 button_bg,
             )?;
-            let button_fg = contrast_label_color(button_bg, sb.text_active);
-            let button_side_pad = AGENT_TOOLBELT_BUTTON_PAD_X * dpi_scale * 0.5;
+            let button_fg = fade(contrast_label_color(button_bg, sb.text_active));
+            let button_side_pad = PANE_TOOLBELT_BUTTON_PAD_X * dpi_scale * 0.5;
             render_text(
                 self,
                 layers,
@@ -8534,60 +9030,55 @@ impl crate::TermWindow {
                 button_bg,
                 true,
             )?;
-            self.ui_items.push(UIItem {
-                x: button_x as usize,
-                y: button_box_y as usize,
-                width: button_w.ceil() as usize,
-                height: button_h.ceil() as usize,
-                item_type,
-            });
-            button_x += button_w + AGENT_TOOLBELT_GAP;
+            if takes_clicks {
+                self.ui_items.push(UIItem {
+                    x: button_x as usize,
+                    y: button_box_y as usize,
+                    width: button_w.ceil() as usize,
+                    height: button_h.ceil() as usize,
+                    item_type,
+                });
+            }
+            button_x += button_w + FLOAT_GAP;
         }
 
         Ok(())
     }
 
-    pub fn paint_agent_copy_menu(
+    pub fn paint_pane_copy_menu(
         &mut self,
         layers: &mut TripleLayerQuadAllocator,
     ) -> anyhow::Result<()> {
-        let Some(menu) = self.agent_copy_menu.clone() else {
+        let Some(menu) = self.pane_copy_menu.clone() else {
             return Ok(());
         };
         if Mux::get().get_pane(menu.pane_id).is_none() {
-            self.agent_copy_menu = None;
+            self.pane_copy_menu = None;
             return Ok(());
         }
 
-        let items = [
-            ("Copy conversation", AgentCopyAction::Conversation),
-            ("Copy as Markdown", AgentCopyAction::Markdown),
-            ("Copy last message", AgentCopyAction::LastAgentMessage),
-            ("Copy agent details", AgentCopyAction::Summary),
-        ];
+        // Frozen at open time — see `PaneCopyMenuState::items`.
+        let items = menu.items.clone();
         let cell_width = self.render_metrics.cell_size.width;
         let cell_height = self.render_metrics.cell_size.height;
         let cell_h_f = cell_height as f32;
         // DPI-scaled geometry: row height must enclose the (DPI-scaled) font
-        // cell height, not just the fixed AGENT_COPY_MENU_ROW_H constant, or
+        // cell height, not just the fixed PANE_COPY_MENU_ROW_H constant, or
         // labels spill outside the row on HiDPI/Retina displays.
         let dpi_scale = (self.dimensions.dpi as f32 / 96.).clamp(1., 2.5);
         let row_vpad = 6. * dpi_scale;
-        let row_h = (cell_h_f + 2. * row_vpad).max(AGENT_COPY_MENU_ROW_H * dpi_scale);
+        let row_h = (cell_h_f + 2. * row_vpad).max(PANE_COPY_MENU_ROW_H * dpi_scale);
         let menu_pad = 8. * dpi_scale;
         let menu_radius = (RADIUS * dpi_scale).min(row_h * 0.5);
         let row_radius = (7. * dpi_scale).min(row_h * 0.5);
         let row_inset = 4. * dpi_scale;
         let row_text_inset = 12. * dpi_scale;
-        let menu_w = AGENT_COPY_MENU_W;
+        let menu_w = PANE_COPY_MENU_W;
         let menu_h = items.len() as f32 * row_h + menu_pad;
-        let max_x = (self.dimensions.pixel_width as f32 - menu_w - AGENT_TOOLBELT_GAP)
-            .max(AGENT_TOOLBELT_GAP);
-        let max_y = (self.dimensions.pixel_height as f32 - menu_h - AGENT_TOOLBELT_GAP)
-            .max(AGENT_TOOLBELT_GAP);
-        let menu_x =
-            (menu.x as f32 - menu_w + AGENT_TOOLBELT_MIN_BUTTON_W).clamp(AGENT_TOOLBELT_GAP, max_x);
-        let menu_y = (menu.y as f32 + AGENT_TOOLBELT_GAP).clamp(AGENT_TOOLBELT_GAP, max_y);
+        let max_x = (self.dimensions.pixel_width as f32 - menu_w - FLOAT_GAP).max(FLOAT_GAP);
+        let max_y = (self.dimensions.pixel_height as f32 - menu_h - FLOAT_GAP).max(FLOAT_GAP);
+        let menu_x = (menu.x as f32 - menu_w + PANE_TOOLBELT_MIN_BUTTON_W).clamp(FLOAT_GAP, max_x);
+        let menu_y = (menu.y as f32 + FLOAT_GAP).clamp(FLOAT_GAP, max_y);
 
         let sb = self.sidebar_palette();
         let fg = sb.text_active;
@@ -8711,7 +9202,7 @@ impl crate::TermWindow {
             .map(|item| item.item_type.clone());
         let left_pressed = self.current_mouse_buttons.contains(&MousePress::Left);
         for (idx, (label, action)) in items.iter().enumerate() {
-            let item_type = UIItemType::AgentCopyMenuItem {
+            let item_type = UIItemType::PaneCopyMenuItem {
                 pane_id: menu.pane_id,
                 action: action.clone(),
             };
@@ -8761,6 +9252,80 @@ impl crate::TermWindow {
     /// installed agent (each expandable into a Split pane / Fullscreen / New
     /// tab submenu for that one launch), plus the sticky project-root
     /// toggle.
+    /// Dropdown opened by the agent section's sessions button.
+    ///
+    /// Two flat groups: what the last run had open, then the sessions found on
+    /// disk. The restore row is first because it is the coarse action — one
+    /// click to get the whole workspace back — and the per-session list below is
+    /// the fine one. Unlike the launcher dropdown the recent sessions are not
+    /// behind an expander here: this menu exists to show them.
+    pub fn paint_sessions_menu(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+    ) -> anyhow::Result<()> {
+        let Some(menu) = self.sessions_menu.clone() else {
+            return Ok(());
+        };
+
+        let mut rows: Vec<SidebarDropdownRow> = Vec::new();
+        if let Some(candidates) = self.agent_restore_candidates() {
+            rows.push(SidebarDropdownRow {
+                label: restore_row_label(&candidates),
+                dot_color: None,
+                checkbox: None,
+                divider_above: false,
+                indent: false,
+                trailing_chevron: false,
+                item_type: UIItemType::SidebarAgentMenuRestoreLastWindow,
+            });
+        }
+
+        if self.agent_resume_menu_limit() > 0 {
+            // `agent_resume_session_rows` builds rows for the launcher, where
+            // they hang under an expander and are indented to show it. Here they
+            // are a top-level group, so drop the indent and put the divider on
+            // the first of them -- but only if something sits above it.
+            let needs_divider = !rows.is_empty();
+            for (index, row) in self.agent_resume_session_rows().into_iter().enumerate() {
+                rows.push(SidebarDropdownRow {
+                    indent: false,
+                    divider_above: needs_divider && index == 0,
+                    ..row
+                });
+            }
+        }
+
+        if rows.is_empty() {
+            // Nothing to restore and nothing on disk. An empty panel would look
+            // broken, so say why.
+            rows.push(SidebarDropdownRow {
+                label: "No sessions to reopen".to_string(),
+                dot_color: None,
+                checkbox: None,
+                divider_above: false,
+                indent: false,
+                trailing_chevron: false,
+                // Not hit-testable as a session: there is no index behind it.
+                item_type: UIItemType::SidebarAgentMenuResume,
+            });
+        }
+
+        // Session labels are prose, so size the panel to the longest one exactly
+        // as the launcher's resume submenu does rather than truncating.
+        let cell_w = self.render_metrics.cell_size.width as f32;
+        let dpi = (self.dimensions.dpi as f32 / 96.0).clamp(1.0, 2.5);
+        let longest_cols = rows
+            .iter()
+            .map(|row| unicode_column_width(&row.label, None))
+            .max()
+            .unwrap_or(0);
+        let needed_cols = (longest_cols as f32 * cell_w + 64.0 * dpi) / dpi;
+        let menu_w = AGENT_RESUME_MENU_W.max(needed_cols);
+        // Downward: the button sits in the agent section header, which is above
+        // its rows, so there is room below and none above.
+        self.paint_sidebar_dropdown(layers, menu.x as f32, menu.y as f32, menu_w, true, &rows)
+    }
+
     pub fn paint_agent_launch_menu(
         &mut self,
         layers: &mut TripleLayerQuadAllocator,
@@ -8854,12 +9419,8 @@ impl crate::TermWindow {
         // when `resume_menu_sessions` is 0. Reads only the snapshot loaded at
         // window creation — paint must not touch the filesystem.
         if let Some(candidates) = self.agent_restore_candidates() {
-            let count = candidates.len();
             rows.push(SidebarDropdownRow {
-                label: format!(
-                    "Reopen last window ({count} agent{})",
-                    if count == 1 { "" } else { "s" }
-                ),
+                label: restore_row_label(&candidates),
                 dot_color: None,
                 checkbox: None,
                 divider_above: false,
@@ -9180,7 +9741,7 @@ impl crate::TermWindow {
     /// Shared renderer for the sidebar's small anchored dropdowns.
     ///
     /// Rows may carry an adapter-colored dot, a checkbox, or neither, and may
-    /// request a divider above them. Geometry matches `paint_agent_copy_menu`
+    /// request a divider above them. Geometry matches `paint_pane_copy_menu`
     /// so all three menus look identical.
     ///
     /// `downward` controls which side of the anchor the menu opens toward.
@@ -9205,7 +9766,7 @@ impl crate::TermWindow {
         let cell_h_f = cell_height as f32;
         let dpi_scale = (self.dimensions.dpi as f32 / 96.).clamp(1., 2.5);
         let row_vpad = 6. * dpi_scale;
-        let row_h = (cell_h_f + 2. * row_vpad).max(AGENT_COPY_MENU_ROW_H * dpi_scale);
+        let row_h = (cell_h_f + 2. * row_vpad).max(PANE_COPY_MENU_ROW_H * dpi_scale);
         let menu_pad = 8. * dpi_scale;
         let menu_radius = (RADIUS * dpi_scale).min(row_h * 0.5);
         let row_radius = (7. * dpi_scale).min(row_h * 0.5);
@@ -9217,31 +9778,29 @@ impl crate::TermWindow {
         // Never wider than the window itself; a 420px submenu on a narrow
         // window would otherwise be clamped to a negative x below.
         let menu_w = (width * dpi_scale)
-            .min(self.dimensions.pixel_width as f32 - AGENT_TOOLBELT_GAP * 2.)
+            .min(self.dimensions.pixel_width as f32 - FLOAT_GAP * 2.)
             .max(AGENT_LAUNCH_MENU_W);
         let divider_count = rows.iter().filter(|row| row.divider_above).count();
         let menu_h = rows.len() as f32 * row_h + divider_count as f32 * divider_band + menu_pad;
 
-        let max_x = (self.dimensions.pixel_width as f32 - menu_w - AGENT_TOOLBELT_GAP)
-            .max(AGENT_TOOLBELT_GAP);
-        let max_y = (self.dimensions.pixel_height as f32 - menu_h - AGENT_TOOLBELT_GAP)
-            .max(AGENT_TOOLBELT_GAP);
-        let menu_x = anchor_x.clamp(AGENT_TOOLBELT_GAP, max_x);
+        let max_x = (self.dimensions.pixel_width as f32 - menu_w - FLOAT_GAP).max(FLOAT_GAP);
+        let max_y = (self.dimensions.pixel_height as f32 - menu_h - FLOAT_GAP).max(FLOAT_GAP);
+        let menu_x = anchor_x.clamp(FLOAT_GAP, max_x);
         // Open in the requested direction; if that would run off-screen,
         // flip to the other side so the menu stays visible.
         let menu_y = if downward {
-            let down_y = anchor_y + AGENT_TOOLBELT_GAP;
-            if down_y + menu_h > self.dimensions.pixel_height as f32 - AGENT_TOOLBELT_GAP {
-                (anchor_y - menu_h - AGENT_TOOLBELT_GAP).clamp(AGENT_TOOLBELT_GAP, max_y)
+            let down_y = anchor_y + FLOAT_GAP;
+            if down_y + menu_h > self.dimensions.pixel_height as f32 - FLOAT_GAP {
+                (anchor_y - menu_h - FLOAT_GAP).clamp(FLOAT_GAP, max_y)
             } else {
-                down_y.clamp(AGENT_TOOLBELT_GAP, max_y)
+                down_y.clamp(FLOAT_GAP, max_y)
             }
         } else {
-            let up_y = anchor_y - menu_h - AGENT_TOOLBELT_GAP;
-            if up_y < AGENT_TOOLBELT_GAP {
-                (anchor_y + AGENT_TOOLBELT_GAP).clamp(AGENT_TOOLBELT_GAP, max_y)
+            let up_y = anchor_y - menu_h - FLOAT_GAP;
+            if up_y < FLOAT_GAP {
+                (anchor_y + FLOAT_GAP).clamp(FLOAT_GAP, max_y)
             } else {
-                up_y.clamp(AGENT_TOOLBELT_GAP, max_y)
+                up_y.clamp(FLOAT_GAP, max_y)
             }
         };
 
@@ -11524,6 +12083,13 @@ impl crate::TermWindow {
                     .cwd
                     .as_deref()
                     .and_then(crate::agent_herd::project_root_for);
+                // Binding compares this against a session file's own `cwd`. A
+                // session written inside a WSL distro records a Linux path,
+                // while the pane running `wsl.exe` reports a Windows or UNC one,
+                // so on that pairing the two never matched and every WSL agent
+                // rendered detached. `project_root` above deliberately keeps the
+                // untranslated path -- it is stat'ed, not compared.
+                let cwd = self.pane_cwd_for_session_match(&pane, agent.cwd);
 
                 panes.push(PaneAgentRow {
                     pane_id,
@@ -11537,7 +12103,7 @@ impl crate::TermWindow {
                     status: herd_status_from_agent(agent.status),
                     model: agent.model,
                     session_id: agent.session_id,
-                    cwd: agent.cwd,
+                    cwd,
                     project_root,
                     git_branch: None,
                     pids: foreground_process_pids(&pane),
@@ -11698,29 +12264,33 @@ impl crate::TermWindow {
         let sessions = window_agent_sessions(agents);
         self.agent_window_sessions = sessions.clone();
 
+        // An empty set is never persisted, whether or not this window has written
+        // before. The snapshot is a restore point, not a live mirror: a window
+        // whose agents have exited -- which is what every shutdown looks like on
+        // the last frame -- must leave its own restore point alone. Overwriting
+        // it with `[]` used to destroy it silently, and `pick_last_window` then
+        // skipped the entry for being empty, so the "Reopen last window" row
+        // never appeared again.
+        if sessions.is_empty() {
+            return;
+        }
+
         if let Some((_, previous)) = &self.agent_snapshot_written {
             if *previous == sessions {
-                self.agent_snapshot_dirty = false;
                 return;
             }
-        } else if sessions.is_empty() {
-            // Nothing has ever been written for this window and there is nothing
-            // to write; don't create an entry for a shell-only window.
-            return;
         }
 
         if let Some((written_at, _)) = &self.agent_snapshot_written {
             if written_at.elapsed() < SNAPSHOT_WRITE_INTERVAL {
                 // Schedule a frame so a deferred write is not lost when the
                 // window goes quiet immediately after the change.
-                self.agent_snapshot_dirty = true;
                 self.update_next_frame_time(Some(Instant::now() + SNAPSHOT_WRITE_INTERVAL));
                 return;
             }
         }
 
         self.agent_snapshot_written = Some((Instant::now(), sessions.clone()));
-        self.agent_snapshot_dirty = false;
 
         let key = tgz_last_session::window_key(self.mux_window_id as usize);
         promise::spawn::spawn_into_new_thread(move || {
@@ -11756,6 +12326,49 @@ impl crate::TermWindow {
         crate::agent_herd::project_root_for(&cwd)
     }
 
+    /// A pane's cwd in the form a vendor session file would record it.
+    ///
+    /// Identity for an ordinary pane. For a pane inside a WSL domain the cwd
+    /// arrives as a Windows or UNC path -- `wsl.exe`'s own directory, or an
+    /// OSC 7 URL resolved against the host -- while the agent running in the
+    /// distro writes a Linux path. Translating back to the distro's view is what
+    /// lets `bind_by_cwd` compare the two.
+    fn pane_cwd_for_session_match(
+        &self,
+        pane: &Arc<dyn Pane>,
+        cwd: Option<PathBuf>,
+    ) -> Option<PathBuf> {
+        let cwd = cwd?;
+        let domain = Mux::get()
+            .get_domain(pane.domain_id())
+            .map(|domain| domain.domain_name().to_string())?;
+        let distro = wsl_paths::distro_for_domain(&domain, &self.config)?;
+        match wsl_paths::windows_to_wsl(&cwd.to_string_lossy(), &distro) {
+            Some(linux) => Some(PathBuf::from(linux)),
+            // Already a Linux path, or a UNC naming another distro. Either way
+            // the untranslated value is the best answer available.
+            None => Some(cwd),
+        }
+    }
+
+    /// `(distribution, username)` for each configured WSL domain.
+    ///
+    /// `distro_for_domain` already prefers a domain's configured distribution
+    /// and falls back to stripping the `WSL:` prefix, so a hand-written domain
+    /// name still resolves.
+    fn wsl_distro_specs(&self) -> Vec<(String, Option<String>)> {
+        // The accessor, not the raw `Option` field: it supplies the built-in
+        // domains for distros the user never named in config.
+        self.config
+            .wsl_domains()
+            .iter()
+            .filter_map(|domain| {
+                let distro = wsl_paths::distro_for_domain(&domain.name, &self.config)?;
+                Some((distro, domain.username.clone()))
+            })
+            .collect()
+    }
+
     /// Refresh vendor session files without blocking paint on filesystem I/O.
     fn kick_agent_herd_scan(&mut self) {
         let ttl = Duration::from_millis(self.config.agent_ui.section.refresh_ms.clamp(100, 10000));
@@ -11776,10 +12389,13 @@ impl crate::TermWindow {
         let Some(window) = self.window.clone() else {
             return;
         };
+        // Read config here; the worker has no handle on it.
+        let distros = self.wsl_distro_specs();
 
         self.agent_herd_scan_started_at = Some(Instant::now());
         let future = promise::spawn::spawn_into_new_thread(move || {
-            let sessions = crate::agent_herd::default_registry().collect_all(&home);
+            let roots = agent_session_roots(home, &distros);
+            let sessions = crate::agent_herd::default_registry().collect_all_from(&roots);
             window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
                 term_window.agent_herd_scan_started_at = None;
                 term_window.agent_herd_session_cache = Some((Instant::now(), Arc::new(sessions)));
@@ -11994,13 +12610,24 @@ impl crate::TermWindow {
                     base
                 }
             });
+        // Sessions button, right-aligned in the header. Reserved before the
+        // label is measured so a long "Agents - N - all" cannot run under it.
+        let sessions_type = UIItemType::SidebarSessionsButton;
+        let sessions_w = cell_h + 6.0 * dpi;
+        let sessions_x = section_x + section_w - pad - sessions_w;
+        let sessions_fits = sessions_x > section_x + pad + cell_h;
         let label_x = section_x + pad + cell_h + 4.0 * dpi;
+        let label_right = if sessions_fits {
+            sessions_x - 4.0 * dpi
+        } else {
+            section_x + section_w - pad
+        };
         self.paint_text(
             layers,
             &label,
             label_x,
             header_y + (header_h - cell_h) * 0.5,
-            (section_x + section_w - pad - label_x).max(0.),
+            (label_right - label_x).max(0.),
             fg,
             bg,
             true,
@@ -12014,6 +12641,73 @@ impl crate::TermWindow {
             height: header_h as usize,
             item_type: UIItemType::SidebarAgentSectionHeader,
         });
+
+        if sessions_fits {
+            // Startup prompt: the first window of a run that has something to
+            // restore opens this dropdown itself, so the feature finds the user
+            // instead of waiting to be discovered. Once per process, not per
+            // window -- opening a second window an hour later must not re-ask.
+            // Deliberately the same menu a click opens, so dismissing it, using
+            // it and ignoring it all go through paths that already exist.
+            if !RESTORE_PROMPT_SHOWN.swap(true, Ordering::Relaxed)
+                && self.sessions_menu.is_none()
+                && self.agent_restore_candidates().is_some()
+            {
+                // Spawns a worker; the filesystem is not touched on this thread.
+                self.kick_agent_session_scan();
+                self.sessions_menu = Some(AgentLaunchMenuState {
+                    x: sessions_x as usize,
+                    y: header_y as usize,
+                    expanded: None,
+                });
+            }
+
+            let sessions_hovered = self
+                .last_ui_item
+                .as_ref()
+                .map(|item| item.item_type == sessions_type)
+                .unwrap_or(false);
+            let open = self.sessions_menu.is_some();
+            let sessions_fg = if sessions_hovered || open {
+                fg
+            } else {
+                lerp_rgba(bg, fg, 0.62)
+            };
+            if sessions_hovered || open {
+                self.sidebar_rounded_fill(
+                    layers,
+                    1,
+                    euclid::rect(
+                        sessions_x,
+                        header_y + 2.0 * dpi,
+                        sessions_w,
+                        header_h - 4.0 * dpi,
+                    ),
+                    RADIUS * dpi,
+                    lerp_rgba(bg, fg, 0.14),
+                )?;
+            }
+            self.paint_text(
+                layers,
+                "\u{21ba}",
+                sessions_x + (sessions_w - cell_h) * 0.5,
+                header_y + (header_h - cell_h) * 0.5,
+                cell_h,
+                sessions_fg,
+                bg,
+                false,
+            )?;
+            // After the header item: hit testing walks `ui_items` in reverse, so
+            // the later push wins the overlap and the button is clickable even
+            // though the header's own rect covers it.
+            self.ui_items.push(UIItem {
+                x: sessions_x as usize,
+                y: header_y as usize,
+                width: sessions_w as usize,
+                height: header_h as usize,
+                item_type: sessions_type,
+            });
+        }
 
         // Agent rows below header.
         if collapsed {
@@ -13042,6 +13736,164 @@ mod tests {
         SidebarAnimationGates::from_config(&agent_ui_with_animations(anim))
     }
 
+    /// A plain pane offers exactly one action, and offers it even with agent
+    /// awareness switched off entirely.
+    ///
+    /// The `enabled: false` half is the regression guard that matters: the
+    /// plain-pane strip is not an agent surface, so it must not be gated on
+    /// any `agent_ui` key.
+    #[test]
+    fn pane_toolbelt_buttons_offers_only_copy_on_a_plain_pane() {
+        let off = AgentUiConfig {
+            enabled: false,
+            show_pane_toolbelt: false,
+            ..AgentUiConfig::default()
+        };
+        let buttons = pane_toolbelt_buttons(&off, &PaneToolbeltKind::Shell, None, false, false);
+        assert_eq!(buttons, vec![("Copy", PaneToolbeltAction::CopyMenu)]);
+
+        // And identically with everything switched on.
+        let on = AgentUiConfig::default();
+        assert_eq!(
+            pane_toolbelt_buttons(&on, &PaneToolbeltKind::Shell, None, true, true),
+            vec![("Copy", PaneToolbeltAction::CopyMenu)]
+        );
+    }
+
+    /// The two menus are different lists, and the agent list is unchanged.
+    #[test]
+    fn pane_copy_menu_items_differ_by_pane_kind() {
+        let shell = pane_copy_menu_items(&PaneToolbeltKind::Shell);
+        assert_eq!(
+            shell,
+            vec![
+                (
+                    "Copy last command output",
+                    PaneCopyAction::Shell(ShellCopyAction::LastCommandOutput)
+                ),
+                (
+                    "Copy last command + output",
+                    PaneCopyAction::Shell(ShellCopyAction::LastCommandWithOutput)
+                ),
+                (
+                    "Copy pane",
+                    PaneCopyAction::Shell(ShellCopyAction::WholePane)
+                ),
+            ]
+        );
+        assert!(shell
+            .iter()
+            .all(|(_, action)| matches!(action, PaneCopyAction::Shell(_))));
+    }
+
+    /// A one-button strip is exactly its button wide, with no status dot.
+    ///
+    /// The dot means *agent status*; on a shell it would mean nothing, and the
+    /// 360px agent floor would leave it stranded in empty space.
+    #[test]
+    fn pane_toolbelt_layout_drops_the_dot_and_the_width_floor_on_a_plain_pane() {
+        let shell = pane_toolbelt_layout(&PaneToolbeltKind::Shell, 1.);
+        assert_eq!(shell.dot_size, 0.);
+        assert!(shell.label_fallbacks.is_empty());
+        assert_eq!(shell.min_w, 0.);
+    }
+
+    /// A fade reaches its target exactly, so the painter stops asking for
+    /// frames instead of creeping toward the target forever.
+    #[test]
+    fn pane_toolbelt_fade_opacity_settles_at_its_target() {
+        let span = pane_toolbelt_fade_span(true);
+        assert_eq!(pane_toolbelt_fade_opacity(true, 0., span, span), 1.);
+        assert_eq!(pane_toolbelt_fade_opacity(true, 0., span * 2, span), 1.);
+        let out = pane_toolbelt_fade_span(false);
+        assert_eq!(pane_toolbelt_fade_opacity(false, 1., out, out), 0.);
+
+        // Monotonic and in range partway through.
+        let mut last = 0.;
+        for n in 0..=4 {
+            let v = pane_toolbelt_fade_opacity(true, 0., span * n / 4, span);
+            assert!((0. ..=1.).contains(&v), "{v} out of range");
+            assert!(v >= last, "not monotonic: {v} < {last}");
+            last = v;
+        }
+
+        // A zero span has nothing to interpolate over.
+        assert_eq!(
+            pane_toolbelt_fade_opacity(true, 0., Duration::ZERO, Duration::ZERO),
+            1.
+        );
+        assert!(pane_toolbelt_fade_is_settled(true, 1.));
+        assert!(pane_toolbelt_fade_is_settled(false, 0.));
+        assert!(!pane_toolbelt_fade_is_settled(true, 0.5));
+    }
+
+    /// Flicking the pointer across the pane edge reverses from what is on
+    /// screen, so the strip never snaps to 0 or 1 mid-fade.
+    #[test]
+    fn pane_toolbelt_fade_opacity_reverses_from_the_visible_value() {
+        let out = pane_toolbelt_fade_span(false);
+        for n in 0..=4 {
+            let v = pane_toolbelt_fade_opacity(false, 0.4, out * n / 4, out);
+            assert!(
+                v <= 0.4 + f32::EPSILON,
+                "fade-out rose above its start: {v}"
+            );
+        }
+        assert_eq!(pane_toolbelt_fade_opacity(false, 0.4, out, out), 0.);
+
+        let inn = pane_toolbelt_fade_span(true);
+        for n in 0..=4 {
+            let v = pane_toolbelt_fade_opacity(true, 0.4, inn * n / 4, inn);
+            assert!(
+                v >= 0.4 - f32::EPSILON,
+                "fade-in dropped below its start: {v}"
+            );
+        }
+        assert_eq!(pane_toolbelt_fade_opacity(true, 0.4, inn, inn), 1.);
+    }
+
+    /// Hover is tested in window pixel space, not cell space.
+    ///
+    /// Cell space would be wrong: `padding_left_top` folds a left sidebar's
+    /// width into `padding_left` and the derived column is clamped with
+    /// `.max(0)`, so a pointer over the sidebar reads as column 0 of the pane.
+    #[test]
+    fn pane_toolbelt_zone_hit_test_is_in_pixel_space() {
+        let zone = PaneToolbeltZone {
+            pane_id: 1,
+            x: 100.,
+            y: 50.,
+            width: 200.,
+            height: 80.,
+        };
+        assert!(zone.contains(100, 50), "top-left corner is inside");
+        assert!(zone.contains(299, 129));
+        assert!(!zone.contains(99, 50), "one pixel left is outside");
+        assert!(!zone.contains(300, 50), "right edge is exclusive");
+        assert!(!zone.contains(100, 130), "bottom edge is exclusive");
+        // A pointer parked over a left sidebar is nowhere near the pane rect.
+        assert!(!zone.contains(0, 60));
+    }
+
+    /// The fade follows the animation master switch, and is not perpetual
+    /// motion.
+    #[test]
+    fn toolbelt_fade_follows_the_animation_master_switch() {
+        assert!(SidebarAnimationGates::from_config(&AgentUiConfig::default()).toolbelt_fade);
+
+        let off = AgentUiConfig {
+            animations: Some(AgentAnimationsConfig {
+                enabled: false,
+                ..AgentAnimationsConfig::default()
+            }),
+            ..AgentUiConfig::default()
+        };
+        let gates = SidebarAnimationGates::from_config(&off);
+        assert!(!gates.toolbelt_fade);
+        // A fade settles; it must not keep `any_motion` true on its own.
+        assert!(!gates.any_motion());
+    }
+
     #[test]
     fn every_animation_runs_out_of_the_box() {
         let gates = SidebarAnimationGates::from_config(&AgentUiConfig::default());
@@ -13054,6 +13906,7 @@ mod tests {
                 agent_enter: true,
                 rail_breathe: true,
                 dot_pulse: true,
+                toolbelt_fade: true,
                 unfocused: true,
             }
         );
@@ -14124,6 +14977,7 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
 
     fn vendor_session(pid: u32, session_id: &str, cwd: &str, interactive: bool) -> VendorSession {
         VendorSession {
+            origin: crate::agent_herd::vendor::SessionOrigin::Host,
             pid,
             interactive,
             vendor: AgentVendor::Codex,
@@ -14307,6 +15161,45 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
 
     fn adapter_set(ids: &[&str]) -> HashSet<String> {
         ids.iter().map(|id| id.to_string()).collect()
+    }
+
+    #[test]
+    fn agent_session_roots_always_includes_the_host_home() {
+        let temp = tempfile::tempdir().unwrap();
+        let roots = agent_session_roots(temp.path().to_path_buf(), &[]);
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0], SessionRoot::host(temp.path()));
+    }
+
+    #[test]
+    fn agent_session_roots_adds_no_wsl_roots_off_windows() {
+        // The UNC form only resolves on Windows. Everywhere else a configured
+        // distro must not add a root, or the scan stats paths that cannot exist.
+        let temp = tempfile::tempdir().unwrap();
+        let distros = vec![("Ubuntu".to_string(), Some("tim".to_string()))];
+        let roots = agent_session_roots(temp.path().to_path_buf(), &distros);
+        if cfg!(windows) {
+            // On Windows the distro is probed; an absent one adds nothing.
+            assert!(roots.len() >= 1);
+        } else {
+            assert_eq!(roots.len(), 1);
+        }
+        assert_eq!(
+            roots[0].origin,
+            crate::agent_herd::vendor::SessionOrigin::Host
+        );
+    }
+
+    #[test]
+    fn an_agent_home_is_recognised_by_any_vendor_marker() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("tim");
+        std::fs::create_dir_all(home.join(".config").join("opencode")).unwrap();
+        assert!(looks_like_an_agent_home(&home));
+
+        let bare = temp.path().join("nobody");
+        std::fs::create_dir_all(&bare).unwrap();
+        assert!(!looks_like_an_agent_home(&bare));
     }
 
     #[test]
@@ -16267,42 +17160,72 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
             ..Default::default()
         };
 
-        assert!(
-            !agent_toolbelt_buttons(&agent_ui, &agent, Some(&adapter), false, false).is_empty()
-        );
+        assert!(!pane_toolbelt_buttons(
+            &agent_ui,
+            &PaneToolbeltKind::Agent(agent.clone()),
+            Some(&adapter),
+            false,
+            false
+        )
+        .is_empty());
 
         // The Compose button appears only when rich_input is enabled and not docked.
-        assert!(
-            !agent_toolbelt_buttons(&agent_ui, &agent, Some(&adapter), false, false)
-                .iter()
-                .any(|(_, action)| action == &AgentToolbeltAction::Compose)
-        );
-        assert!(
-            agent_toolbelt_buttons(&agent_ui, &agent, Some(&adapter), true, false)
-                .iter()
-                .any(|(_, action)| action == &AgentToolbeltAction::Compose)
-        );
+        assert!(!pane_toolbelt_buttons(
+            &agent_ui,
+            &PaneToolbeltKind::Agent(agent.clone()),
+            Some(&adapter),
+            false,
+            false
+        )
+        .iter()
+        .any(|(_, action)| action == &PaneToolbeltAction::Compose));
+        assert!(pane_toolbelt_buttons(
+            &agent_ui,
+            &PaneToolbeltKind::Agent(agent.clone()),
+            Some(&adapter),
+            true,
+            false
+        )
+        .iter()
+        .any(|(_, action)| action == &PaneToolbeltAction::Compose));
         // With docked enabled, the Input (DockInput) button replaces Compose.
-        let docked_buttons = agent_toolbelt_buttons(&agent_ui, &agent, Some(&adapter), true, true);
+        let docked_buttons = pane_toolbelt_buttons(
+            &agent_ui,
+            &PaneToolbeltKind::Agent(agent.clone()),
+            Some(&adapter),
+            true,
+            true,
+        );
         assert!(docked_buttons
             .iter()
-            .any(|(_, action)| action == &AgentToolbeltAction::DockInput));
+            .any(|(_, action)| action == &PaneToolbeltAction::DockInput));
         assert!(!docked_buttons
             .iter()
-            .any(|(_, action)| action == &AgentToolbeltAction::Compose));
+            .any(|(_, action)| action == &PaneToolbeltAction::Compose));
 
         agent_ui.show_pane_toolbelt = false;
-        assert!(agent_toolbelt_buttons(&agent_ui, &agent, Some(&adapter), false, false).is_empty());
+        assert!(pane_toolbelt_buttons(
+            &agent_ui,
+            &PaneToolbeltKind::Agent(agent.clone()),
+            Some(&adapter),
+            false,
+            false
+        )
+        .is_empty());
 
         agent_ui.show_pane_toolbelt = true;
         let disabled_adapter = AgentAdapterConfig {
             enabled: false,
             ..adapter
         };
-        assert!(
-            agent_toolbelt_buttons(&agent_ui, &agent, Some(&disabled_adapter), false, false)
-                .is_empty()
-        );
+        assert!(pane_toolbelt_buttons(
+            &agent_ui,
+            &PaneToolbeltKind::Agent(agent.clone()),
+            Some(&disabled_adapter),
+            false,
+            false
+        )
+        .is_empty());
     }
 
     #[test]
@@ -17468,20 +18391,20 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
     #[test]
     fn toolbelt_shrink_keeps_copy_before_lower_priority_actions() {
         let buttons = vec![
-            ("Stop", AgentToolbeltAction::Interrupt, 88.),
-            ("Copy", AgentToolbeltAction::CopyMenu, 88.),
-            ("Resume", AgentToolbeltAction::Resume, 112.),
-            ("Logs", AgentToolbeltAction::OpenLogs, 88.),
+            ("Stop", PaneToolbeltAction::Interrupt, 88.),
+            ("Copy", PaneToolbeltAction::CopyMenu, 88.),
+            ("Resume", PaneToolbeltAction::Resume, 112.),
+            ("Logs", PaneToolbeltAction::OpenLogs, 88.),
         ];
         let mut visible = buttons.clone();
-        trim_agent_toolbelt_buttons(&mut visible, 190.);
+        trim_pane_toolbelt_buttons(&mut visible, 190.);
 
         assert!(visible
             .iter()
-            .any(|(_, action, _)| action == &AgentToolbeltAction::CopyMenu));
+            .any(|(_, action, _)| action == &PaneToolbeltAction::CopyMenu));
         assert!(!visible
             .iter()
-            .any(|(_, action, _)| action == &AgentToolbeltAction::OpenLogs));
+            .any(|(_, action, _)| action == &PaneToolbeltAction::OpenLogs));
     }
 
     #[test]
@@ -18180,23 +19103,20 @@ gemini is a constellation\n";
     #[test]
     fn toolbelt_trim_drops_input_before_stop_and_copy() {
         let mut visible = vec![
-            ("Stop", AgentToolbeltAction::Interrupt, 88.),
-            ("Copy", AgentToolbeltAction::CopyMenu, 88.),
-            ("Resume", AgentToolbeltAction::Resume, 112.),
-            ("Logs", AgentToolbeltAction::OpenLogs, 88.),
-            ("Input", AgentToolbeltAction::DockInput, 88.),
+            ("Stop", PaneToolbeltAction::Interrupt, 88.),
+            ("Copy", PaneToolbeltAction::CopyMenu, 88.),
+            ("Resume", PaneToolbeltAction::Resume, 112.),
+            ("Logs", PaneToolbeltAction::OpenLogs, 88.),
+            ("Input", PaneToolbeltAction::DockInput, 88.),
         ];
-        trim_agent_toolbelt_buttons(&mut visible, 190.);
+        trim_pane_toolbelt_buttons(&mut visible, 190.);
         let actions: Vec<_> = visible
             .iter()
             .map(|(_, action, _)| action.clone())
             .collect();
         assert_eq!(
             actions,
-            vec![
-                AgentToolbeltAction::Interrupt,
-                AgentToolbeltAction::CopyMenu
-            ],
+            vec![PaneToolbeltAction::Interrupt, PaneToolbeltAction::CopyMenu],
             "Stop and Copy are the last two standing"
         );
     }

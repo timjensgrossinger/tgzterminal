@@ -139,15 +139,28 @@ impl Candidate {
 /// there is; never errors, since a missing or unreadable store just means that
 /// agent contributes no history.
 pub fn collect_recent_sessions(home: &Path, limit: usize) -> Vec<AgentSession> {
+    collect_recent_sessions_across(std::slice::from_ref(&home.to_path_buf()), limit)
+}
+
+/// Like [`collect_recent_sessions`], but over several home directories.
+///
+/// On Windows the agent CLIs usually live inside a WSL distro and write their
+/// transcripts to the distro's home, so the Windows home alone yields nothing.
+/// Candidates from every home are pooled before the sort, so the result is one
+/// newest-first list rather than a list per home.
+pub fn collect_recent_sessions_across(homes: &[PathBuf], limit: usize) -> Vec<AgentSession> {
     if limit == 0 {
         return Vec::new();
     }
 
     let mut candidates = Vec::new();
-    collect_claude_candidates(home, &mut candidates);
-    collect_codex_candidates(home, &mut candidates);
-    collect_opencode_candidates(home, limit, &mut candidates);
-    collect_copilot_candidates(home, &mut candidates);
+    for home in homes {
+        let home = home.as_path();
+        collect_claude_candidates(home, &mut candidates);
+        collect_codex_candidates(home, &mut candidates);
+        collect_opencode_candidates(home, limit, &mut candidates);
+        collect_copilot_candidates(home, &mut candidates);
+    }
 
     candidates.sort_by(|a, b| {
         b.modified()

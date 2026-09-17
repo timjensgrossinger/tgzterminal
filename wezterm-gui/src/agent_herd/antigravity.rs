@@ -1,4 +1,6 @@
-use crate::agent_herd::vendor::{AgentVendor, SessionSource, VendorSession};
+use crate::agent_herd::vendor::{
+    AgentVendor, SessionOrigin, SessionRoot, SessionSource, VendorSession,
+};
 use crate::agent_herd::HerdStatus;
 use std::collections::HashMap;
 use std::convert::TryFrom;
@@ -39,7 +41,8 @@ impl SessionSource for AntigravityDetector {
         AgentVendor::Antigravity
     }
 
-    fn collect_sessions(&self, home: &Path) -> Vec<VendorSession> {
+    fn collect_sessions(&self, root: &SessionRoot) -> Vec<VendorSession> {
+        let home = root.home.as_path();
         let root = antigravity_root(home);
         let last_path = root.join("cache/last_conversations.json");
         let Ok(last_text) = std::fs::read_to_string(last_path) else {
@@ -117,6 +120,7 @@ impl SessionSource for AntigravityDetector {
                     })
                     .flatten();
                 Some(VendorSession {
+                    origin: SessionOrigin::Host,
                     // agy history has no process id. Herd binding falls back to
                     // a unique cwd match against the live pane.
                     pid: 0,
@@ -187,7 +191,7 @@ mod tests {
             ),
         );
 
-        let sessions = AntigravityDetector.collect_sessions(temp.path());
+        let sessions = AntigravityDetector.collect_sessions(&SessionRoot::host(temp.path()));
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].session_id, id);
         assert_eq!(sessions[0].cwd, PathBuf::from("/repo"));
@@ -218,7 +222,7 @@ mod tests {
             &format!(r#"{{"display":"hello","timestamp":{now},"workspace":"/repo"}}"#),
         );
 
-        let sessions = AntigravityDetector.collect_sessions(temp.path());
+        let sessions = AntigravityDetector.collect_sessions(&SessionRoot::host(temp.path()));
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].session_id, id);
         assert_eq!(sessions[0].cwd, PathBuf::from("/repo"));
@@ -250,7 +254,7 @@ mod tests {
             ),
         );
 
-        let sessions = AntigravityDetector.collect_sessions(temp.path());
+        let sessions = AntigravityDetector.collect_sessions(&SessionRoot::host(temp.path()));
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].name.as_deref(), Some("older but identified"));
         assert_eq!(sessions[0].cwd, PathBuf::from("/other"));

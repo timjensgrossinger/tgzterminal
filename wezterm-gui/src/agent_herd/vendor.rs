@@ -88,6 +88,59 @@ impl AgentVendor {
     }
 }
 
+/// Where a session's files were found.
+///
+/// On Windows the agent CLIs usually run inside a WSL distro, so their session
+/// files live under `\\wsl.localhost\<distro>\home\<user>` rather than under
+/// the Windows home. That is not merely a different path: the pid in those files
+/// belongs to the distro's pid namespace, and the `cwd` is a Linux path. Carrying
+/// the origin is what lets liveness and cwd binding treat the two correctly
+/// instead of applying host rules to a guest session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SessionOrigin {
+    /// Found under this machine's own home directory.
+    Host,
+    /// Found inside a WSL distro, named here so paths can be translated back.
+    Wsl(String),
+}
+
+impl SessionOrigin {
+    /// The distro this session lives in, if any.
+    pub fn distro(&self) -> Option<&str> {
+        match self {
+            Self::Host => None,
+            Self::Wsl(distro) => Some(distro.as_str()),
+        }
+    }
+}
+
+/// One home directory to scan, and what kind of home it is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionRoot {
+    /// The home directory, already in a form this process can open. For a WSL
+    /// root that is the UNC path, not the Linux one.
+    pub home: PathBuf,
+    pub origin: SessionOrigin,
+}
+
+impl SessionRoot {
+    /// This machine's own home.
+    pub fn host(home: impl Into<PathBuf>) -> Self {
+        Self {
+            home: home.into(),
+            origin: SessionOrigin::Host,
+        }
+    }
+
+    /// A WSL distro's home, reachable at `home` from this process.
+    pub fn wsl(home: impl Into<PathBuf>, distro: impl Into<String>) -> Self {
+        Self {
+            home: home.into(),
+            origin: SessionOrigin::Wsl(distro.into()),
+        }
+    }
+}
+
 /// A vendor-normalised session record, analogous to `ClaudeSession` but
 /// usable for every vendor.
 #[derive(Clone, Debug, PartialEq)]
@@ -121,6 +174,15 @@ pub struct VendorSession {
     /// unless `agent_ui.section.show_non_interactive` says otherwise. Vendors
     /// whose store does not distinguish the two report `true`.
     pub interactive: bool,
+    /// Where this session's files were found.
+    ///
+    /// [`VendorRegistry::collect_all_from`] is authoritative: it stamps this from
+    /// the root it scanned, overwriting whatever the detector put here. Detectors
+    /// therefore set `SessionOrigin::Host` as a placeholder rather than threading
+    /// the root through every helper that builds a session. Liveness does *not*
+    /// read this field -- it is passed the root's origin directly, before a
+    /// session is even constructed.
+    pub origin: SessionOrigin,
 }
 
 /// Reads session files from a vendor's on-disk store.
@@ -128,9 +190,12 @@ pub trait SessionSource: Send + Sync {
     /// The vendor this source handles.
     fn vendor(&self) -> AgentVendor;
 
-    /// Collect sessions from this vendor's storage directory.
-    /// `home` is the user's home directory (`dirs_next::home_dir()`).
-    fn collect_sessions(&self, home: &Path) -> Vec<VendorSession>;
+    /// Collect sessions from this vendor's storage directory under `root`.
+    ///
+    /// Takes the whole root rather than just a path because liveness depends on
+    /// it: a pid read out of a WSL session file cannot be checked against this
+    /// machine's process table.
+    fn collect_sessions(&self, root: &SessionRoot) -> Vec<VendorSession>;
 }
 
 /// Registry of all registered session sources.
@@ -155,16 +220,28 @@ impl VendorRegistry {
         self.sources.push(source);
     }
 
-    /// Collect sessions from every registered source.
+    /// Collect sessions from every registered source, for this machine's home.
     pub fn collect_all(&self, home: &Path) -> Vec<VendorSession> {
+        self.collect_all_from(std::slice::from_ref(&SessionRoot::host(home)))
+    }
+
+    /// Collect sessions from every registered source, across every root.
+    ///
+    /// The single place `vendor` and `origin` are stamped, so no detector can
+    /// forget either. Roots are scanned in order and their results concatenated;
+    /// de-duplication is the join's job, not this one's.
+    pub fn collect_all_from(&self, roots: &[SessionRoot]) -> Vec<VendorSession> {
         let mut all = Vec::new();
-        for source in &self.sources {
-            let vendor = source.vendor();
-            let mut sessions = source.collect_sessions(home);
-            for session in &mut sessions {
-                session.vendor = vendor.clone();
+        for root in roots {
+            for source in &self.sources {
+                let vendor = source.vendor();
+                let mut sessions = source.collect_sessions(root);
+                for session in &mut sessions {
+                    session.vendor = vendor.clone();
+                    session.origin = root.origin.clone();
+                }
+                all.extend(sessions);
             }
-            all.extend(sessions);
         }
         all
     }

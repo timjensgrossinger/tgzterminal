@@ -31,9 +31,25 @@ const MAX_SNAPSHOT_WINDOWS: usize = 8;
 /// archive.
 const MAX_SNAPSHOT_SESSIONS: usize = 25;
 
-/// Snapshots older than this are not offered. Reopening the agents from a window
-/// closed last month is noise, not continuity.
-const SNAPSHOT_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+/// Snapshots older than this are not offered.
+///
+/// This is a *staleness* bound and nothing else: it decides whether a restore
+/// point is offered at all, never how many windows one restore reopens. That
+/// width is set by [`RESTORE_SIBLING_WINDOW`] in [`pick_last_window_set`], which
+/// keys off the run that wrote the snapshot. Raising this value must not turn
+/// "the last window or windows" into "every window of the last month" — keep the
+/// two rules separate.
+const SNAPSHOT_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
+/// How far apart two windows of the same run may have last been written and
+/// still count as "open together" when the run ended.
+///
+/// A run that stays up for weeks writes an entry per window as its agents
+/// change, so same-run entries can be days apart. Without this band, restoring
+/// "the last window/s" would drag in windows the user closed a fortnight ago.
+/// The paint path rewrites a live window at most every couple of seconds, so
+/// windows that were genuinely open together land well inside five minutes.
+const RESTORE_SIBLING_WINDOW: Duration = Duration::from_secs(5 * 60);
 
 /// One agent session that was open, in the form the resume path consumes.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -228,6 +244,50 @@ fn pick_last_window<'a>(
         })
 }
 
+/// Every window of the last run that was open when that run ended.
+///
+/// This is what "reopen the last window/s" means. The user's windows at quit
+/// time are a *set*, not a single window, and restoring only the newest one
+/// silently drops the rest — but restoring every window in the file is worse,
+/// because the file spans up to [`SNAPSHOT_MAX_AGE`].
+///
+/// The set is pinned to one shutdown by two rules that [`SNAPSHOT_MAX_AGE`]
+/// deliberately does not participate in:
+///
+/// 1. same `run_id` as the newest candidate — never a union across runs, so two
+///    separate launches minutes apart stay separate;
+/// 2. last written within [`RESTORE_SIBLING_WINDOW`] of it — so a long-lived run
+///    that wrote eight window entries over three weeks yields the last set, not
+///    all eight.
+///
+/// Returned oldest-first by key so the reopened tabs land in a stable order.
+fn pick_last_window_set<'a>(
+    file: &'a LastSessionFile,
+    current_run_id: &str,
+    now_ms: u64,
+) -> Vec<&'a WindowSnapshot> {
+    let Some(newest) = pick_last_window(file, current_run_id, now_ms) else {
+        return Vec::new();
+    };
+    let band_ms = RESTORE_SIBLING_WINDOW.as_millis() as u64;
+    let max_age_ms = SNAPSHOT_MAX_AGE.as_millis() as u64;
+    let mut set: Vec<&WindowSnapshot> = file
+        .windows
+        .iter()
+        // Same filters as `pick_last_window`; a sibling is not exempt from them.
+        .filter(|w| w.run_id != current_run_id)
+        .filter(|w| !w.sessions.is_empty())
+        .filter(|w| now_ms.saturating_sub(w.updated_at_ms) <= max_age_ms)
+        // Rule 1: one run only.
+        .filter(|w| w.run_id == newest.run_id)
+        // Rule 2: open at the same time as the newest. Absolute difference, so a
+        // window written a moment *after* the seed still counts.
+        .filter(|w| w.updated_at_ms.abs_diff(newest.updated_at_ms) <= band_ms)
+        .collect();
+    set.sort_by(|a, b| a.key.cmp(&b.key));
+    set
+}
+
 /// Record one window's agent sessions. Best-effort; safe to call from a worker
 /// thread.
 pub fn record_window_sessions(key: String, sessions: Vec<SnapshotSession>, closed_cleanly: bool) {
@@ -248,17 +308,43 @@ pub fn record_window_sessions(key: String, sessions: Vec<SnapshotSession>, close
     write_file_at(&path, &file);
 }
 
-/// Sessions from the last window of a previous run, or `None` when there is
-/// nothing to offer.
+/// What one restore click should reopen: the agent sessions of every window that
+/// was open when the last previous run ended.
 ///
 /// Reads the filesystem, so this is called once at window creation and never
-/// from paint.
-pub fn load_last_window() -> Option<Vec<SnapshotSession>> {
+/// from paint. `None` when there is nothing to offer.
+pub fn load_last_window() -> Option<LastWindowSet> {
     let path = state_path();
     let file = read_file_at(&path);
-    let snapshot = pick_last_window(&file, run_id(), epoch_millis_now())?;
-    let sessions = sanitize_sessions(snapshot.sessions.clone());
-    (!sessions.is_empty()).then_some(sessions)
+    let windows = pick_last_window_set(&file, run_id(), epoch_millis_now());
+    if windows.is_empty() {
+        return None;
+    }
+    let window_count = windows.len();
+    // Dedupe across windows too: the same session can only be resumed once, and
+    // two windows may each have had a row for it.
+    let sessions = sanitize_sessions(
+        windows
+            .into_iter()
+            .flat_map(|w| w.sessions.iter().cloned())
+            .collect(),
+    );
+    (!sessions.is_empty()).then(|| LastWindowSet {
+        sessions,
+        window_count,
+    })
+}
+
+/// The restore offer: what to reopen, and how many windows it came from.
+///
+/// The count is for the label only ("7 agents · 2 windows"); the restore itself
+/// reopens sessions, not window geometry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LastWindowSet {
+    /// Sessions to reopen, deduped, in capture order.
+    pub sessions: Vec<SnapshotSession>,
+    /// How many windows contributed. Always at least 1.
+    pub window_count: usize,
 }
 
 #[cfg(test)]
@@ -285,6 +371,32 @@ mod tests {
                 .collect(),
         }
     }
+
+    /// Like `window`, but with session ids unique to this window, so a test can
+    /// tell which windows a set actually pulled from.
+    fn window_ids(key: &str, run: &str, updated_at_ms: u64, ids: &[&str]) -> WindowSnapshot {
+        WindowSnapshot {
+            key: key.to_string(),
+            run_id: run.to_string(),
+            updated_at_ms,
+            closed_cleanly: false,
+            sessions: ids
+                .iter()
+                .map(|id| session("claude", id, "/repo"))
+                .collect(),
+        }
+    }
+
+    fn ids_of(windows: &[&WindowSnapshot]) -> Vec<String> {
+        windows
+            .iter()
+            .flat_map(|w| w.sessions.iter().map(|s| s.session_id.clone()))
+            .collect()
+    }
+
+    const MINUTE_MS: u64 = 60 * 1000;
+    const DAY_MS: u64 = 24 * 60 * MINUTE_MS;
+    const NOW_MS: u64 = 1_800_000_000_000;
 
     fn file_with(windows: Vec<WindowSnapshot>) -> LastSessionFile {
         LastSessionFile {
@@ -484,5 +596,95 @@ mod tests {
             .map(|i| session("claude", &format!("id-{i}"), "/repo"))
             .collect();
         assert_eq!(sanitize_sessions(many).len(), MAX_SNAPSHOT_SESSIONS);
+    }
+
+    #[test]
+    fn window_set_takes_every_window_open_at_the_same_shutdown() {
+        // Two windows of one run, written a minute apart: both were up when the
+        // run ended, so a restore must bring back both.
+        let file = file_with(vec![
+            window_ids("run-a:0", "run-a", NOW_MS - DAY_MS, &["a0", "a1"]),
+            window_ids("run-a:1", "run-a", NOW_MS - DAY_MS - MINUTE_MS, &["a2"]),
+        ]);
+        let set = pick_last_window_set(&file, "current", NOW_MS);
+        assert_eq!(set.len(), 2);
+        assert_eq!(ids_of(&set), vec!["a0", "a1", "a2"]);
+    }
+
+    #[test]
+    fn window_set_drops_same_run_windows_from_an_older_sitting() {
+        // One long-lived run that wrote an entry three weeks ago and another one
+        // today. Both are inside the 30-day age cap and share a run_id, so only
+        // the sibling band can separate them -- and it must.
+        let file = file_with(vec![
+            window_ids("run-a:0", "run-a", NOW_MS - DAY_MS, &["recent"]),
+            window_ids("run-a:1", "run-a", NOW_MS - 21 * DAY_MS, &["ancient"]),
+        ]);
+        let set = pick_last_window_set(&file, "current", NOW_MS);
+        assert_eq!(ids_of(&set), vec!["recent"]);
+    }
+
+    #[test]
+    fn window_set_never_unions_two_runs() {
+        // Two launches two minutes apart: inside the sibling band, but different
+        // runs. Restoring both would reopen agents the user already closed once.
+        let file = file_with(vec![
+            window_ids("run-b:0", "run-b", NOW_MS - DAY_MS, &["newer"]),
+            window_ids(
+                "run-a:0",
+                "run-a",
+                NOW_MS - DAY_MS - 2 * MINUTE_MS,
+                &["older"],
+            ),
+        ]);
+        let set = pick_last_window_set(&file, "current", NOW_MS);
+        assert_eq!(ids_of(&set), vec!["newer"]);
+    }
+
+    #[test]
+    fn window_set_offers_a_25_day_old_run_whole() {
+        // The age cap decides *whether* there is an offer, never how wide it is:
+        // a run just inside 30 days still yields all of its windows.
+        let age = NOW_MS - 25 * DAY_MS;
+        let file = file_with(vec![
+            window_ids("run-a:0", "run-a", age, &["a0"]),
+            window_ids("run-a:1", "run-a", age - MINUTE_MS, &["a1"]),
+        ]);
+        let set = pick_last_window_set(&file, "current", NOW_MS);
+        assert_eq!(ids_of(&set), vec!["a0", "a1"]);
+    }
+
+    #[test]
+    fn window_set_still_honours_the_age_cap() {
+        let file = file_with(vec![window_ids(
+            "run-a:0",
+            "run-a",
+            NOW_MS - 31 * DAY_MS,
+            &["too-old"],
+        )]);
+        assert!(pick_last_window_set(&file, "current", NOW_MS).is_empty());
+    }
+
+    #[test]
+    fn window_set_skips_the_current_run_and_empty_windows() {
+        let file = file_with(vec![
+            window_ids("cur:0", "current", NOW_MS, &["mine"]),
+            window_ids("run-a:0", "run-a", NOW_MS - MINUTE_MS, &[]),
+            window_ids("run-b:0", "run-b", NOW_MS - 2 * MINUTE_MS, &["offered"]),
+        ]);
+        let set = pick_last_window_set(&file, "current", NOW_MS);
+        assert_eq!(ids_of(&set), vec!["offered"]);
+    }
+
+    #[test]
+    fn window_set_is_empty_on_an_unknown_version() {
+        let mut file = file_with(vec![window_ids(
+            "run-a:0",
+            "run-a",
+            NOW_MS - MINUTE_MS,
+            &["a0"],
+        )]);
+        file.version = SNAPSHOT_VERSION + 1;
+        assert!(pick_last_window_set(&file, "current", NOW_MS).is_empty());
     }
 }

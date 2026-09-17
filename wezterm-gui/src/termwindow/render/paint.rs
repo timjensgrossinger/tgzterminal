@@ -23,6 +23,11 @@ impl crate::TermWindow {
         // may claim the unfocused-animation exemption below. A sidebar that is
         // switched off, scrolled away, or simply idle never re-raises it.
         self.sidebar_wants_animation.set(false);
+        // Cleared for the same reason: only a strip this frame actually painted
+        // may be hovered. Without this, a stale rect keeps the strip alive
+        // after the toolbelt is switched off, the pane shrinks below the size
+        // floor, or the active pane goes away.
+        self.pane_toolbelt_hover_zone = None;
         // Start with the assumption that we should allow images to render
         self.allow_images = AllowImage::Yes;
 
@@ -273,11 +278,9 @@ impl crate::TermWindow {
         }
 
         if let Some(pos) = active_agent_pane.as_ref() {
-            self.paint_agent_toolbelt(&mut layers, pos)
-                .context("paint_agent_toolbelt")?;
+            self.paint_pane_toolbelt(&mut layers, pos)
+                .context("paint_pane_toolbelt")?;
         }
-        self.paint_agent_copy_menu(&mut layers)
-            .context("paint_agent_copy_menu")?;
 
         self.paint_scrollbar_edge_overlay(&mut layers)
             .context("paint_scrollbar_edge_overlay")?;
@@ -299,8 +302,12 @@ impl crate::TermWindow {
         // After the sidebar: the launch menu floats above it, and hit testing
         // walks ui_items in reverse, so its rows must be pushed last to win
         // clicks over the sidebar rows underneath.
+        self.paint_pane_copy_menu(&mut layers)
+            .context("paint_pane_copy_menu")?;
         self.paint_agent_launch_menu(&mut layers)
             .context("paint_agent_launch_menu")?;
+        self.paint_sessions_menu(&mut layers)
+            .context("paint_sessions_menu")?;
         self.paint_new_tab_menu(&mut layers)
             .context("paint_new_tab_menu")?;
         self.paint_close_tab_menu(&mut layers)

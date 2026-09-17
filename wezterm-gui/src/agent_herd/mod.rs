@@ -1065,8 +1065,14 @@ fn transcript_source_at(
     }
 }
 
+/// The user's home directory.
+///
+/// `dirs_next::home_dir`, not `$HOME`: that variable is a unix convention and is
+/// normally unset on Windows, where it would make every caller here silently
+/// decide the user has no home -- so transcript lookup returned `None` for every
+/// agent and the Log action was dead on that platform.
 fn dirs_home() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
+    dirs_next::home_dir()
 }
 
 /// Walk up from `dir` looking for a repo root.
@@ -1113,6 +1119,7 @@ mod tests {
 
     fn session(pid: u32, name: &str, cwd: &str) -> VendorSession {
         VendorSession {
+            origin: crate::agent_herd::vendor::SessionOrigin::Host,
             pid,
             interactive: true,
             vendor: AgentVendor::Claude,

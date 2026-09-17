@@ -127,6 +127,26 @@ pub fn windows_to_wsl(win_path: &str, distro: &str) -> Option<String> {
 
 /// Split `/mnt/<drive>[/tail]` into the drive letter and the remaining path.
 /// Only single-letter mounts count: `/mnt/data` is an ordinary directory.
+/// The UNC path of a distro's `/home`, whose children are candidate users.
+///
+/// The agent CLIs are usually installed inside the distro and write their
+/// session files to the distro's home, which the Windows home knows nothing
+/// about; this is where the herd scan has to look for them.
+pub(crate) fn wsl_home_base(distro: &str) -> Option<PathBuf> {
+    wsl_to_windows("/home", distro)
+}
+
+/// The UNC path of one WSL user's home directory.
+///
+/// The user name reaches a path join, so a separator in it would escape the
+/// distro's `/home` entirely; such a name is refused rather than sanitised.
+pub(crate) fn wsl_home(distro: &str, user: &str) -> Option<PathBuf> {
+    if user.is_empty() || user.contains('/') || user.contains('\\') {
+        return None;
+    }
+    wsl_to_windows(&format!("/home/{user}"), distro)
+}
+
 fn strip_mnt_drive(path: &str) -> Option<(char, &str)> {
     let rest = path.strip_prefix("/mnt/")?;
     let (drive, tail) = match rest.find('/') {
@@ -262,5 +282,25 @@ mod tests {
             windows_to_wsl(&win.to_string_lossy(), "Ubuntu"),
             Some(linux.to_string())
         );
+    }
+
+    #[test]
+    fn wsl_home_paths_are_unc() {
+        assert_eq!(
+            wsl_home_base("Ubuntu"),
+            Some(PathBuf::from(r"\\wsl.localhost\Ubuntu\home"))
+        );
+        assert_eq!(
+            wsl_home("Ubuntu", "tim"),
+            Some(PathBuf::from(r"\\wsl.localhost\Ubuntu\home\tim"))
+        );
+    }
+
+    #[test]
+    fn wsl_home_refuses_a_user_that_is_really_a_path() {
+        assert_eq!(wsl_home("Ubuntu", "../../etc"), None);
+        assert_eq!(wsl_home("Ubuntu", r"a\b"), None);
+        assert_eq!(wsl_home("Ubuntu", ""), None);
+        assert_eq!(wsl_home("", "tim"), None);
     }
 }

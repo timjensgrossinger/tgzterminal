@@ -155,6 +155,26 @@ impl Default for FileBrowserConfig {
     }
 }
 
+/// The floating per-pane toolbelt strip on panes with no agent.
+///
+/// Deliberately not inside `agent_ui`: a Copy button on a plain shell is not an
+/// agent surface, and a user who sets `agent_ui.enabled = false` to switch off
+/// agent awareness must not lose it. Placement is still read from
+/// `agent_ui.toolbelt_position` so the strip cannot sit in two places at once.
+#[derive(Debug, Clone, FromDynamic, ToDynamic)]
+pub struct PaneToolbeltConfig {
+    /// Show a Copy button on plain shell and ssh panes, revealed while the
+    /// pointer is inside the pane.
+    #[dynamic(default = "default_true")]
+    pub shell_copy: bool,
+}
+
+impl Default for PaneToolbeltConfig {
+    fn default() -> Self {
+        Self { shell_copy: true }
+    }
+}
+
 #[derive(Debug, Clone, FromDynamic, ToDynamic)]
 pub struct RichInputConfig {
     /// Enable the optional multiline input composer overlay.
@@ -237,12 +257,12 @@ impl Default for AgentTelemetryConfig {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, FromDynamic, ToDynamic)]
-pub enum AgentToolbeltPosition {
+pub enum PaneToolbeltPosition {
     Top,
     Bottom,
 }
 
-impl Default for AgentToolbeltPosition {
+impl Default for PaneToolbeltPosition {
     fn default() -> Self {
         Self::Top
     }
@@ -1230,7 +1250,7 @@ pub struct AgentUiConfig {
 
     /// Placement for the active-pane toolbelt.
     #[dynamic(default)]
-    pub toolbelt_position: AgentToolbeltPosition,
+    pub toolbelt_position: PaneToolbeltPosition,
 
     /// Per-adapter passive detection switches.
     #[dynamic(default = "default_agent_adapters")]
@@ -1332,7 +1352,7 @@ impl Default for AgentUiConfig {
             detect_processes: true,
             copy_scrollback_lines: default_agent_copy_scrollback_lines(),
             waiting_notification: true,
-            toolbelt_position: AgentToolbeltPosition::Top,
+            toolbelt_position: PaneToolbeltPosition::Top,
             adapters: default_agent_adapters(),
             launcher: AgentLauncherConfig::default(),
             section: AgentSectionConfig::default(),
@@ -1915,6 +1935,10 @@ pub struct Config {
     /// Vendor-neutral agent detection and lightweight pane controls.
     #[dynamic(default)]
     pub agent_ui: AgentUiConfig,
+
+    /// The floating per-pane toolbelt strip on panes with no agent.
+    #[dynamic(default)]
+    pub pane_toolbelt: PaneToolbeltConfig,
 
     /// Shells and domains offered by the sidebar new-tab dropdown.
     #[dynamic(default)]
@@ -3535,6 +3559,23 @@ mod agent_ui_tests {
         assert!(section.show_tokens);
     }
 
+    /// The plain-pane Copy strip is on by default, and lives in its own table.
+    ///
+    /// The second half matters as much as the first: `pane_toolbelt` is
+    /// deliberately *not* under `agent_ui`, so switching agent awareness off
+    /// must leave the shell copy affordance alone.
+    #[test]
+    fn pane_toolbelt_defaults_to_shell_copy_enabled() {
+        let config = Config::default_config();
+
+        assert!(config.pane_toolbelt.shell_copy);
+
+        // The new table must not have disturbed the agent surfaces it sits next to.
+        assert!(config.agent_ui.enabled);
+        assert!(config.agent_ui.show_pane_toolbelt);
+        assert_eq!(config.agent_ui.copy_scrollback_lines, 20_000);
+    }
+
     #[test]
     fn agent_ui_defaults_to_passive_surfaces_enabled() {
         let config = Config::default_config();
@@ -3547,10 +3588,7 @@ mod agent_ui_tests {
         assert!(config.agent_ui.detect_processes);
         assert_eq!(config.agent_ui.copy_scrollback_lines, 20_000);
         assert!(config.agent_ui.waiting_notification);
-        assert_eq!(
-            config.agent_ui.toolbelt_position,
-            AgentToolbeltPosition::Top
-        );
+        assert_eq!(config.agent_ui.toolbelt_position, PaneToolbeltPosition::Top);
         for adapter in [
             "claude",
             "codex",

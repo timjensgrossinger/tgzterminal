@@ -576,6 +576,10 @@ pub enum KeyAssignment {
     ShowTabNavigator,
     ShowDebugOverlay,
     ActivateAgentSection,
+    /// Reopen the agent sessions that were running when the previous run ended.
+    /// Does nothing when there is no restore point, which is also when the
+    /// sidebar's own restore row is hidden.
+    RestoreLastWindowAgents,
     CheckForUpdates,
     HideApplication,
     QuitApplication,
@@ -657,6 +661,16 @@ pub enum KeyAssignment {
     /// Scoped to the current window; focusing a waiting pane acknowledges it
     /// and removes it from the queue.
     CycleWaitingAgent,
+    /// Copy the output of the last command run in the active pane, without the
+    /// command line itself. Exact where the shell emits OSC 133 (shell
+    /// integration); otherwise the prompt boundary is guessed and the
+    /// notification says so.
+    CopyLastCommandOutput,
+    /// Copy the last command line together with its output.
+    CopyLastCommandWithOutput,
+    /// Copy the active pane's scrollback, capped by
+    /// `agent_ui.copy_scrollback_lines`.
+    CopyPaneScrollback,
 }
 impl_lua_conversion_dynamic!(KeyAssignment);
 

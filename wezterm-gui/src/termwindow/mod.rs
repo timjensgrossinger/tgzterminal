@@ -126,6 +126,7 @@ mod prevcursor;
 pub mod render;
 pub mod resize;
 mod selection;
+pub mod shell_copy;
 pub mod spawn;
 pub mod tgz_last_session;
 pub mod tgz_ui_state;
@@ -234,7 +235,7 @@ pub enum TermWindowNotif {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum AgentToolbeltAction {
+pub enum PaneToolbeltAction {
     Interrupt,
     CopyMenu,
     Compose,
@@ -251,6 +252,23 @@ pub enum AgentCopyAction {
     Markdown,
     LastAgentMessage,
     Summary,
+}
+
+/// A copy action on some pane, whatever kind of pane it is.
+///
+/// One type so the toolbelt has one [`UIItemType`] variant, one menu painter
+/// and one click handler; two arms so neither leaf enum has to know the other
+/// exists. The variant *is* the pane-kind discriminant, so an agent action on
+/// a shell pane is not representable and needs no runtime rejection.
+///
+/// Deliberately not one flat enum: [`AgentCopyAction`] is matched exhaustively
+/// by `agent_copy_payload_from_raw` and `agent_copy_toast_message`, and that
+/// exhaustiveness is what keeps those honest. Folding the shell actions in
+/// would force `unreachable!()` arms into both.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PaneCopyAction {
+    Agent(AgentCopyAction),
+    Shell(shell_copy::ShellCopyAction),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -323,6 +341,9 @@ pub enum UIItemType {
     /// The "Reopen last window" button: restores the previous run's agent
     /// sessions into new tabs of this window.
     SidebarAgentMenuRestoreLastWindow,
+    /// Sidebar button in the agent section header that opens the sessions
+    /// dropdown: the last window's sessions on top, recent sessions below.
+    SidebarSessionsButton,
     /// Chevron beside the sidebar new-tab button.
     SidebarNewTabMenuButton,
     /// A shell/domain row in the new-tab dropdown.
@@ -335,13 +356,13 @@ pub enum UIItemType {
     SidebarSshMenuItem {
         domain_name: String,
     },
-    AgentToolbeltButton {
+    PaneToolbeltButton {
         pane_id: PaneId,
-        action: AgentToolbeltAction,
+        action: PaneToolbeltAction,
     },
-    AgentCopyMenuItem {
+    PaneCopyMenuItem {
         pane_id: PaneId,
-        action: AgentCopyAction,
+        action: PaneCopyAction,
     },
     AboveScrollThumb,
     ScrollThumb,
@@ -459,11 +480,58 @@ pub struct SidebarSearchState {
     pub query: String,
 }
 
+/// Pane rect the hover-revealed toolbelt belongs to, in window pixel space.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PaneToolbeltZone {
+    pub pane_id: PaneId,
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+impl PaneToolbeltZone {
+    /// Window-pixel-space hit test.
+    ///
+    /// Pixel space, not cell space: `padding_left_top` folds the left sidebar's
+    /// width into `padding_left`, and `mouse_event_impl` clamps the derived
+    /// column with `.max(0)`, so a pointer over a left sidebar reads as column
+    /// 0 of the pane. The cell-space pane loop in `mouseevent.rs` is correct
+    /// where it stands — it runs after the UI-item dispatcher has taken the
+    /// sidebar's hits — and wrong here.
+    pub fn contains(&self, x: isize, y: isize) -> bool {
+        let (x, y) = (x as f32, y as f32);
+        x >= self.x && x < self.x + self.width && y >= self.y && y < self.y + self.height
+    }
+}
+
+/// Hover/fade state of the hover-revealed toolbelt.
+///
+/// Two halves write it: `update_pane_toolbelt_hover` (mouseevent) owns the
+/// enter/leave *transitions*, `pane_toolbelt_opacity` (paint) owns *settling*.
+/// Both read the same pure functions.
+#[derive(Clone, Copy, Debug)]
+pub struct PaneToolbeltFade {
+    pub pane_id: PaneId,
+    pub hovered: bool,
+    pub changed_at: Instant,
+    /// Opacity when `hovered` last flipped, so a pointer that flicks in and out
+    /// reverses from what is on screen instead of snapping to 0 or 1.
+    pub from: f32,
+}
+
 #[derive(Clone, Debug)]
-pub struct AgentCopyMenuState {
+pub struct PaneCopyMenuState {
     pub pane_id: PaneId,
     pub x: usize,
     pub y: usize,
+    /// Rows, frozen when the menu opens.
+    ///
+    /// Two reasons. Correctness: re-deriving them per frame would let rows
+    /// appear or vanish under the cursor if agent detection flipped while the
+    /// menu stood open. Cost: it would put a second `detect_agent_pane` on the
+    /// paint path every frame the menu is up.
+    pub items: Vec<(&'static str, PaneCopyAction)>,
 }
 
 /// Which row of the agent launch dropdown has its submenu open.
@@ -832,8 +900,12 @@ pub struct TermWindow {
     sidebar_auto_hide_open: bool,
     sidebar_auto_hide_close_after: Option<Instant>,
     sidebar_search: Option<SidebarSearchState>,
-    agent_copy_menu: Option<AgentCopyMenuState>,
+    pane_copy_menu: Option<PaneCopyMenuState>,
     agent_launch_menu: Option<AgentLaunchMenuState>,
+    /// Anchor for the sessions dropdown opened from the agent section header.
+    /// Reuses `AgentLaunchMenuState`; `expanded` is always `None` because both
+    /// of its groups are already flat.
+    sessions_menu: Option<AgentLaunchMenuState>,
     new_tab_menu: Option<AgentLaunchMenuState>,
     close_tab_menu: Option<CloseTabMenuState>,
     /// Sidebar SSH quick-launch dropdown anchor. `None` when closed.
@@ -894,13 +966,10 @@ pub struct TermWindow {
     /// detector (so an unchanged set writes nothing) and the instant is the rate
     /// limiter.
     agent_snapshot_written: Option<(Instant, Vec<tgz_last_session::SnapshotSession>)>,
-    /// The set changed but the rate limit had not elapsed. A frame is scheduled
-    /// so the write is not lost when the window then goes quiet.
-    agent_snapshot_dirty: bool,
-    /// Agent sessions from the last window of the previous run, loaded once at
-    /// window creation. `None` means there is nothing to offer, so the launcher's
-    /// restore row stays hidden.
-    last_window_sessions: Option<Arc<Vec<tgz_last_session::SnapshotSession>>>,
+    /// Agent sessions from the windows that were open when the previous run
+    /// ended, loaded once at window creation. `None` means there is nothing to
+    /// offer, so the restore row stays hidden.
+    last_window_sessions: Option<Arc<tgz_last_session::LastWindowSet>>,
     sidebar_scroll_offset: usize,
     sidebar_drop_flash: Option<(usize, Instant)>,
     /// Tabs whose pane children are shown in the sidebar. Persisted via
@@ -980,6 +1049,23 @@ pub struct TermWindow {
     /// for everything. Reset alongside `has_animation` at the top of each
     /// paint, so a window whose sidebar stops asking stops animating.
     pub(crate) sidebar_wants_animation: Cell<bool>,
+
+    /// Pane rect, in window pixel space, that the hover-revealed toolbelt was
+    /// last painted against.
+    ///
+    /// Recorded by the painter so mouse motion can answer "is the pointer
+    /// inside that pane?" without re-walking the mux on every move — the same
+    /// paint-records-geometry / mouseevent-reads-it split `ui_items` use. Only
+    /// ever set for a plain pane: an agent strip is always visible and needs no
+    /// hover tracking. Cleared at the top of every paint alongside
+    /// `has_animation`, so a stale rect can never keep the strip alive after
+    /// the toolbelt is switched off, the pane shrinks below the size floor, or
+    /// the active pane goes away.
+    pub(crate) pane_toolbelt_hover_zone: Option<PaneToolbeltZone>,
+
+    /// Fade bookkeeping for that strip. Only ever one: the strip is painted for
+    /// the active pane only.
+    pub(crate) pane_toolbelt_fade: Option<PaneToolbeltFade>,
     /// We use this to attempt to do something reasonable
     /// if we run out of texture space
     allow_images: AllowImage,
@@ -1284,8 +1370,9 @@ impl TermWindow {
             sidebar_auto_hide_open: false,
             sidebar_auto_hide_close_after: None,
             sidebar_search: None,
-            agent_copy_menu: None,
+            pane_copy_menu: None,
             agent_launch_menu: None,
+            sessions_menu: None,
             new_tab_menu: None,
             close_tab_menu: None,
             ssh_launch_menu: None,
@@ -1309,7 +1396,6 @@ impl TermWindow {
             agent_session_scan_pending: false,
             agent_window_sessions: Vec::new(),
             agent_snapshot_written: None,
-            agent_snapshot_dirty: false,
             // Read once here, never from paint: the launcher's restore row only
             // ever consults this copy.
             last_window_sessions: (config.agent_ui.launcher.restore_last_window_sessions > 0)
@@ -1390,6 +1476,8 @@ impl TermWindow {
             current_event: None,
             has_animation: RefCell::new(None),
             sidebar_wants_animation: Cell::new(false),
+            pane_toolbelt_hover_zone: None,
+            pane_toolbelt_fade: None,
             scheduled_animation: RefCell::new(None),
             allow_images: AllowImage::Yes,
             semantic_zones: HashMap::new(),
@@ -4749,6 +4837,7 @@ done
             ShowTabNavigator => self.show_tab_navigator(),
             ShowDebugOverlay => self.show_debug_overlay(),
             ActivateAgentSection => self.activate_agent_section_nav(),
+            RestoreLastWindowAgents => self.restore_last_window_agent_sessions(),
             CheckForUpdates => crate::update::check_for_updates_now(),
             ShowLauncher => self.show_launcher(),
             ShowLauncherArgs(args) => {
@@ -5146,6 +5235,28 @@ done
             PromptInputLine(args) => self.show_prompt_input_line(args),
             InputSelector(args) => self.show_input_selector(args),
             Confirmation(args) => self.show_confirmation(args),
+            // Deliberately pane-kind-agnostic: these work on an agent pane
+            // too (it is just text), and the provenance toast keeps them
+            // honest. That is the keyboard path to the same three actions on a
+            // pane whose strip is hover-only.
+            CopyLastCommandOutput => {
+                self.perform_pane_copy(
+                    pane,
+                    &PaneCopyAction::Shell(shell_copy::ShellCopyAction::LastCommandOutput),
+                );
+            }
+            CopyLastCommandWithOutput => {
+                self.perform_pane_copy(
+                    pane,
+                    &PaneCopyAction::Shell(shell_copy::ShellCopyAction::LastCommandWithOutput),
+                );
+            }
+            CopyPaneScrollback => {
+                self.perform_pane_copy(
+                    pane,
+                    &PaneCopyAction::Shell(shell_copy::ShellCopyAction::WholePane),
+                );
+            }
             CycleWaitingAgent => {
                 let queue: Vec<PaneId> =
                     self.waiting_queue().into_iter().map(|(id, _)| id).collect();
