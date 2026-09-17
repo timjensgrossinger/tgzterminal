@@ -780,19 +780,26 @@ the herd section and the sessions list -- therefore read one root per configured
 `wsl_domains` entry in addition to the Windows home. A domain's `username`, when
 set, is used directly; otherwise the distro's `/home` is listed and every child
 holding a `.claude`, `.codex`, `.copilot`, `.gemini` or `opencode` directory is
-taken. A distro that is not running simply contributes nothing.
+taken. `/root` is probed alongside those, because a distro whose default user is
+root keeps its agent state there and `/root` is not a child of `/home`. A distro
+that is not running simply contributes nothing.
 
 Two things work differently for a session found inside a distro:
 
 - **Liveness.** The pid in the session file belongs to the distro's pid
   namespace and means nothing to Windows, so it is not checked. Recency of the
-  session file stands in for it (15 minutes). That is weaker than a pid check
-  and is the strongest signal available without shelling into the distro on the
-  scan path.
+  session file stands in for it, with a deliberately long window of **12 hours**.
+  The two failure modes are not symmetric: a stale row costs a line in the
+  sidebar that you can ignore or resume, whereas a missing row is the bug -- and
+  the row most likely to go missing is an agent *waiting on you*, which writes
+  nothing while it waits. Weaker than a pid check, and the strongest signal
+  available without shelling into the distro on the scan path.
 - **Working directory.** The agent records a Linux path while the pane running
   `wsl.exe` reports a Windows or UNC one. The pane's cwd is translated back to
   the distro's view before it is compared, which is what lets a WSL agent bind
-  to its pane instead of rendering detached.
+  to its pane instead of rendering detached. Two UNC shapes are handled: the
+  `\\wsl.localhost\<distro>\...` share, and the `\\<machine>\...` form that a
+  shell's own OSC 7 report resolves to on the Windows side.
 
 On a native Windows agent (not inside WSL) the pid *is* checked, against the
 Windows process table.

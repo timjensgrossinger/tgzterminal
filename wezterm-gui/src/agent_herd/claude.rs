@@ -190,9 +190,17 @@ pub(crate) fn process_is_alive(_pid: u32) -> bool {
 
 /// How recently a WSL session file must have been touched to count as live.
 ///
-/// Generous on purpose: this stands in for a pid check, and an agent waiting on
-/// the human writes nothing while it waits.
-const WSL_SESSION_LIVE_WINDOW: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+/// Twelve hours, which is far longer than it sounds like it should be. The two
+/// failure modes are not symmetric: a stale row costs the user a line in the
+/// sidebar that they can ignore or resume, while a missing row is the bug this
+/// whole path exists to fix -- and the row most likely to go missing is an agent
+/// **waiting on the human**, which is exactly the one worth showing. A session
+/// file is written when the agent starts and when its state changes, so an agent
+/// parked on a permission prompt or a plan review can sit untouched for hours.
+///
+/// An earlier 15-minute value made that agent disappear while it waited, which
+/// is the opposite of what the herd is for.
+const WSL_SESSION_LIVE_WINDOW: std::time::Duration = std::time::Duration::from_secs(12 * 60 * 60);
 
 /// Is the session described by `session_file` still running?
 ///
@@ -207,15 +215,21 @@ pub(crate) fn session_is_live(origin: &SessionOrigin, pid: u32, session_file: &P
         SessionOrigin::Host => process_is_alive(pid),
         SessionOrigin::Wsl(_) => std::fs::metadata(session_file)
             .and_then(|meta| meta.modified())
-            .map(|modified| {
-                modified
-                    .elapsed()
-                    .map(|age| age <= WSL_SESSION_LIVE_WINDOW)
-                    // A file stamped in the future is a clock skew between the
-                    // distro and the host, not a dead session.
-                    .unwrap_or(true)
-            })
+            .map(|modified| wsl_session_is_fresh(modified, SystemTime::now()))
             .unwrap_or(false),
+    }
+}
+
+/// Does a WSL session file's mtime still count as live?
+///
+/// Pure so the window and the clock-skew rule can be tested without touching
+/// file timestamps.
+fn wsl_session_is_fresh(modified: SystemTime, now: SystemTime) -> bool {
+    match now.duration_since(modified) {
+        Ok(age) => age <= WSL_SESSION_LIVE_WINDOW,
+        // Stamped in the future: a clock difference between the distro and the
+        // host, not a dead session.
+        Err(_) => true,
     }
 }
 
@@ -1136,4 +1150,39 @@ fn activity_for_session(home: &Path, session: &ClaudeSession) -> Option<super::H
         &session.subagents,
     );
     Some(activity)
+}
+
+#[cfg(test)]
+mod wsl_liveness_tests {
+    use super::*;
+
+    #[test]
+    fn a_recently_written_wsl_session_is_live() {
+        let now = SystemTime::now();
+        let modified = now - std::time::Duration::from_secs(60);
+        assert!(wsl_session_is_fresh(modified, now));
+    }
+
+    #[test]
+    fn an_agent_parked_on_a_prompt_for_hours_is_still_live() {
+        // The regression this window exists for: a session waiting on the human
+        // writes nothing, and must not vanish from the herd while it waits.
+        let now = SystemTime::now();
+        let modified = now - std::time::Duration::from_secs(6 * 60 * 60);
+        assert!(wsl_session_is_fresh(modified, now));
+    }
+
+    #[test]
+    fn a_session_file_from_yesterday_is_not_live() {
+        let now = SystemTime::now();
+        let modified = now - std::time::Duration::from_secs(24 * 60 * 60);
+        assert!(!wsl_session_is_fresh(modified, now));
+    }
+
+    #[test]
+    fn a_future_timestamp_is_clock_skew_not_death() {
+        let now = SystemTime::now();
+        let modified = now + std::time::Duration::from_secs(120);
+        assert!(wsl_session_is_fresh(modified, now));
+    }
 }

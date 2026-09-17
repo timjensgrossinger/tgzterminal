@@ -127,6 +127,35 @@ pub fn windows_to_wsl(win_path: &str, distro: &str) -> Option<String> {
 
 /// Split `/mnt/<drive>[/tail]` into the drive letter and the remaining path.
 /// Only single-letter mounts count: `/mnt/data` is an ordinary directory.
+/// Recover the Linux path from a UNC whose host is *not* a WSL share.
+///
+/// A shell inside a distro that emits OSC 7 reports `file://<host>/home/me/p`,
+/// and on Windows `Url::to_file_path` turns that into `\\<host>\home\me\p` --
+/// a UNC naming the machine, not `wsl.localhost`. [`windows_to_wsl`] rightly
+/// refuses it, which left the pane's cwd untranslated and meant a WSL agent
+/// never bound to its pane.
+///
+/// Only meaningful for a pane already known to live in a WSL domain; the caller
+/// owns that check. A genuine network share (`\\server\share\dir`) would be
+/// mistranslated, but the result is only ever compared against a session's cwd,
+/// so the worst case is the same failure to bind as before.
+pub(crate) fn unc_host_path_to_linux(win_path: &str) -> Option<String> {
+    let path = win_path.trim();
+    let rest = path.strip_prefix(r"\\")?;
+    // A WSL share is `windows_to_wsl`'s job, and it knows about distro names.
+    if UNC_PREFIXES.iter().any(|prefix| {
+        path.len() >= prefix.len() && path[..prefix.len()].eq_ignore_ascii_case(prefix)
+    }) {
+        return None;
+    }
+    // Drop the host component; what follows is the absolute path inside it.
+    let tail = rest.split_once(['\\', '/']).map(|(_, tail)| tail)?;
+    if tail.is_empty() {
+        return None;
+    }
+    Some(format!("/{}", tail.replace('\\', "/")))
+}
+
 /// The UNC path of a distro's `/home`, whose children are candidate users.
 ///
 /// The agent CLIs are usually installed inside the distro and write their
@@ -138,13 +167,27 @@ pub(crate) fn wsl_home_base(distro: &str) -> Option<PathBuf> {
 
 /// The UNC path of one WSL user's home directory.
 ///
+/// `root` is special: its home is `/root`, not `/home/root`. Several distro
+/// images default to root, and `wsl -u root` is common, so treating it like any
+/// other user pointed at a directory that does not exist and made those agents
+/// invisible.
+///
 /// The user name reaches a path join, so a separator in it would escape the
 /// distro's `/home` entirely; such a name is refused rather than sanitised.
 pub(crate) fn wsl_home(distro: &str, user: &str) -> Option<PathBuf> {
+    let user = user.trim();
     if user.is_empty() || user.contains('/') || user.contains('\\') {
         return None;
     }
+    if user == "root" {
+        return wsl_root_home(distro);
+    }
     wsl_to_windows(&format!("/home/{user}"), distro)
+}
+
+/// The UNC path of a distro's `/root`, the home of a root-default distro.
+pub(crate) fn wsl_root_home(distro: &str) -> Option<PathBuf> {
+    wsl_to_windows("/root", distro)
 }
 
 fn strip_mnt_drive(path: &str) -> Option<(char, &str)> {
@@ -302,5 +345,46 @@ mod tests {
         assert_eq!(wsl_home("Ubuntu", r"a\b"), None);
         assert_eq!(wsl_home("Ubuntu", ""), None);
         assert_eq!(wsl_home("", "tim"), None);
+    }
+
+    #[test]
+    fn an_osc7_unc_naming_the_machine_still_yields_a_linux_path() {
+        // What `file:///home/me/proj` emitted inside a distro becomes on the
+        // Windows side once `Url::to_file_path` has resolved it.
+        assert_eq!(
+            unc_host_path_to_linux(r"\\DESKTOP-ABC\home\me\proj"),
+            Some("/home/me/proj".to_string())
+        );
+    }
+
+    #[test]
+    fn a_wsl_share_is_left_to_windows_to_wsl() {
+        // That form carries a distro name, which only `windows_to_wsl` can check.
+        assert_eq!(
+            unc_host_path_to_linux(r"\\wsl.localhost\Ubuntu\home\me"),
+            None
+        );
+        assert_eq!(unc_host_path_to_linux(r"\\wsl$\Ubuntu\home\me"), None);
+    }
+
+    #[test]
+    fn a_non_unc_path_is_not_a_host_path() {
+        assert_eq!(unc_host_path_to_linux(r"C:\Users\me"), None);
+        assert_eq!(unc_host_path_to_linux("/home/me"), None);
+        assert_eq!(unc_host_path_to_linux(r"\\DESKTOP-ABC"), None);
+    }
+
+    #[test]
+    fn root_lives_at_slash_root_not_under_home() {
+        // /home/root does not exist; a distro running as root keeps its agent
+        // state in /root.
+        assert_eq!(
+            wsl_home("Ubuntu", "root"),
+            Some(PathBuf::from(r"\\wsl.localhost\Ubuntu\root"))
+        );
+        assert_eq!(
+            wsl_root_home("Ubuntu"),
+            Some(PathBuf::from(r"\\wsl.localhost\Ubuntu\root"))
+        );
     }
 }

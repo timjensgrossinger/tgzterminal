@@ -3804,30 +3804,59 @@ fn agent_session_roots(home: PathBuf, distros: &[(String, Option<String>)]) -> V
             continue;
         }
         if let Some(user) = user {
+            // An explicitly configured user is the answer; do not also guess.
             if let Some(path) = wsl_paths::wsl_home(distro, user) {
                 if seen.insert(path.clone()) && path.is_dir() {
                     roots.push(SessionRoot::wsl(path, distro));
                 }
             }
-            // An explicitly configured user is the answer; do not also guess.
             continue;
         }
-        let Some(base) = wsl_paths::wsl_home_base(distro) else {
-            continue;
-        };
-        let Ok(entries) = std::fs::read_dir(&base) else {
-            // A distro that is not running has no filesystem to read. That is
-            // ordinary, not an error.
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() && looks_like_an_agent_home(&path) && seen.insert(path.clone()) {
+        let home_base = wsl_paths::wsl_home_base(distro);
+        let root_home = wsl_paths::wsl_root_home(distro);
+        for path in wsl_agent_homes(home_base.as_deref(), root_home.as_deref()) {
+            if seen.insert(path.clone()) {
                 roots.push(SessionRoot::wsl(path, distro));
             }
         }
     }
     roots
+}
+
+/// Home directories inside one distro that an agent CLI has actually run under.
+///
+/// Split out from [`agent_session_roots`] so it can be exercised against a real
+/// directory tree on any platform: it takes already-resolved local paths and
+/// never constructs a UNC itself.
+///
+/// `/root` is probed alongside the children of `/home` because a distro whose
+/// default user is root keeps its agent state there, and `/root` is not a child
+/// of `/home`.
+fn wsl_agent_homes(home_base: Option<&Path>, root_home: Option<&Path>) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    if let Some(root_home) = root_home {
+        if root_home.is_dir() && looks_like_an_agent_home(root_home) {
+            found.push(root_home.to_path_buf());
+        }
+    }
+    let Some(base) = home_base else {
+        return found;
+    };
+    // A distro that is not running has no filesystem to read. That is ordinary,
+    // not an error.
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return found;
+    };
+    let mut homes: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir() && looks_like_an_agent_home(path))
+        .collect();
+    // `read_dir` order is filesystem-defined; sort so the scan order, and so any
+    // log or test that depends on it, is stable.
+    homes.sort();
+    found.extend(homes);
+    found
 }
 
 /// The agent sessions running in this window, in tab order, as the snapshot
@@ -12343,12 +12372,19 @@ impl crate::TermWindow {
             .get_domain(pane.domain_id())
             .map(|domain| domain.domain_name().to_string())?;
         let distro = wsl_paths::distro_for_domain(&domain, &self.config)?;
-        match wsl_paths::windows_to_wsl(&cwd.to_string_lossy(), &distro) {
-            Some(linux) => Some(PathBuf::from(linux)),
-            // Already a Linux path, or a UNC naming another distro. Either way
-            // the untranslated value is the best answer available.
-            None => Some(cwd),
+        let raw = cwd.to_string_lossy().to_string();
+        if let Some(linux) = wsl_paths::windows_to_wsl(&raw, &distro) {
+            return Some(PathBuf::from(linux));
         }
+        // OSC 7 emitted inside the distro resolves to a UNC naming this machine
+        // rather than the `wsl.localhost` share, which `windows_to_wsl` refuses.
+        // That is the common case for a shell that reports its directory at all.
+        if let Some(linux) = wsl_paths::unc_host_path_to_linux(&raw) {
+            return Some(PathBuf::from(linux));
+        }
+        // Already a Linux path, or a UNC naming another distro. Either way the
+        // untranslated value is the best answer available.
+        Some(cwd)
     }
 
     /// `(distribution, username)` for each configured WSL domain.
@@ -15161,6 +15197,43 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
 
     fn adapter_set(ids: &[&str]) -> HashSet<String> {
         ids.iter().map(|id| id.to_string()).collect()
+    }
+
+    #[test]
+    fn wsl_agent_homes_finds_users_and_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let root = temp.path().join("root");
+        // Two real users, one of which never ran an agent, plus a root home.
+        std::fs::create_dir_all(home.join("tim").join(".claude")).unwrap();
+        std::fs::create_dir_all(home.join("nobody")).unwrap();
+        std::fs::create_dir_all(root.join(".codex")).unwrap();
+
+        let found = wsl_agent_homes(Some(&home), Some(&root));
+        // `/root` first, then `/home` children sorted.
+        assert_eq!(found, vec![root, home.join("tim")]);
+    }
+
+    #[test]
+    fn wsl_agent_homes_skips_a_root_without_agent_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let root = temp.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(home.join("tim").join(".gemini")).unwrap();
+
+        assert_eq!(
+            wsl_agent_homes(Some(&home), Some(&root)),
+            vec![home.join("tim")]
+        );
+    }
+
+    #[test]
+    fn wsl_agent_homes_tolerates_a_distro_that_is_not_running() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("not-there");
+        assert!(wsl_agent_homes(Some(&missing), Some(&missing)).is_empty());
+        assert!(wsl_agent_homes(None, None).is_empty());
     }
 
     #[test]
