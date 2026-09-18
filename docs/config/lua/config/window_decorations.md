@@ -49,6 +49,11 @@ The value is a set of flags:
       system titlebar background color to match the terminal background color
       defined by your configuration.  This option doesn't make sense to use
       without also including `TITLE|RESIZE` in the set of decorations.
+      Since macOS 27 the system titlebar is painted with the window background
+      color, so a fully opaque window (`window_background_opacity = 1.0`, the
+      default) already picks up your terminal background color without this
+      option.  It remains useful when `window_background_opacity` is less than
+      `1.0` and you want an opaque titlebar over a translucent window.
 
 On X11 and Wayland, the windowing system may override the window decorations.
 

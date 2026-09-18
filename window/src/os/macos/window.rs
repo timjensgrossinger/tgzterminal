@@ -59,10 +59,30 @@ const NSViewLayerContentsPlacementTopLeft: NSInteger = 11;
 const NSViewLayerContentsRedrawDuringViewResize: NSInteger = 2;
 
 /// Returns the background color to use for the window.
-unsafe fn window_background_color(is_opaque: bool) -> id {
-    let clear_color = cocoa::appkit::NSColor::clearColor(nil);
-    if is_opaque {
-        clear_color
+///
+/// The opaque case must not be `clearColor`: since macOS 27 AppKit paints the
+/// native titlebar with the window's own backgroundColor, so a clear one leaves
+/// the titlebar strip (traffic lights, title text) fully see-through.
+/// <https://github.com/wezterm/wezterm/issues/8153>
+/// Earlier macOS releases drew their own titlebar material and ignored this
+/// color, and the terminal content is painted by the GL/Metal layer on top
+/// regardless, so using the palette background here is safe unconditionally.
+unsafe fn window_background_color(config: &ConfigHandle) -> id {
+    if config.window_background_opacity >= 1.0 {
+        // Same color and same fallback as update_titlebar_background, so the
+        // two paths cannot disagree about what the titlebar should look like.
+        let color = config
+            .resolved_palette
+            .background
+            .unwrap_or(RgbaColor::from(SrgbaTuple(0., 0., 0., 255.)));
+
+        // The window is pinned to the sRGB color space (see setColorSpace_ in
+        // new_window), so build the color in sRGB or it will be slightly off.
+        msg_send![class!(NSColor),
+                  colorWithSRGBRed: color.0 as CGFloat
+                  green: color.1 as CGFloat
+                  blue: color.2 as CGFloat
+                  alpha: 1.0 as CGFloat]
     } else {
         // An alpha of zero puts NSWindow into a special mode for irregularly
         // shaped windows, where shadows are generated from the window contents.
@@ -71,6 +91,7 @@ unsafe fn window_background_color(is_opaque: bool) -> id {
         // <https://notes.yvt.jp/Desktop-Apps/Enabling-Backdrop-Blur/#cgssetwindowbackgroundblurradius>
         // iTerm2 uses the same workaround:
         // <https://github.com/gnachman/iTerm2/commit/d5ebd6a00e3522399a47b1a9a739581f69247ccd>
+        let clear_color = cocoa::appkit::NSColor::clearColor(nil);
         msg_send![clear_color, colorWithAlphaComponent: 0.01f64]
     }
 }
@@ -540,8 +561,7 @@ impl Window {
             let _: () = msg_send![*window, setRestorable: NO];
 
             window.setReleasedWhenClosed_(NO);
-            let is_opaque = config.window_background_opacity >= 1.0;
-            window.setBackgroundColor_(window_background_color(is_opaque));
+            window.setBackgroundColor_(window_background_color(&config));
 
             // Tell Cocoa that we output in sRGB, so it handles color space
             // conversion for non-sRGB displays.
@@ -1169,7 +1189,7 @@ impl WindowInner {
             self.window.setHasShadow_(to_yes_no(needs_shadow));
 
             self.window
-                .setBackgroundColor_(window_background_color(is_opaque));
+                .setBackgroundColor_(window_background_color(&self.config));
         }
     }
 
