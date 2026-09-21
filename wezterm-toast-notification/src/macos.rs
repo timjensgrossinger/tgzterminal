@@ -1,4 +1,5 @@
 #![cfg(target_os = "macos")]
+
 use crate::click::{self, ResponseKind};
 use crate::{ToastClick, ToastNotification};
 use block2::{Block, RcBlock};
@@ -129,11 +130,11 @@ impl Drop for NotifDelegate {
 }
 
 const CENTER: LazyLock<Retained<UNUserNotificationCenter>> =
-    LazyLock::new(|| unsafe { UNUserNotificationCenter::currentNotificationCenter() });
+    LazyLock::new(UNUserNotificationCenter::currentNotificationCenter);
 
 pub fn initialize() {
     static INIT: Once = Once::new();
-    INIT.call_once(|| unsafe {
+    INIT.call_once(|| {
         CENTER.requestAuthorizationWithOptions_completionHandler(
             UNAuthorizationOptions::Alert
                 | UNAuthorizationOptions::Provisional
