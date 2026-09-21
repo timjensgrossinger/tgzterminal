@@ -1857,6 +1857,41 @@ fn agent_copy_toast_message(action: &AgentCopyAction, payload: &AgentCopyPayload
     }
 }
 
+/// Horizontal padding either side of the sessions button's glyph. Small on
+/// purpose: this is the compact sibling of the Worktree / SSH / New Tab pills,
+/// not a full-width row.
+const SESSIONS_BUTTON_PAD_X: f32 = 6.0;
+
+/// Geometry of the agent section's sessions button: the pill, and the glyph
+/// inside it.
+///
+/// The glyph occupies one terminal *column*, so it centres on `cell_w`.
+/// Centring it on `cell_h` instead parks it left of centre by half the
+/// difference between the two, which in a fixed-pitch font — where a cell is
+/// roughly twice as tall as it is wide — is most of a character.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct SessionsButtonLayout {
+    pub x: f32,
+    pub w: f32,
+    pub glyph_x: f32,
+}
+
+fn sessions_button_layout(
+    section_x: f32,
+    section_w: f32,
+    pad: f32,
+    cell_w: f32,
+    dpi_scale: f32,
+) -> SessionsButtonLayout {
+    let w = cell_w + SESSIONS_BUTTON_PAD_X * dpi_scale * 2.;
+    let x = section_x + section_w - pad - w;
+    SessionsButtonLayout {
+        x,
+        w,
+        glyph_x: x + (w - cell_w) * 0.5,
+    }
+}
+
 fn pane_toolbelt_button_width(label: &str, cell_width: usize, dpi_scale: f32) -> f32 {
     let text_w = label.chars().count() as f32 * cell_width as f32;
     (text_w + PANE_TOOLBELT_BUTTON_PAD_X * dpi_scale * 2.)
@@ -12649,8 +12684,9 @@ impl crate::TermWindow {
         // Sessions button, right-aligned in the header. Reserved before the
         // label is measured so a long "Agents - N - all" cannot run under it.
         let sessions_type = UIItemType::SidebarSessionsButton;
-        let sessions_w = cell_h + 6.0 * dpi;
-        let sessions_x = section_x + section_w - pad - sessions_w;
+        let sessions = sessions_button_layout(section_x, section_w, pad, cell_w, dpi);
+        let sessions_w = sessions.w;
+        let sessions_x = sessions.x;
         let sessions_fits = sessions_x > section_x + pad + cell_h;
         let label_x = section_x + pad + cell_h + 4.0 * dpi;
         let label_right = if sessions_fits {
@@ -12704,31 +12740,47 @@ impl crate::TermWindow {
                 .map(|item| item.item_type == sessions_type)
                 .unwrap_or(false);
             let open = self.sessions_menu.is_some();
+            let sessions_pressed = sessions_hovered
+                && self.current_mouse_buttons.contains(&MousePress::Left)
+                && self.pressed_ui_item.as_ref() == Some(&sessions_type);
             let sessions_fg = if sessions_hovered || open {
                 fg
             } else {
                 lerp_rgba(bg, fg, 0.62)
             };
-            if sessions_hovered || open {
-                self.sidebar_rounded_fill(
-                    layers,
-                    1,
-                    euclid::rect(
-                        sessions_x,
-                        header_y + 2.0 * dpi,
-                        sessions_w,
-                        header_h - 4.0 * dpi,
-                    ),
-                    RADIUS * dpi,
-                    lerp_rgba(bg, fg, 0.14),
-                )?;
-            }
+            // Same construction as the Worktree / SSH / New Tab pills -- filled,
+            // bordered, and offset a pixel while held -- just sized to a single
+            // glyph. It is painted unconditionally rather than on hover so it
+            // reads as a button at rest instead of appearing under the cursor.
+            let sessions_fill = if sessions_pressed {
+                sb.pressed_fill
+            } else if sessions_hovered || open {
+                sb.hover_fill
+            } else {
+                sb.search_fill
+            };
+            let sessions_offset = if sessions_pressed { 1. } else { 0. };
+            let sessions_h = header_h - 4.0 * dpi;
+            self.sidebar_bordered_fill(
+                layers,
+                1,
+                euclid::rect(
+                    sessions_x,
+                    header_y + 2.0 * dpi + sessions_offset,
+                    sessions_w,
+                    sessions_h,
+                ),
+                (RADIUS * dpi).min(sessions_h * 0.5),
+                dpi.max(1.),
+                sessions_fill,
+                sb.row_border,
+            )?;
             self.paint_text(
                 layers,
                 "\u{21ba}",
-                sessions_x + (sessions_w - cell_h) * 0.5,
-                header_y + (header_h - cell_h) * 0.5,
-                cell_h,
+                sessions.glyph_x,
+                header_y + (header_h - cell_h) * 0.5 + sessions_offset,
+                cell_w,
                 sessions_fg,
                 bg,
                 false,
@@ -13751,6 +13803,35 @@ fn sidebar_rounded_corner_radius(rect: RectF, radius: f32) -> f32 {
 mod tests {
     use super::*;
     use config::{AgentAnimationsConfig, RgbaColor};
+
+    /// The glyph sits in the middle of the pill. Regression guard: this used to
+    /// centre on the cell *height*, which in a fixed-pitch font left the glyph
+    /// visibly off to the left.
+    #[test]
+    fn sessions_button_glyph_is_centred_in_its_pill() {
+        let cell_w = 10.;
+        let layout = sessions_button_layout(0., 200., 8., cell_w, 1.);
+
+        let left_gap = layout.glyph_x - layout.x;
+        let right_gap = (layout.x + layout.w) - (layout.glyph_x + cell_w);
+        assert!(
+            (left_gap - right_gap).abs() < 0.001,
+            "glyph off centre: {left_gap} left vs {right_gap} right"
+        );
+        assert_eq!(left_gap, SESSIONS_BUTTON_PAD_X);
+    }
+
+    /// The pill is right-aligned inside the section, inset by the section pad.
+    #[test]
+    fn sessions_button_is_right_aligned_and_scales_with_dpi() {
+        let one_x = sessions_button_layout(4., 200., 8., 10., 1.);
+        assert_eq!(one_x.x + one_x.w, 4. + 200. - 8.);
+
+        // Retina: the padding doubles, the glyph column does not.
+        let two_x = sessions_button_layout(4., 200., 8., 10., 2.);
+        assert_eq!(two_x.w, 10. + SESSIONS_BUTTON_PAD_X * 4.);
+        assert_eq!(two_x.x + two_x.w, 4. + 200. - 8.);
+    }
 
     /// Ring colours from a preset with no `animations.colors` overrides.
     fn preset_ring(preset: AgentRingColors) -> RingColors {
