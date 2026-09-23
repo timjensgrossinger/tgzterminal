@@ -304,6 +304,14 @@ pub enum UIItemType {
     SidebarPaneClose {
         pane_id: PaneId,
     },
+    /// Copy button on a tab row, left of that row's close button.
+    ///
+    /// This is where a plain pane's Copy lives: the alternative is a box
+    /// floating over the terminal grid, and there is no position on a full grid
+    /// that is not on top of somebody's output.
+    SidebarTabCopy {
+        tab_idx: usize,
+    },
     SidebarTabList,
     SidebarScrollTrack,
     SidebarScrollThumb,
@@ -481,46 +489,6 @@ pub struct SidebarSearchState {
     pub query: String,
 }
 
-/// Pane rect the hover-revealed toolbelt belongs to, in window pixel space.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct PaneToolbeltZone {
-    pub pane_id: PaneId,
-    pub x: f32,
-    pub y: f32,
-    pub width: f32,
-    pub height: f32,
-}
-
-impl PaneToolbeltZone {
-    /// Window-pixel-space hit test.
-    ///
-    /// Pixel space, not cell space: `padding_left_top` folds the left sidebar's
-    /// width into `padding_left`, and `mouse_event_impl` clamps the derived
-    /// column with `.max(0)`, so a pointer over a left sidebar reads as column
-    /// 0 of the pane. The cell-space pane loop in `mouseevent.rs` is correct
-    /// where it stands — it runs after the UI-item dispatcher has taken the
-    /// sidebar's hits — and wrong here.
-    pub fn contains(&self, x: isize, y: isize) -> bool {
-        let (x, y) = (x as f32, y as f32);
-        x >= self.x && x < self.x + self.width && y >= self.y && y < self.y + self.height
-    }
-}
-
-/// Hover/fade state of the hover-revealed toolbelt.
-///
-/// Two halves write it: `update_pane_toolbelt_hover` (mouseevent) owns the
-/// enter/leave *transitions*, `pane_toolbelt_opacity` (paint) owns *settling*.
-/// Both read the same pure functions.
-#[derive(Clone, Copy, Debug)]
-pub struct PaneToolbeltFade {
-    pub pane_id: PaneId,
-    pub hovered: bool,
-    pub changed_at: Instant,
-    /// Opacity when `hovered` last flipped, so a pointer that flicks in and out
-    /// reverses from what is on screen instead of snapping to 0 or 1.
-    pub from: f32,
-}
-
 #[derive(Clone, Debug)]
 pub struct PaneCopyMenuState {
     pub pane_id: PaneId,
@@ -533,6 +501,13 @@ pub struct PaneCopyMenuState {
     /// menu stood open. Cost: it would put a second `detect_agent_pane` on the
     /// paint path every frame the menu is up.
     pub items: Vec<(&'static str, PaneCopyAction)>,
+    /// Whether the menu grows leftwards from `x`.
+    ///
+    /// True for the pane toolbelt, whose button sits at the pane's right edge
+    /// with nothing to its right. False for the sidebar tab row, which is at the
+    /// window's left edge: growing leftwards from there would pin every menu
+    /// against the window frame. Either way the painter clamps into the window.
+    pub opens_left: bool,
 }
 
 /// Which row of the agent launch dropdown has its submenu open.
@@ -1051,22 +1026,6 @@ pub struct TermWindow {
     /// paint, so a window whose sidebar stops asking stops animating.
     pub(crate) sidebar_wants_animation: Cell<bool>,
 
-    /// Pane rect, in window pixel space, that the hover-revealed toolbelt was
-    /// last painted against.
-    ///
-    /// Recorded by the painter so mouse motion can answer "is the pointer
-    /// inside that pane?" without re-walking the mux on every move — the same
-    /// paint-records-geometry / mouseevent-reads-it split `ui_items` use. Only
-    /// ever set for a plain pane: an agent strip is always visible and needs no
-    /// hover tracking. Cleared at the top of every paint alongside
-    /// `has_animation`, so a stale rect can never keep the strip alive after
-    /// the toolbelt is switched off, the pane shrinks below the size floor, or
-    /// the active pane goes away.
-    pub(crate) pane_toolbelt_hover_zone: Option<PaneToolbeltZone>,
-
-    /// Fade bookkeeping for that strip. Only ever one: the strip is painted for
-    /// the active pane only.
-    pub(crate) pane_toolbelt_fade: Option<PaneToolbeltFade>,
     /// We use this to attempt to do something reasonable
     /// if we run out of texture space
     allow_images: AllowImage,
@@ -1477,8 +1436,6 @@ impl TermWindow {
             current_event: None,
             has_animation: RefCell::new(None),
             sidebar_wants_animation: Cell::new(false),
-            pane_toolbelt_hover_zone: None,
-            pane_toolbelt_fade: None,
             scheduled_animation: RefCell::new(None),
             allow_images: AllowImage::Yes,
             semantic_zones: HashMap::new(),

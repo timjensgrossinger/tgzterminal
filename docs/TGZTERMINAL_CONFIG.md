@@ -952,15 +952,30 @@ config.pane_toolbelt = {
 }
 ```
 
-The floating toolbelt strip that agent panes already show is also available on
-plain shell and ssh panes, where it carries a single `Copy` button. On a plain
-pane the strip is **hidden until the pointer enters the pane** and fades in
-there, so it never sits on top of output you are reading; agent panes keep the
-always-visible strip they have today.
+Plain shell and ssh panes get a `Copy` control on their **sidebar tab row**,
+left of that row's `×`. It is drawn on every eligible row at rest, the same way
+the `×` is — a control you have to find before it will show itself is not one
+anybody finds. Hovering it adds a rounded button behind the glyph; that box is
+centred in its own slot rather than pushed against the `×`.
+
+It is deliberately **not** a floating button over the pane. There is no position
+on a full terminal grid where a box is not sitting on somebody's output — a
+right-hand prompt, a column of timestamps, the tail of a long line — and a
+control that hides from the content it overlaps is a control you cannot find.
+Agent panes are the exception and keep their floating strip: it carries five
+actions, not one, and it is the only mouse path to `Stop`.
+
+Two cases where the icon is absent, both deliberate:
+
+- **The sidebar is too narrow.** The icon costs the title 34px, and below about
+  six columns of title the row has stopped naming its tab, so the icon gives way
+  first. Widen the sidebar and it returns.
+- **The sidebar is collapsed** to the icon rail. A rail tile is ~40px and
+  already carries the active-tab bar and the agent status dot.
 
 | Key | Type | Default | Notes |
 | --- | --- | --- | --- |
-| `shell_copy` | bool | `true` | Show the Copy button on panes with no detected agent. |
+| `shell_copy` | bool | `true` | Show the Copy icon on tab rows whose pane has no detected agent. |
 
 The button opens a three-row menu:
 
@@ -986,8 +1001,9 @@ boundary can be wrong, which is exactly why it is labelled rather than presented
 as exact. Sourcing shell integration on the host in question is the fix.
 
 Full-screen programs (vim, less, htop) have no prompts and no meaningful "last
-command", so the strip is hidden while one is running; `Copy pane` remains
-available from the command palette.
+command", but the icon stays put while one is running: it is on the sidebar, not
+over the program, and `Copy pane` is still worth having. A guessed "last command"
+boundary on the alternate screen is labelled as guessed, as everywhere else.
 
 ### Scrollback cap and secrets
 
@@ -1018,15 +1034,15 @@ notification still reports how the boundary was found.
 
 ### Why this is not under `agent_ui`
 
-A Copy button on a plain shell is not an agent surface. Someone who sets
+A Copy control on a plain shell is not an agent surface. Someone who sets
 `agent_ui.enabled = false` to switch off agent awareness should keep it, and
 someone who switches off `agent_ui.show_pane_toolbelt` should lose the agent
-strip without gaining one on every shell. Placement is still read from
-`agent_ui.toolbelt_position`, so the strip cannot sit in two places at once, and
-the scrollback cap is shared for the same reason.
+strip without gaining one on every shell. The scrollback cap
+(`agent_ui.copy_scrollback_lines`) is still shared, because it is a statement
+about how much output a copy may reach, not about agents.
 
-The fade has no key of its own: it follows the animation master switch, so
-`agent_ui.animations = { enabled = false }` makes the strip snap instead.
+`agent_ui.toolbelt_position` no longer has anything to say here: it places the
+agent strip, and the plain-pane control is not placed over a pane at all.
 
 ## Rich Input Composer
 
@@ -1364,6 +1380,7 @@ you are not left hunting for one.
 | Collapsed icon-rail composition | Derived from the auto-hide state and whether an agent CLI was discovered. Two-character badges come from an adapter's `short_label`. |
 | Toolbelt button labels, sizes and drop order | Hardcoded. When the strip is too narrow buttons are dropped in a fixed order (Input/Compose, then Details, Attach, Resume), and Stop and Copy are the last two standing. |
 | Per-toolbelt-button visibility | Toolbelt visibility is derived. Herd-row `Stop` is governed by `agent_ui.show_stop`; it appears when the agent can be interrupted. `Copy` whenever an agent is detected; `Attach` / `Resume` / `Details` need their action templates *and* the control-action gate; `Input` / `Compose` follow `rich_input.enabled` and `rich_input.docked`. If a button is missing, it is a detection or a gate question — see *How an agent is identified*. |
+| Tab-row Copy icon size and threshold | Hardcoded. It matches the close button's size but is centred in its own slot, and it is dropped when the title would fall below six columns. |
 | Sidebar spacing, radii and row geometry | Compile-time constants. |
 | Individual sidebar colors | No per-element keys. The whole palette is derived — see `sidebar_theme` for which source it derives from. The attention colour (waiting-queue dot, pip, selection bar, attention line) comes from the palette too, so it follows the theme rather than being separately settable. |
 | Worktree picker behavior | No config surface. |

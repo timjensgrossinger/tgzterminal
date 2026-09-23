@@ -3,8 +3,7 @@ use crate::tabbar::TabBarItem;
 use crate::termwindow::{
     AgentLaunchMenuState, AgentRowAction, CloseTabMenuAction, CloseTabMenuState, CloseTabSource,
     ExpandedMenuRow, GuiWin, MouseCapture, PaneCopyAction, PaneCopyMenuState, PaneToolbeltAction,
-    PaneToolbeltFade, PositionedSplit, ScrollHit, SshLaunchMenuState, TermWindowNotif, UIItem,
-    UIItemType, TMB,
+    PositionedSplit, ScrollHit, SshLaunchMenuState, TermWindowNotif, UIItem, UIItemType, TMB,
 };
 use ::window::{
     CursorIcon, MouseButtons as WMB, MouseEvent, MouseEventKind as WMEK, MousePress,
@@ -50,6 +49,7 @@ impl super::TermWindow {
             | UIItemType::SidebarTabExpand { .. }
             | UIItemType::SidebarPaneRow { .. }
             | UIItemType::SidebarPaneClose { .. }
+            | UIItemType::SidebarTabCopy { .. }
             | UIItemType::SidebarTabList
             | UIItemType::SidebarScrollTrack
             | UIItemType::SidebarScrollThumb
@@ -94,6 +94,7 @@ impl super::TermWindow {
             | UIItemType::SidebarTabExpand { .. }
             | UIItemType::SidebarPaneRow { .. }
             | UIItemType::SidebarPaneClose { .. }
+            | UIItemType::SidebarTabCopy { .. }
             | UIItemType::SidebarTabList
             | UIItemType::SidebarScrollTrack
             | UIItemType::SidebarScrollThumb
@@ -139,10 +140,6 @@ impl super::TermWindow {
         };
 
         self.current_mouse_event.replace(event.clone());
-        // Before every early return below (window drag, item drag, docked
-        // input band): a plain Move invalidates nothing on its own, so the
-        // hover-revealed toolbelt has to notice the transition itself.
-        self.update_pane_toolbelt_hover(context);
         if self.update_sidebar_auto_hide_state() {
             context.invalidate();
         }
@@ -361,10 +358,6 @@ impl super::TermWindow {
             );
             if !on_copy_menu {
                 self.pane_copy_menu = None;
-                // The menu no longer pins the strip: start a real fade from
-                // what is on screen rather than letting a stale timestamp snap
-                // it off.
-                self.update_pane_toolbelt_hover(context);
                 context.invalidate();
             }
         }
@@ -496,7 +489,6 @@ impl super::TermWindow {
 
     pub fn mouse_leave_impl(&mut self, context: &dyn WindowOps) {
         self.current_mouse_event = None;
-        self.update_pane_toolbelt_hover(context);
         if self.sidebar_auto_hide_open && self.schedule_sidebar_auto_hide_close() {
             context.invalidate();
         }
@@ -684,6 +676,9 @@ impl super::TermWindow {
             }
             UIItemType::SidebarPaneClose { pane_id } => {
                 self.mouse_event_sidebar_pane_close(pane_id, event, context);
+            }
+            UIItemType::SidebarTabCopy { tab_idx } => {
+                self.mouse_event_sidebar_tab_copy(tab_idx, item, event, context);
             }
             UIItemType::SidebarTabList => {
                 self.mouse_event_sidebar_tab_list(event, context);
@@ -875,6 +870,39 @@ impl super::TermWindow {
         if event.kind == WMEK::Release(MousePress::Left) {
             self.pressed_ui_item = None;
             self.close_sidebar_pane(pane_id);
+        }
+        context.invalidate();
+    }
+
+    /// Opens the copy menu for a tab row's pane.
+    ///
+    /// Resolves the pane at click time rather than at paint time: a tab's active
+    /// pane can change, and a pane can die, while a painted rect waits to be
+    /// clicked. Everything below the menu is the toolbelt's path unchanged --
+    /// same rows, same painter, same `perform_pane_copy`.
+    fn mouse_event_sidebar_tab_copy(
+        &mut self,
+        tab_idx: usize,
+        item: UIItem,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        if event.kind == WMEK::Release(MousePress::Left) {
+            self.pressed_ui_item = None;
+            if let Some(pane) = self.sidebar_primary_pane_for_tab_idx(tab_idx) {
+                if let Some(kind) = self.pane_toolbelt_kind(&pane) {
+                    let items = crate::termwindow::render::sidebar::pane_copy_menu_items(&kind);
+                    self.pane_copy_menu = Some(PaneCopyMenuState {
+                        pane_id: pane.pane_id(),
+                        // Below the row and hard against the icon, so the menu
+                        // reads as belonging to the row it came from.
+                        x: item.x,
+                        y: item.y + item.height,
+                        items,
+                        opens_left: false,
+                    });
+                }
+            }
         }
         context.invalidate();
     }
@@ -1458,6 +1486,7 @@ impl super::TermWindow {
                                         x: event.coords.x.max(0) as usize,
                                         y: event.coords.y.max(0) as usize,
                                         items,
+                                        opens_left: true,
                                     });
                                 }
                             }
@@ -1502,65 +1531,6 @@ impl super::TermWindow {
         context.set_cursor(Some(CursorIcon::Default));
     }
 
-    /// Update hover state for the hover-revealed pane toolbelt, starting a fade
-    /// if it changed.
-    ///
-    /// Called for every mouse event and from `mouse_leave_impl`, because a
-    /// plain `Move` inside the terminal region invalidates nothing on its own:
-    /// every `context.invalidate()` in `mouse_event_impl` hangs off a
-    /// `last_ui_item` transition. The enter/leave transition is the only thing
-    /// that *starts* the fade, so it cannot depend on some other painter
-    /// happening to ask for a repaint.
-    pub(crate) fn update_pane_toolbelt_hover(&mut self, context: &dyn WindowOps) {
-        let Some(zone) = self.pane_toolbelt_hover_zone else {
-            self.pane_toolbelt_fade = None;
-            return;
-        };
-
-        let mut hovered = self
-            .current_mouse_event
-            .as_ref()
-            .is_some_and(|event| zone.contains(event.coords.x, event.coords.y));
-
-        // An open menu pins its own strip. The menu is clamped into the window,
-        // so reaching its lower rows can take the pointer out of the pane, and
-        // the strip must not start fading out from under the menu it opened.
-        if self
-            .pane_copy_menu
-            .as_ref()
-            .is_some_and(|menu| menu.pane_id == zone.pane_id)
-        {
-            hovered = true;
-        }
-
-        let prior = self.pane_toolbelt_fade;
-        if let Some(prior) = prior {
-            if prior.pane_id == zone.pane_id && prior.hovered == hovered {
-                return;
-            }
-        }
-
-        // Reverse from what is on screen, not from 0/1.
-        let from = match prior {
-            Some(prior) if prior.pane_id == zone.pane_id => {
-                crate::termwindow::render::sidebar::pane_toolbelt_fade_opacity_at(
-                    prior.hovered,
-                    prior.from,
-                    prior.changed_at.elapsed(),
-                )
-            }
-            _ => 0.,
-        };
-
-        self.pane_toolbelt_fade = Some(PaneToolbeltFade {
-            pane_id: zone.pane_id,
-            hovered,
-            changed_at: Instant::now(),
-            from,
-        });
-        context.invalidate();
-    }
-
     fn mouse_event_pane_copy_menu_item(
         &mut self,
         pane_id: mux::pane::PaneId,
@@ -1584,8 +1554,6 @@ impl super::TermWindow {
                     }
                     self.pane_copy_menu = None;
                     self.pressed_ui_item.take();
-                    // Unpins the strip; fades out if the pointer ended up away.
-                    self.update_pane_toolbelt_hover(context);
                     context.invalidate();
                 }
             }

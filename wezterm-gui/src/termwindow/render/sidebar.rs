@@ -16,10 +16,10 @@ use crate::termwindow::render::RenderScreenLineParams;
 use crate::termwindow::shell_copy::{shell_copy_toast_message, ShellCopyAction};
 use crate::termwindow::tgz_last_session::{self, SnapshotSession};
 use crate::termwindow::{
-    agent_launch, wsl_paths, AgentCopyAction, AgentLauncherEntry,
-    AgentRowAction, CloseTabMenuAction, CloseTabSource, ExpandedMenuRow, NewTabMenuEntry,
-    NewTabTarget, OverlayState, PaneCopyAction, PaneToolbeltAction, PaneToolbeltFade,
-    PaneToolbeltZone, SshQuickLaunchEntry, TermWindowNotif, UIItem, UIItemType,
+    agent_launch, wsl_paths, AgentCopyAction, AgentLauncherEntry, AgentRowAction,
+    CloseTabMenuAction, CloseTabSource, ExpandedMenuRow, NewTabMenuEntry, NewTabTarget,
+    OverlayState, PaneCopyAction, PaneToolbeltAction, SshQuickLaunchEntry, TermWindowNotif, UIItem,
+    UIItemType,
 };
 use config::keyassignment::{SpawnCommand, SpawnTabDomain};
 use config::{
@@ -66,6 +66,21 @@ const RADIUS: f32 = 10.;
 /// [`RADIUS`] so the ring reads as sitting around the row rather than on it.
 const RING_RADIUS: f32 = 11.;
 const CLOSE_ZONE_W: f32 = 34.;
+/// Copy affordance on a sidebar tab row.
+///
+/// `nf-fa-copy`, from `SymbolsNerdFontMono`, which ships inside the bundle and
+/// is appended to the fallback list unconditionally (`config/src/font.rs`).
+/// That is why this is a private-use codepoint rather than a "real" one such as
+/// U+29C9: that resolves only through Apple Symbols, which does not exist on
+/// the Windows and Debian builds this fork also releases, and a tofu box in
+/// place of a control is worse than an unusual codepoint.
+const SIDEBAR_COPY_GLYPH: &str = "\u{f0c5}";
+/// Columns a tab title must keep before a row may also carry a Copy zone.
+///
+/// Same value, and the same reasoning, as `herd_row_columns`: below this the
+/// label has stopped naming the thing the row is for, and a row that is two
+/// icons and an empty title is worse than a row with one icon.
+const MIN_TAB_TITLE_COLS: f32 = 6.;
 /// Gap between the close button's right edge and the right edge of its zone.
 /// Both the hover button and the `×` inside it derive from this, and so does the
 /// text reserve — see [`sidebar_close_geometry`].
@@ -87,26 +102,6 @@ const PANE_TOOLBELT_DOT_SIZE: f32 = 7.;
 const PANE_TOOLBELT_MAX_W: f32 = 760.;
 const PANE_TOOLBELT_MIN_W: f32 = 360.;
 const PANE_TOOLBELT_RIGHT_INSET: f32 = 44.;
-/// How long the plain-pane toolbelt takes to fade in when the pointer enters
-/// the pane. Short: the strip is a control, not an entrance.
-const PANE_TOOLBELT_FADE_IN_MS: u64 = 130;
-/// Fade-out is slower than fade-in. The pointer leaving the pane is often the
-/// pointer on its way somewhere else in the same pane, and a strip that snaps
-/// off and back reads as flicker.
-const PANE_TOOLBELT_FADE_OUT_MS: u64 = 220;
-/// Opacity at or above which the strip takes clicks. One threshold for both
-/// directions: below it the hit rects are not pushed at all, so a nearly
-/// invisible strip can never eat a click meant for the terminal underneath.
-///
-/// Fade-*out* cannot eat a click by construction — the strip is drawn inside
-/// the pane, so a pointer over a button is inside the pane and opacity is 1.
-/// The real cost is a ~45ms dead window at the start of a fade-*in*, which is
-/// below click-after-move latency and far cheaper than an invisible control
-/// swallowing a click meant for the terminal.
-const PANE_TOOLBELT_HIT_MIN_OPACITY: f32 = 0.35;
-/// Opacity below which nothing is drawn at all — skip the quads entirely
-/// rather than emit invisible ones every frame of a fade-out's tail.
-const PANE_TOOLBELT_MIN_VISIBLE_OPACITY: f32 = 0.02;
 const PANE_COPY_MENU_W: f32 = 360.;
 /// Narrower than the copy menu: rows are short agent names, not sentences.
 const AGENT_LAUNCH_MENU_W: f32 = 200.;
@@ -290,12 +285,6 @@ struct SidebarAnimationGates {
     agent_enter: bool,
     rail_breathe: bool,
     dot_pulse: bool,
-    /// Fade the hover-revealed plain-pane toolbelt rather than snapping it.
-    ///
-    /// Under `master`, so the existing animation kill switch covers it and no
-    /// new config key is needed. Deliberately *not* counted by `any_motion`: a
-    /// fade is a transition to a settled state, not perpetual motion.
-    toolbelt_fade: bool,
     /// Keep asking for frames while the window is unfocused.
     unfocused: bool,
 }
@@ -314,7 +303,6 @@ impl SidebarAnimationGates {
             agent_enter: master && anim.agent_enter,
             rail_breathe: master && anim.rail_breathe,
             dot_pulse: master && anim.dot_pulse && agent_ui.pulse_working_dot,
-            toolbelt_fade: master,
             unfocused: master && anim.unfocused,
         }
     }
@@ -536,60 +524,6 @@ fn next_agent_pulse_frame_due() -> Instant {
     let elapsed = AGENT_PULSE_EPOCH.elapsed().as_nanos();
     let next_frame = elapsed / interval + 1;
     *AGENT_PULSE_EPOCH + Duration::from_nanos((next_frame * interval) as u64)
-}
-
-/// The span a hover-revealed toolbelt fade runs over, per direction.
-fn pane_toolbelt_fade_span(hovered: bool) -> Duration {
-    Duration::from_millis(if hovered {
-        PANE_TOOLBELT_FADE_IN_MS
-    } else {
-        PANE_TOOLBELT_FADE_OUT_MS
-    })
-}
-
-/// Opacity of a hover-revealed toolbelt, `0.0..=1.0`.
-///
-/// Pure function of elapsed time like [`agent_pulse_phase`], so it is
-/// unit-testable and the strip needs no per-row mutable clock. `from` is the
-/// opacity at the moment `hovered` last flipped, so a reversal mid-fade
-/// continues from what is on screen rather than snapping to 0 or 1.
-///
-/// Returns *exactly* the target once the span has run out, which is what
-/// [`pane_toolbelt_fade_is_settled`] tests for: the painter stops asking for
-/// frames the moment this stops changing.
-fn pane_toolbelt_fade_opacity(hovered: bool, from: f32, elapsed: Duration, span: Duration) -> f32 {
-    let target = if hovered { 1. } else { 0. };
-    let span_s = span.as_secs_f32();
-    if span_s <= 0. {
-        return target;
-    }
-    let t = elapsed.as_secs_f32() / span_s;
-    if t >= 1. {
-        return target;
-    }
-    // Same easing the agent row's entry slide uses, so the two fork animations
-    // do not each invent a curve.
-    let eased = EasingFunction::EaseOut
-        .evaluate_at_position(t.max(0.))
-        .clamp(0., 1.);
-    (from + (target - from) * eased).clamp(0., 1.)
-}
-
-/// [`pane_toolbelt_fade_opacity`] with the span implied by the direction.
-///
-/// Exists so `mouseevent` can ask "what is on screen right now?" when reversing
-/// a fade without having to know about spans.
-pub(crate) fn pane_toolbelt_fade_opacity_at(hovered: bool, from: f32, elapsed: Duration) -> f32 {
-    pane_toolbelt_fade_opacity(hovered, from, elapsed, pane_toolbelt_fade_span(hovered))
-}
-
-/// Whether the fade has reached its target and needs no further frames.
-fn pane_toolbelt_fade_is_settled(hovered: bool, opacity: f32) -> bool {
-    if hovered {
-        opacity >= 1.
-    } else {
-        opacity <= 0.
-    }
 }
 
 /// Slow pulse in `0.0..=1.0`, smoothstep-eased.
@@ -2163,6 +2097,51 @@ pub(crate) struct SidebarRowColumns {
     /// Shared by the title line and the metadata sub-line.
     pub text_x: f32,
     pub text_w: f32,
+}
+
+/// Geometry of a tab row's Copy control: the button box, and the glyph in it.
+///
+/// Deliberately *not* `sidebar_close_geometry`. That one right-aligns its box
+/// inside its zone so every row's close button lines up hard against one edge,
+/// which is right for the last control on a row. Copy has a neighbour on both
+/// sides, so it centres in its own zone instead — right-aligning it parks the
+/// icon against the close button with a gap on the other side, which is what
+/// "not centred" looks like.
+///
+/// The glyph centres on `cell_width`, not on the box: it occupies one terminal
+/// *column*, and in a fixed-pitch font a cell is about twice as tall as it is
+/// wide, so centring on anything else puts it off by most of a character.
+fn sidebar_tab_copy_geometry(
+    cell_width: f32,
+    cell_height: f32,
+    row_height: f32,
+    zone_w: f32,
+) -> SidebarCloseGeometry {
+    let side = (cell_height + 4.)
+        .min(zone_w - 8.)
+        .min(row_height - 6.)
+        .max(18.);
+    let button_dx = ((zone_w - side) * 0.5).max(0.);
+    SidebarCloseGeometry {
+        side,
+        button_dx,
+        glyph_dx: (button_dx + side * 0.5 - cell_width * 0.5).max(0.),
+    }
+}
+
+/// Width a tab row can spare for a trailing Copy zone, or `0.` when it cannot.
+///
+/// `title_w` is what is left for the title *after* the chevron, the agent badge
+/// and the close reserve have taken their share — i.e. `SidebarRowColumns::text_w`.
+/// A second zone is 34px the title does not get, and at the sidebar's 140px drag
+/// floor the title is already down to about three columns, so the icon is what
+/// gives way. Every other sidebar control degrades the same way.
+fn sidebar_tab_copy_zone_w(title_w: f32, cell_width: f32) -> f32 {
+    if title_w - CLOSE_ZONE_W >= MIN_TAB_TITLE_COLS * cell_width {
+        CLOSE_ZONE_W
+    } else {
+        0.
+    }
 }
 
 fn sidebar_row_columns(
@@ -8157,10 +8136,16 @@ impl crate::TermWindow {
     ///
     /// `detect_agent_pane` is called exactly once here and its result travels
     /// in the returned kind, so no caller has to detect twice.
+    /// What Copy surface, if any, a pane offers.
+    ///
+    /// `Agent` drives the floating strip. `Shell` drives the sidebar tab row's
+    /// copy icon and nothing else — a plain pane has no floating strip, because
+    /// there is no position on a full terminal grid where a box is not sitting
+    /// on somebody's output.
     pub(crate) fn pane_toolbelt_kind(&self, pane: &Arc<dyn Pane>) -> Option<PaneToolbeltKind> {
         // `detect_agent_pane` already returns None when `agent_ui.enabled` is
         // off, which is correct: with agent awareness switched off every pane
-        // is a plain pane and gets the plain-pane strip.
+        // is a plain pane and gets the plain-pane surface.
         if let Some(agent) = self.detect_agent_pane(pane) {
             // Deliberate asymmetry: an agent pane with the toolbelt switched
             // off gets *nothing*, not the shell strip. "Show the agent
@@ -8175,10 +8160,10 @@ impl crate::TermWindow {
         if !self.config.pane_toolbelt.shell_copy {
             return None;
         }
-        // An overlay stands in for the real pane in `get_pos_panes_for_tab`,
-        // so without this the Copy strip floats over copy mode, the launcher,
-        // the tab navigator, the debug REPL and the agent log. The agent gate
-        // used to hide this: an overlay never matched as an agent.
+        // An overlay stands in for the real pane in `get_pos_panes_for_tab`, so
+        // without this the Copy icon offers to copy copy mode, the launcher, the
+        // tab navigator, the debug REPL or the agent log. The agent gate used to
+        // hide this: an overlay never matched as an agent.
         if self.pane_is_overlay(pane.pane_id()) {
             return None;
         }
@@ -8187,11 +8172,11 @@ impl crate::TermWindow {
         if self.is_sidebar_utility_pane(pane) {
             return None;
         }
-        // vim, htop, less: there is no "last command" on the alternate screen,
-        // and a floating button over a full-screen TUI is noise.
-        if pane.is_alt_screen_active() {
-            return None;
-        }
+        // No alt-screen gate. It existed because a box floating over vim is
+        // noise, and the plain-pane strip no longer floats: an icon on the
+        // sidebar row would blink out every time somebody opened a pager, and
+        // `Copy pane` is meaningful on the alternate screen even though "last
+        // command" is not.
         Some(PaneToolbeltKind::Shell)
     }
 
@@ -8461,70 +8446,6 @@ impl crate::TermWindow {
         self.update_next_frame_time(Some(next_due));
     }
 
-    /// Register a next-frame deadline for the toolbelt fade.
-    ///
-    /// Unlike [`Self::schedule_sidebar_frame`] this ignores the `unfocused`
-    /// animation gate. A fade is a transition *to a settled state*, not a loop:
-    /// a window that loses focus mid-fade must still be allowed to finish, or
-    /// it keeps a half-transparent strip on screen until something else
-    /// happens to repaint it.
-    fn schedule_pane_toolbelt_frame(&self) {
-        self.sidebar_wants_animation.set(true);
-        self.update_next_frame_time(Some(next_agent_pulse_frame_due()));
-    }
-
-    /// Opacity the hover-revealed strip should be drawn at, settling the fade
-    /// as a side effect.
-    ///
-    /// Seeds itself *settled* when there is no state, or the state belongs to
-    /// another pane: a tab switch or a split close under a stationary pointer
-    /// changes which pane is under the mouse with no enter and no leave, and
-    /// fading in there would be a lie about a movement that never happened.
-    fn pane_toolbelt_opacity(&mut self, zone: &PaneToolbeltZone) -> f32 {
-        let hovered_now = self
-            .current_mouse_event
-            .as_ref()
-            .is_some_and(|event| zone.contains(event.coords.x, event.coords.y))
-            || self
-                .pane_copy_menu
-                .as_ref()
-                .is_some_and(|menu| menu.pane_id == zone.pane_id);
-
-        let fade = match self.pane_toolbelt_fade {
-            Some(fade) if fade.pane_id == zone.pane_id => fade,
-            _ => {
-                let seeded = PaneToolbeltFade {
-                    pane_id: zone.pane_id,
-                    hovered: hovered_now,
-                    // Far enough in the past that the fade reads as complete.
-                    changed_at: Instant::now() - pane_toolbelt_fade_span(hovered_now),
-                    from: if hovered_now { 1. } else { 0. },
-                };
-                self.pane_toolbelt_fade = Some(seeded);
-                seeded
-            }
-        };
-
-        // Snapping when animations are off is the contract every other fork
-        // animation honours: no phase, no scheduled frame.
-        if !self.sidebar_animation_gates().toolbelt_fade {
-            return if fade.hovered { 1. } else { 0. };
-        }
-
-        let opacity = pane_toolbelt_fade_opacity(
-            fade.hovered,
-            fade.from,
-            fade.changed_at.elapsed(),
-            pane_toolbelt_fade_span(fade.hovered),
-        );
-        // This is why a stationary mouse never leaves a half-faded strip: the
-        // frames come from the painter, not from mouse motion.
-        if !pane_toolbelt_fade_is_settled(fade.hovered, opacity) {
-            self.schedule_pane_toolbelt_frame();
-        }
-        opacity
-    }
-
     /// Rotation of the working-agent throbber, or `None` when this agent is not
     /// working. Registering the next frame here is the cost control: with
     /// nothing working, nothing is scheduled.
@@ -8647,7 +8568,7 @@ impl crate::TermWindow {
         anim
     }
 
-    fn sidebar_primary_pane_for_tab_idx(&self, tab_idx: usize) -> Option<Arc<dyn Pane>> {
+    pub(crate) fn sidebar_primary_pane_for_tab_idx(&self, tab_idx: usize) -> Option<Arc<dyn Pane>> {
         let tab = Mux::get()
             .get_window(self.mux_window_id)
             .and_then(|window| window.get_tab_at_idx(tab_idx).cloned())?;
@@ -8764,7 +8685,9 @@ impl crate::TermWindow {
         pos: &PositionedPane,
     ) -> anyhow::Result<()> {
         self.prune_agent_detection_cache();
-        let Some(kind) = self.pane_toolbelt_kind(&pos.pane) else {
+        // Agent panes only. A plain pane's Copy control lives on the sidebar tab
+        // row, where it covers no output at all.
+        let Some(kind @ PaneToolbeltKind::Agent(_)) = self.pane_toolbelt_kind(&pos.pane) else {
             return Ok(());
         };
 
@@ -8861,38 +8784,11 @@ impl crate::TermWindow {
             PaneToolbeltPosition::Bottom => pane_y + pane_h - strip_h - FLOAT_GAP,
         };
 
-        // Recorded once the pane has qualified and the geometry is real, so the
-        // rect the mouse tests against is exactly the rect that was painted.
-        let opacity = match &kind {
-            // Today's behaviour, unchanged: always visible, no hover, no fade.
-            PaneToolbeltKind::Agent(_) => 1.,
-            PaneToolbeltKind::Shell => {
-                let zone = PaneToolbeltZone {
-                    pane_id: pos.pane.pane_id(),
-                    x: pane_x,
-                    y: pane_y,
-                    width: pane_w,
-                    height: pane_h,
-                };
-                self.pane_toolbelt_hover_zone = Some(zone);
-                self.pane_toolbelt_opacity(&zone)
-            }
-        };
-        if opacity < PANE_TOOLBELT_MIN_VISIBLE_OPACITY {
-            // Nothing drawn and, crucially, no hit rects pushed.
-            return Ok(());
-        }
-        let takes_clicks = opacity >= PANE_TOOLBELT_HIT_MIN_OPACITY;
-        // Scales whatever alpha the colour already carried, so a settled strip
-        // (`opacity == 1.0`) is bit-identical to what it was before — the same
-        // property the agent row's entry fade relies on.
-        let fade = |color: LinearRgba| color.mul_alpha(opacity);
-
         let sb = self.sidebar_palette();
-        let fg = fade(sb.text_active);
-        let bg = fade(sb.row_fill);
-        let hover_bg = fade(sb.pressed_fill);
-        let pressed_bg = fade(lerp_rgba(sb.row_fill, sb.text_active, 0.28));
+        let fg = sb.text_active;
+        let bg = sb.row_fill;
+        let hover_bg = sb.pressed_fill;
+        let pressed_bg = lerp_rgba(sb.row_fill, sb.text_active, 0.28);
         // The status dot is an agent signal; a plain pane has no status to show,
         // so `pane_toolbelt_layout` zeroes `dot_size` and the dot is skipped.
         let dot_accent = agent.map(|agent| {
@@ -8906,14 +8802,14 @@ impl crate::TermWindow {
             );
             // The dot breathes while the agent works; the rest of the strip keeps
             // the steady accent so button text and borders do not shimmer.
-            fade(agent_status_dot_accent(
+            agent_status_dot_accent(
                 &agent.status,
                 accent,
                 bg,
                 self.agent_dot_pulse(agent),
                 sb.ring.pulse,
                 sb.ring.waiting,
-            ))
+            )
         });
 
         self.sidebar_rounded_fill(
@@ -9059,7 +8955,7 @@ impl crate::TermWindow {
             } else if hovered {
                 hover_bg
             } else {
-                fade(lerp_rgba(sb.row_fill, sb.text_active, 0.08))
+                lerp_rgba(sb.row_fill, sb.text_active, 0.08)
             };
             let offset = if pressed { 1. } else { 0. };
             // Button box is centered within the strip and sized to enclose
@@ -9073,7 +8969,7 @@ impl crate::TermWindow {
                 button_radius,
                 button_bg,
             )?;
-            let button_fg = fade(contrast_label_color(button_bg, sb.text_active));
+            let button_fg = contrast_label_color(button_bg, sb.text_active);
             let button_side_pad = PANE_TOOLBELT_BUTTON_PAD_X * dpi_scale * 0.5;
             render_text(
                 self,
@@ -9086,15 +8982,13 @@ impl crate::TermWindow {
                 button_bg,
                 true,
             )?;
-            if takes_clicks {
-                self.ui_items.push(UIItem {
-                    x: button_x as usize,
-                    y: button_box_y as usize,
-                    width: button_w.ceil() as usize,
-                    height: button_h.ceil() as usize,
-                    item_type,
-                });
-            }
+            self.ui_items.push(UIItem {
+                x: button_x as usize,
+                y: button_box_y as usize,
+                width: button_w.ceil() as usize,
+                height: button_h.ceil() as usize,
+                item_type,
+            });
             button_x += button_w + FLOAT_GAP;
         }
 
@@ -9133,14 +9027,27 @@ impl crate::TermWindow {
         let menu_h = items.len() as f32 * row_h + menu_pad;
         let max_x = (self.dimensions.pixel_width as f32 - menu_w - FLOAT_GAP).max(FLOAT_GAP);
         let max_y = (self.dimensions.pixel_height as f32 - menu_h - FLOAT_GAP).max(FLOAT_GAP);
-        let menu_x = (menu.x as f32 - menu_w + PANE_TOOLBELT_MIN_BUTTON_W).clamp(FLOAT_GAP, max_x);
+        // The toolbelt's button sits at the pane's right edge, so its menu grows
+        // leftwards to stay off the window frame; the sidebar's sits at the
+        // window's left edge, where growing leftwards would do the opposite.
+        let menu_anchor_x = if menu.opens_left {
+            menu.x as f32 - menu_w + PANE_TOOLBELT_MIN_BUTTON_W
+        } else {
+            menu.x as f32
+        };
+        let menu_x = menu_anchor_x.clamp(FLOAT_GAP, max_x);
         let menu_y = (menu.y as f32 + FLOAT_GAP).clamp(FLOAT_GAP, max_y);
 
         let sb = self.sidebar_palette();
         let fg = sb.text_active;
-        let bg = sb.row_fill;
-        let hover_bg = sb.pressed_fill;
-        let pressed_bg = lerp_rgba(bg, fg, 0.28);
+        // Forced opaque. This menu is painted *over the terminal*, and a panel
+        // you can read the scrollback through is a panel whose own rows are hard
+        // to read. A palette derived from the window colours inherits whatever
+        // alpha those carry, so the guarantee is made here rather than assumed of
+        // the palette.
+        let bg = opaque(sb.row_fill);
+        let hover_bg = opaque(sb.pressed_fill);
+        let pressed_bg = opaque(lerp_rgba(bg, fg, 0.28));
 
         self.sidebar_rounded_fill(
             layers,
@@ -9151,7 +9058,7 @@ impl crate::TermWindow {
         )?;
 
         // Thin border stroke so the menu stands out against overlapping rows.
-        let border = sb.menu_border;
+        let border = opaque(sb.menu_border);
         let border_w = (1. * dpi_scale).max(1.);
         self.filled_rectangle(
             layers,
@@ -11507,6 +11414,14 @@ impl crate::TermWindow {
                 pane_count > 1,
                 agent.is_some(),
             );
+            // Decided before the title is painted, and always — a zone that
+            // appeared on hover would reflow the title under the pointer.
+            let copy_type = UIItemType::SidebarTabCopy { tab_idx };
+            let copy_hovered = hovered_item.as_ref() == Some(&copy_type);
+            let copy_pressed =
+                left_pressed && copy_hovered && self.pressed_ui_item.as_ref() == Some(&copy_type);
+            let copy_w = sidebar_tab_copy_zone_w(cols.text_w, cell_width as f32);
+            let title_w = (cols.text_w - copy_w).max(0.);
             if pane_count > 1 {
                 render_text(
                     self,
@@ -11570,8 +11485,8 @@ impl crate::TermWindow {
                 &CellAttributes::default(),
                 cols.text_x + slide_x,
                 primary_y,
-                cols.text_w,
-                fade(if active || tab_hovered || close_hovered {
+                title_w,
+                fade(if active || tab_hovered || close_hovered || copy_hovered {
                     inactive_fg
                 } else {
                     inactive_fg.mul_alpha(0.78)
@@ -11586,8 +11501,8 @@ impl crate::TermWindow {
                     &CellAttributes::default(),
                     cols.text_x + slide_x,
                     y + row_offset + metadata_offset,
-                    cols.text_w,
-                    fade(if active || tab_hovered || close_hovered {
+                    title_w,
+                    fade(if active || tab_hovered || close_hovered || copy_hovered {
                         inactive_fg.mul_alpha(0.60)
                     } else {
                         inactive_fg.mul_alpha(0.42)
@@ -11598,7 +11513,7 @@ impl crate::TermWindow {
             self.ui_items.push(UIItem {
                 x: content_x as usize,
                 y: y as usize,
-                width: (content_w - CLOSE_ZONE_W).max(0.) as usize,
+                width: (content_w - CLOSE_ZONE_W - copy_w).max(0.) as usize,
                 height: row_height,
                 item_type: tab_type,
             });
@@ -11616,6 +11531,7 @@ impl crate::TermWindow {
             }
 
             let close_x = content_x + content_w - CLOSE_ZONE_W;
+            let copy_x = close_x - copy_w;
             let close_bg = if close_pressed {
                 lerp_rgba(surface, active_fg, 0.38)
             } else if close_hovered {
@@ -11673,6 +11589,73 @@ impl crate::TermWindow {
                 height: row_height,
                 item_type: close_type,
             });
+
+            // Copy, left of the close button, which keeps the far right where
+            // muscle memory expects it. Hover-revealed for the reason the pane
+            // row's close glyph is: a control on every row at rest is clutter on
+            // every row. The *reserve* above is unconditional, so nothing moves
+            // when it appears.
+            if copy_w > 0. {
+                // Same size as the close control, centred in its own zone
+                // rather than right-aligned in it.
+                let copy_geometry = sidebar_tab_copy_geometry(
+                    cell_width as f32,
+                    cell_height as f32,
+                    row_height as f32,
+                    copy_w,
+                );
+                let copy_glyph_offset = if copy_pressed { 1. } else { 0. };
+                if copy_hovered {
+                    self.sidebar_rounded_fill(
+                        layers,
+                        1,
+                        euclid::rect(
+                            copy_x + copy_geometry.button_dx,
+                            y + row_offset
+                                + (row_height as f32 - copy_geometry.side) * 0.5
+                                + copy_glyph_offset,
+                            copy_geometry.side,
+                            copy_geometry.side,
+                        ),
+                        copy_geometry.side * 0.38,
+                        if copy_pressed {
+                            lerp_rgba(surface, active_fg, 0.38)
+                        } else {
+                            lerp_rgba(surface, active_fg, 0.22)
+                        },
+                    )?;
+                }
+                // Drawn on every row, at rest, like the close glyph beside it:
+                // a control that only exists once you have already found it is
+                // not a control anybody finds. Full strength for the same
+                // reason — a dimmed icon reads as disabled.
+                render_text(
+                    self,
+                    layers,
+                    SIDEBAR_COPY_GLYPH,
+                    &CellAttributes::default(),
+                    copy_x + copy_geometry.glyph_dx,
+                    y + row_offset
+                        + (row_height as f32 - cell_height as f32) * 0.5
+                        + copy_glyph_offset,
+                    cell_width as f32,
+                    if copy_hovered {
+                        hover_fg
+                    } else if active {
+                        active_fg
+                    } else {
+                        inactive_fg
+                    },
+                    LinearRgba::default(),
+                )?;
+                self.ui_items.push(UIItem {
+                    x: copy_x as usize,
+                    y: y as usize,
+                    width: copy_w as usize,
+                    height: row_height,
+                    item_type: copy_type,
+                });
+            }
 
             y += row_height as f32 + GAP;
         }
@@ -13894,102 +13877,6 @@ mod tests {
         assert_eq!(shell.min_w, 0.);
     }
 
-    /// A fade reaches its target exactly, so the painter stops asking for
-    /// frames instead of creeping toward the target forever.
-    #[test]
-    fn pane_toolbelt_fade_opacity_settles_at_its_target() {
-        let span = pane_toolbelt_fade_span(true);
-        assert_eq!(pane_toolbelt_fade_opacity(true, 0., span, span), 1.);
-        assert_eq!(pane_toolbelt_fade_opacity(true, 0., span * 2, span), 1.);
-        let out = pane_toolbelt_fade_span(false);
-        assert_eq!(pane_toolbelt_fade_opacity(false, 1., out, out), 0.);
-
-        // Monotonic and in range partway through.
-        let mut last = 0.;
-        for n in 0..=4 {
-            let v = pane_toolbelt_fade_opacity(true, 0., span * n / 4, span);
-            assert!((0. ..=1.).contains(&v), "{v} out of range");
-            assert!(v >= last, "not monotonic: {v} < {last}");
-            last = v;
-        }
-
-        // A zero span has nothing to interpolate over.
-        assert_eq!(
-            pane_toolbelt_fade_opacity(true, 0., Duration::ZERO, Duration::ZERO),
-            1.
-        );
-        assert!(pane_toolbelt_fade_is_settled(true, 1.));
-        assert!(pane_toolbelt_fade_is_settled(false, 0.));
-        assert!(!pane_toolbelt_fade_is_settled(true, 0.5));
-    }
-
-    /// Flicking the pointer across the pane edge reverses from what is on
-    /// screen, so the strip never snaps to 0 or 1 mid-fade.
-    #[test]
-    fn pane_toolbelt_fade_opacity_reverses_from_the_visible_value() {
-        let out = pane_toolbelt_fade_span(false);
-        for n in 0..=4 {
-            let v = pane_toolbelt_fade_opacity(false, 0.4, out * n / 4, out);
-            assert!(
-                v <= 0.4 + f32::EPSILON,
-                "fade-out rose above its start: {v}"
-            );
-        }
-        assert_eq!(pane_toolbelt_fade_opacity(false, 0.4, out, out), 0.);
-
-        let inn = pane_toolbelt_fade_span(true);
-        for n in 0..=4 {
-            let v = pane_toolbelt_fade_opacity(true, 0.4, inn * n / 4, inn);
-            assert!(
-                v >= 0.4 - f32::EPSILON,
-                "fade-in dropped below its start: {v}"
-            );
-        }
-        assert_eq!(pane_toolbelt_fade_opacity(true, 0.4, inn, inn), 1.);
-    }
-
-    /// Hover is tested in window pixel space, not cell space.
-    ///
-    /// Cell space would be wrong: `padding_left_top` folds a left sidebar's
-    /// width into `padding_left` and the derived column is clamped with
-    /// `.max(0)`, so a pointer over the sidebar reads as column 0 of the pane.
-    #[test]
-    fn pane_toolbelt_zone_hit_test_is_in_pixel_space() {
-        let zone = PaneToolbeltZone {
-            pane_id: 1,
-            x: 100.,
-            y: 50.,
-            width: 200.,
-            height: 80.,
-        };
-        assert!(zone.contains(100, 50), "top-left corner is inside");
-        assert!(zone.contains(299, 129));
-        assert!(!zone.contains(99, 50), "one pixel left is outside");
-        assert!(!zone.contains(300, 50), "right edge is exclusive");
-        assert!(!zone.contains(100, 130), "bottom edge is exclusive");
-        // A pointer parked over a left sidebar is nowhere near the pane rect.
-        assert!(!zone.contains(0, 60));
-    }
-
-    /// The fade follows the animation master switch, and is not perpetual
-    /// motion.
-    #[test]
-    fn toolbelt_fade_follows_the_animation_master_switch() {
-        assert!(SidebarAnimationGates::from_config(&AgentUiConfig::default()).toolbelt_fade);
-
-        let off = AgentUiConfig {
-            animations: Some(AgentAnimationsConfig {
-                enabled: false,
-                ..AgentAnimationsConfig::default()
-            }),
-            ..AgentUiConfig::default()
-        };
-        let gates = SidebarAnimationGates::from_config(&off);
-        assert!(!gates.toolbelt_fade);
-        // A fade settles; it must not keep `any_motion` true on its own.
-        assert!(!gates.any_motion());
-    }
-
     #[test]
     fn every_animation_runs_out_of_the_box() {
         let gates = SidebarAnimationGates::from_config(&AgentUiConfig::default());
@@ -14002,7 +13889,6 @@ mod tests {
                 agent_enter: true,
                 rail_breathe: true,
                 dot_pulse: true,
-                toolbelt_fade: true,
                 unfocused: true,
             }
         );
@@ -16404,6 +16290,109 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
 
     /// The reserve grew when it moved to the button's edge, so pin the default
     /// sidebar width away from the point where a row would paint no text at all.
+    /// The tab row's Copy zone gives way before the title does.
+    ///
+    /// A second 34px zone is 34px the title does not get, and at the sidebar's
+    /// 140px drag floor the title is already down to about three columns.
+    #[test]
+    fn sidebar_tab_copy_zone_is_dropped_before_the_title_is() {
+        let cell_width = 10.;
+
+        // Default sidebar: room for both, with the title still well clear.
+        let default_width = config::Config::default_config().sidebar_width_px as f32;
+        let content_w =
+            default_width - INSET * 2. - RESIZE_GRIP_W as f32 - SIDEBAR_SCROLLBAR_GUTTER_W;
+        let reserve = sidebar_close_text_reserve(cell_width, 20., 34., sidebar_close_inset(1.));
+        let title_w = content_w - PAD_X * 2. - ACTIVE_TEXT_GAP - reserve;
+        let copy_w = sidebar_tab_copy_zone_w(title_w, cell_width);
+        assert_eq!(copy_w, CLOSE_ZONE_W);
+        assert!(
+            title_w - copy_w >= MIN_TAB_TITLE_COLS * cell_width,
+            "title kept {} px, below the floor",
+            title_w - copy_w
+        );
+
+        // Drag floor: the icon goes, the title survives.
+        let narrow_w = 140. - INSET * 2. - RESIZE_GRIP_W as f32 - SIDEBAR_SCROLLBAR_GUTTER_W;
+        let narrow_title = narrow_w - PAD_X * 2. - ACTIVE_TEXT_GAP - reserve;
+        assert_eq!(sidebar_tab_copy_zone_w(narrow_title, cell_width), 0.);
+
+        // Exactly at the floor still qualifies; one pixel under does not.
+        let exact = CLOSE_ZONE_W + MIN_TAB_TITLE_COLS * cell_width;
+        assert_eq!(sidebar_tab_copy_zone_w(exact, cell_width), CLOSE_ZONE_W);
+        assert_eq!(sidebar_tab_copy_zone_w(exact - 1., cell_width), 0.);
+    }
+
+    /// The chevron and the agent badge come out of the same budget, so a split
+    /// agent tab loses the icon at a width where a plain tab keeps it.
+    #[test]
+    fn sidebar_tab_copy_zone_accounts_for_the_chevron_and_badge() {
+        let cell_width = 10.;
+        let cell_height = 20.;
+        // Chosen to sit between the two: plain fits, decorated does not.
+        let label_w = CLOSE_ZONE_W + MIN_TAB_TITLE_COLS * cell_width + 4.;
+
+        let plain = sidebar_row_columns(0., label_w, cell_width, cell_height, false, false);
+        assert_eq!(
+            sidebar_tab_copy_zone_w(plain.text_w, cell_width),
+            CLOSE_ZONE_W
+        );
+
+        let decorated = sidebar_row_columns(0., label_w, cell_width, cell_height, true, true);
+        assert!(decorated.text_w < plain.text_w);
+        assert_eq!(sidebar_tab_copy_zone_w(decorated.text_w, cell_width), 0.);
+    }
+
+    /// The Copy box is centred in its zone; the close box is not, and should
+    /// not be — it is the last control on the row and lines up against the edge.
+    #[test]
+    fn sidebar_tab_copy_box_is_centred_in_its_zone() {
+        for (cell_width, cell_height, row_height) in close_geometry_matrix() {
+            let copy = sidebar_tab_copy_geometry(cell_width, cell_height, row_height, CLOSE_ZONE_W);
+            let left = copy.button_dx;
+            let right = CLOSE_ZONE_W - copy.button_dx - copy.side;
+            assert!(
+                (left - right).abs() <= f32::EPSILON * 8.,
+                "box off centre at cell {cell_width}x{cell_height}, row {row_height}: \
+                 {left} left vs {right} right"
+            );
+
+            // Same size as its neighbour, so the pair reads as one control set.
+            let close = sidebar_close_geometry(
+                cell_width,
+                cell_height,
+                row_height,
+                sidebar_close_inset(1.),
+            );
+            assert_eq!(copy.side, close.side);
+
+            // Glyph centred in the box it sits in.
+            let glyph_left = copy.glyph_dx - copy.button_dx;
+            let glyph_right = copy.side - glyph_left - cell_width;
+            assert!(
+                (glyph_left - glyph_right).abs() <= f32::EPSILON * 8.,
+                "glyph off centre: {glyph_left} vs {glyph_right}"
+            );
+        }
+    }
+
+    /// Copy sits left of close, and the two never share a pixel.
+    #[test]
+    fn sidebar_tab_trailing_zones_do_not_overlap() {
+        let content_x = 100.;
+        let content_w = 300.;
+        let copy_w = CLOSE_ZONE_W;
+        let close_x = content_x + content_w - CLOSE_ZONE_W;
+        let copy_x = close_x - copy_w;
+
+        assert!(copy_x < close_x, "copy must sit left of close");
+        assert_eq!(copy_x + copy_w, close_x, "no gap and no overlap");
+        // The tab body must stop short of both, or drag-to-reorder swallows the
+        // icon: hit-testing takes the last match, but the body is pushed first.
+        let body_w = (content_w - CLOSE_ZONE_W - copy_w).max(0.);
+        assert_eq!(content_x + body_w, copy_x);
+    }
+
     #[test]
     fn close_reserve_leaves_room_for_text_at_the_default_width() {
         let default_width = config::Config::default_config().sidebar_width_px as f32;

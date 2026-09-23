@@ -23,11 +23,6 @@ impl crate::TermWindow {
         // may claim the unfocused-animation exemption below. A sidebar that is
         // switched off, scrolled away, or simply idle never re-raises it.
         self.sidebar_wants_animation.set(false);
-        // Cleared for the same reason: only a strip this frame actually painted
-        // may be hovered. Without this, a stale rect keeps the strip alive
-        // after the toolbelt is switched off, the pane shrinks below the size
-        // floor, or the active pane goes away.
-        self.pane_toolbelt_hover_zone = None;
         // Start with the assumption that we should allow images to render
         self.allow_images = AllowImage::Yes;
 
