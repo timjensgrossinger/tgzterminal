@@ -16,7 +16,7 @@ use crate::termwindow::render::RenderScreenLineParams;
 use crate::termwindow::shell_copy::{shell_copy_toast_message, ShellCopyAction};
 use crate::termwindow::tgz_last_session::{self, SnapshotSession};
 use crate::termwindow::{
-    agent_launch, wsl_paths, AgentCopyAction, AgentLaunchMenuState, AgentLauncherEntry,
+    agent_launch, wsl_paths, AgentCopyAction, AgentLauncherEntry,
     AgentRowAction, CloseTabMenuAction, CloseTabSource, ExpandedMenuRow, NewTabMenuEntry,
     NewTabTarget, OverlayState, PaneCopyAction, PaneToolbeltAction, PaneToolbeltFade,
     PaneToolbeltZone, SshQuickLaunchEntry, TermWindowNotif, UIItem, UIItemType,
@@ -40,7 +40,6 @@ use std::collections::{HashMap, HashSet};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 use std::{env, fs};
@@ -512,13 +511,6 @@ impl SidebarPalette {
 /// The set is checked every paint but changes rarely; this bounds a burst of
 /// tab churn to one write rather than one per frame.
 const SNAPSHOT_WRITE_INTERVAL: Duration = Duration::from_secs(2);
-
-/// Whether this process has already offered to reopen the last session.
-///
-/// Process-wide rather than per-window on purpose: the offer is about the run
-/// that came before this one, so it is answered once, by whichever window paints
-/// its agent section first.
-static RESTORE_PROMPT_SHOWN: AtomicBool = AtomicBool::new(false);
 
 /// Repaint cadence while a status dot is pulsing. ~30fps is ample for a 1.6s
 /// breath and half the cost of the 16ms drop-flash interval.
@@ -12715,25 +12707,12 @@ impl crate::TermWindow {
         });
 
         if sessions_fits {
-            // Startup prompt: the first window of a run that has something to
-            // restore opens this dropdown itself, so the feature finds the user
-            // instead of waiting to be discovered. Once per process, not per
-            // window -- opening a second window an hour later must not re-ask.
-            // Deliberately the same menu a click opens, so dismissing it, using
-            // it and ignoring it all go through paths that already exist.
-            if !RESTORE_PROMPT_SHOWN.swap(true, Ordering::Relaxed)
-                && self.sessions_menu.is_none()
-                && self.agent_restore_candidates().is_some()
-            {
-                // Spawns a worker; the filesystem is not touched on this thread.
-                self.kick_agent_session_scan();
-                self.sessions_menu = Some(AgentLaunchMenuState {
-                    x: sessions_x as usize,
-                    y: header_y as usize,
-                    expanded: None,
-                });
-            }
-
+            // No startup prompt. A dropdown that opens itself over the terminal
+            // on the first painted frame is a modal interruption for a feature
+            // nobody asked for yet; the offer is reachable from this button,
+            // from the launcher dropdown's restore row, from the
+            // `RestoreLastWindowAgents` key assignment and from its command
+            // palette entry, which is where a once-a-run action belongs.
             let sessions_hovered = self
                 .last_ui_item
                 .as_ref()

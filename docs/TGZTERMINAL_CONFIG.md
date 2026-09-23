@@ -741,6 +741,11 @@ restore row still appears at the bottom of the launcher dropdown, and the
 command palette as *Reopen last session's agents*) does the same thing without
 the mouse.
 
+Nothing opens that dropdown for you. An earlier version offered it once per
+process on the first painted frame; a menu that appears over the terminal
+before you have asked for anything is an interruption, and the offer keeps for
+as long as the snapshot does.
+
 What one click reopens is **the windows that were open when the previous run
 ended** -- not "every window of the last month". The snapshot file records one
 entry per window per run, and the offer is built by taking the newest eligible
