@@ -249,13 +249,19 @@ fn distros_from_registry(
 /// forever.
 pub const WSL_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// `wsl.exe` with no console window, no stdin and captured output.
+/// `wsl.exe` with no console window, an empty stdin and captured output.
 ///
 /// A bare `Command::new("wsl.exe")` from a GUI process allocates a visible
 /// console per call.
+///
+/// Stdin is a pipe that [`output_with_timeout`] closes at once, *not*
+/// `Stdio::null()`: `NUL` is a character device, which is what a console
+/// looks like, and a hidden `wsl.exe --exec` given it as stdin never returned
+/// -- every WSL agent probe timed out while the same command with a closed
+/// pipe answered in a tenth of a second.
 pub fn hidden_wsl_command() -> std::process::Command {
     let mut cmd = std::process::Command::new("wsl.exe");
-    cmd.stdin(std::process::Stdio::null());
+    cmd.stdin(std::process::Stdio::piped());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
     #[cfg(windows)]
@@ -297,6 +303,8 @@ pub fn output_with_timeout(
     use std::time::Instant;
 
     let mut child = cmd.spawn()?;
+    // End of input straight away (see `hidden_wsl_command`).
+    drop(child.stdin.take());
     // Drained on threads so a full pipe cannot stall the child while it is
     // being polled. Results come back over channels so waiting for them can
     // be given up on; a reader stuck on an inherited pipe just exits with the

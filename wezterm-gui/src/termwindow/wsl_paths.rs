@@ -370,9 +370,9 @@ fn probe_distro(
 ) -> Option<std::collections::HashMap<String, WslProbeShell>> {
     let mut found = std::collections::HashMap::new();
     let mut answered = false;
-    // `sh -lc` first: it is not interactive, so it cannot hang, and finds
-    // anything `~/.profile` puts on PATH. Only what it misses (nvm, set up in
-    // `.bashrc`) is asked of an interactive bash.
+    // `sh -lc` first: the cheapest shell, and it finds anything `~/.profile`
+    // puts on PATH. Only what it misses (nvm, set up in `.bashrc`) is asked
+    // of an interactive bash.
     for shell in [WslProbeShell::ShLogin, WslProbeShell::BashInteractive] {
         let missing: Vec<&str> = programs
             .iter()
@@ -389,17 +389,7 @@ fn probe_distro(
         }
         // `--exec`, not `--`: the latter re-joins argv into a string for
         // the user's shell to re-parse.
-        args.push("--exec");
-        if shell == WslProbeShell::BashInteractive {
-            // An interactive bash sets up job control on the controlling
-            // terminal it finds, and one started this way is not that
-            // terminal's foreground job: it stops itself with SIGTTIN, over
-            // and over, and never runs the probe. In a session of its own it
-            // has no controlling terminal, so job control is simply off.
-            // `-w` waits for it, so its output is not cut off.
-            args.extend(["setsid", "-w"]);
-        }
-        args.extend([sh, flags, WSL_PROBE_SCRIPT, sh]);
+        args.extend(["--exec", sh, flags, WSL_PROBE_SCRIPT, sh]);
         args.extend(missing.iter().copied());
         let output = match run_wsl_hidden(&args, WSL_PROBE_TIMEOUT) {
             Ok(output) => output,

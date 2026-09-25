@@ -397,9 +397,9 @@ jobs:
           # wsl.conf is read when the distro starts.
           wsl.exe --terminate $distro
 
-          # Diagnostics: how each probe shell behaves when started the way
-          # the app starts it -- hidden (CREATE_NO_WINDOW), stdin at EOF,
-          # output captured. Informational; the smoke test below is the gate.
+          # Diagnostics: how each probe shell behaves when started hidden
+          # (CREATE_NO_WINDOW) with stdin a closed pipe and output captured,
+          # as the app does. Informational; the smoke test below is the gate.
           function Invoke-HiddenWsl([string]$arguments) {
             $psi = New-Object System.Diagnostics.ProcessStartInfo 'wsl.exe', $arguments
             $psi.UseShellExecute = $false
@@ -421,7 +421,6 @@ jobs:
           }
           Invoke-HiddenWsl "-d $distro --exec sh -lc `"command -v claude`""
           Invoke-HiddenWsl "-d $distro --exec bash -lic `"command -v claude`""
-          Invoke-HiddenWsl "-d $distro --exec setsid -w bash -lic `"command -v claude`""
           $config = Join-Path $env:RUNNER_TEMP 'wsl-smoke.lua'
           Set-Content -Path $config -Encoding utf8 -Value "return { default_domain = 'WSL:$distro' }"
 
