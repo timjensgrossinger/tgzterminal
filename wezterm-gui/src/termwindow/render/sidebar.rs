@@ -92,6 +92,12 @@ const RESIZE_GRIP_W: usize = 6;
 const AUTO_HIDE_HOVER_SLOP: isize = 0;
 const AUTO_HIDE_RETAIN_SLOP: isize = 48;
 const AUTO_HIDE_COLLAPSE_DELAY_MS: u64 = 0;
+/// How long a WSL agent probe answer is trusted before it is re-asked.
+const WSL_AGENT_PROBE_TTL: Duration = Duration::from_secs(300);
+/// A WSL agent probe that has not reported back after this long is presumed
+/// dead (one `wsl.exe` per distro and shell, each bounded by
+/// `wsl_paths::WSL_COMMAND_TIMEOUT`).
+const WSL_AGENT_PROBE_WATCHDOG: Duration = Duration::from_secs(90);
 const AUTO_HIDE_RESIZE_GRIP_W: usize = 8;
 const MIN_AUTO_HIDE_RAIL_W: usize = 48;
 const PANE_TOOLBELT_H: f32 = 32.;
@@ -3129,7 +3135,21 @@ fn path_is_executable(path: &Path) -> bool {
 /// invisible to a plain PATH probe and its launcher button never appears.
 fn fallback_command_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
+    // `HOME` is normally unset on Windows; `USERPROFILE` is the same place.
+    let home = env::var_os("HOME").or_else(|| {
+        if cfg!(windows) {
+            env::var_os("USERPROFILE")
+        } else {
+            None
+        }
+    });
+    if cfg!(windows) {
+        // npm's global bin on Windows, where `npm i -g` puts `claude.cmd`.
+        if let Some(appdata) = env::var_os("APPDATA") {
+            dirs.push(PathBuf::from(appdata).join("npm"));
+        }
+    }
+    if let Some(home) = home.map(PathBuf::from) {
         for rel in [
             ".local/bin",
             "bin",
@@ -3158,9 +3178,16 @@ fn resolve_command_path(command: &str) -> Option<PathBuf> {
     if command.is_empty() {
         return None;
     }
+    let extensions = if cfg!(windows) {
+        Some(pathext_list(env::var("PATHEXT").ok().as_deref()))
+    } else {
+        None
+    };
     let command_path = Path::new(command);
     if command_path.components().count() > 1 {
-        return path_is_executable(command_path).then(|| command_path.to_path_buf());
+        return command_candidates(command_path, extensions.as_deref())
+            .into_iter()
+            .find(|candidate| path_is_executable(candidate));
     }
     let path_dirs: Vec<PathBuf> = env::var_os("PATH")
         .map(|path| env::split_paths(&path).collect())
@@ -3168,8 +3195,112 @@ fn resolve_command_path(command: &str) -> Option<PathBuf> {
     path_dirs
         .into_iter()
         .chain(fallback_command_dirs())
-        .map(|dir| dir.join(command))
+        .flat_map(|dir| command_candidates(&dir.join(command), extensions.as_deref()))
         .find(|candidate| path_is_executable(candidate))
+}
+
+/// Pure half of `TermWindow::sidebar_leave_collapses`: the pointer was last
+/// seen at `last_x`; `retain_w` is the open sidebar's width plus slop.
+fn sidebar_leave_collapses(
+    last_x: Option<isize>,
+    window_w: isize,
+    border_left: isize,
+    border_right: isize,
+    retain_w: isize,
+    position: SidebarPosition,
+) -> bool {
+    let Some(x) = last_x else {
+        return true;
+    };
+    match position {
+        SidebarPosition::Left => x > border_left + retain_w,
+        SidebarPosition::Right => x < window_w - border_right - retain_w,
+    }
+}
+
+/// Git for Windows' `bash.exe`, or `None`.
+///
+/// Git Bash is not on PATH in a default install, so the standard install
+/// roots (machine-wide and per-user) are probed first, then the `bin`
+/// directory next to whatever `git.exe` is on PATH.
+pub(crate) fn find_git_bash() -> Option<PathBuf> {
+    let roots = ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"]
+        .iter()
+        .filter_map(|var| env::var_os(var).map(|root| PathBuf::from(root).join("Git")))
+        .chain(
+            env::var_os("LOCALAPPDATA")
+                .map(|root| PathBuf::from(root).join("Programs").join("Git")),
+        )
+        .chain(
+            // `<root>\cmd\git.exe` is what the installer puts on PATH.
+            resolve_command_path("git").and_then(|git| Some(git.parent()?.parent()?.to_path_buf())),
+        );
+    roots
+        .map(|root| root.join("bin").join("bash.exe"))
+        .find(|bash| path_is_executable(bash))
+}
+
+/// Executable extensions from `PATHEXT`, lowercased, with Windows' own
+/// default when the variable is unset or empty.
+fn pathext_list(raw: Option<&str>) -> Vec<String> {
+    let parsed: Vec<String> = raw
+        .unwrap_or_default()
+        .split(';')
+        .map(|ext| ext.trim().to_ascii_lowercase())
+        .filter(|ext| ext.starts_with('.') && ext.len() > 1)
+        .collect();
+    if parsed.is_empty() {
+        [".com", ".exe", ".bat", ".cmd"]
+            .iter()
+            .map(|ext| ext.to_string())
+            .collect()
+    } else {
+        parsed
+    }
+}
+
+/// Paths `path` may be installed as. `extensions` is `Some` on Windows only.
+///
+/// On Windows a bare `claude` is `claude.exe` or npm's `claude.cmd`; the
+/// extensionless file npm drops next to them is a POSIX shell script that
+/// Windows cannot execute, so a name without an extension only ever matches
+/// through `PATHEXT`. A name that already has one (`pwsh.exe`) is taken as is.
+fn command_candidates(path: &Path, extensions: Option<&[String]>) -> Vec<PathBuf> {
+    match extensions {
+        Some(extensions) if path.extension().is_none() => extensions
+            .iter()
+            .map(|ext| {
+                let mut candidate = path.as_os_str().to_os_string();
+                candidate.push(ext);
+                PathBuf::from(candidate)
+            })
+            .collect(),
+        _ => vec![path.to_path_buf()],
+    }
+}
+
+/// `argv` with its program replaced by the resolved path, in a form a pty
+/// can spawn.
+///
+/// `CreateProcessW` cannot start a batch file on its own, and npm installs
+/// agent CLIs on Windows as `.cmd` shims, so those run through `cmd.exe /c`.
+fn spawnable_argv(resolved: &Path, mut argv: Vec<String>) -> Vec<String> {
+    let program = resolved.to_string_lossy().into_owned();
+    let is_batch = resolved
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat"));
+    if argv.is_empty() {
+        argv.push(program);
+    } else {
+        argv[0] = program;
+    }
+    if is_batch {
+        let mut wrapped = vec!["cmd.exe".to_string(), "/c".to_string()];
+        wrapped.extend(argv);
+        return wrapped;
+    }
+    argv
 }
 
 #[allow(dead_code)]
@@ -3177,36 +3308,9 @@ fn command_exists_on_path(command: &str) -> bool {
     resolve_command_path(command).is_some()
 }
 
-/// Name of the WSL distro `command` resolves in, or `None`.
-///
-/// On Windows, an agent CLI (e.g. `claude`) is often installed only inside a
-/// WSL Ubuntu distro's own `$PATH`, which `resolve_command_path`'s native
-/// `PATH`/`fallback_command_dirs` scan can never see — a native Windows
-/// process has no visibility into a WSL guest's filesystem/env. This probes
-/// each registered distro's own `which` as a fallback so those agents still
-/// show up in the launcher. No-op (always `None`) off Windows or when `wsl`
-/// is unavailable.
-fn resolve_command_via_wsl(command: &str) -> Option<String> {
-    if !cfg!(windows) {
-        return None;
-    }
-    let command = command.trim();
-    if command.is_empty() {
-        return None;
-    }
-    for distro in config::WslDistro::load_distro_list().ok()? {
-        let found = std::process::Command::new("wsl.exe")
-            .args(["-d", &distro.name, "--", "which", command])
-            .output()
-            .is_ok_and(|output| output.status.success() && !output.stdout.is_empty());
-        if found {
-            return Some(distro.name);
-        }
-    }
-    None
-}
-
-fn resolve_agent_command(
+/// `command` with its `{...}` placeholders filled in, or `None` when one of
+/// them has no value.
+fn expand_agent_command(
     command: Option<&Vec<String>>,
     values: &AgentActionTemplateValues,
 ) -> Option<Vec<String>> {
@@ -3214,27 +3318,47 @@ fn resolve_agent_command(
     if command.is_empty() {
         return None;
     }
-    let mut argv = command
+    command
         .iter()
         .map(|arg| expand_agent_action_template(arg, values))
-        .collect::<Option<Vec<_>>>()?;
-    // Absolute path, not the bare name: see `resolve_command_path`.
-    let program = resolve_command_path(argv.first()?)?;
-    argv[0] = program.to_string_lossy().into_owned();
-    Some(argv)
+        .collect()
 }
 
+fn resolve_agent_command(
+    command: Option<&Vec<String>>,
+    values: &AgentActionTemplateValues,
+) -> Option<Vec<String>> {
+    let argv = expand_agent_command(command, values)?;
+    // Absolute path, not the bare name: see `resolve_command_path`.
+    let program = resolve_command_path(argv.first()?)?;
+    Some(spawnable_argv(&program, argv))
+}
+
+/// The resume command template that applies to `values`.
+fn agent_resume_template<'a>(
+    adapter: &'a AgentAdapterConfig,
+    values: &AgentActionTemplateValues,
+) -> Option<&'a Vec<String>> {
+    if values.session_id.is_some() {
+        adapter.resume_command.as_ref()
+    } else {
+        adapter.resume_latest_command.as_ref()
+    }
+}
+
+/// Host-only form, kept for the template tests; runtime callers use the
+/// `TermWindow::resolve_agent_*_anywhere` methods, which also look in WSL.
+#[cfg(test)]
 fn resolve_agent_resume_command(
     adapter: &AgentAdapterConfig,
     values: &AgentActionTemplateValues,
 ) -> Option<Vec<String>> {
-    if values.session_id.is_some() {
-        resolve_agent_command(adapter.resume_command.as_ref(), values)
-    } else {
-        resolve_agent_command(adapter.resume_latest_command.as_ref(), values)
-    }
+    resolve_agent_command(agent_resume_template(adapter, values), values)
 }
 
+/// Host-only form, kept for the template tests; runtime callers use the
+/// `TermWindow::resolve_agent_*_anywhere` methods, which also look in WSL.
+#[cfg(test)]
 fn resolve_agent_attach_command(
     adapter: &AgentAdapterConfig,
     values: &AgentActionTemplateValues,
@@ -3580,16 +3704,12 @@ fn discovered_shells() -> Vec<(String, Vec<String>)> {
                 push(label, vec![program.to_string()], &mut shells);
             }
         }
-        // Git Bash is not on PATH in a default install, so probe the two
-        // standard locations directly.
-        for candidate in [
-            r"C:\Program Files\Git\bin\bash.exe",
-            r"C:\Program Files (x86)\Git\bin\bash.exe",
-        ] {
-            if path_is_executable(Path::new(candidate)) {
-                push("Git Bash", vec![candidate.to_string()], &mut shells);
-                break;
-            }
+        if let Some(bash) = find_git_bash() {
+            push(
+                "Git Bash",
+                vec![bash.to_string_lossy().into_owned()],
+                &mut shells,
+            );
         }
     }
 
@@ -5095,7 +5215,7 @@ fn ends_run_only_after_grace(status: &AgentStatus) -> bool {
 /// watchdog is the important half: an in-flight marker that is never cleared
 /// used to mean no scan ever ran again, and every disk-derived status froze
 /// with it.
-fn herd_scan_is_due(
+pub(crate) fn herd_scan_is_due(
     scan_started_at: Option<Instant>,
     scanned_at: Option<Instant>,
     ttl: Duration,
@@ -5424,6 +5544,29 @@ impl crate::TermWindow {
         }
     }
 
+    /// Whether a mouse-leave should collapse the open auto-hide sidebar.
+    ///
+    /// Windows only keeps it open: with resize-only decorations the OS turns a
+    /// strip along the window's left and top edges into non-client resize
+    /// area, so pushing the pointer from the sidebar to the screen edge
+    /// "leaves" the window — and since `nc_mouse_move` forwards nothing from
+    /// that strip, no later event would reopen it. The next in-window move, or
+    /// losing focus with the pointer outside, closes it normally.
+    pub(crate) fn sidebar_leave_collapses(&self, last_x: Option<isize>) -> bool {
+        if !cfg!(windows) {
+            return true;
+        }
+        let border = self.get_os_border();
+        sidebar_leave_collapses(
+            last_x,
+            self.dimensions.pixel_width as isize,
+            border.left.get() as isize,
+            border.right.get() as isize,
+            self.sidebar_expanded_width() as isize + AUTO_HIDE_RETAIN_SLOP,
+            self.config.sidebar_position,
+        )
+    }
+
     fn sidebar_auto_hide_should_open(&self, expanded: usize, was_open: bool) -> bool {
         if !self.sidebar_is_active() || !self.config.sidebar_auto_hide {
             return false;
@@ -5547,10 +5690,12 @@ impl crate::TermWindow {
     /// frame.
     pub fn agent_launcher_entries(&self) -> Arc<Vec<AgentLauncherEntry>> {
         let gen = self.config.generation();
+        let wsl_hits = self.wsl_agent_hits();
+        let probed_at = self.wsl_agent_probe_stamp();
         {
             let cached = self.launcher_cache.borrow();
-            if let Some((cached_gen, ref entries)) = *cached {
-                if cached_gen == gen {
+            if let Some((cached_gen, cached_probe, ref entries)) = *cached {
+                if cached_gen == gen && cached_probe == probed_at {
                     return Arc::clone(entries);
                 }
             }
@@ -5572,38 +5717,186 @@ impl crate::TermWindow {
                 // user has not installed simply never appears in the UI. The
                 // resolved absolute path is what gets spawned — see
                 // `resolve_command_path`. On Windows, a CLI installed only
-                // inside a WSL distro (see `resolve_command_via_wsl`) is
-                // wrapped through `wsl.exe` instead of resolved to a path.
-                let mut argv = argv.clone();
-                if let Some(resolved) = resolve_command_path(program) {
-                    argv[0] = resolved.to_string_lossy().into_owned();
-                } else if let Some(distro) = resolve_command_via_wsl(program) {
-                    let mut wrapped = vec![
-                        "wsl.exe".to_string(),
-                        "-d".to_string(),
-                        distro,
-                        "--".to_string(),
-                    ];
-                    wrapped.extend(argv);
-                    argv = wrapped;
+                // inside a WSL distro (see `wsl_agent_hits`) launches in that
+                // distro's domain, through the shell that found it.
+                let mut launch_domain = adapter.launch_domain.clone();
+                let argv = if let Some(resolved) = resolve_command_path(program) {
+                    spawnable_argv(&resolved, argv.clone())
+                } else if let Some(hit) = wsl_hits.get(program.trim()) {
+                    let Some(domain) = self.wsl_domain_name_for_distro(&hit.distro) else {
+                        continue;
+                    };
+                    launch_domain.get_or_insert(domain);
+                    hit.shell.wrap(argv.clone())
                 } else {
                     continue;
-                }
+                };
                 let kind = adapter_kind_from_id(id, adapter);
                 entries.push(AgentLauncherEntry {
                     adapter_id: id.clone(),
                     label: adapter_label(adapter, id),
                     short_label: adapter_short_label(Some(adapter), &kind),
                     color: adapter_color(Some(adapter), &kind),
-                    launch_domain: adapter.launch_domain.clone(),
+                    launch_domain,
                     argv,
                 });
             }
         }
 
         let result = Arc::new(entries);
-        *self.launcher_cache.borrow_mut() = Some((gen, Arc::clone(&result)));
+        *self.launcher_cache.borrow_mut() = Some((gen, probed_at, Arc::clone(&result)));
         result
+    }
+
+    fn wsl_agent_probe_stamp(&self) -> Option<Instant> {
+        self.wsl_agent_probe
+            .borrow()
+            .as_ref()
+            .map(|(probed_at, _, _)| *probed_at)
+    }
+
+    /// Every program an enabled adapter may launch, resume or attach with.
+    fn wsl_agent_probe_programs(&self) -> Vec<String> {
+        let mut programs: Vec<String> = self
+            .merged_agent_adapters()
+            .iter()
+            .filter(|(_, adapter)| adapter.enabled)
+            .flat_map(|(_, adapter)| {
+                [
+                    adapter.launch_command.as_ref(),
+                    adapter.resume_command.as_ref(),
+                    adapter.resume_latest_command.as_ref(),
+                    adapter.attach_command.as_ref(),
+                ]
+            })
+            .flatten()
+            .filter_map(|argv| argv.first())
+            .map(|program| program.trim().to_string())
+            // A template or a path is not something `command -v` can find.
+            .filter(|program| !program.is_empty() && !program.contains(['{', '/', '\\']))
+            .collect();
+        programs.sort();
+        programs.dedup();
+        programs
+    }
+
+    /// Agent CLIs installed inside WSL, as last probed. Always empty off
+    /// Windows.
+    ///
+    /// Never blocks: a missing, stale or outdated result kicks one background
+    /// probe and this returns what it has, so a WSL-only agent appears a few
+    /// seconds after startup instead of freezing the first paint. Not-found
+    /// answers expire with the TTL rather than sticking until a config reload.
+    pub(crate) fn wsl_agent_hits(&self) -> Arc<HashMap<String, wsl_paths::WslAgentHit>> {
+        if !cfg!(windows) || !self.config.agent_ui.enabled {
+            return Arc::default();
+        }
+        let programs = self.wsl_agent_probe_programs();
+        let (probed_at, current) = match self.wsl_agent_probe.borrow().as_ref() {
+            Some((probed_at, probed, hits)) => {
+                // Asked about different programs (config changed): the old
+                // answer does not cover them.
+                let probed_at = (*probed == programs).then_some(*probed_at);
+                (probed_at, Arc::clone(hits))
+            }
+            None => (None, Arc::default()),
+        };
+        if herd_scan_is_due(
+            self.wsl_agent_probe_started_at.get(),
+            probed_at,
+            WSL_AGENT_PROBE_TTL,
+            WSL_AGENT_PROBE_WATCHDOG,
+            Instant::now(),
+        ) {
+            self.kick_wsl_agent_probe(programs);
+        }
+        current
+    }
+
+    fn kick_wsl_agent_probe(&self, programs: Vec<String>) {
+        let Some(window) = self.window.clone() else {
+            return;
+        };
+        // Usernames pinned in `wsl_domains`, so the probe sees the same
+        // account the launched pane will run as.
+        let users: HashMap<String, String> = wsl_paths::wsl_domains(&self.config)
+            .into_iter()
+            .filter_map(|domain| {
+                let user = domain.username?;
+                let distro = domain.distribution.unwrap_or(domain.name);
+                Some((distro, user))
+            })
+            .collect();
+        self.wsl_agent_probe_started_at.set(Some(Instant::now()));
+        let future = promise::spawn::spawn_into_new_thread(move || {
+            // Loaded fresh here rather than from `wsl_paths::cached_distros`,
+            // which is empty on a cold start and would make the first probe
+            // find nothing for a whole TTL.
+            let distros = config::WslDistro::load_distro_list().unwrap_or_default();
+            let hits = wsl_paths::probe_wsl_agents(&distros, &users, &programs);
+            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                term_window.wsl_agent_probe_started_at.set(None);
+                *term_window.wsl_agent_probe.borrow_mut() =
+                    Some((Instant::now(), programs, Arc::new(hits)));
+                term_window.launcher_cache.borrow_mut().take();
+                if let Some(window) = term_window.window.as_ref() {
+                    window.invalidate();
+                }
+            })));
+            Ok::<(), anyhow::Error>(())
+        });
+        promise::spawn::spawn(async move {
+            if let Err(err) = future.await {
+                log::error!("wsl agent probe failed: {err:#}");
+            }
+        })
+        .detach();
+    }
+
+    /// Name of the registered domain that opens `distro`.
+    fn wsl_domain_name_for_distro(&self, distro: &str) -> Option<String> {
+        wsl_paths::wsl_domains(&self.config)
+            .into_iter()
+            .find(|domain| domain.distribution.as_deref().unwrap_or(&domain.name) == distro)
+            .map(|domain| domain.name)
+            .filter(|name| self.domain_is_registered(name))
+    }
+
+    /// `command` (a resume or attach template) resolved for spawning: on this
+    /// machine when its program is installed here, else inside the WSL distro
+    /// that has it, together with the domain it must spawn into.
+    fn resolve_agent_command_anywhere(
+        &self,
+        command: Option<&Vec<String>>,
+        values: &AgentActionTemplateValues,
+    ) -> Option<(Vec<String>, Option<SpawnTabDomain>)> {
+        if let Some(argv) = resolve_agent_command(command, values) {
+            return Some((argv, None));
+        }
+        let argv = expand_agent_command(command, values)?;
+        let hits = self.wsl_agent_hits();
+        let hit = hits.get(argv.first()?.trim())?;
+        let domain = self.wsl_domain_name_for_distro(&hit.distro)?;
+        Some((
+            hit.shell.wrap(argv),
+            Some(SpawnTabDomain::DomainName(domain)),
+        ))
+    }
+
+    fn resolve_agent_resume_anywhere(
+        &self,
+        adapter: &AgentAdapterConfig,
+        values: &AgentActionTemplateValues,
+    ) -> Option<(Vec<String>, Option<SpawnTabDomain>)> {
+        self.resolve_agent_command_anywhere(agent_resume_template(adapter, values), values)
+    }
+
+    fn resolve_agent_attach_anywhere(
+        &self,
+        adapter: &AgentAdapterConfig,
+        values: &AgentActionTemplateValues,
+    ) -> Option<(Vec<String>, Option<SpawnTabDomain>)> {
+        self.resolve_agent_command_anywhere(adapter.attach_command.as_ref(), values)
     }
 
     /// Pre-registered SSH connections offered by the sidebar SSH quick-launch
@@ -6405,7 +6698,7 @@ impl crate::TermWindow {
             home: dirs_next::home_dir(),
             attach_url: None,
         };
-        let Some(argv) = resolve_agent_resume_command(&adapter, &values) else {
+        let Some((argv, wsl_domain)) = self.resolve_agent_resume_anywhere(&adapter, &values) else {
             if !quiet {
                 wezterm_toast_notification::show(wezterm_toast_notification::ToastNotification {
                     title: "Agent resume".to_string(),
@@ -6418,15 +6711,18 @@ impl crate::TermWindow {
         };
 
         let forced_local = self.agent_launch_forced_local();
-        let domain = match self
-            .agent_launcher_entries()
-            .iter()
-            .find(|entry| entry.adapter_id == adapter_id)
-        {
-            Some(entry) => self.agent_launch_domain(entry, forced_local),
+        let domain = match (
+            wsl_domain,
+            self.agent_launcher_entries()
+                .iter()
+                .find(|entry| entry.adapter_id == adapter_id),
+        ) {
+            // Only that distro has the CLI; nowhere else can run it.
+            (Some(domain), _) => domain,
+            (None, Some(entry)) => self.agent_launch_domain(entry, forced_local),
             // The agent is resumable but not installed as a launcher entry;
             // fall back to the active pane's domain rather than refusing.
-            None => SpawnTabDomain::CurrentPaneDomain,
+            (None, None) => SpawnTabDomain::CurrentPaneDomain,
         };
         let cwd = self.translate_cwd_for_domain(session_cwd, &domain);
         Some(SpawnCommand {
@@ -6514,8 +6810,12 @@ impl crate::TermWindow {
         if controls_allowed {
             if let Some(adapter) = self.agent_adapter_config_by_id(adapter_id) {
                 let values = AgentActionTemplateValues::from_vars(vars, cwd);
-                actions.attach = resolve_agent_attach_command(&adapter, &values).is_some();
-                actions.resume = resolve_agent_resume_command(&adapter, &values).is_some();
+                actions.attach = self
+                    .resolve_agent_attach_anywhere(&adapter, &values)
+                    .is_some();
+                actions.resume = self
+                    .resolve_agent_resume_anywhere(&adapter, &values)
+                    .is_some();
                 actions.open_logs =
                     resolve_agent_detail_path(adapter_id, &adapter, &values).is_some();
             }
@@ -7521,7 +7821,7 @@ impl crate::TermWindow {
             return;
         }
         let values = AgentActionTemplateValues::from_agent(&agent);
-        let Some(argv) = resolve_agent_resume_command(&adapter, &values) else {
+        let Some((argv, wsl_domain)) = self.resolve_agent_resume_anywhere(&adapter, &values) else {
             self.set_agent_feedback("Resume unavailable: command cannot be resolved");
             return;
         };
@@ -7531,6 +7831,7 @@ impl crate::TermWindow {
                 label: Some(format!("{label} Resume")),
                 args: Some(argv),
                 cwd: agent.cwd,
+                domain: wsl_domain.unwrap_or(SpawnTabDomain::CurrentPaneDomain),
                 ..Default::default()
             },
             SpawnWhere::NewTab,
@@ -7585,7 +7886,7 @@ impl crate::TermWindow {
             return;
         }
         let values = AgentActionTemplateValues::from_agent(&agent);
-        let Some(argv) = resolve_agent_attach_command(&adapter, &values) else {
+        let Some((argv, wsl_domain)) = self.resolve_agent_attach_anywhere(&adapter, &values) else {
             self.set_agent_feedback("Attach unavailable: command cannot be resolved");
             return;
         };
@@ -7595,6 +7896,7 @@ impl crate::TermWindow {
                 label: Some(format!("{label} Attach")),
                 args: Some(argv),
                 cwd: agent.cwd,
+                domain: wsl_domain.unwrap_or(SpawnTabDomain::CurrentPaneDomain),
                 ..Default::default()
             },
             SpawnWhere::NewTab,
@@ -12403,10 +12705,10 @@ impl crate::TermWindow {
     /// and falls back to stripping the `WSL:` prefix, so a hand-written domain
     /// name still resolves.
     fn wsl_distro_specs(&self) -> Vec<(String, Option<String>)> {
-        // The accessor, not the raw `Option` field: it supplies the built-in
-        // domains for distros the user never named in config.
-        self.config
-            .wsl_domains()
+        // The cached accessor, not the raw `Option` field: it supplies the
+        // built-in domains for distros the user never named in config, and
+        // unlike `Config::wsl_domains()` it does not spawn `wsl.exe` per call.
+        wsl_paths::wsl_domains(&self.config)
             .iter()
             .filter_map(|domain| {
                 let distro = wsl_paths::distro_for_domain(&domain.name, &self.config)?;
@@ -15598,6 +15900,78 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
 
     fn markers() -> Vec<String> {
         config::default_project_markers()
+    }
+
+    #[test]
+    fn pathext_parsing_lowercases_and_falls_back_to_the_windows_default() {
+        assert_eq!(
+            pathext_list(Some(".COM;.EXE;;.Cmd; .PY ")),
+            vec![".com", ".exe", ".cmd", ".py"]
+        );
+        let default = vec![".com", ".exe", ".bat", ".cmd"];
+        assert_eq!(pathext_list(None), default);
+        assert_eq!(pathext_list(Some("")), default);
+        assert_eq!(pathext_list(Some("exe;;")), default);
+    }
+
+    #[test]
+    fn windows_candidates_only_match_through_pathext() {
+        let exts = vec![".exe".to_string(), ".cmd".to_string()];
+        // npm's extensionless shim is a POSIX script Windows cannot run.
+        assert_eq!(
+            command_candidates(Path::new("npm/claude"), Some(&exts)),
+            vec![
+                PathBuf::from("npm/claude.exe"),
+                PathBuf::from("npm/claude.cmd")
+            ]
+        );
+        assert_eq!(
+            command_candidates(Path::new("pwsh.exe"), Some(&exts)),
+            vec![PathBuf::from("pwsh.exe")]
+        );
+        assert_eq!(
+            command_candidates(Path::new("bin/claude"), None),
+            vec![PathBuf::from("bin/claude")]
+        );
+    }
+
+    #[test]
+    fn pathext_resolution_finds_a_cmd_shim_in_a_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("claude"), "#!/bin/sh\n").unwrap();
+        fs::write(dir.path().join("claude.cmd"), "@echo off\r\n").unwrap();
+        let exts = pathext_list(None);
+        let found = command_candidates(&dir.path().join("claude"), Some(&exts))
+            .into_iter()
+            .find(|candidate| candidate.is_file());
+        assert_eq!(found, Some(dir.path().join("claude.cmd")));
+    }
+
+    #[test]
+    fn batch_shims_run_through_cmd_and_executables_do_not() {
+        let argv = vec!["claude".to_string(), "--resume".to_string()];
+        assert_eq!(
+            spawnable_argv(Path::new(r"C:\npm\claude.CMD"), argv.clone()),
+            vec!["cmd.exe", "/c", r"C:\npm\claude.CMD", "--resume"]
+        );
+        assert_eq!(
+            spawnable_argv(Path::new("/usr/local/bin/claude"), argv),
+            vec!["/usr/local/bin/claude", "--resume"]
+        );
+    }
+
+    #[test]
+    fn leaving_through_the_sidebar_keeps_it_open() {
+        use SidebarPosition::{Left, Right};
+        // Left sidebar, 200px retain zone starting at x=0.
+        assert!(!sidebar_leave_collapses(Some(3), 1000, 0, 0, 200, Left));
+        assert!(!sidebar_leave_collapses(Some(200), 1000, 0, 0, 200, Left));
+        assert!(sidebar_leave_collapses(Some(201), 1000, 0, 0, 200, Left));
+        // Right sidebar mirrors it against the right edge.
+        assert!(!sidebar_leave_collapses(Some(995), 1000, 0, 0, 200, Right));
+        assert!(sidebar_leave_collapses(Some(500), 1000, 0, 0, 200, Right));
+        // No known position: collapse, as before.
+        assert!(sidebar_leave_collapses(None, 1000, 0, 0, 200, Left));
     }
 
     #[test]

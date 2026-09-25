@@ -161,9 +161,20 @@ pub fn set_window_class(cls: &str) {
 /// GUI binary where a CLI was expected. Falling back to the bare name is the
 /// honest alternative: it works when the executable's directory is on PATH and
 /// fails visibly when it is not.
+const SCRIPT_CLI: &str = "tgzterminal";
+
+/// File name of the CLI binary next to the GUI executable.
+fn script_cli_file_name(windows: bool) -> String {
+    if windows {
+        format!("{SCRIPT_CLI}.exe")
+    } else {
+        SCRIPT_CLI.to_string()
+    }
+}
+
 fn cli_bin_for_script(exe: Option<&Path>, windows: bool, exists: &dyn Fn(&Path) -> bool) -> String {
-    const CLI: &str = "tgzterminal";
-    let name = if windows { "tgzterminal.exe" } else { CLI };
+    const CLI: &str = SCRIPT_CLI;
+    let name = script_cli_file_name(windows);
     match exe
         .and_then(|exe| exe.parent())
         .map(|dir| dir.join(name))
@@ -185,6 +196,45 @@ fn shell_path(path: &Path, windows: bool) -> String {
     } else {
         path
     }
+}
+
+/// How the worktree picker's POSIX script gets a shell.
+#[derive(Debug, PartialEq, Eq)]
+enum FileBrowserShell {
+    /// Unix: the user's own shell.
+    Native(String),
+    /// Windows, WSL pane: `sh` inside the pane's distro.
+    Wsl { domain: String, distro: String },
+    /// Windows, anything else: Git for Windows' bash.
+    GitBash(PathBuf),
+}
+
+/// Pick the shell for the worktree picker, or say why there is none.
+///
+/// Windows ships no POSIX shell and the installer bundles none, so the old
+/// unconditional `$SHELL`-or-`/bin/sh` spawned nothing there. A WSL pane runs
+/// the script in its own distro; anything else — including an ssh pane, whose
+/// browser runs locally — needs Git Bash.
+fn file_browser_shell(
+    windows: bool,
+    wsl_target: Option<(String, String)>,
+    runs_locally: bool,
+    git_bash: Option<PathBuf>,
+    unix_shell: Option<String>,
+) -> Result<FileBrowserShell, &'static str> {
+    if !windows {
+        return Ok(FileBrowserShell::Native(
+            unix_shell.unwrap_or_else(|| "/bin/sh".to_string()),
+        ));
+    }
+    if !runs_locally {
+        if let Some((domain, distro)) = wsl_target {
+            return Ok(FileBrowserShell::Wsl { domain, distro });
+        }
+    }
+    git_bash
+        .map(FileBrowserShell::GitBash)
+        .ok_or("Worktree needs a WSL pane or Git for Windows (bash.exe)")
 }
 
 pub fn get_window_class() -> String {
@@ -914,9 +964,23 @@ pub struct TermWindow {
     agent_resume_binds: RefCell<Vec<(String, String, u64, Instant)>>,
     adapter_cache: RefCell<Option<(usize, Arc<Vec<(String, AgentAdapterConfig)>>)>>,
     /// Installed-agent launcher entries, rebuilt only when the config
-    /// generation changes. Building probes `$PATH`, so this must never be
-    /// recomputed per frame.
-    launcher_cache: RefCell<Option<(usize, Arc<Vec<AgentLauncherEntry>>)>>,
+    /// generation or the WSL agent probe changes. Building probes `$PATH`, so
+    /// this must never be recomputed per frame.
+    launcher_cache: RefCell<Option<(usize, Option<Instant>, Arc<Vec<AgentLauncherEntry>>)>>,
+    /// Agent CLIs found inside WSL distros (Windows only), with when they were
+    /// probed and which programs were asked about. Filled by a worker thread:
+    /// probing means spawning `wsl.exe`, which must never happen on the paint
+    /// path. See `wsl_agent_hits`.
+    wsl_agent_probe: RefCell<
+        Option<(
+            Instant,
+            Vec<String>,
+            Arc<HashMap<String, wsl_paths::WslAgentHit>>,
+        )>,
+    >,
+    /// When the in-flight WSL agent probe started; a timestamp, not a bool,
+    /// for the same reason as `agent_herd_scan_started_at`.
+    wsl_agent_probe_started_at: Cell<Option<Instant>>,
     /// SSH quick-launch entries, rebuilt only when the config generation
     /// changes. Building probes `$PATH` for `mosh`/`et`, so this must never
     /// be recomputed per frame.
@@ -1120,6 +1184,13 @@ impl TermWindow {
 
             for state in self.pane_state.borrow_mut().values_mut() {
                 state.mouse_terminal_coords.take();
+            }
+
+            // An auto-hide sidebar kept open by a mouse-leave through its own
+            // edge (see `sidebar_leave_collapses`) must not stay open behind
+            // whatever the user switched to.
+            if self.current_mouse_event.is_none() && self.sidebar_auto_hide_open {
+                self.schedule_sidebar_auto_hide_close();
             }
         }
 
@@ -1351,6 +1422,8 @@ impl TermWindow {
             agent_resume_binds: RefCell::new(Vec::new()),
             adapter_cache: RefCell::new(None),
             launcher_cache: RefCell::new(None),
+            wsl_agent_probe: RefCell::new(None),
+            wsl_agent_probe_started_at: Cell::new(None),
             ssh_launcher_cache: RefCell::new(None),
             agent_session_cache: None,
             agent_session_scan_pending: false,
@@ -1841,6 +1914,7 @@ impl TermWindow {
                     .context("send GetConfigOverrides response")?;
             }
             TermWindowNotif::SetConfigOverrides(value) => {
+                let value = tgz_ui_state::reapply_persisted_overrides(value);
                 if value != self.config_overrides {
                     self.config_overrides = value;
                     self.config_was_reloaded();
@@ -3581,9 +3655,16 @@ impl TermWindow {
 
         // A single fresh fetch of the foreground process info; AllowStale can
         // return an empty argv on macOS (KERN_PROCARGS2 failures), which used
-        // to cause the ssh-argv signal below to silently disappear.
+        // to cause the ssh-argv signal below to silently disappear. Windows
+        // has no such failure, and there a fresh fetch is a full process-tree
+        // snapshot on the GUI thread, so the cached answer is used instead.
+        let policy = if cfg!(windows) {
+            CachePolicy::AllowStale
+        } else {
+            CachePolicy::FetchImmediate
+        };
         let fg_argv = pane
-            .get_foreground_process_info(CachePolicy::FetchImmediate)
+            .get_foreground_process_info(policy)
             .map(|info| info.argv);
 
         let name_is_ssh = matches!(
@@ -4491,7 +4572,6 @@ done
             return;
         }
 
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
         let split_size = self.config.file_browser.split_size_percent.clamp(5, 95);
         let target_pane = self.file_browser_target_pane(pane);
         let (remote_context, pane_looks_remote) = self.file_browser_remote_context(&target_pane);
@@ -4508,6 +4588,35 @@ done
             });
             return;
         }
+        let target_domain_name = Mux::get()
+            .get_domain(target_pane.domain_id())
+            .map(|domain| domain.domain_name().to_string());
+        let wsl_target = target_domain_name.and_then(|name| {
+            wsl_paths::distro_for_domain(&name, &self.config).map(|distro| (name, distro))
+        });
+        let shell_choice = match file_browser_shell(
+            cfg!(windows),
+            wsl_target,
+            remote_context.is_some(),
+            if cfg!(windows) {
+                crate::termwindow::render::sidebar::find_git_bash()
+            } else {
+                None
+            },
+            std::env::var("SHELL").ok(),
+        ) {
+            Ok(choice) => choice,
+            Err(message) => {
+                log::warn!("worktree: {message}");
+                wezterm_toast_notification::show(wezterm_toast_notification::ToastNotification {
+                    title: "Worktree unavailable".to_string(),
+                    message: message.to_string(),
+                    url: None,
+                    timeout: Some(Duration::from_millis(4000)),
+                });
+                return;
+            }
+        };
         let mut set_environment_variables = HashMap::new();
         set_environment_variables.insert(
             "TGZTERMINAL_TARGET_PANE".to_string(),
@@ -4571,20 +4680,87 @@ done
             );
         }
 
-        let spawn = SpawnCommand {
-            label: Some("Worktree".to_string()),
-            args: Some(vec![shell, "-lc".to_string(), self.file_browser_script()]),
-            cwd: remote_context
-                .is_none()
-                .then(|| self.file_browser_cwd(&target_pane))
-                .flatten(),
-            set_environment_variables,
-            domain: if remote_context.is_some() {
-                config::keyassignment::SpawnTabDomain::DomainName("local".to_string())
-            } else {
-                config::keyassignment::SpawnTabDomain::CurrentPaneDomain
+        let cwd = remote_context
+            .is_none()
+            .then(|| self.file_browser_cwd(&target_pane))
+            .flatten();
+        let script = self.file_browser_script();
+        let spawn = match shell_choice {
+            FileBrowserShell::Native(shell) => SpawnCommand {
+                label: Some("Worktree".to_string()),
+                args: Some(vec![shell, "-lc".to_string(), script]),
+                cwd,
+                set_environment_variables,
+                domain: if remote_context.is_some() {
+                    config::keyassignment::SpawnTabDomain::DomainName("local".to_string())
+                } else {
+                    config::keyassignment::SpawnTabDomain::CurrentPaneDomain
+                },
+                ..Default::default()
             },
-            ..Default::default()
+            FileBrowserShell::GitBash(bash) => {
+                // Git for Windows' /etc/profile `cd`s to $HOME on a login
+                // shell unless this is set.
+                set_environment_variables.insert("CHERE_INVOKING".to_string(), "1".to_string());
+                SpawnCommand {
+                    label: Some("Worktree".to_string()),
+                    args: Some(vec![
+                        bash.to_string_lossy().into_owned(),
+                        "-lc".to_string(),
+                        script,
+                    ]),
+                    cwd,
+                    set_environment_variables,
+                    domain: config::keyassignment::SpawnTabDomain::DomainName("local".to_string()),
+                    ..Default::default()
+                }
+            }
+            FileBrowserShell::Wsl { domain, distro } => {
+                // Environment set on the spawn stops at `wsl.exe` (upstream
+                // rebuilds WSLENV from its own list), so it is handed over
+                // inside the distro with `env` instead. The Windows fzf and
+                // tool paths mean nothing to Linux: the CLI is reached through
+                // interop at its /mnt path, and fzf is whatever the distro
+                // has (the script falls back to a prompt without it).
+                let mut argv = vec!["env".to_string()];
+                for key in [
+                    "TGZTERMINAL_TARGET_PANE",
+                    "TGZTERMINAL_EDITOR_COMMAND",
+                    "TGZTERMINAL_REMOTE_DEST",
+                    "TGZTERMINAL_REMOTE_CWD",
+                    "TGZTERMINAL_REMOTE_PORT",
+                    "TGZTERMINAL_REMOTE_DOMAIN_ID",
+                ] {
+                    if let Some(value) = set_environment_variables.get(key) {
+                        argv.push(format!("{key}={value}"));
+                    }
+                }
+                if let Some(cli) = std::env::current_exe()
+                    .ok()
+                    .and_then(|exe| Some(exe.parent()?.join(script_cli_file_name(true))))
+                    .filter(|cli| cli.exists())
+                    .and_then(|cli| wsl_paths::windows_to_wsl(&cli.to_string_lossy(), &distro))
+                {
+                    argv.push(format!("TGZTERMINAL_BIN={cli}"));
+                }
+                argv.extend(["sh".to_string(), "-lc".to_string(), script]);
+                // A WSL shell's OSC 7 names this machine as a UNC host, which
+                // `wsl.exe --cd` cannot open; hand it the Linux path.
+                let cwd = cwd.map(|cwd| {
+                    let raw = cwd.to_string_lossy().to_string();
+                    wsl_paths::windows_to_wsl(&raw, &distro)
+                        .or_else(|| wsl_paths::unc_host_path_to_linux(&raw))
+                        .map(PathBuf::from)
+                        .unwrap_or(cwd)
+                });
+                SpawnCommand {
+                    label: Some("Worktree".to_string()),
+                    args: Some(argv),
+                    cwd,
+                    domain: config::keyassignment::SpawnTabDomain::DomainName(domain),
+                    ..Default::default()
+                }
+            }
         };
         self.spawn_command(
             &spawn,
@@ -5869,6 +6045,42 @@ impl Drop for TermWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worktree_shell_on_unix_is_the_users_shell() {
+        assert_eq!(
+            file_browser_shell(false, None, false, None, Some("/bin/zsh".into())),
+            Ok(FileBrowserShell::Native("/bin/zsh".into()))
+        );
+        assert_eq!(
+            file_browser_shell(false, None, false, None, None),
+            Ok(FileBrowserShell::Native("/bin/sh".into()))
+        );
+    }
+
+    #[test]
+    fn worktree_shell_on_windows_prefers_the_panes_distro_then_git_bash() {
+        let wsl = || Some(("WSL:Ubuntu".to_string(), "Ubuntu".to_string()));
+        let bash = || Some(PathBuf::from(r"C:\Program Files\Git\bin\bash.exe"));
+        assert_eq!(
+            file_browser_shell(true, wsl(), false, bash(), None),
+            Ok(FileBrowserShell::Wsl {
+                domain: "WSL:Ubuntu".into(),
+                distro: "Ubuntu".into()
+            })
+        );
+        // An ssh pane's browser runs locally, so its distro does not help.
+        assert_eq!(
+            file_browser_shell(true, wsl(), true, bash(), None),
+            Ok(FileBrowserShell::GitBash(bash().unwrap()))
+        );
+        assert_eq!(
+            file_browser_shell(true, None, false, bash(), None),
+            Ok(FileBrowserShell::GitBash(bash().unwrap()))
+        );
+        assert!(file_browser_shell(true, None, false, None, Some("/bin/sh".into())).is_err());
+        assert!(file_browser_shell(true, wsl(), true, None, None).is_err());
+    }
 
     #[test]
     fn parse_ssh_simple_user_host() {

@@ -122,6 +122,7 @@ pub fn save_agent_section_view(value: crate::agent_herd::HerdView) {
 
 /// Persist the sidebar auto-hide preference. Best-effort; errors are logged.
 pub fn save_sidebar_auto_hide(value: bool) {
+    *PERSISTED_SIDEBAR_AUTO_HIDE.lock().unwrap() = Some(Some(value));
     let mut state = read_state();
     state.sidebar_auto_hide = Some(value);
     write_state(&state);
@@ -162,6 +163,55 @@ pub fn seed_config_overrides() -> wezterm_dynamic::Value {
     })
 }
 
+/// `value` with the persisted UI toggles filled back in where it does not set
+/// them itself.
+///
+/// Lua's `window:set_config_overrides` replaces a window's overrides
+/// wholesale, so a script that only meant to change the font size also threw
+/// away the seeded `sidebar_auto_hide` and the sidebar silently reverted to
+/// the Lua default until the next restart.
+///
+/// Lua commonly calls `set_config_overrides` from `update-status`, i.e. per
+/// repaint, so the persisted value is read from disk once per process and
+/// kept current by `save_sidebar_auto_hide` rather than re-read here.
+pub fn reapply_persisted_overrides(value: wezterm_dynamic::Value) -> wezterm_dynamic::Value {
+    let sidebar_auto_hide = *PERSISTED_SIDEBAR_AUTO_HIDE
+        .lock()
+        .unwrap()
+        .get_or_insert_with(load_sidebar_auto_hide);
+    overlay_state(
+        value,
+        &TgzUiState {
+            sidebar_auto_hide,
+            ..TgzUiState::default()
+        },
+    )
+}
+
+/// In-memory copy of the persisted `sidebar_auto_hide`: outer `None` = not
+/// loaded yet, inner `None` = nothing persisted.
+static PERSISTED_SIDEBAR_AUTO_HIDE: std::sync::Mutex<Option<Option<bool>>> =
+    std::sync::Mutex::new(None);
+
+fn overlay_state(value: wezterm_dynamic::Value, state: &TgzUiState) -> wezterm_dynamic::Value {
+    use wezterm_dynamic::Value;
+
+    let Value::Object(persisted) = overrides_from_state(state) else {
+        return value;
+    };
+    match value {
+        Value::Null => Value::Object(persisted),
+        Value::Object(explicit) => {
+            let mut merged = persisted;
+            for (key, val) in explicit.iter() {
+                merged.insert(key.clone(), val.clone());
+            }
+            Value::Object(merged)
+        }
+        other => other,
+    }
+}
+
 fn overrides_from_state(state: &TgzUiState) -> wezterm_dynamic::Value {
     use std::collections::BTreeMap;
     use wezterm_dynamic::Value;
@@ -185,6 +235,35 @@ fn overrides_from_state(state: &TgzUiState) -> wezterm_dynamic::Value {
 mod tests {
     use super::*;
     use wezterm_dynamic::Value;
+
+    #[test]
+    fn explicit_overrides_keep_the_persisted_toggle_unless_they_set_it() {
+        use std::collections::BTreeMap;
+        let key = || Value::String("sidebar_auto_hide".to_string());
+        let state = TgzUiState {
+            sidebar_auto_hide: Some(true),
+            ..TgzUiState::default()
+        };
+        let font = BTreeMap::from([(Value::String("font_size".into()), Value::F64(14.0.into()))]);
+        let merged = overlay_state(Value::Object(font.into()), &state);
+        let Value::Object(map) = &merged else {
+            panic!("expected an object, got {merged:?}");
+        };
+        assert_eq!(map.get(&key()), Some(&Value::Bool(true)));
+        assert!(map.get(&Value::String("font_size".into())).is_some());
+
+        let explicit = BTreeMap::from([(key(), Value::Bool(false))]);
+        let merged = overlay_state(Value::Object(explicit.into()), &state);
+        let Value::Object(map) = &merged else {
+            panic!("expected an object, got {merged:?}");
+        };
+        assert_eq!(map.get(&key()), Some(&Value::Bool(false)));
+
+        assert_eq!(
+            overlay_state(Value::Null, &TgzUiState::default()),
+            Value::Null
+        );
+    }
 
     #[test]
     fn default_state_has_no_persisted_toggles() {

@@ -853,6 +853,11 @@ fn run_gui_forever(gui: std::rc::Rc<crate::frontend::GuiFrontEnd>) -> anyhow::Re
     #[cfg(target_os = "macos")]
     crate::macos_permissions::prime_first_run();
 
+    // Load the WSL distro list off the GUI thread before the first paint
+    // asks for it; the sidebar never spawns `wsl.exe` itself.
+    #[cfg(windows)]
+    crate::termwindow::wsl_paths::warm_distro_cache();
+
     gui.run_forever()
 }
 
