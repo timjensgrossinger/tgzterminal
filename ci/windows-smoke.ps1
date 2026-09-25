@@ -198,3 +198,6 @@ if ($failures.Count) {
     exit 1
 }
 Write-Step 'Smoke test passed'
+# Explicit: the Actions pwsh wrapper exits with $LASTEXITCODE, which the last
+# native command (`query user` exits 1 on the runner) left nonzero.
+exit 0
