@@ -196,10 +196,10 @@ const WSL_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 /// launching through the same shell keeps "found" and "launches" in agreement.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WslProbeShell {
-    /// `bash -lic`: reads `~/.profile` *and* `~/.bashrc`, where nvm lives.
+    /// `bash -lic`: reads `~/.profile` *and* `~/.bashrc`, where nvm lives
+    /// (Debian's and Ubuntu's `.bashrc` return at once when not interactive).
     BashInteractive,
-    /// `sh -lc`: `~/.profile` only; the fallback for distros without bash or
-    /// whose `.bashrc` never returns (e.g. one that `exec`s another shell).
+    /// `sh -lc`: `~/.profile` only, which already covers `~/.local/bin`.
     ShLogin,
 }
 
@@ -370,7 +370,10 @@ fn probe_distro(
 ) -> Option<std::collections::HashMap<String, WslProbeShell>> {
     let mut found = std::collections::HashMap::new();
     let mut answered = false;
-    for shell in [WslProbeShell::BashInteractive, WslProbeShell::ShLogin] {
+    // `sh -lc` first: it is not interactive, so it cannot hang, and finds
+    // anything `~/.profile` puts on PATH. Only what it misses (nvm, set up in
+    // `.bashrc`) is asked of an interactive bash.
+    for shell in [WslProbeShell::ShLogin, WslProbeShell::BashInteractive] {
         let missing: Vec<&str> = programs
             .iter()
             .filter(|program| !found.contains_key(*program))
@@ -386,7 +389,17 @@ fn probe_distro(
         }
         // `--exec`, not `--`: the latter re-joins argv into a string for
         // the user's shell to re-parse.
-        args.extend(["--exec", sh, flags, WSL_PROBE_SCRIPT, sh]);
+        args.push("--exec");
+        if shell == WslProbeShell::BashInteractive {
+            // An interactive bash sets up job control on the controlling
+            // terminal it finds, and one started this way is not that
+            // terminal's foreground job: it stops itself with SIGTTIN, over
+            // and over, and never runs the probe. In a session of its own it
+            // has no controlling terminal, so job control is simply off.
+            // `-w` waits for it, so its output is not cut off.
+            args.extend(["setsid", "-w"]);
+        }
+        args.extend([sh, flags, WSL_PROBE_SCRIPT, sh]);
         args.extend(missing.iter().copied());
         let output = match run_wsl_hidden(&args, WSL_PROBE_TIMEOUT) {
             Ok(output) => output,
