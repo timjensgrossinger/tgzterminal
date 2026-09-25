@@ -389,9 +389,13 @@ jobs:
           $default = $lxss.GetValue('DefaultDistribution')
           $distro = (Get-ItemProperty "$($lxss.PSPath)\$default").DistributionName
           Write-Host "WSL distro: $distro"
-          # An agent CLI that exists only inside the distro.
-          wsl.exe -d $distro -u root --exec sh -c 'printf "#!/bin/sh\nexit 0\n" > /usr/local/bin/claude && chmod +x /usr/local/bin/claude'
-          if ($LASTEXITCODE -ne 0) { throw "could not install the stub agent into $distro" }
+          # An agent CLI that exists only inside the distro, and a default
+          # user, as any distro that has been used once has: a fresh one
+          # stops every interactive start at "create a default UNIX user".
+          wsl.exe -d $distro -u root --exec sh -c 'printf "#!/bin/sh\nexit 0\n" > /usr/local/bin/claude && chmod +x /usr/local/bin/claude && printf "[user]\ndefault=root\n" >> /etc/wsl.conf'
+          if ($LASTEXITCODE -ne 0) { throw "could not prepare $distro" }
+          # wsl.conf is read when the distro starts.
+          wsl.exe --terminate $distro
           $config = Join-Path $env:RUNNER_TEMP 'wsl-smoke.lua'
           Set-Content -Path $config -Encoding utf8 -Value "return { default_domain = 'WSL:$distro' }"
 

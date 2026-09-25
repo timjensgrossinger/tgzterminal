@@ -267,6 +267,19 @@ pub fn hidden_wsl_command() -> std::process::Command {
     cmd
 }
 
+/// What [`output_with_timeout`] fails with when it had to kill the child, so
+/// callers can tell "no answer" apart from "answered with an error".
+#[derive(Debug)]
+pub struct WslCommandTimedOut(pub std::time::Duration);
+
+impl std::fmt::Display for WslCommandTimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "wsl.exe did not answer within {:?}", self.0)
+    }
+}
+
+impl std::error::Error for WslCommandTimedOut {}
+
 /// How long to wait for a child's output pipes to close once the child itself
 /// has exited. A process it started (WSL's own helpers) can inherit and hold
 /// them for as long as it lives.
@@ -319,7 +332,7 @@ pub fn output_with_timeout(
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            anyhow::bail!("wsl.exe did not answer within {timeout:?}");
+            return Err(WslCommandTimedOut(timeout).into());
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
     };

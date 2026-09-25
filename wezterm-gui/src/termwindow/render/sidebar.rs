@@ -95,9 +95,9 @@ const AUTO_HIDE_COLLAPSE_DELAY_MS: u64 = 0;
 /// How long a WSL agent probe answer is trusted before it is re-asked.
 const WSL_AGENT_PROBE_TTL: Duration = Duration::from_secs(300);
 /// A WSL agent probe that has not reported back after this long is presumed
-/// dead (one `wsl.exe` per distro and shell, each bounded by
-/// `wsl_paths::WSL_COMMAND_TIMEOUT`).
-const WSL_AGENT_PROBE_WATCHDOG: Duration = Duration::from_secs(90);
+/// dead (a bounded `wsl.exe -l --running`, then up to two bounded probes per
+/// distro; an unresponsive distro ends after one).
+const WSL_AGENT_PROBE_WATCHDOG: Duration = Duration::from_secs(150);
 const AUTO_HIDE_RESIZE_GRIP_W: usize = 8;
 const MIN_AUTO_HIDE_RAIL_W: usize = 48;
 const PANE_TOOLBELT_H: f32 = 32.;

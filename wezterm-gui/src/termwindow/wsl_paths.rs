@@ -36,8 +36,6 @@ const WSL_DISTRO_TTL: Duration = Duration::from_secs(60);
 /// A refresh that has not reported back after this long is presumed dead,
 /// so it cannot suppress every later refresh (see `herd_scan_is_due`).
 const WSL_DISTRO_WATCHDOG: Duration = Duration::from_secs(30);
-/// Upper bound on any single `wsl.exe` invocation made by this module.
-pub(crate) const WSL_COMMAND_TIMEOUT: Duration = config::WSL_COMMAND_TIMEOUT;
 
 #[derive(Default)]
 struct DistroCache {
@@ -150,18 +148,44 @@ pub fn wsl_domains(config: &config::ConfigHandle) -> Vec<WslDomain> {
 ///
 /// A bare `Command::new("wsl.exe")` from a GUI process allocates a visible
 /// console per call — the "ten cmd windows at startup" bug.
-pub(crate) fn run_wsl_hidden(args: &[&str], timeout: Duration) -> Option<String> {
+pub(crate) fn run_wsl_hidden(args: &[&str], timeout: Duration) -> Result<String, WslRunError> {
     let mut cmd = config::hidden_wsl_command();
     cmd.args(args);
     // Killed on timeout, and output a lingering Linux process keeps the pipe
     // open for is abandoned rather than waited on.
-    let output = config::output_with_timeout(cmd, timeout).ok()?;
+    let output = config::output_with_timeout(cmd, timeout).map_err(|err| {
+        if err.is::<config::WslCommandTimedOut>() {
+            WslRunError::TimedOut
+        } else {
+            WslRunError::Failed(format!("{err:#}"))
+        }
+    })?;
     if !output.status.success() {
-        return None;
+        // `wsl.exe`'s own complaints are UTF-16; a Linux program's are not.
+        let stderr: String = config::decode_wsl_output(&output.stderr)
+            .trim()
+            .chars()
+            .take(300)
+            .collect();
+        return Err(WslRunError::Failed(format!("{}: {stderr}", output.status)));
     }
     // What a Linux program printed, passed through by `wsl.exe` untouched.
-    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
+
+/// Why [`run_wsl_hidden`] has no output to offer.
+#[derive(Debug)]
+pub(crate) enum WslRunError {
+    /// No answer before the timeout; the child was killed.
+    TimedOut,
+    /// It could not start, or exited unsuccessfully (with its stderr).
+    Failed(String),
+}
+
+/// Upper bound on one agent probe. Longer than [`config::WSL_COMMAND_TIMEOUT`]: it
+/// runs off the GUI thread, and asking a stopped distro first boots its VM,
+/// which on a cold start can take longer than ten seconds.
+const WSL_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Which shell found an agent inside WSL, and therefore which shell must
 /// launch it.
@@ -299,23 +323,30 @@ pub(crate) fn probe_wsl_agents(
         };
         let found = match remembered {
             Some(found) => found,
-            None => {
-                let found = probe_distro(distro, users.get(&distro.name), &missing);
-                for (program, shell) in &found {
-                    log::info!(
-                        "wsl agent probe: found {program} in {} ({shell:?})",
-                        distro.name
+            None => match probe_distro(distro, users.get(&distro.name), &missing) {
+                Some(found) => {
+                    for (program, shell) in &found {
+                        log::info!(
+                            "wsl agent probe: found {program} in {} ({shell:?})",
+                            distro.name
+                        );
+                    }
+                    if found.is_empty() {
+                        log::debug!("wsl agent probe: none of {missing:?} in {}", distro.name);
+                    }
+                    PROBED_DISTROS.lock().unwrap().insert(
+                        distro.name.clone(),
+                        ProbedDistro {
+                            asked: missing.clone(),
+                            found: found.clone(),
+                        },
                     );
+                    found
                 }
-                PROBED_DISTROS.lock().unwrap().insert(
-                    distro.name.clone(),
-                    ProbedDistro {
-                        asked: missing.clone(),
-                        found: found.clone(),
-                    },
-                );
-                found
-            }
+                // No answer is not "not installed": remembering it would
+                // hide the distro's agents for the rest of the session.
+                None => std::collections::HashMap::new(),
+            },
         };
         for (program, shell) in found {
             if missing.contains(&program) {
@@ -330,13 +361,15 @@ pub(crate) fn probe_wsl_agents(
 }
 
 /// Ask one distro which of `programs` it has, trying `bash -lic` and then
-/// `sh -lc` for whatever the first did not find.
+/// `sh -lc` for whatever the first did not find. `None` when the distro gave
+/// no answer at all, which must not be mistaken for "none installed".
 fn probe_distro(
     distro: &WslDistro,
     user: Option<&String>,
     programs: &[String],
-) -> std::collections::HashMap<String, WslProbeShell> {
+) -> Option<std::collections::HashMap<String, WslProbeShell>> {
     let mut found = std::collections::HashMap::new();
+    let mut answered = false;
     for shell in [WslProbeShell::BashInteractive, WslProbeShell::ShLogin] {
         let missing: Vec<&str> = programs
             .iter()
@@ -355,15 +388,33 @@ fn probe_distro(
         // the user's shell to re-parse.
         args.extend(["--exec", sh, flags, WSL_PROBE_SCRIPT, sh]);
         args.extend(missing.iter().copied());
-        let Some(output) = run_wsl_hidden(&args, WSL_COMMAND_TIMEOUT) else {
-            continue;
+        let output = match run_wsl_hidden(&args, WSL_PROBE_TIMEOUT) {
+            Ok(output) => output,
+            Err(WslRunError::TimedOut) => {
+                log::info!(
+                    "wsl agent probe: {} did not answer within {WSL_PROBE_TIMEOUT:?}",
+                    distro.name
+                );
+                // An unresponsive distro will not answer the next shell
+                // either; waiting for it again only delays the others.
+                break;
+            }
+            Err(WslRunError::Failed(reason)) => {
+                // Typically the shell does not exist (no bash); `sh` next.
+                log::info!(
+                    "wsl agent probe: {} via {shell:?} failed: {reason}",
+                    distro.name
+                );
+                continue;
+            }
         };
+        answered = true;
         let asked: Vec<String> = missing.iter().map(|program| program.to_string()).collect();
         for program in parse_wsl_probe_output(&output, &asked) {
             found.entry(program).or_insert(shell);
         }
     }
-    found
+    answered.then_some(found)
 }
 
 /// `command` started in `distro` through `wsl.exe` from a Windows shell, for
