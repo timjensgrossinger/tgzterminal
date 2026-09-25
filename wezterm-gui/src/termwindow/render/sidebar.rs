@@ -6089,8 +6089,42 @@ impl crate::TermWindow {
             // `wsl_paths::cached_distros`, whose state may not be known yet
             // on a cold start: the probe must know what is running to avoid
             // booting distros.
-            let distros = wsl_paths::load_distros_with_state().unwrap_or_default();
+            let started = Instant::now();
+            let distros = match wsl_paths::load_distros_with_state() {
+                Ok(distros) => distros,
+                Err(err) => {
+                    log::info!("wsl agent probe: could not list distros: {err:#}");
+                    vec![]
+                }
+            };
+            if !distros.is_empty() {
+                let names: Vec<String> = distros
+                    .iter()
+                    .map(|distro| {
+                        let mut name = distro.name.clone();
+                        if distro.is_default {
+                            name.push_str(" (default)");
+                        }
+                        if distro.is_running() {
+                            name.push_str(" (running)");
+                        }
+                        name
+                    })
+                    .collect();
+                log::info!(
+                    "wsl agent probe: asking {} for {} programs",
+                    names.join(", "),
+                    programs.len()
+                );
+            }
             let hits = wsl_paths::probe_wsl_agents(&distros, &users, &programs);
+            if !distros.is_empty() {
+                log::info!(
+                    "wsl agent probe: done in {:?}, {} found",
+                    started.elapsed(),
+                    hits.len()
+                );
+            }
             window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
                 term_window.wsl_agent_probe_started_at.set(None);
                 *term_window.wsl_agent_probe.borrow_mut() =

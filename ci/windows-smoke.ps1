@@ -32,7 +32,11 @@ param(
     [string[]]$ExpectLog = @(),
     [string]$OutDir = (Join-Path $env:RUNNER_TEMP 'tgz-smoke'),
     [int]$WindowTimeout = 60,
-    [int]$StaySeconds = 20
+    [int]$StaySeconds = 20,
+    # How long past -StaySeconds to keep it running while -ExpectLog patterns
+    # are still unmatched: background work (a WSL probe while the distro's VM
+    # boots) can legitimately take a while to report.
+    [int]$ExpectTimeout = 90
 )
 
 $ErrorActionPreference = 'Stop'
@@ -153,7 +157,15 @@ if ($dialog) {
 } else {
     Write-Step "Window up: $window"
     $stayUntil = (Get-Date).AddSeconds($StaySeconds)
-    while ((Get-Date) -lt $stayUntil -and -not $proc.HasExited) {
+    $expectUntil = $stayUntil.AddSeconds($ExpectTimeout)
+    while (-not $proc.HasExited) {
+        $now = Get-Date
+        if ($now -ge $expectUntil) { break }
+        if ($now -ge $stayUntil) {
+            $current = (Get-ChildItem $logDir -Filter '*-log-*.txt' -ErrorAction SilentlyContinue |
+                ForEach-Object { Get-Content $_.FullName -Raw -ErrorAction SilentlyContinue }) -join "`n"
+            if (-not ($ExpectLog | Where-Object { $current -notmatch $_ })) { break }
+        }
         Watch-Consoles
         $dialog = [TgzWin]::Visible() | Where-Object { $_.Pid -eq $proc.Id -and $_.Class -eq '#32770' } | Select-Object -First 1
         if ($dialog) { $failures.Add("error dialog: $([TgzWin]::AllText($dialog.Handle))"); break }
