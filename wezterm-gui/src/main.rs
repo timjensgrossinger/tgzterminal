@@ -496,6 +496,10 @@ async fn async_run_terminal_gui(
     spawn_tab_in_domain_if_mux_is_empty(cmd, is_connecting, domain, opts.workspace).await
 }
 
+/// How long a new launch waits for an already-running GUI to take its
+/// spawn request before starting a GUI of its own.
+const GUI_HANDOFF_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 #[derive(Debug)]
 enum Publish {
     TryPathOrPublish(PathBuf),
@@ -556,18 +560,21 @@ impl Publish {
                 Ok(client) => {
                     let executor = promise::spawn::ScopedExecutor::new();
                     let command = cmd.clone();
-                    let res = block_on(executor.run(async move {
+                    // A reborrow the future can own, so `self` is usable again
+                    // once the hand-off has finished or been abandoned.
+                    let this = &mut *self;
+                    let handoff = executor.run(async move {
                         let vers = client.verify_version_compat(&mut ui).await?;
 
                         if vers.executable_path != std::env::current_exe().context("resolve executable path")? {
-                            *self = Publish::NoConnectNoPublish;
+                            *this = Publish::NoConnectNoPublish;
                             anyhow::bail!(
                                 "Running GUI is a different executable from us, will start a new one");
                         }
                         if vers.config_file_path
                             != std::env::var_os("WEZTERM_CONFIG_FILE").map(Into::into)
                         {
-                            *self = Publish::NoConnectNoPublish;
+                            *this = Publish::NoConnectNoPublish;
                             anyhow::bail!(
                                 "Running GUI has different config from us, will start a new one"
                             );
@@ -618,7 +625,29 @@ impl Publish {
                                 ).to_string(),
                             })
                             .await
-                    }));
+                    });
+                    // Every request above is answered on the running instance's
+                    // GUI thread. If that thread is hung, the client would wait
+                    // out its 60s timeout with no window on screen before
+                    // starting one anyway, and every later launch would do the
+                    // same. Give it a few seconds, then start our own GUI and
+                    // take over the published socket so later launches find us.
+                    let res = block_on(smol::future::or(
+                        async move { Some(handoff.await) },
+                        async {
+                            smol::Timer::after(GUI_HANDOFF_TIMEOUT).await;
+                            None
+                        },
+                    ));
+                    let Some(res) = res else {
+                        log::warn!(
+                            "The running GUI instance did not answer within {:?}; \
+                             starting a new one",
+                            GUI_HANDOFF_TIMEOUT
+                        );
+                        *self = Publish::NoConnectButPublish;
+                        return Ok(false);
+                    };
 
                     match res {
                         Ok(res) => {
@@ -801,6 +830,20 @@ fn fatal_toast_notification(title: &str, message: &str) {
     std::thread::sleep(std::time::Duration::new(2, 0));
 }
 
+/// A blocking error dialog, for an error the GUI is about to exit over.
+///
+/// Windows only. A GUI-subsystem process has no console, and a toast is easy
+/// to miss (and is not delivered at all without a registered Start Menu
+/// shortcut), so a startup failure otherwise looks like a busy cursor and then
+/// nothing -- which is exactly how every such failure was reported. The dialog
+/// names the log file (see `set_fatal_error_hint` in `run`).
+fn show_fatal_dialog(message: &str) {
+    #[cfg(windows)]
+    ::window::os::windows::show_fatal_error(crate::brand::PRODUCT_NAME, message);
+    #[cfg(not(windows))]
+    let _ = message;
+}
+
 fn notify_on_panic() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -814,6 +857,10 @@ fn notify_on_panic() {
 fn terminate_with_error_message(err: &str) -> ! {
     log::error!("{}; terminating", err);
     fatal_toast_notification("Wezterm Error", &err);
+    show_fatal_dialog(&format!(
+        "{} stopped because of an error:\n\n{err}",
+        crate::brand::PRODUCT_NAME
+    ));
     std::process::exit(1);
 }
 
@@ -836,8 +883,21 @@ fn main() {
     config::designate_this_as_the_main_thread();
     config::assign_error_callback(mux::connui::show_configuration_error_message);
     notify_on_panic();
-    if let Err(e) = run() {
-        terminate_with_error(e);
+    // A panic that unwinds all the way out of the GUI is fatal; say so rather
+    // than vanish. (The hook has logged it already. Panics Lua callbacks
+    // raise are caught by mlua and never get here, which is why the hook
+    // itself does not show a dialog.)
+    match std::panic::catch_unwind(run) {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => terminate_with_error(e),
+        Err(payload) => {
+            show_fatal_dialog(&format!(
+                "{} stopped because of an internal error:\n\n{}",
+                crate::brand::PRODUCT_NAME,
+                env_bootstrap::panic_message(&*payload),
+            ));
+            std::process::exit(1);
+        }
     }
     Mux::shutdown();
     frontend::shutdown();
@@ -1220,6 +1280,14 @@ fn run() -> anyhow::Result<()> {
     };
 
     env_bootstrap::bootstrap();
+    // Every fatal-error dialog names the file a bug report needs.
+    #[cfg(windows)]
+    if let Some(path) = env_bootstrap::ringlog::log_file_path() {
+        ::window::os::windows::set_fatal_error_hint(format!(
+            "Details are in the log file:\n{}",
+            path.display()
+        ));
+    }
     // window_funcs is not set up by env_bootstrap as window_funcs is
     // GUI environment specific and env_bootstrap is used to setup the
     // headless mux server.

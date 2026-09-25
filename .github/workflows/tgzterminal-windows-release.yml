@@ -11,19 +11,53 @@ name: TGZTerminal Windows Release
 #     wezterm.lua next to the binaries outrank the user's own config; the
 #     installed build deliberately has no marker and so ignores that directory.
 #   * A .sha256 sidecar for each.
-# Both use the ANGLE GL backend bundled in assets/windows. x64 only: the
-# vendored ANGLE/conpty/OpenConsole/mesa/fzf payload is x64, so arm64 machines
-# run the x64 build under emulation.
+# Rendering goes through the system's OpenGL (WGL) first and falls back to the
+# ANGLE libraries bundled from assets/windows when that is missing or too old
+# (a VM, a basic display driver, these runners); mesa is used for
+# front_end="Software" and RDP sessions. x64 only: the vendored
+# ANGLE/conpty/OpenConsole/mesa/fzf payload is x64, so arm64 machines run the
+# x64 build under emulation.
+#
+# Every build is installed and launched by ci/windows-smoke.ps1, twice: as
+# installed, and inside a WSL setup. A build that does not open a window, shows
+# an error dialog, flashes a console or logs a panic fails the run, and nothing
+# is published -- every Windows startup failure shipped so far looked like
+# "busy cursor, then nothing", which no earlier step could see.
 #
 # NOTE: if the fork's additive code does not compile on windows-msvc, the build
 # step is where that surfaces — fix compile errors and re-tag.
 #
-# Manual runs (workflow_dispatch) build and upload the portable zip as a CI
-# artifact only; they do not publish a Release.
+# Manual runs (workflow_dispatch) and pushes to main that touch the Windows
+# build run everything except publishing: the artifacts and the smoke-test
+# evidence are uploaded to the run instead.
+#
+# Optional, off until configured (repository secrets/variables):
+#   * SignPath code signing -- vars.SIGNPATH_ORGANIZATION_ID,
+#     vars.SIGNPATH_PROJECT_SLUG, vars.SIGNPATH_SIGNING_POLICY_SLUG and
+#     secrets.SIGNPATH_API_TOKEN. Signs the binaries before they are packaged
+#     and the Setup exe after. See README "Windows (beta)".
+#   * winget -- secrets.WINGET_TOKEN (a classic PAT with public_repo, from the
+#     account whose fork of microsoft/winget-pkgs receives the branch). Opens
+#     the winget-pkgs PR for each release once the package exists there.
 
 on:
   push:
     tags: ["tgz-v*"]
+    # Path filters do not apply to tag pushes.
+    branches: [main]
+    paths:
+      - ".github/workflows/tgzterminal-windows-release.yml"
+      - "ci/windows-smoke.ps1"
+      - "ci/tgzterminal-windows-installer.iss"
+      - "Cargo.lock"
+      - "assets/windows/**"
+      - "config/**"
+      - "env-bootstrap/**"
+      - "mux/**"
+      - "pty/**"
+      - "wezterm-gui/**"
+      - "wezterm-toast-notification/**"
+      - "window/**"
   workflow_dispatch:
 
 permissions:
@@ -38,9 +72,13 @@ env:
 
 jobs:
   windows:
-    name: Build & publish Windows release
+    name: Build and smoke-test Windows release
     runs-on: windows-latest
     if: github.repository != 'wezterm/wezterm'
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      is_release: ${{ steps.ver.outputs.is_release }}
+      winget_version: ${{ steps.ver.outputs.winget_version }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -70,12 +108,15 @@ jobs:
           # tgz-vYYYY.MM.PATCH form: tgz-v2026.08.5 -> 2026.8.5.0.
           if [[ "${VERSION}" =~ ^tgz-v([0-9]+)\.0*([0-9]+)\.0*([0-9]+)$ ]]; then
             VINFO="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}.0"
+            WINGET_VERSION="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}"
           else
             VINFO="0.0.0.0"
+            WINGET_VERSION=""
           fi
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "is_release=${IS_RELEASE}" >> "$GITHUB_OUTPUT"
           echo "vinfo=${VINFO}" >> "$GITHUB_OUTPUT"
+          echo "winget_version=${WINGET_VERSION}" >> "$GITHUB_OUTPUT"
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -92,6 +133,35 @@ jobs:
         run: |
           PATH C:\Strawberry\perl\bin;%PATH%
           cargo build --release -p wezterm -p wezterm-gui -p wezterm-mux-server -p strip-ansi-escapes
+
+      # Code signing, off until the SignPath variables are set (see the header).
+      # The binaries are signed here, before anything packages them, so the
+      # zip and the installer both carry signed executables.
+      - name: Upload binaries for signing
+        id: unsigned-binaries
+        if: vars.SIGNPATH_ORGANIZATION_ID != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-binaries
+          path: |
+            target/release/tgzterminal.exe
+            target/release/wezterm-gui.exe
+            target/release/wezterm-mux-server.exe
+            target/release/strip-ansi-escapes.exe
+          if-no-files-found: error
+
+      - name: Sign binaries (SignPath)
+        if: vars.SIGNPATH_ORGANIZATION_ID != ''
+        uses: signpath/github-action-submit-signing-request@v2
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          artifact-configuration-slug: binaries
+          github-artifact-id: ${{ steps.unsigned-binaries.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: target/release
 
       - name: Stage portable package
         shell: bash
@@ -196,6 +266,58 @@ jobs:
           test -f "${setup}.exe"
           echo "SETUP_EXE=${setup}.exe" >> "$GITHUB_ENV"
 
+      - name: Upload installer for signing
+        id: unsigned-installer
+        if: vars.SIGNPATH_ORGANIZATION_ID != '' && env.SETUP_EXE != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-installer
+          path: ${{ env.SETUP_EXE }}
+          if-no-files-found: error
+
+      - name: Sign installer (SignPath)
+        if: vars.SIGNPATH_ORGANIZATION_ID != '' && env.SETUP_EXE != ''
+        uses: signpath/github-action-submit-signing-request@v2
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          artifact-configuration-slug: installer
+          github-artifact-id: ${{ steps.unsigned-installer.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: .
+
+      - name: Signature report
+        shell: pwsh
+        run: |
+          $files = @(Get-ChildItem target/release/*.exe) + @(Get-ChildItem TGZTerminal-Setup-*.exe -ErrorAction SilentlyContinue)
+          $files | ForEach-Object {
+            $sig = Get-AuthenticodeSignature $_.FullName
+            "{0,-40} {1,-12} {2}" -f $_.Name, $sig.Status, $sig.SignerCertificate.Subject
+          }
+
+      # The gate. The installer is exercised when it built; otherwise the
+      # portable tree the zip was made from, which is the same binaries.
+      - name: Smoke test
+        shell: pwsh
+        run: |
+          $smoke = @{ OutDir = "smoke-default"; ExpectLog = @('OpenGL: ') }
+          if ($env:SETUP_EXE) {
+            $smoke.Installer = (Resolve-Path $env:SETUP_EXE).Path
+          } else {
+            $smoke.AppDir = (Resolve-Path "TGZTerminal-windows-portable-${{ steps.ver.outputs.version }}").Path
+          }
+          ./ci/windows-smoke.ps1 @smoke
+
+      - name: Upload smoke-test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-default
+          path: smoke-default
+          if-no-files-found: ignore
+
       - name: Checksums
         shell: bash
         run: |
@@ -225,14 +347,124 @@ jobs:
             *.sha256
           if-no-files-found: error
 
+  # The same build inside WSL: a pane in a WSL domain, an agent CLI installed
+  # only inside the distro. This is the setup the "no window" and "console
+  # storm" reports came from. When the runner cannot provide WSL at all the job
+  # says so and passes; it fails only when WSL is there and the app misbehaves.
+  smoke-wsl:
+    name: Smoke-test in WSL (WSL ${{ matrix.wsl-version }})
+    needs: windows
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        wsl-version: [2, 1]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Download build
+        uses: actions/download-artifact@v4
+        with:
+          name: TGZTerminal-windows
+
+      - name: Set up WSL
+        id: wsl
+        continue-on-error: true
+        uses: Vampire/setup-wsl@v7
+        with:
+          wsl-version: ${{ matrix.wsl-version }}
+          set-as-default: "true"
+
+      - name: WSL unavailable
+        if: steps.wsl.outcome != 'success'
+        run: echo "::warning::This runner could not set up WSL ${{ matrix.wsl-version }}; the WSL smoke test did not run."
+
+      - name: Smoke test with a WSL default domain
+        if: steps.wsl.outcome == 'success'
+        shell: pwsh
+        run: |
+          # The distro setup-wsl registered, read the way the app reads it.
+          $lxss = Get-Item 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Lxss'
+          $default = $lxss.GetValue('DefaultDistribution')
+          $distro = (Get-ItemProperty "$($lxss.PSPath)\$default").DistributionName
+          Write-Host "WSL distro: $distro"
+          # An agent CLI that exists only inside the distro.
+          wsl.exe -d $distro -u root --exec sh -c 'printf "#!/bin/sh\nexit 0\n" > /usr/local/bin/claude && chmod +x /usr/local/bin/claude'
+          if ($LASTEXITCODE -ne 0) { throw "could not install the stub agent into $distro" }
+          $config = Join-Path $env:RUNNER_TEMP 'wsl-smoke.lua'
+          Set-Content -Path $config -Encoding utf8 -Value "return { default_domain = 'WSL:$distro' }"
+
+          $setup = Get-ChildItem TGZTerminal-Setup-*.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+          $smoke = @{
+            OutDir = "smoke-wsl"
+            Config = $config
+            ExpectLog = @('OpenGL: ', "wsl agent probe: found claude in $([regex]::Escape($distro))")
+          }
+          if ($setup) {
+            $smoke.Installer = $setup.FullName
+          } else {
+            $zip = Get-ChildItem TGZTerminal-windows-portable-*.zip | Select-Object -First 1
+            Expand-Archive $zip.FullName -DestinationPath portable
+            $smoke.AppDir = (Get-ChildItem portable -Directory | Select-Object -First 1).FullName
+          }
+          ./ci/windows-smoke.ps1 @smoke
+
+      - name: Upload smoke-test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-wsl-${{ matrix.wsl-version }}
+          path: smoke-wsl
+          if-no-files-found: ignore
+
+  publish:
+    name: Publish Windows release
+    needs: [windows, smoke-wsl]
+    # Explicit, though a condition without a status function implies it: a
+    # failed smoke test means nothing is published.
+    if: success() && needs.windows.outputs.is_release == '1'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download build
+        uses: actions/download-artifact@v4
+        with:
+          name: TGZTerminal-windows
+
       - name: Publish to GitHub Release
-        if: steps.ver.outputs.is_release == '1'
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ needs.windows.outputs.version }}
           files: |
             TGZTerminal-windows-portable-*.zip
             TGZTerminal-Setup-*.exe
             *.sha256
           # The Setup exe is best-effort and may legitimately be absent; the
-          # Checksums step above already hard-fails if the zip is missing.
+          # Checksums step already hard-fails if the zip is missing.
           fail_on_unmatched_files: false
+
+  # `winget install TimGrossinger.TGZTerminal` downloads outside the browser,
+  # so it never shows the "not commonly downloaded" warning. Opens the
+  # winget-pkgs PR for this version; the package's first version has to be
+  # submitted by hand (see README), after which this keeps it current.
+  winget:
+    name: Submit to winget
+    needs: [windows, publish]
+    if: success() && needs.windows.outputs.is_release == '1'
+    runs-on: windows-latest
+    env:
+      WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+    steps:
+      - name: winget not configured
+        if: env.WINGET_TOKEN == ''
+        run: echo "::notice::WINGET_TOKEN is not set; skipping the winget submission."
+
+      - name: Submit to winget-pkgs
+        if: env.WINGET_TOKEN != ''
+        uses: vedantmgoyal9/winget-releaser@v2
+        with:
+          identifier: TimGrossinger.TGZTerminal
+          version: ${{ needs.windows.outputs.winget_version }}
+          release-tag: ${{ needs.windows.outputs.version }}
+          installers-regex: '^TGZTerminal-Setup-.*\.exe$'
+          token: ${{ env.WINGET_TOKEN }}

@@ -1,4 +1,4 @@
-use crate::termwindow::{RenderFrame, ScrollHit, TermWindowNotif, UIItemType};
+use crate::termwindow::{RenderFrame, TermWindowNotif, UIItemType};
 use ::window::bitmaps::atlas::OutOfTextureSpace;
 use ::window::WindowOps;
 use anyhow::Context;
@@ -338,15 +338,16 @@ impl crate::TermWindow {
             return Ok(());
         }
 
-        let thumb_y_offset = border.top.get();
-        let bottom_offset = border.bottom.get();
-        let track_height = self
-            .dimensions
-            .pixel_height
-            .saturating_sub(thumb_y_offset + bottom_offset);
-        if track_height == 0 {
+        let current_viewport = self.get_viewport(pane.pane_id());
+        // Nothing beyond the current viewport to scroll to (a fresh pane, or
+        // one pinned to the alternate/managed screen some full-screen TUIs
+        // use): a thumb spanning the whole track reads as "stuck", so skip
+        // drawing it entirely rather than show a misleading permanently-full
+        // bar. The same geometry drives render/pane.rs's hit-test
+        // registration and the drag handler.
+        let Some(geometry) = self.scroll_bar_geometry(&*pane, current_viewport) else {
             return Ok(());
-        }
+        };
 
         let thumb_x = self
             .dimensions
@@ -355,14 +356,13 @@ impl crate::TermWindow {
         let mouse_over_scrollbar = self.current_mouse_event.as_ref().is_some_and(|event| {
             event.coords.x >= thumb_x as isize
                 && event.coords.x <= (thumb_x + padding as usize + border.right.get()) as isize
-                && event.coords.y >= thumb_y_offset as isize
-                && event.coords.y <= self.dimensions.pixel_height as isize
+                && event.coords.y >= geometry.track_top as isize
+                && event.coords.y <= geometry.track_bottom as isize
         });
         let dragging_scrollbar = matches!(
             self.dragging.as_ref().map(|(item, _)| &item.item_type),
             Some(UIItemType::ScrollThumb)
         );
-        let current_viewport = self.get_viewport(pane.pane_id());
         let expanded = !self.config.scroll_bar_auto_hide
             || mouse_over_scrollbar
             || dragging_scrollbar
@@ -380,38 +380,15 @@ impl crate::TermWindow {
         let visible_track_x = visual_right - track_width;
         let foreground = self.palette().foreground.to_linear();
         let color = foreground.mul_alpha(if expanded { 0.56 } else { 0.44 });
-        let top_inset = (16. * dpi_scale).clamp(16., 32.);
-        let rail_y = thumb_y_offset as f32 + top_inset;
-        let rail_h = (track_height as f32 - top_inset * 2.).max(0.);
-        if rail_h <= 0. {
-            return Ok(());
-        }
-
-        // Nothing beyond the current viewport to scroll to (a fresh pane, or
-        // one pinned to the alternate/managed screen some full-screen TUIs
-        // use): a thumb spanning the whole track reads as "stuck", so skip
-        // drawing it entirely rather than show a misleading permanently-full
-        // bar. Mirrored in render/pane.rs's hit-test registration.
-        let render_dims = pane.get_dimensions();
-        if render_dims.scrollback_rows <= render_dims.viewport_rows {
-            return Ok(());
-        }
-
-        let info = ScrollHit::thumb(
-            &*pane,
-            current_viewport,
-            rail_h as usize,
-            self.min_scroll_bar_height() as usize,
-        );
 
         self.sidebar_pill_fill(
             layers,
             2,
             euclid::rect(
                 visible_track_x,
-                rail_y + info.top as f32,
+                geometry.thumb_top() as f32,
                 track_width,
-                info.height as f32,
+                geometry.thumb.height as f32,
             ),
             track_width * 0.5,
             color,

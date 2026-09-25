@@ -5,7 +5,7 @@ use crate::termwindow::render::{
     same_hyperlink, CursorProperties, LineQuadCacheKey, LineQuadCacheValue, LineToEleShapeCacheKey,
     RenderScreenLineParams,
 };
-use crate::termwindow::{ScrollHit, UIItem, UIItemType};
+use crate::termwindow::{UIItem, UIItemType};
 use ::window::bitmaps::TextureRect;
 use ::window::DeadKeyStatus;
 use anyhow::Context;
@@ -68,10 +68,10 @@ impl crate::TermWindow {
         } else {
             0.
         };
-        let (top_bar_height, bottom_bar_height) = if self.config.tab_bar_at_bottom {
-            (0.0, tab_bar_height)
+        let top_bar_height = if self.config.tab_bar_at_bottom {
+            0.0
         } else {
-            (tab_bar_height, 0.0)
+            tab_bar_height
         };
 
         let border = self.get_os_border();
@@ -232,51 +232,46 @@ impl crate::TermWindow {
         // one pinned to the alternate/managed screen some full-screen TUIs
         // use): a thumb spanning the whole track reads as "stuck", so skip
         // drawing and hit-testing it entirely rather than show a misleading
-        // permanently-full bar.
-        if pos.is_active && self.show_scroll_bar && dims.scrollback_rows > dims.viewport_rows {
-            let thumb_y_offset = top_bar_height as usize + border.top.get();
-
-            let min_height = self.min_scroll_bar_height();
-
-            let info = ScrollHit::thumb(
-                &*pos.pane,
-                current_viewport,
-                self.dimensions.pixel_height.saturating_sub(
-                    thumb_y_offset + border.bottom.get() + bottom_bar_height as usize,
-                ),
-                min_height as usize,
-            );
-            let abs_thumb_top = thumb_y_offset + info.top;
-            let thumb_size = info.height;
-            // Adjust the scrollbar thumb position
+        // permanently-full bar. The geometry is the one the painter uses, so
+        // the clickable thumb is exactly where the pill is drawn.
+        let scroll_bar = if pos.is_active && self.show_scroll_bar {
+            self.scroll_bar_geometry(&*pos.pane, current_viewport)
+        } else {
+            None
+        };
+        if let Some(geometry) = scroll_bar {
             let config = &self.config;
-            let padding = self.effective_right_padding(&config) as f32;
+            let padding = self.effective_right_padding(&config);
 
-            let thumb_x = self.dimensions.pixel_width - padding as usize - border.right.get();
+            let thumb_x = self
+                .dimensions
+                .pixel_width
+                .saturating_sub(padding + border.right.get());
+            let (hit_top, hit_height) = geometry.thumb_hit();
 
             // Register the scroll bar location
             self.ui_items.push(UIItem {
                 x: thumb_x,
-                width: padding as usize,
-                y: thumb_y_offset,
-                height: info.top,
+                width: padding,
+                y: geometry.track_top,
+                height: hit_top.saturating_sub(geometry.track_top),
                 item_type: UIItemType::AboveScrollThumb,
             });
             self.ui_items.push(UIItem {
                 x: thumb_x,
-                width: padding as usize,
-                y: abs_thumb_top,
-                height: thumb_size,
+                width: padding,
+                y: hit_top,
+                height: hit_height,
                 item_type: UIItemType::ScrollThumb,
             });
             self.ui_items.push(UIItem {
                 x: thumb_x,
-                width: padding as usize,
-                y: abs_thumb_top + thumb_size,
+                width: padding,
+                y: hit_top + hit_height,
                 height: self
                     .dimensions
                     .pixel_height
-                    .saturating_sub(abs_thumb_top + thumb_size),
+                    .saturating_sub(hit_top + hit_height),
                 item_type: UIItemType::BelowScrollThumb,
             });
         }

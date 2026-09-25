@@ -3,7 +3,7 @@ use crate::tabbar::TabBarItem;
 use crate::termwindow::{
     AgentLaunchMenuState, AgentRowAction, CloseTabMenuAction, CloseTabMenuState, CloseTabSource,
     ExpandedMenuRow, GuiWin, MouseCapture, PaneCopyAction, PaneCopyMenuState, PaneToolbeltAction,
-    PositionedSplit, ScrollHit, SshLaunchMenuState, TermWindowNotif, UIItem, UIItemType, TMB,
+    PositionedSplit, SshLaunchMenuState, TermWindowNotif, UIItem, UIItemType, TMB,
 };
 use ::window::{
     CursorIcon, MouseButtons as WMB, MouseEvent, MouseEventKind as WMEK, MousePress,
@@ -544,38 +544,15 @@ impl super::TermWindow {
         let dims = pane.get_dimensions();
         let current_viewport = self.get_viewport(pane.pane_id());
 
-        let tab_bar_height = if self.show_tab_bar && !self.sidebar_is_active() {
-            self.tab_bar_pixel_height().unwrap_or(0.)
-        } else {
-            0.
+        // Same geometry the pill was painted and hit-tested with; `item` is
+        // the grab box as it was when the drag started, so the thumb moves by
+        // exactly the distance the pointer has.
+        let Some(geometry) = self.scroll_bar_geometry(&*pane, current_viewport) else {
+            return;
         };
-        let (top_bar_height, bottom_bar_height) = if self.config.tab_bar_at_bottom {
-            (0.0, tab_bar_height)
-        } else {
-            (tab_bar_height, 0.0)
-        };
-
-        let border = self.get_os_border();
-        let y_offset = top_bar_height + border.top.get() as f32;
-
-        let from_top = start_event.coords.y.saturating_sub(item.y as isize);
-        let effective_thumb_top = event
-            .coords
-            .y
-            .saturating_sub(y_offset as isize + from_top)
-            .max(0) as usize;
-
-        // Convert thumb top into a row index by reversing the math
-        // in ScrollHit::thumb
-        let row = ScrollHit::thumb_top_to_scroll_top(
-            effective_thumb_top,
-            &*pane,
-            current_viewport,
-            self.dimensions.pixel_height.saturating_sub(
-                y_offset as usize + border.bottom.get() + bottom_bar_height as usize,
-            ),
-            self.min_scroll_bar_height() as usize,
-        );
+        let thumb_top =
+            geometry.dragged_thumb_top(item.y, event.coords.y.saturating_sub(start_event.coords.y));
+        let row = geometry.scroll_top_for(thumb_top, &dims, current_viewport);
         self.set_viewport(pane.pane_id(), Some(row), dims);
         self.dragging.replace((item, start_event));
     }

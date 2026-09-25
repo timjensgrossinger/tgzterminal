@@ -426,6 +426,7 @@ impl GuiFrontEnd {
 
         // then spawn any new windows that are needed
         promise::spawn::spawn(async move {
+            let mut failed: Option<anyhow::Error> = None;
             while let Some(mux_window_id) = mux_windows.next() {
                 if front_end().has_mux_window(mux_window_id)
                     || front_end()
@@ -448,6 +449,16 @@ impl GuiFrontEnd {
                         .spawned_mux_window
                         .borrow_mut()
                         .remove(&mux_window_id);
+                    failed.get_or_insert(err);
+                }
+            }
+            // Not one window could be opened and none exists: nothing is left
+            // to show the user, and the startup activity keeps the process
+            // alive -- a windowless zombie that later launches then hand
+            // their spawn to. Exit with the reason instead.
+            if let Some(err) = failed {
+                if front_end().known_windows.borrow().is_empty() {
+                    crate::terminate_with_error(err.context("could not open a window"));
                 }
             }
             *front_end().switching_workspaces.borrow_mut() = false;

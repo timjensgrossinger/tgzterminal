@@ -2992,6 +2992,95 @@ fn find_git_branch(mut dir: &Path) -> Option<String> {
     }
 }
 
+/// Results of filesystem walks over network (UNC) paths, computed off the
+/// GUI thread.
+///
+/// A WSL pane's cwd arrives as `\\wsl.localhost\<distro>\...` or, from a
+/// shell's OSC 7 `file://<host>/...`, as `\\<host>\...` -- an SMB lookup of
+/// this very machine. The sidebar walks those up to the root looking for
+/// `.git` and project markers every frame, and each miss on such a path can
+/// block for seconds: the "random freezes" with a WSL pane open. Local paths
+/// are still walked inline; they are cheap and callers rely on the answer
+/// being current.
+struct NetworkPathProbes<T> {
+    entries: HashMap<PathBuf, (Instant, Option<T>)>,
+    in_flight: HashSet<PathBuf>,
+}
+
+impl<T> Default for NetworkPathProbes<T> {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+            in_flight: HashSet::new(),
+        }
+    }
+}
+
+/// How long a network-path walk result is reused before it is redone.
+const NETWORK_PATH_PROBE_TTL: Duration = Duration::from_secs(10);
+
+fn is_network_path(path: &Path) -> bool {
+    let text = path.as_os_str().to_string_lossy();
+    text.starts_with(r"\\") || text.starts_with("//")
+}
+
+/// `probe(path)`, inline for a local path; for a network path the last
+/// result (or `None`), with a background refresh started when it is stale.
+fn probe_path_off_thread<T: Clone + Send + 'static>(
+    cache: &'static LazyLock<Mutex<NetworkPathProbes<T>>>,
+    path: &Path,
+    probe: fn(&Path) -> Option<T>,
+) -> Option<T> {
+    if !is_network_path(path) {
+        return probe(path);
+    }
+    let now = Instant::now();
+    let mut probes = cache.lock().unwrap();
+    let cached = probes.entries.get(path).cloned();
+    let fresh = cached
+        .as_ref()
+        .is_some_and(|(at, _)| now.duration_since(*at) < NETWORK_PATH_PROBE_TTL);
+    if !fresh && !probes.in_flight.contains(path) {
+        if probes.entries.len() > 128 {
+            probes.entries.clear();
+        }
+        probes.in_flight.insert(path.to_path_buf());
+        let owned = path.to_path_buf();
+        let spawned = std::thread::Builder::new()
+            .name("sidebar-path-probe".into())
+            .spawn(move || {
+                let answer = probe(&owned);
+                let mut probes = cache.lock().unwrap();
+                probes.in_flight.remove(&owned);
+                probes.entries.insert(owned, (Instant::now(), answer));
+            });
+        if spawned.is_err() {
+            probes.in_flight.remove(path);
+        }
+    }
+    cached.and_then(|(_, answer)| answer)
+}
+
+static GIT_BRANCH_PROBES: LazyLock<Mutex<NetworkPathProbes<String>>> =
+    LazyLock::new(Default::default);
+static PROJECT_ROOT_PROBES: LazyLock<Mutex<NetworkPathProbes<PathBuf>>> =
+    LazyLock::new(Default::default);
+
+/// [`find_git_branch`], never blocking paint on a network path.
+fn git_branch_for(dir: &Path) -> Option<String> {
+    probe_path_off_thread(&GIT_BRANCH_PROBES, dir, find_git_branch)
+}
+
+/// [`crate::agent_herd::project_root_for`], never blocking paint on a
+/// network path.
+fn project_root_off_thread(dir: &Path) -> Option<PathBuf> {
+    probe_path_off_thread(
+        &PROJECT_ROOT_PROBES,
+        dir,
+        crate::agent_herd::project_root_for,
+    )
+}
+
 fn parse_git_head(head: &str) -> Option<String> {
     let head = head.trim();
     head.strip_prefix("ref: refs/heads/")
@@ -3163,10 +3252,25 @@ fn fallback_command_dirs() -> Vec<PathBuf> {
             dirs.push(home.join(rel));
         }
     }
-    dirs.push(PathBuf::from("/opt/homebrew/bin"));
-    dirs.push(PathBuf::from("/usr/local/bin"));
+    if !cfg!(windows) {
+        // On Windows these are relative to the current drive's root, which
+        // for a process started from a network share is a network lookup.
+        dirs.push(PathBuf::from("/opt/homebrew/bin"));
+        dirs.push(PathBuf::from("/usr/local/bin"));
+    }
     dirs
 }
+
+/// How long a [`resolve_command_path`] answer is reused.
+///
+/// Resolving is a `metadata` call per PATH entry -- per `PATHEXT` extension on
+/// Windows, roughly 600 of them for one miss -- and agent-pane detection asks
+/// again for every adapter each time a pane's screen changes. A new install
+/// shows up within this long.
+const COMMAND_RESOLVE_TTL: Duration = Duration::from_secs(30);
+
+static COMMAND_RESOLVE_CACHE: LazyLock<Mutex<HashMap<String, (Instant, Option<PathBuf>)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Absolute path of an installed command, or `None` when it is not installed.
 ///
@@ -3178,6 +3282,24 @@ fn resolve_command_path(command: &str) -> Option<PathBuf> {
     if command.is_empty() {
         return None;
     }
+    let now = Instant::now();
+    if let Some((resolved_at, answer)) = COMMAND_RESOLVE_CACHE.lock().unwrap().get(command) {
+        if now.duration_since(*resolved_at) < COMMAND_RESOLVE_TTL {
+            return answer.clone();
+        }
+    }
+    let answer = resolve_command_path_uncached(command);
+    let mut cache = COMMAND_RESOLVE_CACHE.lock().unwrap();
+    // Keys are adapter and shell program names, a handful; the bound only
+    // guards against a config that templates the program itself.
+    if cache.len() > 256 {
+        cache.clear();
+    }
+    cache.insert(command.to_string(), (now, answer.clone()));
+    answer
+}
+
+fn resolve_command_path_uncached(command: &str) -> Option<PathBuf> {
     let extensions = if cfg!(windows) {
         Some(pathext_list(env::var("PATHEXT").ok().as_deref()))
     } else {
@@ -3280,11 +3402,18 @@ fn command_candidates(path: &Path, extensions: Option<&[String]>) -> Vec<PathBuf
 }
 
 /// `argv` with its program replaced by the resolved path, in a form a pty
-/// can spawn.
+/// can spawn, or `None` when it cannot be started safely.
 ///
 /// `CreateProcessW` cannot start a batch file on its own, and npm installs
-/// agent CLIs on Windows as `.cmd` shims, so those run through `cmd.exe /c`.
-fn spawnable_argv(resolved: &Path, mut argv: Vec<String>) -> Vec<String> {
+/// agent CLIs on Windows as `.cmd` shims. Those are started as the `node`
+/// script they wrap wherever the shim can be read (see [`npm_shim_target`]),
+/// because `cmd.exe /c` re-parses its command line: `&`, `|` or `%` in an
+/// argument (a session title, a `{cwd}` such as `C:\R&D`) would run as
+/// commands, and two quoted items (a path with a space plus an argument with
+/// one) have their quotes stripped. Only a batch file that is not a
+/// recognisable shim still goes through `cmd.exe`, and only when its command
+/// line is one cmd reads back unchanged.
+fn spawnable_argv(resolved: &Path, mut argv: Vec<String>) -> Option<Vec<String>> {
     let program = resolved.to_string_lossy().into_owned();
     let is_batch = resolved
         .extension()
@@ -3295,12 +3424,123 @@ fn spawnable_argv(resolved: &Path, mut argv: Vec<String>) -> Vec<String> {
     } else {
         argv[0] = program;
     }
-    if is_batch {
-        let mut wrapped = vec!["cmd.exe".to_string(), "/c".to_string()];
-        wrapped.extend(argv);
-        return wrapped;
+    if !is_batch {
+        return Some(argv);
     }
-    argv
+    if let Some((node, script)) = cached_npm_shim_target(resolved) {
+        let mut direct = vec![
+            node.to_string_lossy().into_owned(),
+            script.to_string_lossy().into_owned(),
+        ];
+        direct.extend(argv.into_iter().skip(1));
+        return Some(direct);
+    }
+    if !cmd_reads_back_unchanged(&argv) {
+        log::warn!(
+            "not starting {} through cmd.exe: its arguments contain characters \
+             cmd.exe would reinterpret",
+            argv[0]
+        );
+        return None;
+    }
+    let mut wrapped = vec!["cmd.exe".to_string(), "/d".to_string(), "/c".to_string()];
+    wrapped.extend(argv);
+    Some(wrapped)
+}
+
+/// Whether `cmd.exe /d /c <argv>` runs exactly `argv`, given that the pty
+/// quotes an element only when it contains whitespace or a quote.
+fn cmd_reads_back_unchanged(argv: &[String]) -> bool {
+    const CMD_SPECIAL: &[char] = &['&', '|', '<', '>', '^', '%', '!', '"', '(', ')', '\n', '\r'];
+    if argv.iter().any(|arg| arg.contains(CMD_SPECIAL)) {
+        return false;
+    }
+    // More than one quoted element and cmd strips the first and the last
+    // quote of the whole line, splicing the two together.
+    argv.iter()
+        .filter(|arg| arg.is_empty() || arg.contains(char::is_whitespace))
+        .count()
+        <= 1
+}
+
+static NPM_SHIM_CACHE: LazyLock<Mutex<HashMap<PathBuf, (Instant, Option<(PathBuf, PathBuf)>)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// [`npm_shim_target`], remembered for [`COMMAND_RESOLVE_TTL`]: spawnable
+/// argv is rebuilt whenever agent detection asks what a pane can do.
+fn cached_npm_shim_target(shim: &Path) -> Option<(PathBuf, PathBuf)> {
+    let now = Instant::now();
+    if let Some((read_at, target)) = NPM_SHIM_CACHE.lock().unwrap().get(shim) {
+        if now.duration_since(*read_at) < COMMAND_RESOLVE_TTL {
+            return target.clone();
+        }
+    }
+    let target = npm_shim_target(shim);
+    let mut cache = NPM_SHIM_CACHE.lock().unwrap();
+    if cache.len() > 64 {
+        cache.clear();
+    }
+    cache.insert(shim.to_path_buf(), (now, target.clone()));
+    target
+}
+
+/// The `node` and script an npm (or pnpm) `.cmd` shim runs, or `None` when
+/// `shim` is not one or its target is missing.
+///
+/// Mirrors the shim itself: the `node.exe` next to it when there is one,
+/// otherwise the `node` on PATH.
+fn npm_shim_target(shim: &Path) -> Option<(PathBuf, PathBuf)> {
+    let dir = shim.parent()?;
+    // A shim is a few hundred bytes; anything large is not one.
+    if fs::metadata(shim).ok()?.len() > 16 * 1024 {
+        return None;
+    }
+    let text = fs::read_to_string(shim).ok()?;
+    let relative = npm_shim_script(&text)?;
+    let script = relative
+        .split(['\\', '/'])
+        .filter(|part| !part.is_empty())
+        .fold(dir.to_path_buf(), |path, part| path.join(part));
+    if !script.is_file() {
+        return None;
+    }
+    let bundled_node = dir.join("node.exe");
+    let node = if bundled_node.is_file() {
+        bundled_node
+    } else {
+        resolve_command_path("node")?
+    };
+    Some((node, script))
+}
+
+/// The script path, relative to the shim's directory, that a `.cmd` shim
+/// hands to node.
+///
+/// npm's shims (cmd-shim) name it as `"%dp0%\<path>"`, pnpm's as
+/// `"%~dp0\<path>"`; the last such quoted path ending in a JavaScript
+/// extension is the one run with the user's arguments.
+fn npm_shim_script(text: &str) -> Option<String> {
+    const SCRIPT_EXTENSIONS: [&str; 3] = [".js", ".cjs", ".mjs"];
+    let mut found = None;
+    for marker in ["\"%dp0%\\", "\"%~dp0\\"] {
+        let mut rest = text;
+        while let Some(start) = rest.find(marker) {
+            let after = &rest[start + marker.len()..];
+            let Some(end) = after.find('"') else {
+                break;
+            };
+            let candidate = &after[..end];
+            if SCRIPT_EXTENSIONS
+                .iter()
+                .any(|ext| candidate.to_ascii_lowercase().ends_with(ext))
+                && !candidate.contains(['%', '\n', '\r'])
+            {
+                found = Some(candidate.to_string());
+            }
+            rest = &after[end..];
+        }
+    }
+    found
 }
 
 #[allow(dead_code)]
@@ -3331,7 +3571,7 @@ fn resolve_agent_command(
     let argv = expand_agent_command(command, values)?;
     // Absolute path, not the bare name: see `resolve_command_path`.
     let program = resolve_command_path(argv.first()?)?;
-    Some(spawnable_argv(&program, argv))
+    spawnable_argv(&program, argv)
 }
 
 /// The resume command template that applies to `values`.
@@ -3968,8 +4208,10 @@ fn wsl_agent_homes(home_base: Option<&Path>, root_home: Option<&Path>) -> Vec<Pa
     let Some(base) = home_base else {
         return found;
     };
-    // A distro that is not running has no filesystem to read. That is ordinary,
-    // not an error.
+    // No `/home` (or an unreachable share) is ordinary, not an error. Note
+    // that reading a stopped distro's share does not fail -- it boots the
+    // distro -- which is why callers only pass distros that are running (see
+    // `wsl_distro_specs`).
     let Ok(entries) = std::fs::read_dir(base) else {
         return found;
     };
@@ -5721,13 +5963,27 @@ impl crate::TermWindow {
                 // distro's domain, through the shell that found it.
                 let mut launch_domain = adapter.launch_domain.clone();
                 let argv = if let Some(resolved) = resolve_command_path(program) {
-                    spawnable_argv(&resolved, argv.clone())
-                } else if let Some(hit) = wsl_hits.get(program.trim()) {
-                    let Some(domain) = self.wsl_domain_name_for_distro(&hit.distro) else {
+                    let Some(argv) = spawnable_argv(&resolved, argv.clone()) else {
                         continue;
                     };
-                    launch_domain.get_or_insert(domain);
-                    hit.shell.wrap(argv.clone())
+                    argv
+                } else if let Some(hit) = wsl_hits.get(program.trim()) {
+                    let wrapped = hit.shell.wrap(argv.clone());
+                    match self.wsl_domain_name_for_distro(&hit.distro) {
+                        Some(domain) => {
+                            launch_domain.get_or_insert(domain);
+                            wrapped
+                        }
+                        // No registered domain opens that distro (a
+                        // hand-written `wsl_domains` that leaves it out):
+                        // reach it through `wsl.exe` from the local domain
+                        // rather than hide an agent that is installed.
+                        None if launch_domain.is_none() => {
+                            launch_domain = Some("local".to_string());
+                            wsl_paths::wsl_exec_argv(&hit.distro, wrapped)
+                        }
+                        None => continue,
+                    }
                 } else {
                     continue;
                 };
@@ -5829,10 +6085,11 @@ impl crate::TermWindow {
             .collect();
         self.wsl_agent_probe_started_at.set(Some(Instant::now()));
         let future = promise::spawn::spawn_into_new_thread(move || {
-            // Loaded fresh here rather than from `wsl_paths::cached_distros`,
-            // which is empty on a cold start and would make the first probe
-            // find nothing for a whole TTL.
-            let distros = config::WslDistro::load_distro_list().unwrap_or_default();
+            // Loaded fresh here, with running state, rather than from
+            // `wsl_paths::cached_distros`, whose state may not be known yet
+            // on a cold start: the probe must know what is running to avoid
+            // booting distros.
+            let distros = wsl_paths::load_distros_with_state().unwrap_or_default();
             let hits = wsl_paths::probe_wsl_agents(&distros, &users, &programs);
             window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
                 term_window.wsl_agent_probe_started_at.set(None);
@@ -5876,11 +6133,16 @@ impl crate::TermWindow {
         let argv = expand_agent_command(command, values)?;
         let hits = self.wsl_agent_hits();
         let hit = hits.get(argv.first()?.trim())?;
-        let domain = self.wsl_domain_name_for_distro(&hit.distro)?;
-        Some((
-            hit.shell.wrap(argv),
-            Some(SpawnTabDomain::DomainName(domain)),
-        ))
+        let wrapped = hit.shell.wrap(argv);
+        Some(match self.wsl_domain_name_for_distro(&hit.distro) {
+            Some(domain) => (wrapped, Some(SpawnTabDomain::DomainName(domain))),
+            // See `agent_launcher_entries`: no domain opens that distro, so
+            // go through `wsl.exe` from the local domain.
+            None => (
+                wsl_paths::wsl_exec_argv(&hit.distro, wrapped),
+                Some(SpawnTabDomain::DomainName("local".to_string())),
+            ),
+        })
     }
 
     fn resolve_agent_resume_anywhere(
@@ -8335,7 +8597,7 @@ impl crate::TermWindow {
             })
             .or(active_pane);
         let cwd = pane.as_ref().and_then(pane_working_dir);
-        let git_branch = cwd.as_deref().and_then(find_git_branch);
+        let git_branch = cwd.as_deref().and_then(git_branch_for);
         let command = pane
             .as_ref()
             .and_then(|pane| pane.get_foreground_process_name(CachePolicy::AllowStale))
@@ -12420,10 +12682,7 @@ impl crate::TermWindow {
                 // The repo root, not the cwd's parent: `belongs_to_project`
                 // compares roots exactly, so a parent directory made the pane row
                 // fail project scoping whenever the pane sat at the repo root.
-                let project_root = agent
-                    .cwd
-                    .as_deref()
-                    .and_then(crate::agent_herd::project_root_for);
+                let project_root = agent.cwd.as_deref().and_then(project_root_off_thread);
                 // Binding compares this against a session file's own `cwd`. A
                 // session written inside a WSL distro records a Linux path,
                 // while the pane running `wsl.exe` reports a Windows or UNC one,
@@ -12664,7 +12923,7 @@ impl crate::TermWindow {
     fn current_project_root(&self) -> Option<PathBuf> {
         let pane = self.get_active_pane_or_overlay()?;
         let cwd = pane_working_dir(&pane)?;
-        crate::agent_herd::project_root_for(&cwd)
+        project_root_off_thread(&cwd)
     }
 
     /// A pane's cwd in the form a vendor session file would record it.
@@ -12704,17 +12963,42 @@ impl crate::TermWindow {
     /// `distro_for_domain` already prefers a domain's configured distribution
     /// and falls back to stripping the `WSL:` prefix, so a hand-written domain
     /// name still resolves.
+    ///
+    /// Only distros a live pane of this process is running in. Reading a
+    /// distro's `\\wsl.localhost\` share boots it, and the herd scan reads
+    /// every 500ms: scanning every registered distro kept all of them --
+    /// Docker Desktop's included -- running for as long as the terminal was
+    /// open, and re-booted any that stopped. A distro with a pane open is
+    /// running anyway, so reading it costs nothing extra.
     fn wsl_distro_specs(&self) -> Vec<(String, Option<String>)> {
+        if !cfg!(windows) {
+            return vec![];
+        }
+        let mux = Mux::get();
+        let live: HashSet<String> = mux
+            .iter_panes()
+            .iter()
+            .filter(|pane| !pane.is_dead())
+            .filter_map(|pane| mux.get_domain(pane.domain_id()))
+            .filter_map(|domain| wsl_paths::distro_for_domain(domain.domain_name(), &self.config))
+            .collect();
+        if live.is_empty() {
+            return vec![];
+        }
         // The cached accessor, not the raw `Option` field: it supplies the
         // built-in domains for distros the user never named in config, and
         // unlike `Config::wsl_domains()` it does not spawn `wsl.exe` per call.
-        wsl_paths::wsl_domains(&self.config)
+        let mut specs: Vec<(String, Option<String>)> = wsl_paths::wsl_domains(&self.config)
             .iter()
             .filter_map(|domain| {
                 let distro = wsl_paths::distro_for_domain(&domain.name, &self.config)?;
-                Some((distro, domain.username.clone()))
+                live.contains(&distro)
+                    .then(|| (distro, domain.username.clone()))
             })
-            .collect()
+            .collect();
+        specs.sort();
+        specs.dedup();
+        specs
     }
 
     /// Refresh vendor session files without blocking paint on filesystem I/O.
@@ -15950,13 +16234,88 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
     #[test]
     fn batch_shims_run_through_cmd_and_executables_do_not() {
         let argv = vec!["claude".to_string(), "--resume".to_string()];
+        let expected: Vec<String> = ["cmd.exe", "/d", "/c", r"C:\npm\claude.CMD", "--resume"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         assert_eq!(
             spawnable_argv(Path::new(r"C:\npm\claude.CMD"), argv.clone()),
-            vec!["cmd.exe", "/c", r"C:\npm\claude.CMD", "--resume"]
+            Some(expected)
         );
         assert_eq!(
             spawnable_argv(Path::new("/usr/local/bin/claude"), argv),
-            vec!["/usr/local/bin/claude", "--resume"]
+            Some(vec![
+                "/usr/local/bin/claude".to_string(),
+                "--resume".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn batch_files_are_refused_when_cmd_would_reinterpret_the_line() {
+        let shim = Path::new(r"C:\npm\codex.cmd");
+        let with = |arg: &str| vec!["codex".to_string(), arg.to_string()];
+        // An argument cmd would run as a second command.
+        assert_eq!(spawnable_argv(shim, with(r"C:\R&D")), None);
+        assert_eq!(spawnable_argv(shim, with("%PATH%")), None);
+        // Two quoted elements: cmd would strip the outer quotes and splice them.
+        assert_eq!(
+            spawnable_argv(Path::new(r"C:\Users\Jo Doe\npm\codex.cmd"), with("a b")),
+            None
+        );
+        // One quoted element is fine.
+        assert!(spawnable_argv(Path::new(r"C:\Users\Jo Doe\npm\codex.cmd"), with("ab")).is_some());
+    }
+
+    #[test]
+    fn npm_and_pnpm_shims_name_the_script_they_run() {
+        let npm = "@ECHO off\r\nGOTO start\r\n:find_dp0\r\nSET dp0=%~dp0\r\nEXIT /b\r\n:start\r\n\
+                   SETLOCAL\r\nCALL :find_dp0\r\n\r\nIF EXIST \"%dp0%\\node.exe\" (\r\n  \
+                   SET \"_prog=%dp0%\\node.exe\"\r\n) ELSE (\r\n  SET \"_prog=node\"\r\n)\r\n\r\n\
+                   endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & \"%_prog%\"  \
+                   \"%dp0%\\node_modules\\@openai\\codex\\bin\\codex.js\" %*\r\n";
+        assert_eq!(
+            npm_shim_script(npm).as_deref(),
+            Some(r"node_modules\@openai\codex\bin\codex.js")
+        );
+        let pnpm = "@IF EXIST \"%~dp0\\node.exe\" (\r\n  \"%~dp0\\node.exe\"  \
+                    \"%~dp0\\..\\@google\\gemini-cli\\dist\\index.mjs\" %*\r\n) ELSE (\r\n  node  \
+                    \"%~dp0\\..\\@google\\gemini-cli\\dist\\index.mjs\" %*\r\n)\r\n";
+        assert_eq!(
+            npm_shim_script(pnpm).as_deref(),
+            Some(r"..\@google\gemini-cli\dist\index.mjs")
+        );
+        assert_eq!(npm_shim_script("@echo off\r\nclaude.exe %*\r\n"), None);
+    }
+
+    #[test]
+    fn a_readable_npm_shim_starts_its_node_script_directly() {
+        let dir = tempfile::tempdir().unwrap();
+        let shim = dir.path().join("codex.cmd");
+        fs::write(
+            &shim,
+            "@ECHO off\r\n\"%_prog%\"  \"%dp0%\\node_modules\\codex\\cli.js\" %*\r\n",
+        )
+        .unwrap();
+        let script = dir.path().join("node_modules").join("codex").join("cli.js");
+        fs::create_dir_all(script.parent().unwrap()).unwrap();
+        fs::write(&script, "").unwrap();
+        let node = dir.path().join("node.exe");
+        fs::write(&node, "").unwrap();
+
+        let argv = vec![
+            "codex".to_string(),
+            "resume".to_string(),
+            r"C:\R&D".to_string(),
+        ];
+        assert_eq!(
+            spawnable_argv(&shim, argv),
+            Some(vec![
+                node.to_string_lossy().into_owned(),
+                script.to_string_lossy().into_owned(),
+                "resume".to_string(),
+                r"C:\R&D".to_string(),
+            ])
         );
     }
 

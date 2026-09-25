@@ -30,13 +30,14 @@ use std::time::{Duration, Instant};
 /// is the modern form; `wsl$` still works and is what older docs show.
 const UNC_PREFIXES: [&str; 2] = [r"\\wsl.localhost\", r"\\wsl$\"];
 
-/// How long a loaded distro list is served before a background refresh.
+/// How long a loaded distro list (and which of them are running) is served
+/// before a background refresh.
 const WSL_DISTRO_TTL: Duration = Duration::from_secs(60);
 /// A refresh that has not reported back after this long is presumed dead,
 /// so it cannot suppress every later refresh (see `herd_scan_is_due`).
 const WSL_DISTRO_WATCHDOG: Duration = Duration::from_secs(30);
 /// Upper bound on any single `wsl.exe` invocation made by this module.
-pub(crate) const WSL_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const WSL_COMMAND_TIMEOUT: Duration = config::WSL_COMMAND_TIMEOUT;
 
 #[derive(Default)]
 struct DistroCache {
@@ -50,13 +51,41 @@ static WSL_DISTRO_CACHE: LazyLock<Mutex<DistroCache>> =
 
 /// The registered WSL distros, as last seen by a background refresh.
 ///
-/// Never blocks and never spawns on the calling thread: a cold or stale cache
-/// returns what it has (empty on a cold start) and kicks one refresh. Always
-/// empty off Windows.
+/// Never spawns on the calling thread. A cold cache is filled from the
+/// registry right away (instant, no `wsl.exe`), with `state` unknown until
+/// the background refresh has asked which distros are running; a stale one
+/// returns what it has and kicks that refresh. Always empty off Windows.
 pub fn cached_distros() -> Arc<Vec<WslDistro>> {
     let mut cache = WSL_DISTRO_CACHE.lock().unwrap();
+    if cache.refreshed_at.is_none() && cache.distros.is_empty() {
+        if let Ok(distros) = WslDistro::registered_distros() {
+            cache.distros = Arc::new(distros);
+        }
+    }
     kick_refresh_if_due(&mut cache);
     Arc::clone(&cache.distros)
+}
+
+/// The registered distros with `state` filled in from `wsl.exe -l --running
+/// -q`. Blocking (one hidden, bounded `wsl.exe`, and none at all when no
+/// distro is registered), so call it from a worker thread only.
+pub(crate) fn load_distros_with_state() -> anyhow::Result<Vec<WslDistro>> {
+    let mut distros = WslDistro::load_distro_list()?;
+    if distros.is_empty() {
+        return Ok(distros);
+    }
+    match WslDistro::running_distro_names() {
+        Ok(running) => WslDistro::mark_running(&mut distros, &running),
+        Err(err) => {
+            // Unknown counts as not running everywhere this is read, which
+            // errs towards not booting anything.
+            log::debug!("could not list running WSL distros: {err:#}");
+            for distro in &mut distros {
+                distro.state.clear();
+            }
+        }
+    }
+    Ok(distros)
 }
 
 /// Start loading the distro list now, so the first frame that needs it
@@ -85,7 +114,7 @@ fn kick_refresh_if_due(cache: &mut DistroCache) {
     let spawned = std::thread::Builder::new()
         .name("wsl-distro-list".into())
         .spawn(|| {
-            let distros = match WslDistro::load_distro_list() {
+            let distros = match load_distros_with_state() {
                 Ok(distros) => Some(distros),
                 Err(err) => {
                     log::debug!("wsl distro list unavailable: {err:#}");
@@ -122,50 +151,16 @@ pub fn wsl_domains(config: &config::ConfigHandle) -> Vec<WslDomain> {
 /// A bare `Command::new("wsl.exe")` from a GUI process allocates a visible
 /// console per call — the "ten cmd windows at startup" bug.
 pub(crate) fn run_wsl_hidden(args: &[&str], timeout: Duration) -> Option<String> {
-    use std::io::Read;
-    use std::process::{Command, Stdio};
-
-    let mut cmd = Command::new("wsl.exe");
-    cmd.args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
-    let mut child = cmd.spawn().ok()?;
-    let mut stdout = child.stdout.take()?;
-    // Drain on a thread so a chatty child cannot block on a full pipe while
-    // we poll for its exit.
-    let reader = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stdout.read_to_end(&mut buf);
-        buf
-    });
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(25));
-            }
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                break None;
-            }
-        }
-    };
-    // On a timeout, do not join the reader: a Linux process the killed
-    // `wsl.exe` left behind can hold the pipe open indefinitely.
-    if !status?.success() {
+    let mut cmd = config::hidden_wsl_command();
+    cmd.args(args);
+    // Killed on timeout, and output a lingering Linux process keeps the pipe
+    // open for is abandoned rather than waited on.
+    let output = config::output_with_timeout(cmd, timeout).ok()?;
+    if !output.status.success() {
         return None;
     }
-    let buf = reader.join().ok()?;
-    Some(String::from_utf8_lossy(&buf).into_owned())
+    // What a Linux program printed, passed through by `wsl.exe` untouched.
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 /// Which shell found an agent inside WSL, and therefore which shell must
@@ -233,8 +228,9 @@ pub(crate) fn parse_wsl_probe_output(output: &str, programs: &[String]) -> Vec<S
 ///
 /// `wsl.exe -d` boots a stopped distro, which takes seconds and is not the
 /// user's to pay for an agent they may not have. So: the default distro
-/// (booted or not — it is where a new WSL tab lands), then any running one.
-/// Docker Desktop's utility distros never hold a user's CLI.
+/// (booted or not — it is where a new WSL tab lands — but see
+/// [`probe_wsl_agents`] for how rarely), then any running one. Docker
+/// Desktop's utility distros never hold a user's CLI.
 pub(crate) fn wsl_probe_order(distros: &[WslDistro]) -> Vec<&WslDistro> {
     let usable =
         |distro: &&WslDistro| !distro.name.is_empty() && !distro.name.starts_with("docker-desktop");
@@ -247,15 +243,32 @@ pub(crate) fn wsl_probe_order(distros: &[WslDistro]) -> Vec<&WslDistro> {
         distros
             .iter()
             .filter(usable)
-            .filter(|distro| !distro.is_default && distro.state.eq_ignore_ascii_case("running")),
+            .filter(|distro| !distro.is_default && distro.is_running()),
     );
     ordered
 }
+
+/// What one earlier probe of a distro found, kept so a stopped distro is not
+/// booted again just to be asked the same question.
+struct ProbedDistro {
+    asked: Vec<String>,
+    found: std::collections::HashMap<String, WslProbeShell>,
+}
+
+/// Process-wide, so a second window (or the periodic re-probe) reuses what
+/// the first probe learned instead of booting the distro once more.
+static PROBED_DISTROS: LazyLock<Mutex<std::collections::HashMap<String, ProbedDistro>>> =
+    LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 
 /// Which of `programs` each probed distro can run, first distro wins.
 ///
 /// Blocking — one hidden, time-bounded `wsl.exe` per distro and shell, never
 /// per program. Call from a worker thread only.
+///
+/// Only running distros are asked again. The default distro is asked even
+/// when stopped, which boots it, but only while nothing is known about it:
+/// after one look its answer is remembered, where the old policy re-booted it
+/// every five minutes for as long as the terminal was open.
 pub(crate) fn probe_wsl_agents(
     distros: &[WslDistro],
     users: &std::collections::HashMap<String, String>,
@@ -266,39 +279,106 @@ pub(crate) fn probe_wsl_agents(
         return hits;
     }
     for distro in wsl_probe_order(distros) {
-        for shell in [WslProbeShell::BashInteractive, WslProbeShell::ShLogin] {
-            let missing: Vec<String> = programs
-                .iter()
-                .filter(|program| !hits.contains_key(*program))
-                .cloned()
-                .collect();
-            if missing.is_empty() {
-                return hits;
-            }
-            let [sh, flags] = shell.shell();
-            let mut args = vec!["-d", distro.name.as_str()];
-            if let Some(user) = users.get(&distro.name) {
-                args.extend(["-u", user.as_str()]);
-            }
-            // `--exec`, not `--`: the latter re-joins argv into a string for
-            // the user's shell to re-parse.
-            args.extend(["--exec", sh, flags, WSL_PROBE_SCRIPT, sh]);
-            args.extend(missing.iter().map(String::as_str));
-            let Some(output) = run_wsl_hidden(&args, WSL_COMMAND_TIMEOUT) else {
-                continue;
-            };
-            for found in parse_wsl_probe_output(&output, &missing) {
-                hits.insert(
-                    found,
-                    WslAgentHit {
-                        distro: distro.name.clone(),
-                        shell,
+        let missing: Vec<String> = programs
+            .iter()
+            .filter(|program| !hits.contains_key(*program))
+            .cloned()
+            .collect();
+        if missing.is_empty() {
+            break;
+        }
+        let remembered = if distro.is_running() {
+            None
+        } else {
+            PROBED_DISTROS
+                .lock()
+                .unwrap()
+                .get(&distro.name)
+                .filter(|probed| missing.iter().all(|program| probed.asked.contains(program)))
+                .map(|probed| probed.found.clone())
+        };
+        let found = match remembered {
+            Some(found) => found,
+            None => {
+                let found = probe_distro(distro, users.get(&distro.name), &missing);
+                for (program, shell) in &found {
+                    log::info!(
+                        "wsl agent probe: found {program} in {} ({shell:?})",
+                        distro.name
+                    );
+                }
+                PROBED_DISTROS.lock().unwrap().insert(
+                    distro.name.clone(),
+                    ProbedDistro {
+                        asked: missing.clone(),
+                        found: found.clone(),
                     },
                 );
+                found
+            }
+        };
+        for (program, shell) in found {
+            if missing.contains(&program) {
+                hits.entry(program).or_insert_with(|| WslAgentHit {
+                    distro: distro.name.clone(),
+                    shell,
+                });
             }
         }
     }
     hits
+}
+
+/// Ask one distro which of `programs` it has, trying `bash -lic` and then
+/// `sh -lc` for whatever the first did not find.
+fn probe_distro(
+    distro: &WslDistro,
+    user: Option<&String>,
+    programs: &[String],
+) -> std::collections::HashMap<String, WslProbeShell> {
+    let mut found = std::collections::HashMap::new();
+    for shell in [WslProbeShell::BashInteractive, WslProbeShell::ShLogin] {
+        let missing: Vec<&str> = programs
+            .iter()
+            .filter(|program| !found.contains_key(*program))
+            .map(String::as_str)
+            .collect();
+        if missing.is_empty() {
+            break;
+        }
+        let [sh, flags] = shell.shell();
+        let mut args = vec!["-d", distro.name.as_str()];
+        if let Some(user) = user {
+            args.extend(["-u", user.as_str()]);
+        }
+        // `--exec`, not `--`: the latter re-joins argv into a string for
+        // the user's shell to re-parse.
+        args.extend(["--exec", sh, flags, WSL_PROBE_SCRIPT, sh]);
+        args.extend(missing.iter().copied());
+        let Some(output) = run_wsl_hidden(&args, WSL_COMMAND_TIMEOUT) else {
+            continue;
+        };
+        let asked: Vec<String> = missing.iter().map(|program| program.to_string()).collect();
+        for program in parse_wsl_probe_output(&output, &asked) {
+            found.entry(program).or_insert(shell);
+        }
+    }
+    found
+}
+
+/// `command` started in `distro` through `wsl.exe` from a Windows shell, for
+/// when that distro has no registered domain to spawn into (a hand-written
+/// `wsl_domains` that leaves it out). `command` should already be wrapped by
+/// the probing shell (see [`WslProbeShell::wrap`]).
+pub(crate) fn wsl_exec_argv(distro: &str, command: Vec<String>) -> Vec<String> {
+    let mut argv = vec![
+        "wsl.exe".to_string(),
+        "-d".to_string(),
+        distro.to_string(),
+        "--exec".to_string(),
+    ];
+    argv.extend(command);
+    argv
 }
 
 /// Distro name for a domain, or `None` when the domain is not a WSL domain.
@@ -362,6 +442,20 @@ pub fn wsl_to_windows(linux_path: &str, distro: &str) -> Option<PathBuf> {
     )))
 }
 
+/// `path` without `prefix`, compared ASCII-case-insensitively.
+///
+/// Never slices `path` at a byte offset that might fall inside a character:
+/// `&path[..16]` on `C:\Users\Jens.Müller\…` splits the `ü` and panics, and
+/// this runs on the GUI thread for every WSL pane, every frame.
+fn strip_prefix_ignore_ascii_case<'a>(path: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = path.get(..prefix.len())?;
+    if head.eq_ignore_ascii_case(prefix) {
+        path.get(prefix.len()..)
+    } else {
+        None
+    }
+}
+
 /// The inverse of [`wsl_to_windows`]: a Windows path rewritten as the distro
 /// sees it. Used to map a UNC marker-walk result back into the distro's view.
 ///
@@ -379,8 +473,7 @@ pub fn windows_to_wsl(win_path: &str, distro: &str) -> Option<String> {
     for prefix in UNC_PREFIXES {
         // Windows path comparison is case-insensitive, and so are distro names
         // as far as the UNC share is concerned.
-        if path.len() >= prefix.len() && path[..prefix.len()].eq_ignore_ascii_case(prefix) {
-            let rest = &path[prefix.len()..];
+        if let Some(rest) = strip_prefix_ignore_ascii_case(path, prefix) {
             let (unc_distro, tail) = match rest.find(['\\', '/']) {
                 Some(idx) => (&rest[..idx], &rest[idx + 1..]),
                 None => (rest, ""),
@@ -425,9 +518,10 @@ pub(crate) fn unc_host_path_to_linux(win_path: &str) -> Option<String> {
     let path = win_path.trim();
     let rest = path.strip_prefix(r"\\")?;
     // A WSL share is `windows_to_wsl`'s job, and it knows about distro names.
-    if UNC_PREFIXES.iter().any(|prefix| {
-        path.len() >= prefix.len() && path[..prefix.len()].eq_ignore_ascii_case(prefix)
-    }) {
+    if UNC_PREFIXES
+        .iter()
+        .any(|prefix| strip_prefix_ignore_ascii_case(path, prefix).is_some())
+    {
         return None;
     }
     // Drop the host component; what follows is the absolute path inside it.
@@ -497,6 +591,25 @@ mod tests {
             version: "2".to_string(),
             is_default,
         }
+    }
+
+    #[test]
+    fn non_ascii_paths_never_split_a_character() {
+        // Byte 16 of this path falls inside the `ü`, exactly where the
+        // `\\wsl.localhost\` prefix check used to slice.
+        let path = r"C:\Users\Jens.Müller\src";
+        assert!(!path.is_char_boundary(16));
+        assert_eq!(
+            windows_to_wsl(path, "Ubuntu").as_deref(),
+            Some("/mnt/c/Users/Jens.Müller/src")
+        );
+        assert_eq!(unc_host_path_to_linux(path), None);
+        assert_eq!(
+            unc_host_path_to_linux(r"\\hö\home\jürgen").as_deref(),
+            Some("/home/jürgen")
+        );
+        assert_eq!(windows_to_wsl("ü", "Ubuntu"), None);
+        assert_eq!(windows_to_wsl(r"\\wsl.localhöst\x", "Ubuntu"), None);
     }
 
     #[test]
