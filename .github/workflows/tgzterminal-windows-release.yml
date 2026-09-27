@@ -20,6 +20,14 @@ name: TGZTerminal Windows Release
 #
 # Manual runs (workflow_dispatch) build and upload the portable zip as a CI
 # artifact only; they do not publish a Release.
+#
+# When a real release publishes, a final best-effort step submits a winget
+# manifest update for TimGrossinger.TGZTerminal via wingetcreate (see the
+# "Submit winget manifest update" step). That only works once the package
+# exists in microsoft/winget-pkgs: the first version was introduced by the
+# one-time manual PR generated with ci/make-tgz-winget-manifests.sh. The step
+# needs a WINGET_PAT repo secret (classic PAT, repo scope) and is non-fatal,
+# so a winget hiccup never costs the release.
 
 on:
   push:
@@ -236,3 +244,40 @@ jobs:
           # The Setup exe is best-effort and may legitimately be absent; the
           # Checksums step above already hard-fails if the zip is missing.
           fail_on_unmatched_files: false
+
+      # Submits a winget manifest update for this version via wingetcreate
+      # (https://github.com/microsoft/winget-create), the same route
+      # microsoft/terminal and PowerToys use. Only runs once the Release is
+      # live (wingetcreate downloads the installer from the InstallerUrl to
+      # recompute its hash) and only when the installer step produced a Setup
+      # exe. It updates the package introduced by the one-time manual PR from
+      # ci/make-tgz-winget-manifests.sh; before that PR is merged, this step
+      # fails harmlessly under continue-on-error. The WINGET_PAT secret must
+      # hold a classic PAT with repo scope; wingetcreate forks
+      # microsoft/winget-pkgs under that account and opens the PR itself.
+      - name: Submit winget manifest update
+        if: steps.ver.outputs.is_release == '1' && env.SETUP_EXE != ''
+        continue-on-error: true
+        shell: pwsh
+        env:
+          WINGET_PAT: ${{ secrets.WINGET_PAT }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if (-not $env:WINGET_PAT) {
+            Write-Error "WINGET_PAT secret not set; skipping winget submission"
+          }
+          $tag = $env:GITHUB_REF_NAME
+          if ($tag -notmatch '^tgz-v0*(\d+)\.0*(\d+)\.0*(\d+)$') {
+            Write-Error "cannot map $tag to a winget PackageVersion"
+          }
+          # winget PackageVersion must be dotted-numeric, no leading zeros.
+          $numeric = "$($Matches[1]).$($Matches[2]).$($Matches[3])"
+          $url = "https://github.com/timjensgrossinger/tgzterminal/releases/download/$tag/TGZTerminal-Setup-$tag.exe"
+          # wingetcreate.exe is a .NET 6 standalone and the runner image does
+          # not guarantee a .NET 6 runtime, so install a private one.
+          Invoke-WebRequest https://dot.net/v1/dotnet-install.ps1 -OutFile dotnet-install.ps1
+          ./dotnet-install.ps1 -Runtime dotnet -Architecture x64 -Version 6.0.36 -InstallDir "$PWD/dotnet6"
+          $env:DOTNET_ROOT = "$PWD/dotnet6"
+          $env:PATH = "$env:DOTNET_ROOT;$env:PATH"
+          Invoke-WebRequest https://aka.ms/wingetcreate/latest -OutFile wingetcreate.exe
+          ./wingetcreate.exe update TimGrossinger.TGZTerminal -u $url -v $numeric -t $env:WINGET_PAT --submit
