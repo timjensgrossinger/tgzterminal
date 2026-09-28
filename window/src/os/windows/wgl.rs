@@ -34,7 +34,46 @@ impl Drop for WglWrapper {
     }
 }
 
+type DescribePixelFormatFunc =
+    unsafe extern "system" fn(HDC, i32, u32, *mut PIXELFORMATDESCRIPTOR) -> i32;
+type SetPixelFormatFunc = unsafe extern "system" fn(HDC, i32, *const PIXELFORMATDESCRIPTOR) -> i32;
+
 impl WglWrapper {
+    /// `DescribePixelFormat` for this GL. gdi32's version dispatches into the
+    /// module named opengl32.dll that the process loaded first -- the system
+    /// one -- which knows nothing of the pixel formats the bundled mesa (loaded
+    /// by path beside it) hands out, and fails with "The parameter is
+    /// incorrect". Mesa exports its own.
+    unsafe fn describe_pixel_format(
+        &self,
+        hdc: HDC,
+        format: i32,
+        pfd: &mut PIXELFORMATDESCRIPTOR,
+    ) -> i32 {
+        let size = std::mem::size_of::<PIXELFORMATDESCRIPTOR>() as u32;
+        if self.is_mesa {
+            match self
+                .lib
+                .get::<DescribePixelFormatFunc>(b"wglDescribePixelFormat\0")
+            {
+                Ok(func) => return func(hdc, format, size, pfd),
+                Err(err) => log::warn!("mesa has no wglDescribePixelFormat: {err:#}"),
+            }
+        }
+        DescribePixelFormat(hdc, format, size, pfd)
+    }
+
+    /// `SetPixelFormat` for this GL; see `describe_pixel_format`.
+    unsafe fn set_pixel_format(&self, hdc: HDC, format: i32, pfd: &PIXELFORMATDESCRIPTOR) -> i32 {
+        if self.is_mesa {
+            match self.lib.get::<SetPixelFormatFunc>(b"wglSetPixelFormat\0") {
+                Ok(func) => return func(hdc, format, pfd),
+                Err(err) => log::warn!("mesa has no wglSetPixelFormat: {err:#}"),
+            }
+        }
+        SetPixelFormat(hdc, format, pfd)
+    }
+
     fn load() -> anyhow::Result<Self> {
         let class_name = wide_string("wezterm wgl extension probing window");
         let h_inst = unsafe { GetModuleHandleW(null()) };
@@ -332,14 +371,7 @@ impl GlState {
 
         let mut pfd: PIXELFORMATDESCRIPTOR = unsafe { std::mem::zeroed() };
 
-        let res = unsafe {
-            DescribePixelFormat(
-                hdc,
-                format_id,
-                std::mem::size_of::<PIXELFORMATDESCRIPTOR>() as _,
-                &mut pfd,
-            )
-        };
+        let res = unsafe { wgl.describe_pixel_format(hdc, format_id, &mut pfd) };
         if res == 0 {
             anyhow::bail!(
                 "DescribePixelFormat function failed: {}",
@@ -347,7 +379,7 @@ impl GlState {
             );
         }
 
-        let res = unsafe { SetPixelFormat(hdc, format_id, &pfd) };
+        let res = unsafe { wgl.set_pixel_format(hdc, format_id, &pfd) };
         if res == 0 {
             anyhow::bail!(
                 "SetPixelFormat function failed: {}",
