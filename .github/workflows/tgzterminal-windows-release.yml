@@ -431,6 +431,19 @@ jobs:
           # stops every interactive start at "create a default UNIX user".
           wsl.exe -d $distro -u root --exec sh -c 'printf "#!/bin/sh\nexit 0\n" > /usr/local/bin/claude && chmod +x /usr/local/bin/claude && printf "[user]\ndefault=root\n" >> /etc/wsl.conf'
           if ($LASTEXITCODE -ne 0) { throw "could not prepare $distro" }
+          # A fresh distro also runs its first-run setup ("Enter new UNIX
+          # username:") the first time it is opened interactively -- here by
+          # the app's WSL pane -- and wsl.conf's default user does not skip
+          # it. While it waits for an answer every other wsl.exe for that
+          # distro waits too, the agent probe included, so it timed out with
+          # nothing printed. A distro anyone has used is past this; make this
+          # one so: drop the setup command, clear WSL's RunOOBE flag, start
+          # as root.
+          wsl.exe -d $distro -u root --exec sh -c 'f=/etc/wsl-distribution.conf; if [ -f "$f" ]; then cat "$f"; sed -i "/^\[oobe\]/,/^\[/{/^[[:space:]]*command[[:space:]]*=/d}" "$f"; fi; exit 0'
+          $key = "$($lxss.PSPath)\$default"
+          New-ItemProperty -Path $key -Name RunOOBE -Value 0 -PropertyType DWord -Force | Out-Null
+          New-ItemProperty -Path $key -Name DefaultUid -Value 0 -PropertyType DWord -Force | Out-Null
+          Get-ItemProperty $key | Format-List | Out-String | Write-Host
           # wsl.conf is read when the distro starts.
           wsl.exe --terminate $distro
 
