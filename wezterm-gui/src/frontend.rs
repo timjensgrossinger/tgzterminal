@@ -440,7 +440,28 @@ impl GuiFrontEnd {
                     .borrow_mut()
                     .insert(mux_window_id);
                 log::trace!("Creating TermWindow for mux_window_id={}", mux_window_id);
-                if let Err(err) = TermWindow::new_window(mux_window_id).await {
+                // If window creation fails because the accelerated
+                // renderer doesn't work on this machine (the classic
+                // case is a system with the Microsoft Basic Display
+                // Adapter, whose only OpenGL is the ancient GDI
+                // Generic 1.1 stack), destroy the half-built window,
+                // force the software renderer for the remainder of the
+                // process and try once more. That makes the machine
+                // usable instead of dying with
+                // "The OpenGL implementation is too old to work with glium".
+                let mut create_err = TermWindow::new_window(mux_window_id).await.err();
+                if create_err.is_some() {
+                    if let Some(window) = crate::termwindow::take_failed_window() {
+                        log::error!(
+                            "Failed to create window: {:#}; retrying with software rendering",
+                            create_err.unwrap()
+                        );
+                        window.close();
+                        ::window::configuration::set_force_swrast(true);
+                        create_err = TermWindow::new_window(mux_window_id).await.err();
+                    }
+                }
+                if let Some(err) = create_err {
                     log::error!("Failed to create window: {:#}", err);
                     let mux = Mux::get();
                     mux.kill_window(mux_window_id);

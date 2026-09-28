@@ -11,7 +11,15 @@ fn main() {
             .ok()
             .and_then(|cwd| cwd.parent().map(|p| p.to_path_buf()))
             .unwrap();
-        let exe_output_dir = repo_dir.join("target").join(profile);
+        // OUT_DIR is <target>/<profile>/build/<pkg>-<hash>/out, so three
+        // levels up is <target>/<profile>: the directory the final exe and
+        // its sidecar DLLs live in. This honours --target-dir/CARGO_TARGET_DIR
+        // overrides, which a hard-coded repo-relative layout does not.
+        let exe_output_dir = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap())
+            .ancestors()
+            .nth(3)
+            .expect("OUT_DIR has the standard <target>/<profile>/build/... layout")
+            .to_path_buf();
         let windows_dir = repo_dir.join("assets").join("windows");
 
         let conhost_dir = windows_dir.join("conhost");
@@ -20,6 +28,7 @@ fn main() {
             let src_name = conhost_dir.join(name);
 
             if !dest_name.exists() {
+                let _ = std::fs::create_dir_all(&exe_output_dir);
                 std::fs::copy(&src_name, &dest_name)
                     .context(format!(
                         "copy {} -> {}",
@@ -36,6 +45,7 @@ fn main() {
             let src_name = angle_dir.join(name);
 
             if !dest_name.exists() {
+                let _ = std::fs::create_dir_all(&exe_output_dir);
                 std::fs::copy(&src_name, &dest_name)
                     .context(format!(
                         "copy {} -> {}",

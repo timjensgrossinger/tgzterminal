@@ -20,6 +20,9 @@ struct WglWrapper {
     lib: libloading::Library,
     wgl: ffi::Wgl,
     ext: Option<ffiextra::Wgl>,
+    /// true when `lib` is the bundled mesa software renderer rather
+    /// than the system OpenGL stack
+    is_mesa: bool,
 }
 
 type GetProcAddressFunc =
@@ -92,7 +95,8 @@ impl WglWrapper {
     }
 
     fn create() -> anyhow::Result<Self> {
-        if crate::configuration::prefer_swrast() {
+        let swrast = crate::configuration::prefer_swrast();
+        if swrast {
             let mesa_dir = std::env::current_exe()
                 .unwrap()
                 .parent()
@@ -106,10 +110,47 @@ impl WglWrapper {
             }
         }
 
-        let lib = unsafe { libloading::Library::new("opengl32.dll") }.map_err(|e| {
-            log::error!("{:?}", e);
-            e
-        })?;
+        // Load mesa by its explicit absolute path.
+        // We can't rely on the DLL search path alone: the executable's
+        // import table references opengl32.dll, so the system copy is
+        // already loaded into the process by the time we get here, and
+        // loading by name would simply return that already-loaded
+        // module, which then only provides a GDI Generic OpenGL 1.1
+        // context on systems without a hardware driver.
+        let (lib, is_mesa) = if swrast {
+            let mesa_dll = std::env::current_exe()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("mesa")
+                .join("opengl32.dll");
+            match unsafe { libloading::Library::new(&mesa_dll) } {
+                Ok(lib) => {
+                    log::trace!("loaded mesa software OpenGL from {:?}", mesa_dll);
+                    (lib, true)
+                }
+                Err(err) => {
+                    log::warn!(
+                        "failed to load {:?}: {:?}, falling back to the system opengl32.dll",
+                        mesa_dll,
+                        err
+                    );
+                    (
+                        unsafe { libloading::Library::new("opengl32.dll") }.map_err(|e| {
+                            log::error!("{:?}", e);
+                            e
+                        })?,
+                        false,
+                    )
+                }
+            }
+        } else {
+            let lib = unsafe { libloading::Library::new("opengl32.dll") }.map_err(|e| {
+                log::error!("{:?}", e);
+                e
+            })?;
+            (lib, false)
+        };
         log::trace!("loaded {:?}", lib);
 
         let get_proc_address: libloading::Symbol<GetProcAddressFunc> =
@@ -125,6 +166,7 @@ impl WglWrapper {
             lib,
             wgl,
             ext: None,
+            is_mesa,
         })
     }
 
@@ -159,6 +201,10 @@ impl GlState {
     fn into_wrapper(mut self) -> WglWrapper {
         self.delete();
         self.wgl.take().unwrap()
+    }
+
+    pub fn is_mesa(&self) -> bool {
+        self.wgl.as_ref().map(|w| w.is_mesa).unwrap_or(false)
     }
 
     pub fn create(window: HWND) -> anyhow::Result<Self> {
@@ -408,6 +454,23 @@ unsafe impl glium::backend::Backend for GlState {
 
     fn swap_buffers(&self) -> Result<(), glium::SwapBuffersError> {
         unsafe {
+            // The mesa software renderer doesn't support the plain
+            // gdi32 SwapBuffers path; it exposes the WGL swap function
+            // instead, which is the reliable way to present on that
+            // stack. For the system OpenGL stack keep the original
+            // SwapBuffers behavior.
+            if self.is_mesa() {
+                if let Some(wgl) = self.wgl.as_ref() {
+                    if let Some(ext) = wgl.ext.as_ref() {
+                        if ext.SwapLayerBuffers.is_loaded() {
+                            // WGL_SWAP_MAIN_PLANE == 1
+                            if ext.SwapLayerBuffers(self.hdc as _, 1) != 0 {
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+            }
             SwapBuffers(self.hdc);
         }
         Ok(())

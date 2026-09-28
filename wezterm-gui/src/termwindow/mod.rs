@@ -141,6 +141,10 @@ const ATLAS_SIZE: usize = 128;
 lazy_static::lazy_static! {
     static ref WINDOW_CLASS: Mutex<String> = Mutex::new(wezterm_gui_subcommands::DEFAULT_WINDOW_CLASS.to_owned());
     static ref POSITION: Mutex<Option<GuiPosition>> = Mutex::new(None);
+    /// A window whose renderer failed to initialize. The GUI frontend
+    /// picks this up, destroys the window, and retries with software
+    /// rendering.
+    static ref FAILED_WINDOW: Mutex<Option<::window::Window>> = Mutex::new(None);
 }
 
 pub const ICON_DATA: &'static [u8] = include_bytes!("../../../assets/icon/terminal.png");
@@ -151,6 +155,14 @@ pub fn set_window_position(pos: GuiPosition) {
 
 pub fn set_window_class(cls: &str) {
     *WINDOW_CLASS.lock().unwrap() = cls.to_owned();
+}
+
+/// If the last window-creation attempt recorded a window whose renderer
+/// failed to initialize, take ownership of it (so it can be destroyed)
+/// and clear the record. Returns None when the attempt succeeded or no
+/// failure has been recorded yet.
+pub fn take_failed_window() -> Option<::window::Window> {
+    FAILED_WINDOW.lock().unwrap().take()
 }
 
 /// Path handed to the worktree script as `$TGZTERMINAL_BIN`.
@@ -195,6 +207,30 @@ fn shell_path(path: &Path, windows: bool) -> String {
         path.replace('\\', "/")
     } else {
         path
+    }
+}
+
+/// Write the worktree picker script to a per-process temp file.
+///
+/// One file per process id, overwritten on every open, so an app instance
+/// never accumulates files. Returns None when the write fails; the caller
+/// falls back to the inline `bash -lc` form in that case.
+///
+/// Free-standing rather than a method so it can be unit-tested (see
+/// `worktree_script_file_name_is_process_scoped`).
+fn worktree_script_file_name(pid: u32) -> String {
+    format!("tgzterminal-worktree-script-{pid}.sh")
+}
+
+fn write_worktree_script_to_temp(script: &str) -> Option<PathBuf> {
+    let pid = std::process::id();
+    let path = std::env::temp_dir().join(worktree_script_file_name(pid));
+    match std::fs::write(&path, script) {
+        Ok(()) => Some(path),
+        Err(err) => {
+            log::warn!("worktree: failed to write {}: {:#}", path.display(), err);
+            None
+        }
     }
 }
 
@@ -1575,17 +1611,50 @@ impl TermWindow {
             }
         });
 
-        let gl = match config.front_end {
+        // When the software-renderer fallback has been engaged (either
+        // explicitly by the user config or automatically after the
+        // accelerated renderer failed), create this window with the
+        // software renderer regardless of what config.front_end says.
+        let effective_front_end =
+            if ::window::configuration::force_swrast() {
+                FrontEndSelection::Software
+            } else {
+                config.front_end
+            };
+
+        let gl = match effective_front_end {
             FrontEndSelection::WebGpu => None,
-            _ => Some(window.enable_opengl().await?),
+            _ => Some(match window.enable_opengl().await {
+                Ok(gl) => gl,
+                Err(err) => {
+                    // Hand the (invisible, unusable) window back to the
+                    // caller so that it can destroy it before retrying
+                    // with a different renderer.
+                    FAILED_WINDOW.lock().unwrap().replace(window.clone());
+                    return Err(err.context(
+                        "failed to initialize the OpenGL renderer for this window",
+                    ));
+                }
+            }),
         };
 
         {
             let mut myself = tw.borrow_mut();
-            let webgpu = match config.front_end {
-                FrontEndSelection::WebGpu => Some(Rc::new(
-                    WebGpuState::new(&window, dimensions, &config).await?,
-                )),
+            let webgpu = match effective_front_end {
+                FrontEndSelection::WebGpu => {
+                    match WebGpuState::new(&window, dimensions, &config).await {
+                        Ok(state) => Some(Rc::new(state)),
+                        Err(err) => {
+                            // Hand the (invisible, unusable) window back to the
+                            // caller so that it can destroy it before retrying
+                            // with a different renderer.
+                            FAILED_WINDOW.lock().unwrap().replace(window.clone());
+                            return Err(err.context(
+                                "failed to initialize the WebGpu renderer for this window",
+                            ));
+                        }
+                    }
+                }
                 _ => None,
             };
             myself.config_subscription.replace(config_subscription);
@@ -4702,13 +4771,29 @@ done
                 // Git for Windows' /etc/profile `cd`s to $HOME on a login
                 // shell unless this is set.
                 set_environment_variables.insert("CHERE_INVOKING".to_string(), "1".to_string());
+                // Hand the script over as a FILE, not as an inline `bash -lc
+                // <script>` argument. The script is ~23KB of quoted shell text;
+                // carrying it as a single Windows command line argument gets
+                // mangled by the Win32 <-> msys argv translation, and bash then
+                // reports bogus "unexpected EOF while looking for matching
+                // `''" parse errors (it never normally happens on a POSIX
+                // host). Passing a path avoids the quoting entirely; `-l`
+                // keeps CHERE_INVOKING/profile semantics unchanged.
+                let script_path = write_worktree_script_to_temp(&script);
+                let mut args = vec![bash.to_string_lossy().into_owned(), "-l".to_string()];
+                if let Some(path) = &script_path {
+                    args.push(path.to_string_lossy().into_owned());
+                } else {
+                    // Temp file could not be written (read-only disk, ...):
+                    // fall back to the historical inline form rather than
+                    // failing the click outright.
+                    log::warn!("worktree: could not write script to temp file, using inline form");
+                    args.push("-c".to_string());
+                    args.push(script);
+                }
                 SpawnCommand {
                     label: Some("Worktree".to_string()),
-                    args: Some(vec![
-                        bash.to_string_lossy().into_owned(),
-                        "-lc".to_string(),
-                        script,
-                    ]),
+                    args: Some(args),
                     cwd,
                     set_environment_variables,
                     domain: config::keyassignment::SpawnTabDomain::DomainName("local".to_string()),
@@ -6209,6 +6294,37 @@ mod tests {
             shell_path(&PathBuf::from("/opt/a b/c"), false),
             "/opt/a b/c"
         );
+    }
+
+    #[test]
+    fn worktree_script_file_name_is_process_scoped() {
+        // One file per process, so different app instances (and different
+        // windows in the same instance) never race on the same file.
+        let name = worktree_script_file_name(1234);
+        assert!(
+            name.starts_with("tgzterminal-worktree-script-")
+                && name.ends_with(".sh")
+                && name.contains("1234")
+        );
+    }
+
+    #[test]
+    fn worktree_script_temp_write_round_trips() {
+        // The GitBash invocation hands the picker script over as a file to
+        // avoid Win32<->msys argv quoting; the file must carry the script
+        // byte-for-byte (LF endings intact).
+        let script = "set -e\nprintf '%s' 'squares: '''\n";
+        let wrote = write_worktree_script_to_temp(script);
+        if wrote.is_none() {
+            // Read-only temp is an allowed environment failure; the caller
+            // falls back to the inline form in that case.
+            return;
+        }
+        let path = wrote.unwrap();
+        let round_tripped = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(path.file_name().unwrap(), worktree_script_file_name(std::process::id()));
+        assert_eq!(&round_tripped, script);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
