@@ -323,6 +323,38 @@ jobs:
           path: smoke-default
           if-no-files-found: ignore
 
+      # front_end = "Software" (and every RDP session) loads the bundled mesa
+      # opengl32.dll by its absolute path (window/src/os/windows/wgl.rs). The
+      # window must open; which renderer it got is reported, and anything but
+      # mesa's llvmpipe means the WGL -> ANGLE fallback caught a mesa failure.
+      - name: Smoke test with the software renderer
+        shell: pwsh
+        run: |
+          $config = Join-Path $env:RUNNER_TEMP 'software-smoke.lua'
+          Set-Content -Path $config -Encoding utf8 -Value "return { front_end = 'Software' }"
+          $smoke = @{ OutDir = "smoke-software"; Config = $config; ExpectLog = @('OpenGL: ') }
+          if ($env:SETUP_EXE) {
+            $smoke.Installer = (Resolve-Path $env:SETUP_EXE).Path
+          } else {
+            $smoke.AppDir = (Resolve-Path "TGZTerminal-windows-portable-${{ steps.ver.outputs.version }}").Path
+          }
+          ./ci/windows-smoke.ps1 @smoke
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $renderer = Get-ChildItem smoke-software -Recurse -File |
+            Select-String -Pattern 'OpenGL: .*' | Select-Object -First 1
+          Write-Host "software renderer: $($renderer.Matches.Value)"
+          if ("$($renderer.Matches.Value)" -notmatch 'llvmpipe') {
+            Write-Host "::warning::front_end=Software did not get mesa's llvmpipe: $($renderer.Matches.Value)"
+          }
+
+      - name: Upload software-renderer smoke evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-software
+          path: smoke-software
+          if-no-files-found: ignore
+
       - name: Checksums
         shell: bash
         run: |
