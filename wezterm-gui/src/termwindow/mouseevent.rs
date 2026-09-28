@@ -1380,12 +1380,6 @@ impl super::TermWindow {
             WMEK::Release(MousePress::Left) => {
                 if self.pressed_ui_item.as_ref() == Some(&item_type) {
                     let new_val = !self.config.sidebar_auto_hide;
-                    // The sidebar's reserved width is about to change; the
-                    // terminal grid must stay put, so remember the current
-                    // reservation and grow/shrink the window by the delta
-                    // after the reload, matching what happens when the
-                    // sidebar is shown or hidden at creation time.
-                    let reserved_before = self.sidebar_reserved_width();
 
                     // Merge the new value into any existing per-window config
                     // overrides so every read site of self.config.sidebar_auto_hide
@@ -1404,27 +1398,13 @@ impl super::TermWindow {
                     self.config_overrides = Value::Object(map.into());
 
                     // Persist across restarts, then rebuild self.config from the
-                    // overrides (config_was_reloaded also relayouts + invalidates).
+                    // overrides. config_was_reloaded relayouts against
+                    // sidebar_reserved_width(), so the window keeps its size and
+                    // the pane takes whatever the sidebar leaves: everything but
+                    // the collapsed rail when hidden, the (drag-resizable)
+                    // sidebar width less when pinned.
                     crate::termwindow::tgz_ui_state::save_sidebar_auto_hide(new_val);
                     self.config_was_reloaded();
-
-                    let reserved_after = self.sidebar_reserved_width();
-                    if reserved_after != reserved_before {
-                        // Fix up the window so the pane keeps its columns
-                        // instead of being swallowed by the grown panel.
-                        // (see the sidebar auto-hide toggle tests)
-                        let dims = self.dimensions;
-                        let delta = reserved_after as isize - reserved_before as isize;
-                        let new_width = (dims.pixel_width as isize + delta)
-                            .clamp(160, i32::MAX as isize)
-                            as usize;
-                        if let Some(window) = self.window.as_ref().map(|w| w.clone()) {
-                            window.notify(TermWindowNotif::SetInnerSize {
-                                width: new_width,
-                                height: dims.pixel_height,
-                            });
-                        }
-                    }
 
                     self.pressed_ui_item.take();
                     context.invalidate();
