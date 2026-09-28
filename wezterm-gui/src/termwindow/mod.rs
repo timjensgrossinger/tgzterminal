@@ -6322,7 +6322,7 @@ mod tests {
         let round_tripped = std::fs::read_to_string(&path).unwrap();
         assert_eq!(
             path.file_name().unwrap(),
-            worktree_script_file_name(std::process::id())
+            std::ffi::OsStr::new(&worktree_script_file_name(std::process::id()))
         );
         assert_eq!(&round_tripped, script);
         let _ = std::fs::remove_file(&path);
