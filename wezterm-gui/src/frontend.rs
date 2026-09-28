@@ -463,6 +463,13 @@ impl GuiFrontEnd {
                 }
                 if let Some(err) = create_err {
                     log::error!("Failed to create window: {:#}", err);
+                    // The retry (if any) failed too; consume and destroy its
+                    // half-built window so it can neither leak an invisible
+                    // OS window nor leave a stale stash that a later,
+                    // unrelated failure could mistake for a renderer failure.
+                    if let Some(window) = crate::termwindow::take_failed_window() {
+                        window.close();
+                    }
                     let mux = Mux::get();
                     mux.kill_window(mux_window_id);
                     front_end()
