@@ -387,30 +387,55 @@ impl GlState {
             );
         }
 
-        let mut attribs = vec![
-            CONTEXT_MAJOR_VERSION_ARB as i32,
-            4,
-            CONTEXT_MINOR_VERSION_ARB as i32,
-            5,
-            CONTEXT_PROFILE_MASK_ARB as i32,
-            CONTEXT_CORE_PROFILE_BIT_ARB as i32,
-        ];
-
-        if has_extension(&extensions, "WGL_ARB_create_context_robustness") {
-            log::trace!("requesting robustness features");
-            attribs.push(CONTEXT_RESET_NOTIFICATION_STRATEGY_ARB as i32);
-            attribs.push(LOSE_CONTEXT_ON_RESET_ARB as i32);
-            attribs.push(CONTEXT_FLAGS_ARB as i32);
-            attribs.push(CONTEXT_ROBUST_ACCESS_BIT_ARB as i32);
+        // 4.5 core first, as ever. A driver that tops out lower refuses it
+        // outright -- the bundled mesa 20.1's llvmpipe does -- so also ask
+        // for 3.3 core, the version our shaders are written against, and
+        // only then without robustness, which not every driver supports.
+        let robustness = has_extension(&extensions, "WGL_ARB_create_context_robustness");
+        let mut attempts = vec![];
+        for version in [(4, 5), (3, 3)] {
+            if robustness {
+                attempts.push((version, true));
+            }
+            attempts.push((version, false));
         }
-        attribs.push(0);
 
-        let rc = unsafe {
-            wgl.ext
-                .as_ref()
-                .unwrap()
-                .CreateContextAttribsARB(hdc as _, null(), attribs.as_ptr())
-        };
+        let mut rc = null();
+        for (index, ((major, minor), robust)) in attempts.into_iter().enumerate() {
+            let mut attribs = vec![
+                CONTEXT_MAJOR_VERSION_ARB as i32,
+                major,
+                CONTEXT_MINOR_VERSION_ARB as i32,
+                minor,
+                CONTEXT_PROFILE_MASK_ARB as i32,
+                CONTEXT_CORE_PROFILE_BIT_ARB as i32,
+            ];
+            if robust {
+                log::trace!("requesting robustness features");
+                attribs.push(CONTEXT_RESET_NOTIFICATION_STRATEGY_ARB as i32);
+                attribs.push(LOSE_CONTEXT_ON_RESET_ARB as i32);
+                attribs.push(CONTEXT_FLAGS_ARB as i32);
+                attribs.push(CONTEXT_ROBUST_ACCESS_BIT_ARB as i32);
+            }
+            attribs.push(0);
+
+            rc = unsafe {
+                wgl.ext.as_ref().unwrap().CreateContextAttribsARB(
+                    hdc as _,
+                    null(),
+                    attribs.as_ptr(),
+                )
+            };
+            if !rc.is_null() {
+                if index > 0 {
+                    log::info!(
+                        "WGL context: OpenGL {major}.{minor} core{}",
+                        if robust { "" } else { " without robustness" }
+                    );
+                }
+                break;
+            }
+        }
 
         if rc.is_null() {
             let err = unsafe { winapi::um::errhandlingapi::GetLastError() };
