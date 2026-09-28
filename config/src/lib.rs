@@ -380,27 +380,7 @@ where
 
 fn default_config_with_overrides_applied() -> anyhow::Result<Config> {
     // Cause the default config to be re-evaluated with the overrides applied
-    let lua = lua::make_lua_context(Path::new("override")).context("make_lua_context")?;
-    let table = mlua::Value::Table(lua.create_table()?);
-    let config = Config::apply_overrides_to(&lua, table).context("apply_overrides_to")?;
-
-    let dyn_config = luahelper::lua_value_to_dynamic(config)?;
-
-    let cfg: Config = Config::from_dynamic(
-        &dyn_config,
-        FromDynamicOptions {
-            unknown_fields: UnknownFieldAction::Deny,
-            deprecated_fields: UnknownFieldAction::Warn,
-        },
-    )
-    .context("Error converting lua value from overrides to Config struct")?;
-    // Compute but discard the key bindings here so that we raise any
-    // problems earlier than we use them.
-    let _ = cfg.key_bindings();
-
-    cfg.check_consistency().context("check_consistency")?;
-
-    Ok(cfg)
+    default_config_with_dynamic_overrides_applied(&wezterm_dynamic::Value::default())
 }
 
 /// As [`default_config_with_overrides_applied`], but with an additional
@@ -409,7 +389,7 @@ fn default_config_with_overrides_applied() -> anyhow::Result<Config> {
 /// overrides object). Without this, machines without any wezterm.lua (the
 /// common case on a stock Windows install) discarded the overrides object
 /// entirely, leaving runtime per-window overrides — e.g. the sidebar
-/// auto-hide toggle button — dead.
+/// auto-hide toggle button — dead. A `Null` overrides value applies nothing.
 pub(crate) fn default_config_with_dynamic_overrides_applied(
     overrides: &wezterm_dynamic::Value,
 ) -> anyhow::Result<Config> {
