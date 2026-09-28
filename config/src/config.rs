@@ -21,7 +21,7 @@ use crate::units::Dimension;
 use crate::unix::UnixDomain;
 use crate::wsl::WslDomain;
 use crate::{
-    default_config_with_overrides_applied, default_one_point_oh, default_one_point_oh_f64,
+    default_one_point_oh, default_one_point_oh_f64,
     default_true, default_win32_acrylic_accent_color, CellWidth, GpuInfo,
     IntegratedTitleButtonColor, KeyMapPreference, LoadedConfig, MouseEventTriggerMods, RgbaColor,
     SerialDomain, SystemBackdrop, WebGpuPowerPreference, CONFIG_DIRS, CONFIG_FILE_OVERRIDE,
@@ -2572,7 +2572,7 @@ impl Config {
         std::env::remove_var("WEZTERM_CONFIG_FILE");
         std::env::remove_var("WEZTERM_CONFIG_DIR");
 
-        match Self::try_default() {
+        match Self::try_default_with_overrides(overrides) {
             Err(err) => LoadedConfig {
                 config: Err(err),
                 file_name: None,
@@ -2584,9 +2584,26 @@ impl Config {
     }
 
     pub fn try_default() -> anyhow::Result<LoadedConfig> {
+        use std::collections::BTreeMap;
+        use wezterm_dynamic::Value;
+        Self::try_default_with_overrides(&Value::Object(BTreeMap::<Value, Value>::default().into()))
+    }
+
+    /// As `try_default`, but also apply a per-window overrides object.
+    ///
+    /// Without this, machines without any wezterm.lua (the common case on a
+    /// stock Windows install) threw the overrides away entirely, so runtime
+    /// per-window config overrides — e.g. the sidebar auto-hide toggle
+    /// button — never reached self.config and appeared to do nothing.
+    fn try_default_with_overrides(
+        overrides: &wezterm_dynamic::Value,
+    ) -> anyhow::Result<LoadedConfig> {
         let (config, warnings) =
             wezterm_dynamic::Error::capture_warnings(|| -> anyhow::Result<Config> {
-                Ok(default_config_with_overrides_applied()?.compute_extra_defaults(None))
+                Ok(
+                    crate::default_config_with_dynamic_overrides_applied(overrides)?
+                        .compute_extra_defaults(None),
+                )
             });
 
         Ok(LoadedConfig {

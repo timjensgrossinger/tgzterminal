@@ -132,6 +132,10 @@ jobs:
           # the user's own (config::PORTABLE_MARKER). The installer never ships
           # one, so an installed build reads only the user's config.
           printf 'This file enables portable mode: configuration, colors and wezterm_modules next to these binaries take precedence over your user configuration. Delete it to use only your user configuration.\r\n' > "$pkg/.portable"
+          # The default config ships next to the binaries so portable mode has a
+          # visible, editable starting point (portable mode reads it; deleting it
+          # falls back to the built-in defaults).
+          cp ci/wezterm-default.lua "$pkg/wezterm.lua"
           7z a -tzip "${pkg}.zip" "$pkg" >/dev/null
           echo "PKG_ZIP=${pkg}.zip" >> "$GITHUB_ENV"
 

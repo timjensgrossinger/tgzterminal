@@ -119,6 +119,12 @@ Source: "..\target\release\conpty.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\target\release\OpenConsole.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\target\release\strip-ansi-escapes.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\target\release\fzf.exe"; DestDir: "{app}"; Flags: ignoreversion
+; A starting-point wezterm.lua installed into the user's config directory.
+; onlyifdoesntexist: a user who already edited their config must never have it
+; clobbered by an upgrade. (Windows resolves the config at
+; HOME\.config\wezterm\wezterm.lua; see config::config_file_candidates.)
+Source: "..\ci\wezterm-default.lua"; DestDir: "{app}"; DestName: "wezterm-default.lua"; Flags: ignoreversion
+Source: "..\ci\wezterm-default.lua"; DestDir: "{%USERPROFILE}\.config\wezterm"; DestName: "wezterm.lua"; Flags: onlyifdoesntexist uninsneveruninstall
 ; Deliberately no wildcards and no skipifsourcedoesntexist: a missing payload
 ; file must fail the build loudly rather than ship a broken install.
 
