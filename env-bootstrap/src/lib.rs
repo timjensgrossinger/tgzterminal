@@ -163,11 +163,23 @@ pub fn set_lang_from_locale() {
     }
 }
 
+/// A panic's message, whether it was raised with a literal (`&str`) or
+/// formatted (`String`, which is what `unwrap`, `expect` and index
+/// out-of-bounds produce).
+pub fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        s
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.as_str()
+    } else {
+        "!?"
+    }
+}
+
 fn register_panic_hook() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let payload = info.payload();
-        let payload = payload.downcast_ref::<&str>().unwrap_or(&"!?");
+        let payload = panic_message(info.payload());
         let bt = backtrace::Backtrace::new();
         if let Some(loc) = info.location() {
             log::error!(

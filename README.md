@@ -176,8 +176,25 @@ Universal binary — runs natively on Apple Silicon and Intel, no Rosetta tax.
 
 ### Windows (beta)
 
-Two artifacts, both published with every release plus a `.sha256` beside each. SmartScreen
-will warn you once either way, because the build is unsigned — **More info → Run anyway**.
+Two artifacts, both published with every release plus a `.sha256` beside each.
+
+**Download warning.** Edge says the setup "is not commonly downloaded", and SmartScreen
+may say "Windows protected your PC". Both come from the build being unsigned: Windows
+judges unsigned files by how often *that exact file* has been downloaded, and every release
+is a new file, so the warning comes back with each version. It is not a detection. To get
+past it, choose **Keep** (Edge: **⋯ → Keep → Show more → Keep anyway**) and then
+**More info → Run anyway**, or clear the mark before running it:
+
+```powershell
+Unblock-File .\TGZTerminal-Setup-<version>.exe
+```
+
+Installing with **winget** avoids the prompt altogether, because winget downloads outside
+the browser (once the package is listed; see *Distribution* below):
+
+```powershell
+winget install TimGrossinger.TGZTerminal
+```
 
 **Installed** — `TGZTerminal-Setup-<version>.exe`. Installs **for your user only**, into
 `%LOCALAPPDATA%\Programs\TGZTerminal`, with **no admin prompt**. You get a Start Menu
@@ -205,6 +222,41 @@ directory, so a file dropped there can't override anybody's config.
 > Windows support is new and comes from the exact same additive fork. If it does
 > something weird, open an issue with the release version — not a screenshot of your
 > desktop wallpaper, the actual version.
+
+**If it does not start**, it now says why in a dialog, and names its log file:
+`%USERPROFILE%\.local\share\wezterm\wezterm-gui.exe-log-<pid>.txt`. Attach that file to
+the issue. For more detail, start it from a terminal with logging turned up:
+
+```powershell
+$env:WEZTERM_LOG = "debug"
+& "$env:LOCALAPPDATA\Programs\TGZTerminal\wezterm-gui.exe" start --always-new-process
+```
+
+On a machine without a working GPU driver (a VM, a basic display adapter) it falls back
+from the system OpenGL to the bundled ANGLE renderer by itself. If even that fails,
+`front_end = "Software"` in your config uses the bundled software renderer.
+
+#### Distribution: signing and winget
+
+Every Windows build is installed and launched on a real Windows runner before a release
+is published — once as installed, once with a WSL default domain — and the release is held
+back if it shows no window, an error dialog, a console window or a panic.
+
+Two things are wired into `tgzterminal-windows-release.yml` and stay off until configured:
+
+- **Code signing (SignPath Foundation).** Free for open-source projects. Apply at
+  [signpath.org](https://signpath.org), publish the code-signing policy they ask for, and
+  create artifact configurations named `binaries` (the four `.exe` files, uploaded flat)
+  and `installer` (the Setup exe). Then set the repository variables
+  `SIGNPATH_ORGANIZATION_ID`, `SIGNPATH_PROJECT_SLUG`, `SIGNPATH_SIGNING_POLICY_SLUG` and
+  the secret `SIGNPATH_API_TOKEN`. Signed releases build SmartScreen reputation under one
+  publisher, so the warning fades out and then stays away across versions — which
+  unsigned builds can never do.
+- **winget.** The first version has to be submitted once by hand: fork
+  `microsoft/winget-pkgs`, then run `wingetcreate new <Setup-exe-URL>` with the
+  identifier `TimGrossinger.TGZTerminal`, installer type `inno`, scope `user`. After it
+  is merged, add a classic personal access token with `public_repo` scope as the
+  secret `WINGET_TOKEN`, and every release opens the winget-pkgs update PR itself.
 
 ### Ubuntu and Debian
 

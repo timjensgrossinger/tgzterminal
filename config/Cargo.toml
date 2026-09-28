@@ -49,3 +49,5 @@ nix = {workspace=true, features=["resource"]}
 
 [target."cfg(windows)".dependencies]
 windows-sys = { workspace = true, features = ["Win32_System_Threading"] }
+# WSL distro list: read from the registry instead of spawning `wsl.exe`.
+winreg.workspace = true

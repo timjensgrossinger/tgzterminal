@@ -207,6 +207,12 @@ impl log::Log for Logger {
 
             let mut file = self.file.lock().unwrap();
             if file.is_none() {
+                // The runtime dir is otherwise only created once the mux
+                // listener starts, so anything logged before that -- exactly
+                // the startup failures worth reading -- used to be lost.
+                if let Some(dir) = self.file_name.parent() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
                 if let Ok(f) = std::fs::OpenOptions::new()
                     .append(true)
                     .create(true)
@@ -309,8 +315,17 @@ fn setup_pretty() -> (LevelFilter, Logger) {
     )
 }
 
+/// Where this process writes its log, once [`setup_logger`] has run. Shown in
+/// fatal-error dialogs so a user knows which file to send.
+pub fn log_file_path() -> Option<PathBuf> {
+    LOG_FILE_PATH.get().cloned()
+}
+
+static LOG_FILE_PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
 pub fn setup_logger() {
     let (max_level, logger) = setup_pretty();
+    let _ = LOG_FILE_PATH.set(logger.file_name.clone());
     if log::set_boxed_logger(Box::new(logger)).is_ok() {
         log::set_max_level(max_level);
     }
