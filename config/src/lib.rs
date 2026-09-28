@@ -416,8 +416,8 @@ pub(crate) fn default_config_with_dynamic_overrides_applied(
     let lua = lua::make_lua_context(Path::new("override")).context("make_lua_context")?;
     let table = mlua::Value::Table(lua.create_table()?);
     let config = Config::apply_overrides_to(&lua, table).context("apply_overrides_to")?;
-    let config =
-        Config::apply_overrides_obj_to(&lua, config, overrides).context("apply_overrides_obj_to")?;
+    let config = Config::apply_overrides_obj_to(&lua, config, overrides)
+        .context("apply_overrides_obj_to")?;
 
     let dyn_config = luahelper::lua_value_to_dynamic(config)?;
 

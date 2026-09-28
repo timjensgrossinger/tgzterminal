@@ -1615,12 +1615,11 @@ impl TermWindow {
         // explicitly by the user config or automatically after the
         // accelerated renderer failed), create this window with the
         // software renderer regardless of what config.front_end says.
-        let effective_front_end =
-            if ::window::configuration::force_swrast() {
-                FrontEndSelection::Software
-            } else {
-                config.front_end
-            };
+        let effective_front_end = if ::window::configuration::force_swrast() {
+            FrontEndSelection::Software
+        } else {
+            config.front_end
+        };
 
         let gl = match effective_front_end {
             FrontEndSelection::WebGpu => None,
@@ -1631,9 +1630,9 @@ impl TermWindow {
                     // caller so that it can destroy it before retrying
                     // with a different renderer.
                     FAILED_WINDOW.lock().unwrap().replace(window.clone());
-                    return Err(err.context(
-                        "failed to initialize the OpenGL renderer for this window",
-                    ));
+                    return Err(
+                        err.context("failed to initialize the OpenGL renderer for this window")
+                    );
                 }
             }),
         };
@@ -6322,7 +6321,10 @@ mod tests {
         }
         let path = wrote.unwrap();
         let round_tripped = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(path.file_name().unwrap(), worktree_script_file_name(std::process::id()));
+        assert_eq!(
+            path.file_name().unwrap(),
+            worktree_script_file_name(std::process::id())
+        );
         assert_eq!(&round_tripped, script);
         let _ = std::fs::remove_file(&path);
     }

@@ -1438,9 +1438,9 @@ impl super::TermWindow {
                         // (see the sidebar auto-hide toggle tests)
                         let dims = self.dimensions;
                         let delta = reserved_after as isize - reserved_before as isize;
-                        let new_width =
-                            (dims.pixel_width as isize + delta).clamp(160, i32::MAX as isize)
-                                as usize;
+                        let new_width = (dims.pixel_width as isize + delta)
+                            .clamp(160, i32::MAX as isize)
+                            as usize;
                         if let Some(window) = self.window.as_ref().map(|w| w.clone()) {
                             window.notify(TermWindowNotif::SetInnerSize {
                                 width: new_width,

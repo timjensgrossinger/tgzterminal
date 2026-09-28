@@ -21,11 +21,11 @@ use crate::units::Dimension;
 use crate::unix::UnixDomain;
 use crate::wsl::WslDomain;
 use crate::{
-    default_one_point_oh, default_one_point_oh_f64,
-    default_true, default_win32_acrylic_accent_color, CellWidth, GpuInfo,
-    IntegratedTitleButtonColor, KeyMapPreference, LoadedConfig, MouseEventTriggerMods, RgbaColor,
-    SerialDomain, SystemBackdrop, WebGpuPowerPreference, CONFIG_DIRS, CONFIG_FILE_OVERRIDE,
-    CONFIG_OVERRIDES, CONFIG_SKIP, HOME_DIR,
+    default_one_point_oh, default_one_point_oh_f64, default_true,
+    default_win32_acrylic_accent_color, CellWidth, GpuInfo, IntegratedTitleButtonColor,
+    KeyMapPreference, LoadedConfig, MouseEventTriggerMods, RgbaColor, SerialDomain, SystemBackdrop,
+    WebGpuPowerPreference, CONFIG_DIRS, CONFIG_FILE_OVERRIDE, CONFIG_OVERRIDES, CONFIG_SKIP,
+    HOME_DIR,
 };
 use anyhow::Context;
 use luahelper::impl_lua_conversion_dynamic;
