@@ -404,8 +404,11 @@ jobs:
           # Diagnostics: how each probe shell behaves when started hidden
           # (CREATE_NO_WINDOW) with stdin a closed pipe and output captured,
           # as the app does. Informational; the smoke test below is the gate.
-          function Invoke-HiddenWsl([string]$arguments) {
-            $psi = New-Object System.Diagnostics.ProcessStartInfo 'wsl.exe', $arguments
+          function Invoke-HiddenWsl([string[]]$arguments) {
+            $psi = New-Object System.Diagnostics.ProcessStartInfo 'wsl.exe'
+            # One entry per argument, quoted by .NET the way Rust's Command
+            # quotes them, so this is the app's command line exactly.
+            foreach ($a in $arguments) { $psi.ArgumentList.Add($a) }
             $psi.UseShellExecute = $false
             $psi.CreateNoWindow = $true
             $psi.RedirectStandardInput = $true
@@ -417,14 +420,18 @@ jobs:
             $out = $p.StandardOutput.ReadToEndAsync()
             $err = $p.StandardError.ReadToEndAsync()
             if ($p.WaitForExit(20000)) {
-              "{0,6:N1}s exit {1} out=[{2}] err=[{3}]  wsl.exe {4}" -f $watch.Elapsed.TotalSeconds, $p.ExitCode, $out.Result.Trim(), $err.Result.Trim(), $arguments
+              "{0,6:N1}s exit {1} out=[{2}] err=[{3}]  wsl.exe {4}" -f $watch.Elapsed.TotalSeconds, $p.ExitCode, $out.Result.Trim(), $err.Result.Trim(), ($arguments -join ' | ')
             } else {
               $p.Kill()
-              "  hung (killed after 20s)  wsl.exe $arguments"
+              "  hung (killed after 20s)  wsl.exe $($arguments -join ' | ')"
             }
           }
-          Invoke-HiddenWsl "-d $distro --exec sh -lc `"command -v claude`""
-          Invoke-HiddenWsl "-d $distro --exec bash -lic `"command -v claude`""
+          Invoke-HiddenWsl @('-d', $distro, '--exec', 'sh', '-lc', 'command -v claude')
+          Invoke-HiddenWsl @('-d', $distro, '--exec', 'bash', '-lic', 'command -v claude')
+          # The app's probe, verbatim (wsl_paths::WSL_PROBE_SCRIPT).
+          $probeScript = 'for c in "$@"; do command -v "$c" >/dev/null 2>&1 && printf ''tgz-found:%s\n'' "$c"; done; exit 0'
+          Invoke-HiddenWsl @('-d', $distro, '--exec', 'sh', '-lc', $probeScript, 'sh', 'claude', 'codex', 'gemini')
+          Invoke-HiddenWsl @('-d', $distro, '--exec', 'sh', '-lc', 'exit 0', 'sh', 'claude')
           $config = Join-Path $env:RUNNER_TEMP 'wsl-smoke.lua'
           Set-Content -Path $config -Encoding utf8 -Value "return { default_domain = 'WSL:$distro' }"
 

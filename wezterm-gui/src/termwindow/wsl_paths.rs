@@ -153,13 +153,13 @@ pub(crate) fn run_wsl_hidden(args: &[&str], timeout: Duration) -> Result<String,
     cmd.args(args);
     // Killed on timeout, and output a lingering Linux process keeps the pipe
     // open for is abandoned rather than waited on.
-    let output = config::output_with_timeout(cmd, timeout).map_err(|err| {
-        if err.is::<config::WslCommandTimedOut>() {
-            WslRunError::TimedOut
-        } else {
-            WslRunError::Failed(format!("{err:#}"))
-        }
-    })?;
+    let output =
+        config::output_with_timeout(cmd, timeout).map_err(|err| match err
+            .downcast_ref::<config::WslCommandTimedOut>()
+        {
+            Some(timed_out) => WslRunError::TimedOut(format!("{timed_out}; ran wsl.exe {args:?}")),
+            None => WslRunError::Failed(format!("{err:#}")),
+        })?;
     if !output.status.success() {
         // `wsl.exe`'s own complaints are UTF-16; a Linux program's are not.
         let stderr: String = config::decode_wsl_output(&output.stderr)
@@ -176,8 +176,9 @@ pub(crate) fn run_wsl_hidden(args: &[&str], timeout: Duration) -> Result<String,
 /// Why [`run_wsl_hidden`] has no output to offer.
 #[derive(Debug)]
 pub(crate) enum WslRunError {
-    /// No answer before the timeout; the child was killed.
-    TimedOut,
+    /// No answer before the timeout; the child was killed. Says what it had
+    /// printed and what it was asked.
+    TimedOut(String),
     /// It could not start, or exited unsuccessfully (with its stderr).
     Failed(String),
 }
@@ -393,11 +394,8 @@ fn probe_distro(
         args.extend(missing.iter().copied());
         let output = match run_wsl_hidden(&args, WSL_PROBE_TIMEOUT) {
             Ok(output) => output,
-            Err(WslRunError::TimedOut) => {
-                log::info!(
-                    "wsl agent probe: {} did not answer within {WSL_PROBE_TIMEOUT:?}",
-                    distro.name
-                );
+            Err(WslRunError::TimedOut(detail)) => {
+                log::info!("wsl agent probe: {} did not answer: {detail}", distro.name);
                 // An unresponsive distro will not answer the next shell
                 // either; waiting for it again only delays the others.
                 break;

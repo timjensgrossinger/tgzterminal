@@ -274,13 +274,30 @@ pub fn hidden_wsl_command() -> std::process::Command {
 }
 
 /// What [`output_with_timeout`] fails with when it had to kill the child, so
-/// callers can tell "no answer" apart from "answered with an error".
+/// callers can tell "no answer" apart from "answered with an error". Carries
+/// whatever the child had printed by then: a `wsl.exe` that is waiting for
+/// something (a prompt, an update, a service) usually says so.
 #[derive(Debug)]
-pub struct WslCommandTimedOut(pub std::time::Duration);
+pub struct WslCommandTimedOut {
+    pub timeout: std::time::Duration,
+    pub stdout: String,
+    pub stderr: String,
+}
 
 impl std::fmt::Display for WslCommandTimedOut {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "wsl.exe did not answer within {:?}", self.0)
+        write!(f, "wsl.exe did not answer within {:?}", self.timeout)?;
+        let excerpt = |text: &str| -> String { text.trim().chars().take(300).collect() };
+        if self.stdout.trim().is_empty() && self.stderr.trim().is_empty() {
+            write!(f, " and printed nothing")
+        } else {
+            write!(
+                f,
+                "; it printed stdout {:?}, stderr {:?}",
+                excerpt(&self.stdout),
+                excerpt(&self.stderr)
+            )
+        }
     }
 }
 
@@ -306,19 +323,42 @@ pub fn output_with_timeout(
     // End of input straight away (see `hidden_wsl_command`).
     drop(child.stdin.take());
     // Drained on threads so a full pipe cannot stall the child while it is
-    // being polled. Results come back over channels so waiting for them can
-    // be given up on; a reader stuck on an inherited pipe just exits with the
-    // process later.
+    // being polled. Chunks land in a shared buffer as they arrive, so what
+    // was printed can be read even when the pipe never closes (a process
+    // the child started keeps it open) and waiting for it is given up on.
+    struct Drained {
+        buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        done: mpsc::Receiver<()>,
+    }
+    impl Drained {
+        fn collect(&self, until: Instant) -> Vec<u8> {
+            let _ = self
+                .done
+                .recv_timeout(until.saturating_duration_since(Instant::now()));
+            self.buf.lock().map(|buf| buf.clone()).unwrap_or_default()
+        }
+    }
     let drain = |pipe: Option<Box<dyn Read + Send>>| {
-        let (tx, rx) = mpsc::channel();
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (tx, done) = mpsc::channel();
+        let sink = std::sync::Arc::clone(&buf);
         std::thread::spawn(move || {
-            let mut buf = Vec::new();
             if let Some(mut pipe) = pipe {
-                let _ = pipe.read_to_end(&mut buf);
+                let mut chunk = [0u8; 4096];
+                loop {
+                    match pipe.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if let Ok(mut buf) = sink.lock() {
+                                buf.extend_from_slice(&chunk[..n]);
+                            }
+                        }
+                    }
+                }
             }
-            let _ = tx.send(buf);
+            let _ = tx.send(());
         });
-        rx
+        Drained { buf, done }
     };
     let stdout = drain(
         child
@@ -340,19 +380,21 @@ pub fn output_with_timeout(
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(WslCommandTimedOut(timeout).into());
+            let until = Instant::now() + std::time::Duration::from_millis(500);
+            return Err(WslCommandTimedOut {
+                timeout,
+                stdout: decode_wsl_output(&stdout.collect(until)),
+                stderr: decode_wsl_output(&stderr.collect(until)),
+            }
+            .into());
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
     };
     let grace_ends = Instant::now() + PIPE_DRAIN_GRACE;
-    let collect = |rx: mpsc::Receiver<Vec<u8>>| {
-        rx.recv_timeout(grace_ends.saturating_duration_since(Instant::now()))
-            .unwrap_or_default()
-    };
     Ok(std::process::Output {
         status,
-        stdout: collect(stdout),
-        stderr: collect(stderr),
+        stdout: stdout.collect(grace_ends),
+        stderr: stderr.collect(grace_ends),
     })
 }
 
@@ -659,4 +701,29 @@ fn wsl_output_is_decoded_as_utf16_or_utf8() {
     // WSL_UTF8=1
     assert_eq!(decode_wsl_output("Ubuntu\n".as_bytes()), "Ubuntu\n");
     assert_eq!(decode_wsl_output(b""), "");
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn a_timed_out_command_reports_what_it_printed() {
+    let mut cmd = std::process::Command::new("sh");
+    cmd.args(["-c", "echo waiting for you; sleep 5"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let err = output_with_timeout(cmd, std::time::Duration::from_millis(500)).unwrap_err();
+    let timed_out = err
+        .downcast_ref::<WslCommandTimedOut>()
+        .expect("a timeout, not another error");
+    assert_eq!(timed_out.stdout.trim(), "waiting for you");
+    assert!(timed_out.to_string().contains("waiting for you"));
+
+    let mut cmd = std::process::Command::new("sh");
+    cmd.args(["-c", "echo done"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let output = output_with_timeout(cmd, std::time::Duration::from_secs(5)).unwrap();
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "done");
 }
