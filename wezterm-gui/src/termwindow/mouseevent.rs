@@ -870,7 +870,7 @@ impl super::TermWindow {
         if event.kind == WMEK::Release(MousePress::Left) {
             self.pressed_ui_item = None;
             if let Some(pane) = self.sidebar_primary_pane_for_tab_idx(tab_idx) {
-                if let Some(kind) = self.pane_toolbelt_kind(&pane) {
+                if let Some(kind) = self.sidebar_copy_kind(&pane) {
                     let items = crate::termwindow::render::sidebar::pane_copy_menu_items(&kind);
                     self.pane_copy_menu = Some(PaneCopyMenuState {
                         pane_id: pane.pane_id(),

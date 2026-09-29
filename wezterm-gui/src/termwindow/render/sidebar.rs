@@ -4572,9 +4572,9 @@ fn pane_toolbelt_buttons(
     {
         buttons.push(("Stop", PaneToolbeltAction::Interrupt));
     }
-    if agent.actions.copy_summary {
-        buttons.push(("Copy", PaneToolbeltAction::CopyMenu));
-    }
+    // No Copy here: every tab's sidebar row carries the Copy icon, agent tabs
+    // included, and it opens this pane's agent copy menu. A second Copy on the
+    // floating strip meant two controls for one thing, in two places.
     if agent.actions.attach {
         buttons.push(("Attach", PaneToolbeltAction::Attach));
     }
@@ -8876,6 +8876,19 @@ impl crate::TermWindow {
     /// copy icon and nothing else — a plain pane has no floating strip, because
     /// there is no position on a full terminal grid where a box is not sitting
     /// on somebody's output.
+    /// Which copy menu the sidebar tab row's Copy icon opens for `pane`.
+    ///
+    /// Unlike [`Self::pane_toolbelt_kind`] this ignores
+    /// `agent_ui.show_pane_toolbelt`: that switch is about the floating strip,
+    /// and Copy no longer lives on the strip. An agent tab with the strip off
+    /// still gets its agent copy menu here instead of an icon that does nothing.
+    pub(crate) fn sidebar_copy_kind(&self, pane: &Arc<dyn Pane>) -> Option<PaneToolbeltKind> {
+        if let Some(agent) = self.detect_agent_pane(pane) {
+            return Some(PaneToolbeltKind::Agent(agent));
+        }
+        self.pane_toolbelt_kind(pane)
+    }
+
     pub(crate) fn pane_toolbelt_kind(&self, pane: &Arc<dyn Pane>) -> Option<PaneToolbeltKind> {
         // `detect_agent_pane` already returns None when `agent_ui.enabled` is
         // off, which is correct: with agent awareness switched off every pane
@@ -18299,6 +18312,18 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
             false
         )
         .is_empty());
+
+        // Copy lives on the sidebar tab row for every tab; the agent strip no
+        // longer carries a second one, even for an agent that can copy.
+        assert!(!pane_toolbelt_buttons(
+            &agent_ui,
+            &PaneToolbeltKind::Agent(agent.clone()),
+            Some(&adapter),
+            false,
+            false
+        )
+        .iter()
+        .any(|(_, action)| *action == PaneToolbeltAction::CopyMenu));
 
         // The Compose button appears only when rich_input is enabled and not docked.
         assert!(!pane_toolbelt_buttons(
