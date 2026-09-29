@@ -8876,6 +8876,51 @@ impl crate::TermWindow {
     /// copy icon and nothing else — a plain pane has no floating strip, because
     /// there is no position on a full terminal grid where a box is not sitting
     /// on somebody's output.
+    /// Where the Copy glyph's ink is centred, `(x, y)` in px from its cell's
+    /// top-left corner.
+    ///
+    /// The Nerd Font icon is rasterised wider than one cell and anchored at the
+    /// cell's left edge, so centring the *cell* in the hover box left the icon
+    /// visibly right of centre, while the narrow `×` beside it looked fine.
+    /// Measured from the glyph cache on every call rather than remembered: a
+    /// measurement taken while the fallback font was still loading would
+    /// otherwise stick, and shaping one glyph per visible row is cheap.
+    fn sidebar_copy_glyph_ink_center(&self) -> Option<(f32, f32)> {
+        let style = self
+            .fonts
+            .match_style(&self.config, &CellAttributes::default());
+        let font = self.fonts.resolve_font(style).ok()?;
+        let window = self.window.as_ref()?.clone();
+        let infos = font
+            .shape(
+                SIDEBAR_COPY_GLYPH,
+                move || window.notify(TermWindowNotif::InvalidateShapeCache),
+                crate::customglyph::BlockKey::filter_out_synthetic,
+                None,
+                wezterm_bidi::Direction::LeftToRight,
+                None,
+                None,
+            )
+            .ok()?;
+        let info = infos.first()?;
+        let glyph = self
+            .render_state
+            .as_ref()?
+            .glyph_cache
+            .borrow_mut()
+            .cached_glyph(info, style, false, &font, &self.render_metrics, 1)
+            .ok()?;
+        let texture = glyph.texture.as_ref()?;
+        let left = (glyph.x_offset + glyph.bearing_x).get() as f32;
+        let width = texture.coords.size.width as f32 * glyph.scale as f32;
+        // `screen_line`'s placement for a baseline-aligned glyph at scale 1.
+        let top = self.render_metrics.cell_size.height as f32
+            + self.render_metrics.descender.get() as f32
+            - (glyph.y_offset + glyph.bearing_y).get() as f32;
+        let height = texture.coords.size.height as f32 * glyph.scale as f32;
+        Some((left + width * 0.5, top + height * 0.5))
+    }
+
     /// Which copy menu the sidebar tab row's Copy icon opens for `pane`.
     ///
     /// Unlike [`Self::pane_toolbelt_kind`] this ignores
@@ -12391,15 +12436,25 @@ impl crate::TermWindow {
                 // a control that only exists once you have already found it is
                 // not a control anybody finds. Full strength for the same
                 // reason — a dimmed icon reads as disabled.
+                // Centre the glyph's *ink* on the hover box; the cell-based
+                // placement is the fallback when the glyph cannot be measured.
+                let (copy_glyph_x, copy_glyph_y) = match self.sidebar_copy_glyph_ink_center() {
+                    Some((ink_x, ink_y)) => (
+                        copy_x + copy_geometry.button_dx + copy_geometry.side * 0.5 - ink_x,
+                        y + row_offset + row_height as f32 * 0.5 - ink_y,
+                    ),
+                    None => (
+                        copy_x + copy_geometry.glyph_dx,
+                        y + row_offset + (row_height as f32 - cell_height as f32) * 0.5,
+                    ),
+                };
                 render_text(
                     self,
                     layers,
                     SIDEBAR_COPY_GLYPH,
                     &CellAttributes::default(),
-                    copy_x + copy_geometry.glyph_dx,
-                    y + row_offset
-                        + (row_height as f32 - cell_height as f32) * 0.5
-                        + copy_glyph_offset,
+                    copy_glyph_x,
+                    copy_glyph_y + copy_glyph_offset,
                     cell_width as f32,
                     if copy_hovered {
                         hover_fg
