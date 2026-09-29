@@ -258,10 +258,7 @@ mod windows {
     /// back — the mapping only exists while its handles are open, so the
     /// caller must keep the holder alive while resolving.
     #[cfg(test)]
-    pub fn publish_bare_name_for_test(
-        class_name: &str,
-        bare: &str,
-    ) -> anyhow::Result<NameHolder> {
+    pub fn publish_bare_name_for_test(class_name: &str, bare: &str) -> anyhow::Result<NameHolder> {
         let (mutex_name, map_name) = NameHolder::compute_names(class_name);
         let mutex = NamedMutex::new(&mutex_name)?;
         mutex.with_lock(|| {
@@ -453,7 +450,10 @@ mod test {
         let class_name = test_class_name("full");
         let holder = publish_gui_sock_path(&full, &class_name).unwrap();
         let resolved = resolve_gui_sock_path(&class_name).unwrap();
-        assert!(resolved.is_absolute(), "resolved {resolved:?} is not absolute");
+        assert!(
+            resolved.is_absolute(),
+            "resolved {resolved:?} is not absolute"
+        );
         assert_eq!(resolved, full);
         drop(holder);
     }

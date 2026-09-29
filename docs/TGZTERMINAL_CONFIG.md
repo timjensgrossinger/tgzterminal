@@ -923,17 +923,17 @@ Both sources are filtered before display:
   already gated by the same adapter config).
 
 ```lua
- agent_ui = {
-   section = {
-     enabled = true,      -- show the Agents section in the sidebar at all
-     refresh_ms = 500,     -- how often the disk-scanned source re-reads, clamped 100..=10000
-     show_non_interactive = false, -- also list SDK/headless/hook agent processes
-     show_activity = true, -- transcript headline, attention, branch, subagent summary + tree
-     show_tokens = true, -- pane-reported token/cost telemetry
-     sort_attention_first = true, -- surface blocked/waiting agents at the top of the list
-   },
- }
- ```
+agent_ui = {
+  section = {
+    enabled = true,      -- show the Agents section in the sidebar at all
+    refresh_ms = 500,     -- how often the disk-scanned source re-reads, clamped 100..=10000
+    show_non_interactive = false, -- also list SDK/headless/hook agent processes
+    show_activity = true, -- transcript headline, attention, branch, subagent summary + tree
+    show_tokens = true, -- pane-reported token/cost telemetry
+    sort_attention_first = true, -- surface blocked/waiting agents at the top of the list
+  },
+}
+```
 
 The section header reads `Agents · N` (or `Agents · N · M⚠` when `M` agents
 need attention). Scroll the list with the mouse wheel when it is taller than
