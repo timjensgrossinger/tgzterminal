@@ -130,7 +130,7 @@ impl SessionSource for OpenCodeDetector {
 
     fn collect_sessions(&self, root: &SessionRoot) -> Vec<VendorSession> {
         let home = root.home.as_path();
-        let mut sessions = collect_database_sessions(home);
+        let mut sessions = collect_database_sessions_cached(home);
         if !sessions.is_empty() {
             return sessions;
         }
@@ -211,6 +211,64 @@ impl SessionSource for OpenCodeDetector {
         }
         sessions
     }
+}
+
+/// How long an unchanged database's answer may be reused. Only time moves the
+/// result while the files stand still -- sessions age out of the active and
+/// working windows -- and both windows are minutes long.
+const OPENCODE_DB_CACHE_TTL: Duration = Duration::from_secs(30);
+
+/// Size and mtime of the database and its write-ahead log.
+type DbFingerprint = [(u64, Option<SystemTime>); 2];
+
+fn db_fingerprint(db: &Path) -> Option<DbFingerprint> {
+    let stamp = |path: &Path| {
+        std::fs::metadata(path)
+            .map(|meta| (meta.len(), meta.modified().ok()))
+            .unwrap_or((0, None))
+    };
+    let mut wal = db.as_os_str().to_owned();
+    wal.push("-wal");
+    let main = std::fs::metadata(db).ok()?;
+    Some([(main.len(), main.modified().ok()), stamp(Path::new(&wal))])
+}
+
+/// [`collect_database_sessions`], reused while the database is unchanged.
+///
+/// Opening `opencode.db` replays its whole write-ahead log, and a store inside
+/// WSL is read through the 9p share: with a 7 MB log that is ~16 s per open on
+/// a slow machine, every scan, for a database nobody had written to in hours.
+/// That stalled the whole herd scan, and with it how soon a newly started agent
+/// of *any* vendor was seen and recorded for "Reopen last window".
+fn collect_database_sessions_cached(home: &Path) -> Vec<VendorSession> {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::time::Instant;
+
+    static CACHE: Mutex<Option<HashMap<PathBuf, (DbFingerprint, Instant, Vec<VendorSession>)>>> =
+        Mutex::new(None);
+
+    let db = opencode_db(home);
+    let Some(fingerprint) = db_fingerprint(&db) else {
+        return Vec::new();
+    };
+    if let Some((cached_print, at, sessions)) = CACHE
+        .lock()
+        .unwrap()
+        .get_or_insert_with(HashMap::new)
+        .get(&db)
+    {
+        if *cached_print == fingerprint && at.elapsed() < OPENCODE_DB_CACHE_TTL {
+            return sessions.clone();
+        }
+    }
+    let sessions = collect_database_sessions(home);
+    CACHE
+        .lock()
+        .unwrap()
+        .get_or_insert_with(HashMap::new)
+        .insert(db, (fingerprint, Instant::now(), sessions.clone()));
+    sessions
 }
 
 fn collect_database_sessions(home: &Path) -> Vec<VendorSession> {

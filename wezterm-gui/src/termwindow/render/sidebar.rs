@@ -5129,8 +5129,11 @@ const AGENT_STICKY_VISIBLE_TTL: Duration = Duration::from_secs(30);
 /// worker that dies, or a window that never processes the notification, would
 /// otherwise suppress every later scan and freeze the whole herd view. The
 /// value only has to be longer than a slow scan; OpenCode's store is the
-/// pathological case, at hundreds of megabytes.
-const HERD_SCAN_WATCHDOG: Duration = Duration::from_secs(15);
+/// pathological case, at hundreds of megabytes. A WSL store is read through
+/// the 9p share, where 20 s scans were measured on a slow machine: at 15 s the
+/// watchdog started a second scan on top of the first, and each slowed the
+/// other.
+const HERD_SCAN_WATCHDOG: Duration = Duration::from_secs(60);
 
 /// How long the same spinner-led line may sit on screen before it stops
 /// counting as a spinner.
@@ -12797,6 +12800,11 @@ impl crate::TermWindow {
         let mut panes: Vec<PaneAgentRow> = Vec::new();
 
         let tab_count = window.count_tabs();
+        let window_panes: HashSet<PaneId> = window
+            .iter_tabs()
+            .flat_map(|tab| tab.iter_panes_ignoring_zoom())
+            .map(|pos| pos.pane.pane_id())
+            .collect();
         // The mux borrow has to go before `detect_agent_pane`, which reaches
         // back into the mux for each pane.
         drop(window);
@@ -12871,6 +12879,39 @@ impl crate::TermWindow {
                 )
             })
             .unwrap_or_default();
+
+        // A session whose own environment names a pane of this window is in
+        // that pane, whether or not screen detection has recognised it yet. A
+        // WSL agent often is not recognised -- its foreground process is
+        // `wslhost.exe`, and a fresh prompt has none of the text detection
+        // looks for -- and with no row to bind to, the session rendered
+        // detached and was never recorded for "Reopen last window".
+        for session in &sessions {
+            let Some(hint) = session.pane_hint else {
+                continue;
+            };
+            if !window_panes.contains(&hint) || panes.iter().any(|row| row.pane_id == hint) {
+                continue;
+            }
+            panes.push(PaneAgentRow {
+                pane_id: hint,
+                provider: Some(session.vendor.adapter_id().to_string()),
+                title: session.vendor.label().to_string(),
+                status: crate::agent_herd::HerdStatus::Unknown,
+                model: None,
+                session_id: None,
+                cwd: None,
+                project_root: None,
+                git_branch: None,
+                pids: HashSet::new(),
+                input_tokens: None,
+                output_tokens: None,
+                cost: None,
+                activity: None,
+                can_attach: false,
+                can_open_logs: false,
+            });
+        }
 
         let mut agents = crate::agent_herd::join_sessions_with_panes(sessions, panes);
         // Apply pending resume bindings. OpenCode panes report no cwd, so the
@@ -13171,11 +13212,29 @@ impl crate::TermWindow {
 
         self.agent_herd_scan_started_at = Some(Instant::now());
         let future = promise::spawn::spawn_into_new_thread(move || {
+            let started = Instant::now();
             let roots = agent_session_roots(home, &distros);
             let sessions = crate::agent_herd::default_registry().collect_all_from(&roots);
+            // A scan reads every vendor's store, WSL ones through the 9p share;
+            // on a slow machine that is where the herd's latency goes.
+            if started.elapsed() > Duration::from_secs(2) {
+                log::info!(
+                    "agent herd scan took {:?} for {} roots",
+                    started.elapsed(),
+                    roots.len()
+                );
+            }
             window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
                 term_window.agent_herd_scan_started_at = None;
                 term_window.agent_herd_session_cache = Some((Instant::now(), Arc::new(sessions)));
+                // The herd, and the "Reopen last window" snapshot, are only
+                // rebuilt on paint. Without asking for one, a quiet window sat
+                // on the new sessions -- and did not start the next scan --
+                // until something else redrew it, which is how an agent started
+                // half a minute before the window closed never got recorded.
+                if let Some(window) = term_window.window.as_ref() {
+                    window.invalidate();
+                }
             })));
             Ok::<(), anyhow::Error>(())
         });

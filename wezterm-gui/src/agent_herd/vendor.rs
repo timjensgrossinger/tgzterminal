@@ -240,7 +240,16 @@ impl VendorRegistry {
         for root in roots {
             for source in &self.sources {
                 let vendor = source.vendor();
+                let started = std::time::Instant::now();
                 let mut sessions = source.collect_sessions(root);
+                if started.elapsed() > std::time::Duration::from_millis(500) {
+                    log::info!(
+                        "agent herd: {} took {:?} under {}",
+                        vendor.label(),
+                        started.elapsed(),
+                        root.home.display()
+                    );
+                }
                 for session in &mut sessions {
                     session.vendor = vendor.clone();
                     session.origin = root.origin.clone();
