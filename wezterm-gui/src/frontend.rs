@@ -426,6 +426,7 @@ impl GuiFrontEnd {
 
         // then spawn any new windows that are needed
         promise::spawn::spawn(async move {
+            let mut failed: Option<anyhow::Error> = None;
             while let Some(mux_window_id) = mux_windows.next() {
                 if front_end().has_mux_window(mux_window_id)
                     || front_end()
@@ -440,14 +441,13 @@ impl GuiFrontEnd {
                     .borrow_mut()
                     .insert(mux_window_id);
                 log::trace!("Creating TermWindow for mux_window_id={}", mux_window_id);
-                // If window creation fails because the accelerated
-                // renderer doesn't work on this machine (the classic
-                // case is a system with the Microsoft Basic Display
-                // Adapter, whose only OpenGL is the ancient GDI
-                // Generic 1.1 stack), destroy the half-built window,
-                // force the software renderer for the remainder of the
-                // process and try once more. That makes the machine
-                // usable instead of dying with
+                // Last resort. On Windows `enable_opengl` already falls
+                // back from WGL to the bundled ANGLE in place when WGL is
+                // missing or too old (GDI Generic 1.1 on a Microsoft Basic
+                // Display Adapter); this runs only when that failed too, or
+                // WebGpu did. Destroy the half-built window, force the
+                // software renderer (the bundled mesa) for the remainder of
+                // the process and try once more, rather than dying with
                 // "The OpenGL implementation is too old to work with glium".
                 let mut create_err = TermWindow::new_window(mux_window_id).await.err();
                 if create_err.is_some() {
@@ -476,6 +476,16 @@ impl GuiFrontEnd {
                         .spawned_mux_window
                         .borrow_mut()
                         .remove(&mux_window_id);
+                    failed.get_or_insert(err);
+                }
+            }
+            // Not one window could be opened and none exists: nothing is left
+            // to show the user, and the startup activity keeps the process
+            // alive -- a windowless zombie that later launches then hand
+            // their spawn to. Exit with the reason instead.
+            if let Some(err) = failed {
+                if front_end().known_windows.borrow().is_empty() {
+                    crate::terminate_with_error(err.context("could not open a window"));
                 }
             }
             *front_end().switching_workspaces.borrow_mut() = false;

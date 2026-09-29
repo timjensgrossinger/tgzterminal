@@ -220,42 +220,103 @@ impl HasWindowHandle for WindowInner {
     }
 }
 
+/// `context`, if the GUI's shaders can compile on it: they are tried as GLSL
+/// `330 core`, `330`, `320 es` and `300 es` (`wezterm-gui/src/renderstate.rs`),
+/// so the floor is desktop OpenGL 3.3 or OpenGL ES 3.0.
+fn require_renderable_version(
+    context: Rc<glium::backend::Context>,
+) -> anyhow::Result<Rc<glium::backend::Context>> {
+    let glium::Version(api, major, minor) = *context.get_opengl_version();
+    let usable = match api {
+        glium::Api::Gl => (major, minor) >= (3, 3),
+        glium::Api::GlEs => major >= 3,
+    };
+    anyhow::ensure!(
+        usable,
+        "{} is too old (need OpenGL 3.3 or OpenGL ES 3.0)",
+        context.get_opengl_version_string()
+    );
+    Ok(context)
+}
+
 impl WindowInner {
     fn enable_opengl(&mut self) -> anyhow::Result<Rc<glium::backend::Context>> {
         let conn = Connection::get().unwrap();
+        let hwnd = self.hwnd.0;
 
-        let gl_state = if self.config.prefer_egl {
-            match conn.gl_connection.borrow().as_ref() {
-                None => crate::egl::GlState::create(None, self.hwnd.0),
-                Some(glconn) => {
-                    crate::egl::GlState::create_with_existing_connection(glconn, self.hwnd.0)
-                }
+        let egl = || {
+            // Cloned out first so the shared borrow has ended before the
+            // `borrow_mut` below stores the connection.
+            let existing = conn.gl_connection.borrow().as_ref().map(Rc::clone);
+            match existing {
+                None => crate::egl::GlState::create(None, hwnd),
+                Some(glconn) => crate::egl::GlState::create_with_existing_connection(&glconn, hwnd),
             }
-        } else {
-            Err(anyhow::anyhow!("Config says to avoid EGL"))
-        }
-        .and_then(|egl| unsafe {
-            log::trace!("Initialized EGL!");
-            conn.gl_connection
-                .borrow_mut()
-                .replace(Rc::clone(egl.get_connection()));
-            let backend = Rc::new(egl);
-            Ok(glium::backend::Context::new(
-                backend,
-                true,
-                callback_behavior(),
-            )?)
-        })
-        .or_else(|err| {
-            log::trace!("EGL init failed {:?}, fall back to WGL", err);
-            super::wgl::GlState::create(self.hwnd.0).and_then(|state| unsafe {
+            .and_then(|egl| unsafe {
+                log::trace!("Initialized EGL!");
+                conn.gl_connection
+                    .borrow_mut()
+                    .replace(Rc::clone(egl.get_connection()));
+                let backend = Rc::new(egl);
+                Ok(glium::backend::Context::new(
+                    backend,
+                    true,
+                    callback_behavior(),
+                )?)
+            })
+        };
+        let wgl = || {
+            super::wgl::GlState::create(hwnd).and_then(|state| unsafe {
                 Ok(glium::backend::Context::new(
                     Rc::new(state),
                     true,
                     callback_behavior(),
                 )?)
             })
-        })?;
+        };
+
+        let gl_state = if self.config.prefer_egl {
+            egl()
+                .and_then(require_renderable_version)
+                .or_else(|egl_err| {
+                    log::trace!("EGL init failed {:?}, fall back to WGL", egl_err);
+                    wgl()
+                        .and_then(require_renderable_version)
+                        .map_err(|wgl_err| {
+                            anyhow::anyhow!(
+                                "No usable OpenGL. ANGLE: {egl_err:#}. WGL: {wgl_err:#}. \
+                             Setting front_end = \"Software\" in the configuration \
+                             may work around this."
+                            )
+                        })
+                })?
+        } else {
+            // WGL first, as ever. But the only WGL on a machine without a
+            // working GPU driver (a VM, a basic display adapter, a CI runner)
+            // is GDI Generic's OpenGL 1.1, which cannot compile our shaders,
+            // and nothing used to fall back from it: the window never
+            // appeared. The ANGLE libraries shipped next to the binary run on
+            // Direct3D, including its WARP software rasterizer.
+            wgl()
+                .and_then(require_renderable_version)
+                .or_else(|wgl_err| {
+                    log::warn!("WGL OpenGL is unusable ({wgl_err:#}); trying ANGLE (EGL)");
+                    egl()
+                        .and_then(require_renderable_version)
+                        .map_err(|egl_err| {
+                            anyhow::anyhow!(
+                                "No usable OpenGL. WGL: {wgl_err:#}. ANGLE: {egl_err:#}. \
+                             Setting front_end = \"Software\" in the configuration \
+                             may work around this."
+                            )
+                        })
+                })?
+        };
+        log::info!(
+            "OpenGL: {} ({})",
+            gl_state.get_opengl_version_string(),
+            gl_state.get_opengl_renderer_string()
+        );
 
         self.gl_state.replace(gl_state.clone());
 
@@ -3013,13 +3074,32 @@ unsafe extern "system" fn wnd_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    // A fatal-error dialog is up (see `show_fatal_error`): our window state
+    // may be mid-panic, so do not run any of it.
+    if super::FATAL_ERROR_SHOWING.load(std::sync::atomic::Ordering::SeqCst) {
+        return DefWindowProcW(hwnd, msg, wparam, lparam);
+    }
     match std::panic::catch_unwind(|| {
         do_wnd_proc(hwnd, msg, wparam, lparam)
             .unwrap_or_else(|| DefWindowProcW(hwnd, msg, wparam, lparam))
     }) {
         Ok(result) => result,
         Err(e) => {
-            log::error!("caught {:?}", e);
+            let message = match e.downcast_ref::<&str>() {
+                Some(s) => (*s).to_string(),
+                None => e
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .unwrap_or_else(|| format!("{e:?}")),
+            };
+            log::error!("caught {message}");
+            // Upstream exited silently here, which for a GUI-subsystem
+            // process is a window that vanishes (or never appears) with no
+            // trace outside the log.
+            super::show_fatal_error(
+                "Unexpected error",
+                &format!("The application stopped because of an internal error:\n\n{message}"),
+            );
             std::process::exit(1)
         }
     }

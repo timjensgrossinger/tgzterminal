@@ -34,7 +34,46 @@ impl Drop for WglWrapper {
     }
 }
 
+type DescribePixelFormatFunc =
+    unsafe extern "system" fn(HDC, i32, u32, *mut PIXELFORMATDESCRIPTOR) -> i32;
+type SetPixelFormatFunc = unsafe extern "system" fn(HDC, i32, *const PIXELFORMATDESCRIPTOR) -> i32;
+
 impl WglWrapper {
+    /// `DescribePixelFormat` for this GL. gdi32's version dispatches into the
+    /// module named opengl32.dll that the process loaded first -- the system
+    /// one -- which knows nothing of the pixel formats the bundled mesa (loaded
+    /// by path beside it) hands out, and fails with "The parameter is
+    /// incorrect". Mesa exports its own.
+    unsafe fn describe_pixel_format(
+        &self,
+        hdc: HDC,
+        format: i32,
+        pfd: &mut PIXELFORMATDESCRIPTOR,
+    ) -> i32 {
+        let size = std::mem::size_of::<PIXELFORMATDESCRIPTOR>() as u32;
+        if self.is_mesa {
+            match self
+                .lib
+                .get::<DescribePixelFormatFunc>(b"wglDescribePixelFormat\0")
+            {
+                Ok(func) => return func(hdc, format, size, pfd),
+                Err(err) => log::warn!("mesa has no wglDescribePixelFormat: {err:#}"),
+            }
+        }
+        DescribePixelFormat(hdc, format, size, pfd)
+    }
+
+    /// `SetPixelFormat` for this GL; see `describe_pixel_format`.
+    unsafe fn set_pixel_format(&self, hdc: HDC, format: i32, pfd: &PIXELFORMATDESCRIPTOR) -> i32 {
+        if self.is_mesa {
+            match self.lib.get::<SetPixelFormatFunc>(b"wglSetPixelFormat\0") {
+                Ok(func) => return func(hdc, format, pfd),
+                Err(err) => log::warn!("mesa has no wglSetPixelFormat: {err:#}"),
+            }
+        }
+        SetPixelFormat(hdc, format, pfd)
+    }
+
     fn load() -> anyhow::Result<Self> {
         let class_name = wide_string("wezterm wgl extension probing window");
         let h_inst = unsafe { GetModuleHandleW(null()) };
@@ -249,72 +288,90 @@ impl GlState {
     fn create_ext(wgl: WglWrapper, extensions: String, hdc: HDC) -> anyhow::Result<Self> {
         use ffiextra::*;
 
-        let mut attribs: Vec<i32> = vec![
-            DRAW_TO_WINDOW_ARB as i32,
-            1,
-            SUPPORT_OPENGL_ARB as i32,
-            1,
-            DOUBLE_BUFFER_ARB as i32,
-            1,
-            PIXEL_TYPE_ARB as i32,
-            TYPE_RGBA_ARB as i32,
-            COLOR_BITS_ARB as i32,
-            24,
-            ALPHA_BITS_ARB as i32,
-            8,
-            DEPTH_BITS_ARB as i32,
-            24,
-            STENCIL_BITS_ARB as i32,
-            8,
-            SAMPLE_BUFFERS_ARB as i32,
-            1,
-            SAMPLES_ARB as i32,
-            4,
-        ];
-
-        if has_extension(&extensions, "WGL_ARB_framebuffer_sRGB") {
+        let srgb_attrib = if has_extension(&extensions, "WGL_ARB_framebuffer_sRGB") {
             log::trace!("will request FRAMEBUFFER_SRGB_CAPABLE_ARB");
-            attribs.push(FRAMEBUFFER_SRGB_CAPABLE_ARB as i32);
-            attribs.push(1);
+            Some(FRAMEBUFFER_SRGB_CAPABLE_ARB)
         } else if has_extension(&extensions, "WGL_EXT_framebuffer_sRGB") {
             log::trace!("will request FRAMEBUFFER_SRGB_CAPABLE_EXT");
-            attribs.push(FRAMEBUFFER_SRGB_CAPABLE_EXT as i32);
-            attribs.push(1);
-        }
+            Some(FRAMEBUFFER_SRGB_CAPABLE_EXT)
+        } else {
+            None
+        };
 
-        attribs.push(0);
+        // Most preferred first. Not every driver offers a 4x multisampled
+        // format: the bundled mesa (llvmpipe, used for front_end = "Software"
+        // and RDP) offers none, and failing here fell all the way back to a
+        // basic context, which on mesa is a legacy OpenGL 3.1 that cannot run
+        // our shaders. Only then give up sRGB as well.
+        let mut attempts = vec![(true, true), (false, true)];
+        if srgb_attrib.is_some() {
+            attempts.push((false, false));
+        }
 
         let mut format_id = 0;
-        let mut num_formats = 0;
-
-        let res = unsafe {
-            wgl.ext.as_ref().unwrap().ChoosePixelFormatARB(
-                hdc as _,
-                attribs.as_ptr(),
-                null(),
+        let mut last_failure = String::new();
+        for (index, (multisample, srgb)) in attempts.into_iter().enumerate() {
+            let mut attribs: Vec<i32> = vec![
+                DRAW_TO_WINDOW_ARB as i32,
                 1,
-                &mut format_id,
-                &mut num_formats,
-            )
-        };
-        if res == 0 {
-            anyhow::bail!("ChoosePixelFormatARB returned 0");
-        }
+                SUPPORT_OPENGL_ARB as i32,
+                1,
+                DOUBLE_BUFFER_ARB as i32,
+                1,
+                PIXEL_TYPE_ARB as i32,
+                TYPE_RGBA_ARB as i32,
+                COLOR_BITS_ARB as i32,
+                24,
+                ALPHA_BITS_ARB as i32,
+                8,
+                DEPTH_BITS_ARB as i32,
+                24,
+                STENCIL_BITS_ARB as i32,
+                8,
+            ];
+            if multisample {
+                attribs.extend_from_slice(&[SAMPLE_BUFFERS_ARB as i32, 1, SAMPLES_ARB as i32, 4]);
+            }
+            if let (true, Some(attrib)) = (srgb, srgb_attrib) {
+                attribs.extend_from_slice(&[attrib as i32, 1]);
+            }
+            attribs.push(0);
 
-        if num_formats == 0 {
-            anyhow::bail!("ChoosePixelFormatARB returned 0 formats");
+            let mut num_formats = 0;
+            let res = unsafe {
+                wgl.ext.as_ref().unwrap().ChoosePixelFormatARB(
+                    hdc as _,
+                    attribs.as_ptr(),
+                    null(),
+                    1,
+                    &mut format_id,
+                    &mut num_formats,
+                )
+            };
+            last_failure = if res == 0 {
+                "ChoosePixelFormatARB returned 0".to_string()
+            } else if num_formats == 0 {
+                "ChoosePixelFormatARB returned 0 formats".to_string()
+            } else {
+                if index > 0 {
+                    log::info!(
+                        "WGL pixel format without 4x multisampling{}",
+                        if srgb { "" } else { " or sRGB" }
+                    );
+                }
+                String::new()
+            };
+            if last_failure.is_empty() {
+                break;
+            }
+        }
+        if !last_failure.is_empty() {
+            anyhow::bail!("{last_failure}");
         }
 
         let mut pfd: PIXELFORMATDESCRIPTOR = unsafe { std::mem::zeroed() };
 
-        let res = unsafe {
-            DescribePixelFormat(
-                hdc,
-                format_id,
-                std::mem::size_of::<PIXELFORMATDESCRIPTOR>() as _,
-                &mut pfd,
-            )
-        };
+        let res = unsafe { wgl.describe_pixel_format(hdc, format_id, &mut pfd) };
         if res == 0 {
             anyhow::bail!(
                 "DescribePixelFormat function failed: {}",
@@ -322,7 +379,7 @@ impl GlState {
             );
         }
 
-        let res = unsafe { SetPixelFormat(hdc, format_id, &pfd) };
+        let res = unsafe { wgl.set_pixel_format(hdc, format_id, &pfd) };
         if res == 0 {
             anyhow::bail!(
                 "SetPixelFormat function failed: {}",
@@ -330,30 +387,55 @@ impl GlState {
             );
         }
 
-        let mut attribs = vec![
-            CONTEXT_MAJOR_VERSION_ARB as i32,
-            4,
-            CONTEXT_MINOR_VERSION_ARB as i32,
-            5,
-            CONTEXT_PROFILE_MASK_ARB as i32,
-            CONTEXT_CORE_PROFILE_BIT_ARB as i32,
-        ];
-
-        if has_extension(&extensions, "WGL_ARB_create_context_robustness") {
-            log::trace!("requesting robustness features");
-            attribs.push(CONTEXT_RESET_NOTIFICATION_STRATEGY_ARB as i32);
-            attribs.push(LOSE_CONTEXT_ON_RESET_ARB as i32);
-            attribs.push(CONTEXT_FLAGS_ARB as i32);
-            attribs.push(CONTEXT_ROBUST_ACCESS_BIT_ARB as i32);
+        // 4.5 core first, as ever. A driver that tops out lower refuses it
+        // outright -- the bundled mesa 20.1's llvmpipe does -- so also ask
+        // for 3.3 core, the version our shaders are written against, and
+        // only then without robustness, which not every driver supports.
+        let robustness = has_extension(&extensions, "WGL_ARB_create_context_robustness");
+        let mut attempts = vec![];
+        for version in [(4, 5), (3, 3)] {
+            if robustness {
+                attempts.push((version, true));
+            }
+            attempts.push((version, false));
         }
-        attribs.push(0);
 
-        let rc = unsafe {
-            wgl.ext
-                .as_ref()
-                .unwrap()
-                .CreateContextAttribsARB(hdc as _, null(), attribs.as_ptr())
-        };
+        let mut rc = null();
+        for (index, ((major, minor), robust)) in attempts.into_iter().enumerate() {
+            let mut attribs = vec![
+                CONTEXT_MAJOR_VERSION_ARB as i32,
+                major,
+                CONTEXT_MINOR_VERSION_ARB as i32,
+                minor,
+                CONTEXT_PROFILE_MASK_ARB as i32,
+                CONTEXT_CORE_PROFILE_BIT_ARB as i32,
+            ];
+            if robust {
+                log::trace!("requesting robustness features");
+                attribs.push(CONTEXT_RESET_NOTIFICATION_STRATEGY_ARB as i32);
+                attribs.push(LOSE_CONTEXT_ON_RESET_ARB as i32);
+                attribs.push(CONTEXT_FLAGS_ARB as i32);
+                attribs.push(CONTEXT_ROBUST_ACCESS_BIT_ARB as i32);
+            }
+            attribs.push(0);
+
+            rc = unsafe {
+                wgl.ext.as_ref().unwrap().CreateContextAttribsARB(
+                    hdc as _,
+                    null(),
+                    attribs.as_ptr(),
+                )
+            };
+            if !rc.is_null() {
+                if index > 0 {
+                    log::info!(
+                        "WGL context: OpenGL {major}.{minor} core{}",
+                        if robust { "" } else { " without robustness" }
+                    );
+                }
+                break;
+            }
+        }
 
         if rc.is_null() {
             let err = unsafe { winapi::um::errhandlingapi::GetLastError() };

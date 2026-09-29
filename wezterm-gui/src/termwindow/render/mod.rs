@@ -35,6 +35,11 @@ use wezterm_term::color::{ColorAttribute, ColorPalette};
 use wezterm_term::{CellAttributes, Line, StableRowIndex};
 use window::color::LinearRgba;
 
+/// Smallest pane-scrollbar pill, before DPI scaling.
+const SCROLL_BAR_MIN_PILL_PX: f32 = 24.;
+/// Pixels above and below the pill that still grab it, before DPI scaling.
+const SCROLL_BAR_GRAB_SLOP_PX: f32 = 6.;
+
 pub mod borders;
 pub mod corners;
 pub mod draw;
@@ -338,6 +343,45 @@ impl crate::TermWindow {
                 pixel_max: self.terminal_size.pixel_height as f32,
                 pixel_cell: self.render_metrics.cell_size.height as f32,
             })
+    }
+
+    /// Where the pane scrollbar's rail and thumb are for `pane`, shared by
+    /// the painter, the hit-test registration and the drag handler so the
+    /// three can never disagree about where the thumb is. `None` when there
+    /// is nothing to scroll.
+    pub fn scroll_bar_geometry(
+        &self,
+        pane: &dyn Pane,
+        viewport: Option<StableRowIndex>,
+    ) -> Option<crate::scrollbar::ScrollBarGeometry> {
+        let tab_bar_height = if self.show_tab_bar && !self.sidebar_is_active() {
+            self.tab_bar_pixel_height().unwrap_or(0.)
+        } else {
+            0.
+        };
+        let (top_bar_height, bottom_bar_height) = if self.config.tab_bar_at_bottom {
+            (0.0, tab_bar_height)
+        } else {
+            (tab_bar_height, 0.0)
+        };
+        let border = self.get_os_border();
+        let dpi_scale = (self.dimensions.dpi as f32 / 96.).clamp(1., 2.5);
+        let layout = crate::scrollbar::ScrollBarLayout {
+            track_top: top_bar_height as usize + border.top.get(),
+            track_bottom: self
+                .dimensions
+                .pixel_height
+                .saturating_sub(border.bottom.get() + bottom_bar_height as usize),
+            inset: (16. * dpi_scale).clamp(16., 32.) as usize,
+            // A few-pixel pill over a long scrollback is unclickable; this
+            // floor still honours `min_scroll_bar_height` as a minimum.
+            min_thumb: self
+                .min_scroll_bar_height()
+                .max(SCROLL_BAR_MIN_PILL_PX * dpi_scale)
+                .ceil() as usize,
+            slop: (SCROLL_BAR_GRAB_SLOP_PX * dpi_scale) as usize,
+        };
+        crate::scrollbar::ScrollBarGeometry::compute(layout, &pane.get_dimensions(), viewport)
     }
 
     pub fn padding_left_top(&self) -> (f32, f32) {
