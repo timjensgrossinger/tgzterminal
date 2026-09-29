@@ -860,6 +860,21 @@ agent_ui = {
 }
 ```
 
+Agents installed natively on Windows (in PowerShell or cmd, not in WSL) need
+no WSL at all: turn `prefer_wsl` off so launches stay in the Windows domain.
+Their sessions are read from the Windows home (`%USERPROFILE%\.claude` and
+friends), which is always scanned, and a resume looks for the CLI on the
+Windows `PATH` before trying any distro.
+
+```lua
+agent_ui = {
+  launcher = {
+    prefer_wsl = false,
+    domain = 'local', -- optional: launch on Windows even from a WSL tab
+  },
+}
+```
+
 The working directory follows you across the domain change:
 
 - **Windows → WSL** needs no translation. The spawn becomes

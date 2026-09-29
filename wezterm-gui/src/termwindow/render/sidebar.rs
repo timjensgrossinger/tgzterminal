@@ -6854,7 +6854,7 @@ impl crate::TermWindow {
             return;
         };
         // Read config here; the worker has no handle on it.
-        let distros = self.wsl_distro_specs();
+        let distros = self.wsl_session_distro_specs();
 
         self.agent_session_scan_pending = true;
         let future = promise::spawn::spawn_into_new_thread(move || {
@@ -13194,6 +13194,37 @@ impl crate::TermWindow {
             .filter_map(|pane| mux.get_domain(pane.domain_id()))
             .filter_map(|domain| wsl_paths::distro_for_domain(domain.domain_name(), &self.config))
             .collect();
+        self.wsl_specs_for(&live)
+    }
+
+    /// [`Self::wsl_distro_specs`] plus every distro agents live in: those the
+    /// agent probe found a CLI in, and `agent_ui.launcher.wsl_distro`.
+    ///
+    /// For the resume submenu only. The live-pane rule above exists because the
+    /// herd scans every 500ms; this scan runs when the user opens the menu, at
+    /// most every [`Self::SESSION_SCAN_TTL`], and resuming would boot the distro
+    /// anyway. Without it, a window holding only cmd or PowerShell tabs listed
+    /// none of the sessions its agents -- all inside WSL -- had written.
+    fn wsl_session_distro_specs(&self) -> Vec<(String, Option<String>)> {
+        if !cfg!(windows) {
+            return vec![];
+        }
+        let mux = Mux::get();
+        let mut wanted: HashSet<String> = mux
+            .iter_panes()
+            .iter()
+            .filter(|pane| !pane.is_dead())
+            .filter_map(|pane| mux.get_domain(pane.domain_id()))
+            .filter_map(|domain| wsl_paths::distro_for_domain(domain.domain_name(), &self.config))
+            .collect();
+        wanted.extend(self.wsl_agent_hits().values().map(|hit| hit.distro.clone()));
+        wanted.extend(self.config.agent_ui.launcher.wsl_distro.clone());
+        self.wsl_specs_for(&wanted)
+    }
+
+    /// `(distribution, username)` for each configured WSL domain whose distro
+    /// is in `distros`.
+    fn wsl_specs_for(&self, live: &HashSet<String>) -> Vec<(String, Option<String>)> {
         if live.is_empty() {
             return vec![];
         }
