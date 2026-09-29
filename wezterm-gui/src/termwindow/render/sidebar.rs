@@ -11743,6 +11743,21 @@ impl crate::TermWindow {
         });
 
         let total_tabs = rows.len();
+        // The scrollbar gutter only earns its width while the list can scroll.
+        // Reserving it always parked every row's Copy and close controls 30px
+        // short of the edge -- dead space the title could have had.
+        let reclaimed = if total_tabs > visible_rows {
+            0.
+        } else {
+            scrollbar_gutter
+        };
+        let row_content_x = match self.config.sidebar_position {
+            SidebarPosition::Left => content_x,
+            SidebarPosition::Right => content_x - reclaimed,
+        };
+        let row_content_w = content_w + reclaimed;
+        let row_text_w = text_w + reclaimed;
+        let row_text_x = text_x + (row_content_x - content_x);
         for row in rows
             .into_iter()
             .skip(self.sidebar_scroll_offset)
@@ -11898,8 +11913,8 @@ impl crate::TermWindow {
                     let badge_w = badge
                         .map(|_| sidebar_agent_badge_w(cell_height as f32))
                         .unwrap_or(0.);
-                    let label_x = content_x + indent + PAD_X + ACTIVE_TEXT_GAP + badge_w;
-                    let label_w = (content_w
+                    let label_x = row_content_x + indent + PAD_X + ACTIVE_TEXT_GAP + badge_w;
+                    let label_w = (row_content_w
                         - indent
                         - PAD_X * 2.
                         - ACTIVE_TEXT_GAP
@@ -11907,7 +11922,7 @@ impl crate::TermWindow {
                         - close_reserve)
                         .max(0.);
                     if let Some((size, color)) = badge {
-                        let badge_x = content_x + indent + PAD_X + ACTIVE_TEXT_GAP;
+                        let badge_x = row_content_x + indent + PAD_X + ACTIVE_TEXT_GAP;
                         let badge_y = y + row_offset + (row_height as f32 - size) * 0.5;
                         self.sidebar_pill_fill(
                             layers,
@@ -11938,14 +11953,14 @@ impl crate::TermWindow {
                         row_bg,
                     )?;
                     self.ui_items.push(UIItem {
-                        x: (content_x + indent) as usize,
+                        x: (row_content_x + indent) as usize,
                         y: y as usize,
-                        width: (content_w - indent - CLOSE_ZONE_W).max(0.) as usize,
+                        width: (row_content_w - indent - CLOSE_ZONE_W).max(0.) as usize,
                         height: row_height,
                         item_type: row_type,
                     });
 
-                    let close_x = content_x + content_w - CLOSE_ZONE_W;
+                    let close_x = row_content_x + row_content_w - CLOSE_ZONE_W;
                     let close_geometry = sidebar_close_geometry(
                         cell_width as f32,
                         cell_height as f32,
@@ -12154,8 +12169,8 @@ impl crate::TermWindow {
             // only the width from them is what painted the leading "N: " index
             // on top of the chevron and the dot.
             let cols = sidebar_row_columns(
-                text_x,
-                text_w,
+                row_text_x,
+                row_text_w,
                 cell_width as f32,
                 cell_height as f32,
                 pane_count > 1,
@@ -12258,9 +12273,9 @@ impl crate::TermWindow {
                 )?;
             }
             self.ui_items.push(UIItem {
-                x: content_x as usize,
+                x: row_content_x as usize,
                 y: y as usize,
-                width: (content_w - CLOSE_ZONE_W - copy_w).max(0.) as usize,
+                width: (row_content_w - CLOSE_ZONE_W - copy_w).max(0.) as usize,
                 height: row_height,
                 item_type: tab_type,
             });
@@ -12277,7 +12292,7 @@ impl crate::TermWindow {
                 });
             }
 
-            let close_x = content_x + content_w - CLOSE_ZONE_W;
+            let close_x = row_content_x + row_content_w - CLOSE_ZONE_W;
             let copy_x = close_x - copy_w;
             let close_bg = if close_pressed {
                 lerp_rgba(surface, active_fg, 0.38)
