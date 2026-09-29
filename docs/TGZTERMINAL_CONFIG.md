@@ -991,8 +991,11 @@ config.pane_toolbelt = {
 }
 ```
 
-Plain shell and ssh panes get a `Copy` control on their **sidebar tab row**,
-left of that row's `×`. It is drawn on every eligible row at rest, the same way
+Every tab gets a `Copy` control on its **sidebar tab row**, left of that row's
+`×`. On a shell or ssh tab it offers the rows below; on an agent tab it opens the
+agent copy menu (conversation, Markdown, last message, agent details) — also
+when `agent_ui.show_pane_toolbelt` is off, since that switch is about the
+floating strip. It is drawn on every eligible row at rest, the same way
 the `×` is — a control you have to find before it will show itself is not one
 anybody finds. Hovering it adds a rounded button behind the glyph; that box is
 centred in its own slot rather than pushed against the `×`.
@@ -1001,8 +1004,10 @@ It is deliberately **not** a floating button over the pane. There is no position
 on a full terminal grid where a box is not sitting on somebody's output — a
 right-hand prompt, a column of timestamps, the tail of a long line — and a
 control that hides from the content it overlaps is a control you cannot find.
-Agent panes are the exception and keep their floating strip: it carries five
-actions, not one, and it is the only mouse path to `Stop`.
+Agent panes additionally keep their floating strip for `Stop`, `Attach`,
+`Resume`, `Details` and `Input`/`Compose` — it is the only mouse path to
+`Stop` — but not for Copy, which sits on the tab row like it does for every
+other tab.
 
 It stays at every sidebar width where its button fits: when the sidebar is
 narrow, the tab title is shortened instead. The one case where the icon is
@@ -1121,7 +1126,7 @@ config.keys = {
 ```
 
 When `rich_input.enabled = true`, the agent pane toolbelt also shows a **Compose**
-button (next to Copy). Clicking it toggles the composer open/closed for that pane,
+button. Clicking it toggles the composer open/closed for that pane,
 so no key binding is required. The button honors the same gating as
 `ActivateComposer` (`agent_panes_only`), and the toolbelt only appears on detected
 agent panes.
@@ -1416,9 +1421,9 @@ you are not left hunting for one.
 | Worktree button | Appears when the sidebar is wider than 180px; its label ladder and its half of the shared row are computed, not configured. |
 | `+ New Tab` button and label | Always drawn. `new_tab_menu.enabled` controls only the chevron beside it, not the button. |
 | Collapsed icon-rail composition | Derived from the auto-hide state and whether an agent CLI was discovered. Two-character badges come from an adapter's `short_label`. |
-| Toolbelt button labels, sizes and drop order | Hardcoded. When the strip is too narrow buttons are dropped in a fixed order (Input/Compose, then Details, Attach, Resume), and Stop and Copy are the last two standing. |
-| Per-toolbelt-button visibility | Toolbelt visibility is derived. Herd-row `Stop` is governed by `agent_ui.show_stop`; it appears when the agent can be interrupted. `Copy` whenever an agent is detected; `Attach` / `Resume` / `Details` need their action templates *and* the control-action gate; `Input` / `Compose` follow `rich_input.enabled` and `rich_input.docked`. If a button is missing, it is a detection or a gate question — see *How an agent is identified*. |
-| Tab-row Copy icon size and threshold | Hardcoded. It matches the close button's size but is centred in its own slot, and it is dropped when the title would fall below six columns. |
+| Toolbelt button labels, sizes and drop order | Hardcoded. When the strip is too narrow buttons are dropped in a fixed order (Input/Compose, then Details, Attach, Resume), and Stop is the last one standing. |
+| Per-toolbelt-button visibility | Toolbelt visibility is derived. Herd-row `Stop` is governed by `agent_ui.show_stop`; it appears when the agent can be interrupted. `Attach` / `Resume` / `Details` need their action templates *and* the control-action gate; `Input` / `Compose` follow `rich_input.enabled` and `rich_input.docked`. If a button is missing, it is a detection or a gate question — see *How an agent is identified*. |
+| Tab-row Copy icon size and threshold | Hardcoded. It matches the close button's size but is centred in its own slot. It stays at every width its box fits, shrinking its slot at the 140px drag floor; the title is shortened instead. |
 | Sidebar spacing, radii and row geometry | Compile-time constants. |
 | Individual sidebar colors | No per-element keys. The whole palette is derived — see `sidebar_theme` for which source it derives from. The attention colour (waiting-queue dot, pip, selection bar, attention line) comes from the palette too, so it follows the theme rather than being separately settable. |
 | Worktree picker behavior | `config.file_browser` — `shell` picks where the picker runs (`"Auto"` / `"Wsl"` / `"GitBash"`), `wsl_distro` names the distro when the target pane is not a WSL pane, `editor_command` opens selections, and `split_size_percent` sizes the split. The picker's internal script, its cache location and the fzf fallback prompt are not configurable. |

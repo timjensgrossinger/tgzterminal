@@ -4572,9 +4572,9 @@ fn pane_toolbelt_buttons(
     {
         buttons.push(("Stop", PaneToolbeltAction::Interrupt));
     }
-    if agent.actions.copy_summary {
-        buttons.push(("Copy", PaneToolbeltAction::CopyMenu));
-    }
+    // No Copy here: every tab's sidebar row carries the Copy icon, agent tabs
+    // included, and it opens this pane's agent copy menu. A second Copy on the
+    // floating strip meant two controls for one thing, in two places.
     if agent.actions.attach {
         buttons.push(("Attach", PaneToolbeltAction::Attach));
     }
@@ -8876,6 +8876,64 @@ impl crate::TermWindow {
     /// copy icon and nothing else — a plain pane has no floating strip, because
     /// there is no position on a full terminal grid where a box is not sitting
     /// on somebody's output.
+    /// Where the Copy glyph's ink is centred, `(x, y)` in px from its cell's
+    /// top-left corner.
+    ///
+    /// The Nerd Font icon is rasterised wider than one cell and anchored at the
+    /// cell's left edge, so centring the *cell* in the hover box left the icon
+    /// visibly right of centre, while the narrow `×` beside it looked fine.
+    /// Measured from the glyph cache on every call rather than remembered: a
+    /// measurement taken while the fallback font was still loading would
+    /// otherwise stick, and shaping one glyph per visible row is cheap.
+    fn sidebar_copy_glyph_ink_center(&self) -> Option<(f32, f32)> {
+        let style = self
+            .fonts
+            .match_style(&self.config, &CellAttributes::default());
+        let font = self.fonts.resolve_font(style).ok()?;
+        let window = self.window.as_ref()?.clone();
+        let infos = font
+            .shape(
+                SIDEBAR_COPY_GLYPH,
+                move || window.notify(TermWindowNotif::InvalidateShapeCache),
+                crate::customglyph::BlockKey::filter_out_synthetic,
+                None,
+                wezterm_bidi::Direction::LeftToRight,
+                None,
+                None,
+            )
+            .ok()?;
+        let info = infos.first()?;
+        let glyph = self
+            .render_state
+            .as_ref()?
+            .glyph_cache
+            .borrow_mut()
+            .cached_glyph(info, style, false, &font, &self.render_metrics, 1)
+            .ok()?;
+        let texture = glyph.texture.as_ref()?;
+        let left = (glyph.x_offset + glyph.bearing_x).get() as f32;
+        let width = texture.coords.size.width as f32 * glyph.scale as f32;
+        // `screen_line`'s placement for a baseline-aligned glyph at scale 1.
+        let top = self.render_metrics.cell_size.height as f32
+            + self.render_metrics.descender.get() as f32
+            - (glyph.y_offset + glyph.bearing_y).get() as f32;
+        let height = texture.coords.size.height as f32 * glyph.scale as f32;
+        Some((left + width * 0.5, top + height * 0.5))
+    }
+
+    /// Which copy menu the sidebar tab row's Copy icon opens for `pane`.
+    ///
+    /// Unlike [`Self::pane_toolbelt_kind`] this ignores
+    /// `agent_ui.show_pane_toolbelt`: that switch is about the floating strip,
+    /// and Copy no longer lives on the strip. An agent tab with the strip off
+    /// still gets its agent copy menu here instead of an icon that does nothing.
+    pub(crate) fn sidebar_copy_kind(&self, pane: &Arc<dyn Pane>) -> Option<PaneToolbeltKind> {
+        if let Some(agent) = self.detect_agent_pane(pane) {
+            return Some(PaneToolbeltKind::Agent(agent));
+        }
+        self.pane_toolbelt_kind(pane)
+    }
+
     pub(crate) fn pane_toolbelt_kind(&self, pane: &Arc<dyn Pane>) -> Option<PaneToolbeltKind> {
         // `detect_agent_pane` already returns None when `agent_ui.enabled` is
         // off, which is correct: with agent awareness switched off every pane
@@ -11730,6 +11788,21 @@ impl crate::TermWindow {
         });
 
         let total_tabs = rows.len();
+        // The scrollbar gutter only earns its width while the list can scroll.
+        // Reserving it always parked every row's Copy and close controls 30px
+        // short of the edge -- dead space the title could have had.
+        let reclaimed = if total_tabs > visible_rows {
+            0.
+        } else {
+            scrollbar_gutter
+        };
+        let row_content_x = match self.config.sidebar_position {
+            SidebarPosition::Left => content_x,
+            SidebarPosition::Right => content_x - reclaimed,
+        };
+        let row_content_w = content_w + reclaimed;
+        let row_text_w = text_w + reclaimed;
+        let row_text_x = text_x + (row_content_x - content_x);
         for row in rows
             .into_iter()
             .skip(self.sidebar_scroll_offset)
@@ -11885,8 +11958,8 @@ impl crate::TermWindow {
                     let badge_w = badge
                         .map(|_| sidebar_agent_badge_w(cell_height as f32))
                         .unwrap_or(0.);
-                    let label_x = content_x + indent + PAD_X + ACTIVE_TEXT_GAP + badge_w;
-                    let label_w = (content_w
+                    let label_x = row_content_x + indent + PAD_X + ACTIVE_TEXT_GAP + badge_w;
+                    let label_w = (row_content_w
                         - indent
                         - PAD_X * 2.
                         - ACTIVE_TEXT_GAP
@@ -11894,7 +11967,7 @@ impl crate::TermWindow {
                         - close_reserve)
                         .max(0.);
                     if let Some((size, color)) = badge {
-                        let badge_x = content_x + indent + PAD_X + ACTIVE_TEXT_GAP;
+                        let badge_x = row_content_x + indent + PAD_X + ACTIVE_TEXT_GAP;
                         let badge_y = y + row_offset + (row_height as f32 - size) * 0.5;
                         self.sidebar_pill_fill(
                             layers,
@@ -11925,14 +11998,14 @@ impl crate::TermWindow {
                         row_bg,
                     )?;
                     self.ui_items.push(UIItem {
-                        x: (content_x + indent) as usize,
+                        x: (row_content_x + indent) as usize,
                         y: y as usize,
-                        width: (content_w - indent - CLOSE_ZONE_W).max(0.) as usize,
+                        width: (row_content_w - indent - CLOSE_ZONE_W).max(0.) as usize,
                         height: row_height,
                         item_type: row_type,
                     });
 
-                    let close_x = content_x + content_w - CLOSE_ZONE_W;
+                    let close_x = row_content_x + row_content_w - CLOSE_ZONE_W;
                     let close_geometry = sidebar_close_geometry(
                         cell_width as f32,
                         cell_height as f32,
@@ -12141,8 +12214,8 @@ impl crate::TermWindow {
             // only the width from them is what painted the leading "N: " index
             // on top of the chevron and the dot.
             let cols = sidebar_row_columns(
-                text_x,
-                text_w,
+                row_text_x,
+                row_text_w,
                 cell_width as f32,
                 cell_height as f32,
                 pane_count > 1,
@@ -12245,9 +12318,9 @@ impl crate::TermWindow {
                 )?;
             }
             self.ui_items.push(UIItem {
-                x: content_x as usize,
+                x: row_content_x as usize,
                 y: y as usize,
-                width: (content_w - CLOSE_ZONE_W - copy_w).max(0.) as usize,
+                width: (row_content_w - CLOSE_ZONE_W - copy_w).max(0.) as usize,
                 height: row_height,
                 item_type: tab_type,
             });
@@ -12264,7 +12337,7 @@ impl crate::TermWindow {
                 });
             }
 
-            let close_x = content_x + content_w - CLOSE_ZONE_W;
+            let close_x = row_content_x + row_content_w - CLOSE_ZONE_W;
             let copy_x = close_x - copy_w;
             let close_bg = if close_pressed {
                 lerp_rgba(surface, active_fg, 0.38)
@@ -12363,15 +12436,25 @@ impl crate::TermWindow {
                 // a control that only exists once you have already found it is
                 // not a control anybody finds. Full strength for the same
                 // reason — a dimmed icon reads as disabled.
+                // Centre the glyph's *ink* on the hover box; the cell-based
+                // placement is the fallback when the glyph cannot be measured.
+                let (copy_glyph_x, copy_glyph_y) = match self.sidebar_copy_glyph_ink_center() {
+                    Some((ink_x, ink_y)) => (
+                        copy_x + copy_geometry.button_dx + copy_geometry.side * 0.5 - ink_x,
+                        y + row_offset + row_height as f32 * 0.5 - ink_y,
+                    ),
+                    None => (
+                        copy_x + copy_geometry.glyph_dx,
+                        y + row_offset + (row_height as f32 - cell_height as f32) * 0.5,
+                    ),
+                };
                 render_text(
                     self,
                     layers,
                     SIDEBAR_COPY_GLYPH,
                     &CellAttributes::default(),
-                    copy_x + copy_geometry.glyph_dx,
-                    y + row_offset
-                        + (row_height as f32 - cell_height as f32) * 0.5
-                        + copy_glyph_offset,
+                    copy_glyph_x,
+                    copy_glyph_y + copy_glyph_offset,
                     cell_width as f32,
                     if copy_hovered {
                         hover_fg
@@ -18299,6 +18382,18 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
             false
         )
         .is_empty());
+
+        // Copy lives on the sidebar tab row for every tab; the agent strip no
+        // longer carries a second one, even for an agent that can copy.
+        assert!(!pane_toolbelt_buttons(
+            &agent_ui,
+            &PaneToolbeltKind::Agent(agent.clone()),
+            Some(&adapter),
+            false,
+            false
+        )
+        .iter()
+        .any(|(_, action)| *action == PaneToolbeltAction::CopyMenu));
 
         // The Compose button appears only when rich_input is enabled and not docked.
         assert!(!pane_toolbelt_buttons(
