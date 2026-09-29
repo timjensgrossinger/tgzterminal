@@ -60,7 +60,9 @@ pub fn collect_sessions_in(root: &SessionRoot, include_subagents: bool) -> Vec<C
             continue;
         }
         match parse_session_file(&path) {
-            Some(session) if session_is_live(&root.origin, session.pid, &path) => {
+            Some(session)
+                if session_is_live_with_start(root, session.pid, session.proc_start, &path) =>
+            {
                 let mut session = session;
                 if include_subagents {
                     session.subagents = collect_subagents(home, &session.cwd, &session.session_id);
@@ -112,6 +114,12 @@ fn parse_session_file(path: &Path) -> Option<ClaudeSession> {
 
     Some(ClaudeSession {
         pid,
+        // A string in the file ("19502"): `/proc/<pid>/stat`'s starttime.
+        proc_start: value.get("procStart").and_then(|v| {
+            v.as_str()
+                .and_then(|s| s.parse().ok())
+                .or_else(|| v.as_u64())
+        }),
         interactive,
         session_id,
         project_root: super::project_root_for(&cwd),
@@ -210,13 +218,40 @@ const WSL_SESSION_LIVE_WINDOW: std::time::Duration = std::time::Duration::from_s
 /// at all: recency of the file stands in for it. That is weaker than a pid
 /// check and it is the strongest signal available without shelling into the
 /// distro on the scan path.
-pub(crate) fn session_is_live(origin: &SessionOrigin, pid: u32, session_file: &Path) -> bool {
-    match origin {
-        SessionOrigin::Host => process_is_alive(pid),
-        SessionOrigin::Wsl(_) => std::fs::metadata(session_file)
+pub(crate) fn session_is_live(root: &SessionRoot, pid: u32, session_file: &Path) -> bool {
+    session_is_live_with_start(root, pid, None, session_file)
+}
+
+/// [`session_is_live`] for a session file that also records its process's
+/// start time (Claude's `procStart`), which rules out a reused pid.
+///
+/// A WSL session asks the distro's own `/proc` first. The file mtime is only
+/// the fallback for when the share cannot be read: a session that had exited
+/// minutes ago used to count as live for twelve hours, and a restore then
+/// skipped it as "already running".
+pub(crate) fn session_is_live_with_start(
+    root: &SessionRoot,
+    pid: u32,
+    proc_start: Option<u64>,
+    session_file: &Path,
+) -> bool {
+    let mtime_fresh = || {
+        std::fs::metadata(session_file)
             .and_then(|meta| meta.modified())
             .map(|modified| wsl_session_is_fresh(modified, SystemTime::now()))
-            .unwrap_or(false),
+            .unwrap_or(false)
+    };
+    match root.origin {
+        SessionOrigin::Host => process_is_alive(pid),
+        SessionOrigin::Wsl(_) => {
+            match super::wsl_proc::process_state(&root.home, pid, proc_start) {
+                Some(false) => false,
+                // Without a start time a live pid may be a reused one; the
+                // mtime still has to agree.
+                Some(true) => proc_start.is_some() || mtime_fresh(),
+                None => mtime_fresh(),
+            }
+        }
     }
 }
 
@@ -1112,6 +1147,7 @@ impl crate::agent_herd::vendor::SessionSource for ClaudeDetector {
                 let name = session_name(transcript.as_deref(), s.name, s.name_is_derived);
                 crate::agent_herd::vendor::VendorSession {
                     origin: SessionOrigin::Host,
+                    pane_hint: None,
                     pid: s.pid,
                     interactive: s.interactive,
                     vendor: crate::agent_herd::vendor::AgentVendor::Claude,

@@ -806,13 +806,18 @@ that is not running simply contributes nothing.
 Two things work differently for a session found inside a distro:
 
 - **Liveness.** The pid in the session file belongs to the distro's pid
-  namespace and means nothing to Windows, so it is not checked. Recency of the
-  session file stands in for it, with a deliberately long window of **12 hours**.
-  The two failure modes are not symmetric: a stale row costs a line in the
-  sidebar that you can ignore or resume, whereas a missing row is the bug -- and
-  the row most likely to go missing is an agent *waiting on you*, which writes
-  nothing while it waits. Weaker than a pid check, and the strongest signal
-  available without shelling into the distro on the scan path.
+  namespace and means nothing to Windows process APIs, so the distro's own
+  `/proc/<pid>/stat` is read through the same `\\wsl.localhost\<distro>\`
+  share. A missing or zombie process is dead; Claude's `procStart` is compared
+  against the process start time so a reused pid is not mistaken for the
+  session. Only when that share cannot be read does recency of the session file
+  stand in, with a deliberately long window of **12 hours** (an agent waiting
+  on you writes nothing while it waits).
+- **Which pane.** WSL panes forward `WEZTERM_PANE` and `WEZTERM_UNIX_SOCKET`
+  into the distro through `WSLENV`, and the agent's `/proc/<pid>/environ`
+  names its pane exactly. Without that, two agents started in the same
+  directory could not be told apart, stayed unbound, and neither was recorded
+  for "Reopen last window".
 - **Working directory.** The agent records a Linux path while the pane running
   `wsl.exe` reports a Windows or UNC one. The pane's cwd is translated back to
   the distro's view before it is compared, which is what lets a WSL agent bind

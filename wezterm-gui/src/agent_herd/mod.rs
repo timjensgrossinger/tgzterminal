@@ -26,6 +26,7 @@ pub mod opencode;
 pub mod sessions;
 pub mod transcript;
 pub mod vendor;
+pub mod wsl_proc;
 
 use std::collections::HashMap;
 
@@ -547,6 +548,9 @@ impl HerdAgent {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ClaudeSession {
     pub pid: u32,
+    /// Claude's `procStart`: the process's start time in its own pid
+    /// namespace, which tells a live session from a reused pid.
+    pub proc_start: Option<u64>,
     /// See [`crate::agent_herd::vendor::VendorSession::interactive`].
     pub interactive: bool,
     pub session_id: String,
@@ -694,9 +698,26 @@ pub fn subagent_is_working(sub: &HerdSubagent, now: SystemTime) -> bool {
 /// `wslhost.exe`; neither tells the user which agent they are looking at.
 fn is_generic_pane_title(title: &str) -> bool {
     matches!(
-        title.trim().trim_end_matches(".exe").to_ascii_lowercase().as_str(),
-        "bash" | "cmd" | "fish" | "nu" | "powershell" | "pwsh" | "sh" | "tgzterminal" | "wezterm"
-            | "wezterm-gui" | "wsl" | "wslhost" | "wslrelay" | "ubuntu" | "zsh"
+        title
+            .trim()
+            .trim_end_matches(".exe")
+            .to_ascii_lowercase()
+            .as_str(),
+        "bash"
+            | "cmd"
+            | "fish"
+            | "nu"
+            | "powershell"
+            | "pwsh"
+            | "sh"
+            | "tgzterminal"
+            | "wezterm"
+            | "wezterm-gui"
+            | "wsl"
+            | "wslhost"
+            | "wslrelay"
+            | "ubuntu"
+            | "zsh"
     )
 }
 
@@ -722,7 +743,8 @@ pub fn join_sessions_with_panes(
     let mut agents = Vec::with_capacity(sessions.len() + panes.len());
 
     for session in sessions {
-        let bound = bind_by_pid(&session, &panes, &claimed)
+        let bound = bind_by_hint(&session, &panes, &claimed)
+            .or_else(|| bind_by_pid(&session, &panes, &claimed))
             .or_else(|| bind_by_cwd(&session, &panes, &claimed));
         if let Some(pane_id) = bound {
             claimed.insert(pane_id);
@@ -734,8 +756,7 @@ pub fn join_sessions_with_panes(
                 .name
                 .clone()
                 .or_else(|| {
-                    pane
-                        .map(|p| p.title.clone())
+                    pane.map(|p| p.title.clone())
                         .filter(|title| !is_generic_pane_title(title))
                 })
                 .unwrap_or_else(|| session.session_id.clone()),
@@ -857,6 +878,21 @@ pub fn join_sessions_with_panes(
     }
 
     agents
+}
+
+/// The pane the session's own process named in its environment. Exact, so it
+/// outranks the pid and cwd guesses; it is how two WSL agents started in one
+/// directory each find their own pane.
+fn bind_by_hint(
+    session: &VendorSession,
+    panes: &[PaneAgentRow],
+    claimed: &HashSet<PaneId>,
+) -> Option<PaneId> {
+    let hint = session.pane_hint?;
+    panes
+        .iter()
+        .find(|row| row.pane_id == hint && !claimed.contains(&row.pane_id))
+        .map(|row| row.pane_id)
 }
 
 fn bind_by_pid(
@@ -1137,6 +1173,7 @@ mod tests {
     fn session(pid: u32, name: &str, cwd: &str) -> VendorSession {
         VendorSession {
             origin: crate::agent_herd::vendor::SessionOrigin::Host,
+            pane_hint: None,
             pid,
             interactive: true,
             vendor: AgentVendor::Claude,
@@ -1287,6 +1324,24 @@ mod tests {
         assert!(!alpha.can_stop());
         // Both panes still show up on their own.
         assert_eq!(agents.len(), 3);
+    }
+
+    #[test]
+    fn pane_hints_split_two_agents_in_one_directory() {
+        // Two WSL claude sessions in one cwd: their pids mean nothing to the
+        // panes, and cwd alone is ambiguous. The environment says which is which.
+        let mut alpha = session(1, "alpha", "/repo");
+        alpha.pane_hint = Some(2);
+        let mut beta = session(2, "beta", "/repo");
+        beta.pane_hint = Some(1);
+        let agents = join_sessions_with_panes(
+            vec![alpha, beta],
+            vec![pane(1, "claude", &[]), pane(2, "claude", &[])],
+        );
+        let find = |name: &str| agents.iter().find(|a| a.name == name).unwrap().pane_id;
+        assert_eq!(find("alpha"), Some(2));
+        assert_eq!(find("beta"), Some(1));
+        assert_eq!(agents.len(), 2);
     }
 
     #[test]

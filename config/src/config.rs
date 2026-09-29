@@ -3176,6 +3176,14 @@ impl Config {
                 wsl_env.push(':');
             }
             wsl_env.push_str("TERM:COLORTERM:TERM_PROGRAM:TERM_PROGRAM_VERSION");
+            // Which pane, of which GUI process, a WSL process was started in.
+            // The agent herd reads these back from the distro's
+            // `/proc/<pid>/environ`: a Linux pid is invisible to the pane's
+            // Windows process tree, and without them two agents started in one
+            // directory cannot be told apart. The socket also lets
+            // `tgzterminal.exe cli` called from inside the distro find the GUI.
+            // Passed verbatim (no `/p`): they are compared, not opened, in Linux.
+            wsl_env.push_str(":WEZTERM_PANE:WEZTERM_UNIX_SOCKET");
             cmd.env("WSLENV", wsl_env);
         }
 

@@ -6971,6 +6971,24 @@ impl crate::TermWindow {
             .map(|(id, _)| id.clone())
             .collect();
 
+        // A restore that reopens nothing shows one toast and no reason; say per
+        // entry why it was dropped, for whoever has to find out.
+        for entry in &entries.sessions {
+            let key = (entry.adapter_id.clone(), entry.session_id.clone());
+            if live.contains(&key) {
+                log::info!(
+                    "restore: skipping {} {}: still running",
+                    entry.adapter_id,
+                    entry.session_id
+                );
+            } else if !enabled.contains(&entry.adapter_id) {
+                log::info!(
+                    "restore: skipping {} {}: adapter not enabled",
+                    entry.adapter_id,
+                    entry.session_id
+                );
+            }
+        }
         let plan = plan_session_restore(
             &entries.sessions,
             &live,
@@ -6998,12 +7016,31 @@ impl crate::TermWindow {
                         wsl_paths::wsl_to_windows(&entry.cwd.to_string_lossy(), distro)
                     });
                     if !entry.cwd.is_dir() && !windows_view.is_some_and(|path| path.is_dir()) {
+                        log::info!(
+                            "restore: skipping {} {}: cwd {} not found (distro {distro:?})",
+                            entry.adapter_id,
+                            entry.session_id,
+                            entry.cwd.display()
+                        );
                         skipped += 1;
                         continue;
                     }
+                    log::info!(
+                        "restore: reopening {} {} in {:?}",
+                        entry.adapter_id,
+                        entry.session_id,
+                        spawn.domain
+                    );
                     spawns.push(spawn);
                 }
-                None => skipped += 1,
+                None => {
+                    log::info!(
+                        "restore: skipping {} {}: no resume command resolved",
+                        entry.adapter_id,
+                        entry.session_id
+                    );
+                    skipped += 1;
+                }
             }
         }
 
@@ -12965,7 +13002,6 @@ impl crate::TermWindow {
         }
 
         let sessions = window_agent_sessions(agents);
-        self.agent_window_sessions = sessions.clone();
 
         // An empty set is never persisted, whether or not this window has written
         // before. The snapshot is a restore point, not a live mirror: a window
@@ -12974,9 +13010,15 @@ impl crate::TermWindow {
         // it with `[]` used to destroy it silently, and `pick_last_window` then
         // skipped the entry for being empty, so the "Reopen last window" row
         // never appeared again.
+        //
+        // The same holds for the list the close handler persists: it keeps the
+        // last non-empty set. Clearing it here meant the close-time write --
+        // the one that marks the entry `closed_cleanly` and catches changes the
+        // write throttle deferred -- found nothing to write.
         if sessions.is_empty() {
             return;
         }
+        self.agent_window_sessions = sessions.clone();
 
         if let Some((_, previous)) = &self.agent_snapshot_written {
             if *previous == sessions {
@@ -15649,6 +15691,7 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
     fn vendor_session(pid: u32, session_id: &str, cwd: &str, interactive: bool) -> VendorSession {
         VendorSession {
             origin: crate::agent_herd::vendor::SessionOrigin::Host,
+            pane_hint: None,
             pid,
             interactive,
             vendor: AgentVendor::Codex,

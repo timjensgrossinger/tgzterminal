@@ -149,7 +149,7 @@ impl SessionSource for OpenCodeDetector {
                         // this session rather than show a phantom row.
                         _ => continue,
                     };
-                    if !session_is_live(&root.origin, pid, &file) {
+                    if !session_is_live(root, pid, &file) {
                         continue;
                     }
                     let session_id = json
@@ -183,6 +183,7 @@ impl SessionSource for OpenCodeDetector {
                         .unwrap_or(HerdStatus::Unknown);
                     sessions.push(VendorSession {
                         origin: SessionOrigin::Host,
+                        pane_hint: None,
                         pid,
                         // This store does not distinguish harness-spawned
                         // sessions from interactive ones.
@@ -311,6 +312,7 @@ fn collect_database_sessions(home: &Path) -> Vec<VendorSession> {
         let activity = opencode_activity(&conn, schema, &session_id);
         Some(VendorSession {
             origin: SessionOrigin::Host,
+            pane_hint: None,
             // OpenCode's current database has no process id. Binding falls back
             // to the unique cwd match, while pane detection still handles live
             // sessions whose database row is too old.
