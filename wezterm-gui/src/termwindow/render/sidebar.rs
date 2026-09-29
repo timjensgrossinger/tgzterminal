@@ -75,12 +75,7 @@ const CLOSE_ZONE_W: f32 = 34.;
 /// the Windows and Debian builds this fork also releases, and a tofu box in
 /// place of a control is worse than an unusual codepoint.
 const SIDEBAR_COPY_GLYPH: &str = "\u{f0c5}";
-/// Columns a tab title must keep before a row may also carry a Copy zone.
-///
-/// Same value, and the same reasoning, as `herd_row_columns`: below this the
-/// label has stopped naming the thing the row is for, and a row that is two
-/// icons and an empty title is worse than a row with one icon.
-const MIN_TAB_TITLE_COLS: f32 = 6.;
+
 /// Gap between the close button's right edge and the right edge of its zone.
 /// Both the hover button and the `×` inside it derive from this, and so does the
 /// text reserve — see [`sidebar_close_geometry`].
@@ -2135,16 +2130,22 @@ fn sidebar_tab_copy_geometry(
     }
 }
 
-/// Width a tab row can spare for a trailing Copy zone, or `0.` when it cannot.
+/// Width a tab row gives its trailing Copy zone, or `0.` when it cannot fit.
 ///
 /// `title_w` is what is left for the title *after* the chevron, the agent badge
 /// and the close reserve have taken their share — i.e. `SidebarRowColumns::text_w`.
-/// A second zone is 34px the title does not get, and at the sidebar's 140px drag
-/// floor the title is already down to about three columns, so the icon is what
-/// gives way. Every other sidebar control degrades the same way.
-fn sidebar_tab_copy_zone_w(title_w: f32, cell_width: f32) -> f32 {
-    if title_w - CLOSE_ZONE_W >= MIN_TAB_TITLE_COLS * cell_width {
-        CLOSE_ZONE_W
+/// The icon is kept whenever its box physically fits, and the title gives way
+/// instead: Copy is an action people reach for at any sidebar width, and an
+/// icon that vanished whenever the sidebar was narrow read as a missing
+/// feature. The title is still in the tab bar and the tooltip.
+fn sidebar_tab_copy_zone_w(title_w: f32, _cell_width: f32) -> f32 {
+    // `sidebar_tab_copy_geometry` never draws a box under 18px, and wants a
+    // little air around it. At the 140px drag floor the title area is just
+    // under a full zone, so the zone shrinks to what is there rather than
+    // letting the icon vanish at the narrowest widths.
+    const MIN_COPY_ZONE_W: f32 = 22.;
+    if title_w >= MIN_COPY_ZONE_W {
+        title_w.min(CLOSE_ZONE_W)
     } else {
         0.
     }
@@ -17308,59 +17309,47 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
         }
     }
 
-    /// The reserve grew when it moved to the button's edge, so pin the default
-    /// sidebar width away from the point where a row would paint no text at all.
-    /// The tab row's Copy zone gives way before the title does.
-    ///
-    /// A second 34px zone is 34px the title does not get, and at the sidebar's
-    /// 140px drag floor the title is already down to about three columns.
+    /// The tab row's Copy icon stays at every width where its box fits; at the
+    /// sidebar's 140px drag floor the title gives way instead.
     #[test]
-    fn sidebar_tab_copy_zone_is_dropped_before_the_title_is() {
+    fn sidebar_tab_copy_zone_is_kept_at_narrow_widths() {
         let cell_width = 10.;
+        let reserve = sidebar_close_text_reserve(cell_width, 20., 34., sidebar_close_inset(1.));
 
-        // Default sidebar: room for both, with the title still well clear.
+        // Default sidebar: room for both.
         let default_width = config::Config::default_config().sidebar_width_px as f32;
         let content_w =
             default_width - INSET * 2. - RESIZE_GRIP_W as f32 - SIDEBAR_SCROLLBAR_GUTTER_W;
-        let reserve = sidebar_close_text_reserve(cell_width, 20., 34., sidebar_close_inset(1.));
         let title_w = content_w - PAD_X * 2. - ACTIVE_TEXT_GAP - reserve;
-        let copy_w = sidebar_tab_copy_zone_w(title_w, cell_width);
-        assert_eq!(copy_w, CLOSE_ZONE_W);
-        assert!(
-            title_w - copy_w >= MIN_TAB_TITLE_COLS * cell_width,
-            "title kept {} px, below the floor",
-            title_w - copy_w
-        );
+        assert_eq!(sidebar_tab_copy_zone_w(title_w, cell_width), CLOSE_ZONE_W);
 
-        // Drag floor: the icon goes, the title survives.
+        // Drag floor: the icon stays; the title is what gives way.
         let narrow_w = 140. - INSET * 2. - RESIZE_GRIP_W as f32 - SIDEBAR_SCROLLBAR_GUTTER_W;
         let narrow_title = narrow_w - PAD_X * 2. - ACTIVE_TEXT_GAP - reserve;
-        assert_eq!(sidebar_tab_copy_zone_w(narrow_title, cell_width), 0.);
+        let narrow_zone = sidebar_tab_copy_zone_w(narrow_title, cell_width);
+        assert!(
+            narrow_zone > 0. && narrow_zone <= CLOSE_ZONE_W,
+            "zone {narrow_zone} for a {narrow_title}px title at the drag floor"
+        );
+        // The shrunken zone still holds the geometry's smallest box.
+        let geometry = sidebar_tab_copy_geometry(cell_width, 20., 28., narrow_zone);
+        assert!(geometry.button_dx + geometry.side <= narrow_zone + 0.01);
 
-        // Exactly at the floor still qualifies; one pixel under does not.
-        let exact = CLOSE_ZONE_W + MIN_TAB_TITLE_COLS * cell_width;
-        assert_eq!(sidebar_tab_copy_zone_w(exact, cell_width), CLOSE_ZONE_W);
-        assert_eq!(sidebar_tab_copy_zone_w(exact - 1., cell_width), 0.);
-    }
-
-    /// The chevron and the agent badge come out of the same budget, so a split
-    /// agent tab loses the icon at a width where a plain tab keeps it.
-    #[test]
-    fn sidebar_tab_copy_zone_accounts_for_the_chevron_and_badge() {
-        let cell_width = 10.;
-        let cell_height = 20.;
-        // Chosen to sit between the two: plain fits, decorated does not.
-        let label_w = CLOSE_ZONE_W + MIN_TAB_TITLE_COLS * cell_width + 4.;
-
-        let plain = sidebar_row_columns(0., label_w, cell_width, cell_height, false, false);
+        // Only a zone too small for any box is dropped.
+        assert_eq!(sidebar_tab_copy_zone_w(22., cell_width), 22.);
+        assert_eq!(sidebar_tab_copy_zone_w(21., cell_width), 0.);
         assert_eq!(
-            sidebar_tab_copy_zone_w(plain.text_w, cell_width),
+            sidebar_tab_copy_zone_w(CLOSE_ZONE_W, cell_width),
             CLOSE_ZONE_W
         );
-
-        let decorated = sidebar_row_columns(0., label_w, cell_width, cell_height, true, true);
-        assert!(decorated.text_w < plain.text_w);
-        assert_eq!(sidebar_tab_copy_zone_w(decorated.text_w, cell_width), 0.);
+        assert_eq!(
+            sidebar_tab_copy_zone_w(CLOSE_ZONE_W - 1., cell_width),
+            CLOSE_ZONE_W - 1.
+        );
+        assert_eq!(
+            sidebar_tab_copy_zone_w(CLOSE_ZONE_W * 3., cell_width),
+            CLOSE_ZONE_W
+        );
     }
 
     /// The Copy box is centred in its zone; the close box is not, and should

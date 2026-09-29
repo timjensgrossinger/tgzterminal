@@ -1004,11 +1004,10 @@ control that hides from the content it overlaps is a control you cannot find.
 Agent panes are the exception and keep their floating strip: it carries five
 actions, not one, and it is the only mouse path to `Stop`.
 
-Two cases where the icon is absent, both deliberate:
+It stays at every sidebar width where its button fits: when the sidebar is
+narrow, the tab title is shortened instead. The one case where the icon is
+absent, deliberately:
 
-- **The sidebar is too narrow.** The icon costs the title 34px, and below about
-  six columns of title the row has stopped naming its tab, so the icon gives way
-  first. Widen the sidebar and it returns.
 - **The sidebar is collapsed** to the icon rail. A rail tile is ~40px and
   already carries the active-tab bar and the agent status dot.
 
