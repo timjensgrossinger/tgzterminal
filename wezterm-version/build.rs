@@ -13,19 +13,30 @@ fn main() {
         // Otherwise we'll derive it from the git information
 
         if let Ok(repo) = git2::Repository::discover(".") {
+            // Re-run whenever HEAD moves. Watching only the branch's loose
+            // ref file was not enough: while refs are packed there is no
+            // such file, a build made then watched nothing but build.rs and
+            // reported that commit's version forever, and a checkout of
+            // another branch was never noticed. The reflog changes on every
+            // commit, checkout, reset and pull; HEAD, packed-refs and the
+            // loose ref cover a disabled reflog. Refs live in the common
+            // dir, which is not repo.path() in a linked worktree.
+            let mut watch = vec![
+                repo.path().join("logs").join("HEAD"),
+                repo.path().join("HEAD"),
+                repo.commondir().join("packed-refs"),
+            ];
             if let Ok(ref_head) = repo.find_reference("HEAD") {
-                let repo_path = repo.path().to_path_buf();
-
                 if let Ok(resolved) = ref_head.resolve() {
                     if let Some(name) = resolved.name() {
-                        let path = repo_path.join(name);
-                        if path.exists() {
-                            println!(
-                                "cargo:rerun-if-changed={}",
-                                path.canonicalize().unwrap().display()
-                            );
-                        }
+                        watch.push(repo.commondir().join(name));
                     }
+                }
+            }
+            for path in watch {
+                if path.exists() {
+                    let path = path.canonicalize().unwrap_or(path);
+                    println!("cargo:rerun-if-changed={}", path.display());
                 }
             }
 
