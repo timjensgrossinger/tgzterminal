@@ -185,8 +185,10 @@ pub(crate) enum WslRunError {
 
 /// Upper bound on one agent probe. Longer than [`config::WSL_COMMAND_TIMEOUT`]: it
 /// runs off the GUI thread, and asking a stopped distro first boots its VM,
-/// which on a cold start can take longer than ten seconds.
-const WSL_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+/// which on a cold start can take longer than ten seconds. Generous because a
+/// slow machine sits right at the edge: the same probe answered in 27s on one
+/// run and hit this bound on the next.
+const WSL_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Which shell found an agent inside WSL, and therefore which shell must
 /// launch it.
@@ -236,7 +238,14 @@ pub struct WslAgentHit {
 /// Marker each found command is echoed with, so noise an interactive rc file
 /// prints to stdout can never be mistaken for a hit.
 const WSL_PROBE_MARKER: &str = "tgz-found:";
-const WSL_PROBE_SCRIPT: &str = r#"for c in "$@"; do command -v "$c" >/dev/null 2>&1 && printf 'tgz-found:%s\n' "$c"; done; exit 0"#;
+/// Probe with the Windows-mounted PATH entries removed.
+///
+/// Every PATH miss makes `command -v` stat every remaining directory, and on
+/// this distro the mounted ones (`/mnt/...`) go through the Windows 9p share,
+/// where one stat can take seconds. Eight candidate programs then blow the
+/// whole probe budget before a single hit is echoed. Everything that matters
+/// for launching came from the distro's own rc files anyway.
+const WSL_PROBE_SCRIPT: &str = r#"oldIFS=$IFS; IFS=:; p=""; for d in $PATH; do case $d in /mnt/*) ;; *) p="$p:$d";; esac; done; IFS=$oldIFS; PATH=${p#:}; export PATH; for c in "$@"; do command -v "$c" >/dev/null 2>&1 && printf 'tgz-found:%s\n' "$c"; done; exit 0"#;
 
 /// The programs `output` reports found, restricted to those that were asked
 /// about.
@@ -324,16 +333,23 @@ pub(crate) fn probe_wsl_agents(
         };
         let found = match remembered {
             Some(found) => found,
-            None => match probe_distro(distro, users.get(&distro.name), &missing) {
-                Some(found) => {
-                    for (program, shell) in &found {
+            None => {
+                // A slow machine sits right at the bound: the same probe
+                // answered in 27s on one run and hit this bound on the next.
+                // Retry once before giving up, and remember only answers.
+                let found = match probe_distro(distro, users.get(&distro.name), &missing) {
+                    Some(found) => Some(found),
+                    None => {
                         log::info!(
-                            "wsl agent probe: found {program} in {} ({shell:?})",
+                            "wsl agent probe: {} did not answer; retrying once",
                             distro.name
                         );
+                        probe_distro(distro, users.get(&distro.name), &missing)
                     }
-                    if found.is_empty() {
-                        log::debug!("wsl agent probe: none of {missing:?} in {}", distro.name);
+                };
+                if let Some(found) = &found {
+                    for (program, shell) in found {
+                        log::info!("wsl agent probe: found {program} in {}", distro.name);
                     }
                     PROBED_DISTROS.lock().unwrap().insert(
                         distro.name.clone(),
@@ -342,12 +358,9 @@ pub(crate) fn probe_wsl_agents(
                             found: found.clone(),
                         },
                     );
-                    found
                 }
-                // No answer is not "not installed": remembering it would
-                // hide the distro's agents for the rest of the session.
-                None => std::collections::HashMap::new(),
-            },
+                found.unwrap_or_default()
+            }
         };
         for (program, shell) in found {
             if missing.contains(&program) {

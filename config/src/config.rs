@@ -125,6 +125,27 @@ pub enum SidebarTabMetadata {
     WorkingDirectory,
 }
 
+/// Which shell runs the worktree picker's script.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromDynamic, ToDynamic)]
+pub enum FileBrowserShellChoice {
+    /// Prefer the target pane's own distro, then Git Bash. On Windows this
+    /// normally means: an Ubuntu pane runs the picker with Ubuntu's tools.
+    Auto,
+    /// Always run the picker inside WSL (`file_browser.wsl_distro`, or the
+    /// launcher's `wsl_distro`, or the machine's default distro), even when
+    /// the target pane is a Windows shell.
+    Wsl,
+    /// Always run the picker under Git for Windows' bash; unavailable without
+    /// Git for Windows.
+    GitBash,
+}
+
+impl Default for FileBrowserShellChoice {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
 #[derive(Debug, Clone, FromDynamic, ToDynamic)]
 pub struct FileBrowserConfig {
     /// Command used to open a selected file. The file path is appended.
@@ -142,6 +163,16 @@ pub struct FileBrowserConfig {
     /// Reuse a previously opened editor pane when possible.
     #[dynamic(default = "default_true")]
     pub reuse_editor_pane: bool,
+
+    /// Which shell runs the worktree picker.
+    #[dynamic(default)]
+    pub shell: FileBrowserShellChoice,
+
+    /// Preferred WSL distro for the picker when the target pane is not a WSL
+    /// pane. Falls back to `agent_ui.launcher.wsl_distro`, then the machine's
+    /// default distro.
+    #[dynamic(default)]
+    pub wsl_distro: Option<String>,
 }
 
 impl Default for FileBrowserConfig {
@@ -151,6 +182,8 @@ impl Default for FileBrowserConfig {
             list_command: default_file_browser_list_command(),
             split_size_percent: default_file_browser_split_size_percent(),
             reuse_editor_pane: true,
+            shell: FileBrowserShellChoice::default(),
+            wsl_distro: None,
         }
     }
 }
@@ -535,6 +568,16 @@ pub struct AgentAdapterConfig {
     /// another on the Windows host.
     #[dynamic(default)]
     pub launch_domain: Option<String>,
+
+    /// Tab title given to panes this adapter launches, instead of the derived
+    /// `"Claude agent"`-style label.
+    ///
+    /// On Windows this matters most for adapters launched inside WSL: the
+    /// pane's foreground process is the `wslhost.exe` shim there, so without a
+    /// spawn-time title the tab can only be named after the shim or the
+    /// adapter's own OSC titles.
+    #[dynamic(default)]
+    pub tab_title: Option<String>,
 }
 
 impl Default for AgentAdapterConfig {
@@ -559,6 +602,7 @@ impl Default for AgentAdapterConfig {
             detail_paths: None,
             launch_command: None,
             launch_domain: None,
+            tab_title: None,
         }
     }
 }
@@ -606,6 +650,7 @@ impl AgentAdapterConfig {
             detail_paths: None,
             launch_command: None,
             launch_domain: None,
+            tab_title: None,
         }
     }
 
@@ -1061,6 +1106,12 @@ pub struct AgentLauncherConfig {
     #[dynamic(default)]
     pub domain: Option<String>,
 
+    /// Pin a specific WSL distro, e.g. `"Ubuntu"`, for `prefer_wsl`, resume
+    /// domain resolution and the worktree picker's WSL fallback — instead of
+    /// whichever WSL domain happens to be registered first.
+    #[dynamic(default)]
+    pub wsl_distro: Option<String>,
+
     /// When no explicit domain is set, launch agents into the first registered
     /// WSL domain if there is one. Defaults to true on Windows, where agent
     /// CLIs are typically installed inside a distro rather than on the host.
@@ -1072,6 +1123,13 @@ pub struct AgentLauncherConfig {
     /// not a session browser, and every row costs a transcript read.
     #[dynamic(default = "default_resume_menu_sessions")]
     pub resume_menu_sessions: u8,
+
+    /// Where a *resumed* session (an old session picked from the launcher's
+    /// resume dropdown) opens. Fresh launches follow `open_in`; resumes follow
+    /// this key. Defaults to `NewTab`, so a resumed session gets the whole tab
+    /// to itself instead of splitting whatever pane happens to be active.
+    #[dynamic(default = "default_resume_open_in")]
+    pub resume_open_in: AgentLaunchTarget,
 
     /// How many agent sessions the launcher's "Reopen last window" button may
     /// restore in one click. `0` hides the button and skips reading the snapshot
@@ -1091,6 +1149,10 @@ pub fn default_resume_menu_sessions() -> u8 {
 
 pub fn default_restore_last_window_sessions() -> u8 {
     8
+}
+
+pub fn default_resume_open_in() -> AgentLaunchTarget {
+    AgentLaunchTarget::NewTab
 }
 
 /// Claude Code leads the launcher out of the box; an uninstalled default still
@@ -1114,8 +1176,10 @@ impl Default for AgentLauncherConfig {
             remote_behavior: AgentRemoteBehavior::default(),
             project_markers: default_project_markers(),
             domain: None,
+            wsl_distro: None,
             prefer_wsl: default_prefer_wsl(),
             resume_menu_sessions: default_resume_menu_sessions(),
+            resume_open_in: default_resume_open_in(),
             restore_last_window_sessions: default_restore_last_window_sessions(),
         }
     }
@@ -1245,7 +1309,10 @@ pub struct AgentUiConfig {
     pub copy_scrollback_lines: usize,
 
     /// Show a throttled notification when an agent appears to wait for input.
-    #[dynamic(default = "default_true")]
+    ///
+    /// Off by default: every short task ends waiting for input, so on a busy
+    /// day the toast fires after nearly every turn and turns into noise.
+    #[dynamic(default)]
     pub waiting_notification: bool,
 
     /// Placement for the active-pane toolbelt.
@@ -1351,7 +1418,7 @@ impl Default for AgentUiConfig {
             show_stop: true,
             detect_processes: true,
             copy_scrollback_lines: default_agent_copy_scrollback_lines(),
-            waiting_notification: true,
+            waiting_notification: false,
             toolbelt_position: PaneToolbeltPosition::Top,
             adapters: default_agent_adapters(),
             launcher: AgentLauncherConfig::default(),
@@ -3112,6 +3179,14 @@ impl Config {
                 wsl_env.push(':');
             }
             wsl_env.push_str("TERM:COLORTERM:TERM_PROGRAM:TERM_PROGRAM_VERSION");
+            // Which pane, of which GUI process, a WSL process was started in.
+            // The agent herd reads these back from the distro's
+            // `/proc/<pid>/environ`: a Linux pid is invisible to the pane's
+            // Windows process tree, and without them two agents started in one
+            // directory cannot be told apart. The socket also lets
+            // `tgzterminal.exe cli` called from inside the distro find the GUI.
+            // Passed verbatim (no `/p`): they are compared, not opened, in Linux.
+            wsl_env.push_str(":WEZTERM_PANE:WEZTERM_UNIX_SOCKET");
             cmd.env("WSLENV", wsl_env);
         }
 
@@ -3604,7 +3679,7 @@ mod agent_ui_tests {
         assert!(config.agent_ui.show_stop);
         assert!(config.agent_ui.detect_processes);
         assert_eq!(config.agent_ui.copy_scrollback_lines, 20_000);
-        assert!(config.agent_ui.waiting_notification);
+        assert!(!config.agent_ui.waiting_notification);
         assert_eq!(config.agent_ui.toolbelt_position, PaneToolbeltPosition::Top);
         for adapter in [
             "claude",

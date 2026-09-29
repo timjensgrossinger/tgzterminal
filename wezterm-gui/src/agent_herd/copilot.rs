@@ -68,7 +68,7 @@ impl SessionSource for CopilotDetector {
                         // this session rather than show a phantom row.
                         _ => continue,
                     };
-                    if !session_is_live(&root.origin, pid, &file) {
+                    if !session_is_live(root, pid, &file) {
                         continue;
                     }
                     let session_id = json
@@ -97,6 +97,7 @@ impl SessionSource for CopilotDetector {
                         .unwrap_or(HerdStatus::Unknown);
                     sessions.push(VendorSession {
                         origin: SessionOrigin::Host,
+                        pane_hint: None,
                         pid,
                         // This store does not distinguish harness-spawned
                         // sessions from interactive ones.
@@ -168,6 +169,7 @@ fn collect_state_sessions(home: &Path) -> Vec<VendorSession> {
             crate::agent_herd::sessions::activity_from_session_files(&events, &root, session_id);
         sessions.push(VendorSession {
             origin: SessionOrigin::Host,
+            pane_hint: None,
             // Copilot session state has no process id. Herd binding falls back
             // to a unique cwd match against the live pane.
             pid: 0,

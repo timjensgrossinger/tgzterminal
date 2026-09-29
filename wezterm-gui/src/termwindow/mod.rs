@@ -39,8 +39,8 @@ use config::keyassignment::{
 use config::window::WindowLevel;
 use config::{
     configuration, AgentAdapterConfig, AgentLaunchTarget, AudibleBell, ConfigHandle, Dimension,
-    DimensionContext, FrontEndSelection, GeometryOrigin, GuiPosition, TermConfig,
-    WindowCloseConfirmation,
+    DimensionContext, FileBrowserShellChoice, FrontEndSelection, GeometryOrigin, GuiPosition,
+    TermConfig, WindowCloseConfirmation,
 };
 use lfucache::*;
 use mlua::{FromLua, LuaSerdeExt, UserData, UserDataFields};
@@ -221,6 +221,46 @@ fn worktree_script_file_name(pid: u32) -> String {
     format!("tgzterminal-worktree-script-{pid}.sh")
 }
 
+/// The `env KEY=VALUE…` prefix that carries the picker's variables into a
+/// WSL distro.
+///
+/// Environment set on the spawn stops at `wsl.exe` (only WSLENV-listed
+/// variables bridge the boundary — see Microsoft's WSL docs), so the
+/// forward is built explicitly. `TGZTERMINAL_BIN` is resolved here too,
+/// through interop at the CLI's `/mnt` path, because the bare name would
+/// rely on the distro's own PATH.
+fn file_browser_wsl_env_argv(
+    set_environment_variables: &HashMap<String, String>,
+    distro: &str,
+) -> Vec<String> {
+    let mut argv = vec!["env".to_string()];
+    for key in [
+        "TGZTERMINAL_TARGET_PANE",
+        "TGZTERMINAL_EDITOR_COMMAND",
+        "TGZTERMINAL_REMOTE_DEST",
+        "TGZTERMINAL_REMOTE_CWD",
+        "TGZTERMINAL_REMOTE_PORT",
+        "TGZTERMINAL_REMOTE_DOMAIN_ID",
+        // The picker drives panes through `$TGZTERMINAL_BIN cli`, so it must
+        // be able to find this GUI's socket; without it every `cli` call
+        // inside the distro fails (it cannot be discovered by name).
+        "WEZTERM_UNIX_SOCKET",
+    ] {
+        if let Some(value) = set_environment_variables.get(key) {
+            argv.push(format!("{key}={value}"));
+        }
+    }
+    if let Some(cli) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| Some(exe.parent()?.join(script_cli_file_name(true))))
+        .filter(|cli| cli.exists())
+        .and_then(|cli| wsl_paths::windows_to_wsl(&cli.to_string_lossy(), distro))
+    {
+        argv.push(format!("TGZTERMINAL_BIN={cli}"));
+    }
+    argv
+}
+
 fn write_worktree_script_to_temp(script: &str) -> Option<PathBuf> {
     let pid = std::process::id();
     let path = std::env::temp_dir().join(worktree_script_file_name(pid));
@@ -238,8 +278,12 @@ fn write_worktree_script_to_temp(script: &str) -> Option<PathBuf> {
 enum FileBrowserShell {
     /// Unix: the user's own shell.
     Native(String),
-    /// Windows, WSL pane: `sh` inside the pane's distro.
+    /// Windows, WSL pane or a registered domain for the preferred distro:
+    /// `sh` inside that distro's domain.
     Wsl { domain: String, distro: String },
+    /// Windows, no registered domain opens the preferred distro: run through
+    /// `wsl.exe` from the local domain, the way the agent launcher does.
+    WslViaLocal { distro: String },
     /// Windows, anything else: Git for Windows' bash.
     GitBash(PathBuf),
 }
@@ -248,11 +292,18 @@ enum FileBrowserShell {
 ///
 /// Windows ships no POSIX shell and the installer bundles none, so the old
 /// unconditional `$SHELL`-or-`/bin/sh` spawned nothing there. A WSL pane runs
-/// the script in its own distro; anything else — including an ssh pane, whose
-/// browser runs locally — needs Git Bash.
+/// the script in its own distro; a configured `file_browser.wsl_distro` (or
+/// `agent_ui.launcher.wsl_distro`) is used even when the target pane is a
+/// Windows shell, which is the common case — projects live in Ubuntu, the tab
+/// may not. Anything else — including an ssh pane, whose browser runs locally —
+/// needs Git Bash.
+#[allow(clippy::too_many_arguments)]
 fn file_browser_shell(
     windows: bool,
+    choice: FileBrowserShellChoice,
     wsl_target: Option<(String, String)>,
+    preferred_distro: Option<String>,
+    domain_for_distro: &dyn Fn(&str) -> Option<String>,
     runs_locally: bool,
     git_bash: Option<PathBuf>,
     unix_shell: Option<String>,
@@ -262,11 +313,31 @@ fn file_browser_shell(
             unix_shell.unwrap_or_else(|| "/bin/sh".to_string()),
         ));
     }
-    if !runs_locally {
-        if let Some((domain, distro)) = wsl_target {
+
+    // The target pane's own distro is always the best guess for `Auto` and the
+    // forced `Wsl`: the picker then uses exactly the tools the pane shows.
+    if let Some((domain, distro)) = wsl_target {
+        if !runs_locally && choice != FileBrowserShellChoice::GitBash {
             return Ok(FileBrowserShell::Wsl { domain, distro });
         }
     }
+
+    if choice != FileBrowserShellChoice::GitBash {
+        if let Some(distro) = preferred_distro {
+            if let Some(domain) = domain_for_distro(&distro) {
+                return Ok(FileBrowserShell::Wsl { domain, distro });
+            }
+            // No domain opens that distro: go through wsl.exe from the local
+            // domain, mirroring the agent launcher's fallback.
+            return Ok(FileBrowserShell::WslViaLocal { distro });
+        }
+        if choice == FileBrowserShellChoice::Wsl {
+            return Err(
+                "Worktree WSL shell needs file_browser.wsl_distro or agent_ui.launcher.wsl_distro",
+            );
+        }
+    }
+
     git_bash
         .map(FileBrowserShell::GitBash)
         .ok_or("Worktree needs a WSL pane or Git for Windows (bash.exe)")
@@ -4661,9 +4732,21 @@ done
         let wsl_target = target_domain_name.and_then(|name| {
             wsl_paths::distro_for_domain(&name, &self.config).map(|distro| (name, distro))
         });
+        // The distro a forced/auto WSL picker should use when the target pane
+        // is not itself a WSL pane: `file_browser.wsl_distro`, falling back to
+        // the launcher's distro preference.
+        let preferred_distro = self
+            .config
+            .file_browser
+            .wsl_distro
+            .clone()
+            .or_else(|| self.config.agent_ui.launcher.wsl_distro.clone());
         let shell_choice = match file_browser_shell(
             cfg!(windows),
+            self.config.file_browser.shell,
             wsl_target,
+            preferred_distro,
+            &|distro| self.wsl_domain_name_for_distro(distro),
             remote_context.is_some(),
             if cfg!(windows) {
                 crate::termwindow::render::sidebar::find_git_bash()
@@ -4805,27 +4888,7 @@ done
                 // tool paths mean nothing to Linux: the CLI is reached through
                 // interop at its /mnt path, and fzf is whatever the distro
                 // has (the script falls back to a prompt without it).
-                let mut argv = vec!["env".to_string()];
-                for key in [
-                    "TGZTERMINAL_TARGET_PANE",
-                    "TGZTERMINAL_EDITOR_COMMAND",
-                    "TGZTERMINAL_REMOTE_DEST",
-                    "TGZTERMINAL_REMOTE_CWD",
-                    "TGZTERMINAL_REMOTE_PORT",
-                    "TGZTERMINAL_REMOTE_DOMAIN_ID",
-                ] {
-                    if let Some(value) = set_environment_variables.get(key) {
-                        argv.push(format!("{key}={value}"));
-                    }
-                }
-                if let Some(cli) = std::env::current_exe()
-                    .ok()
-                    .and_then(|exe| Some(exe.parent()?.join(script_cli_file_name(true))))
-                    .filter(|cli| cli.exists())
-                    .and_then(|cli| wsl_paths::windows_to_wsl(&cli.to_string_lossy(), &distro))
-                {
-                    argv.push(format!("TGZTERMINAL_BIN={cli}"));
-                }
+                let mut argv = file_browser_wsl_env_argv(&set_environment_variables, &distro);
                 argv.extend(["sh".to_string(), "-lc".to_string(), script]);
                 // A WSL shell's OSC 7 names this machine as a UNC host, which
                 // `wsl.exe --cd` cannot open; hand it the Linux path.
@@ -4841,6 +4904,31 @@ done
                     args: Some(argv),
                     cwd,
                     domain: config::keyassignment::SpawnTabDomain::DomainName(domain),
+                    ..Default::default()
+                }
+            }
+            FileBrowserShell::WslViaLocal { distro } => {
+                // No registered domain opens the preferred distro: the agent
+                // launcher's fallback shape — `wsl.exe` from the local domain.
+                // Same env handling as the domain route above, plus an explicit
+                // `--cd` because the local domain cannot supply one.
+                let mut argv = wsl_paths::wsl_exec_argv(
+                    &distro,
+                    file_browser_wsl_env_argv(&set_environment_variables, &distro),
+                );
+                argv.extend(["sh".to_string(), "-lc".to_string(), script]);
+                let cwd = cwd.map(|cwd| {
+                    let raw = cwd.to_string_lossy().to_string();
+                    wsl_paths::windows_to_wsl(&raw, &distro)
+                        .or_else(|| wsl_paths::unc_host_path_to_linux(&raw))
+                        .map(PathBuf::from)
+                        .unwrap_or(cwd)
+                });
+                SpawnCommand {
+                    label: Some("Worktree".to_string()),
+                    args: Some(argv),
+                    cwd,
+                    domain: config::keyassignment::SpawnTabDomain::DomainName("local".to_string()),
                     ..Default::default()
                 }
             }
@@ -6129,14 +6217,63 @@ impl Drop for TermWindow {
 mod tests {
     use super::*;
 
+    /// Test shorthands for `file_browser_shell`'s inputs.
+    #[derive(Clone)]
+    struct ShellTest {
+        choice: FileBrowserShellChoice,
+        wsl_target: Option<(String, String)>,
+        preferred: Option<String>,
+        registered: Vec<String>,
+    }
+
+    impl ShellTest {
+        fn auto() -> Self {
+            Self {
+                choice: FileBrowserShellChoice::Auto,
+                wsl_target: None,
+                preferred: None,
+                registered: vec![],
+            }
+        }
+        fn run(
+            self,
+            windows: bool,
+            runs_locally: bool,
+            git_bash: Option<PathBuf>,
+            unix_shell: Option<String>,
+        ) -> Result<FileBrowserShell, &'static str> {
+            let Self {
+                choice,
+                wsl_target,
+                preferred,
+                registered,
+            } = self;
+            file_browser_shell(
+                windows,
+                choice,
+                wsl_target,
+                preferred,
+                &|distro: &str| {
+                    registered
+                        .iter()
+                        .any(|name| name == distro)
+                        .then(|| format!("WSL:{distro}"))
+                },
+                runs_locally,
+                git_bash,
+                unix_shell,
+            )
+        }
+    }
+
     #[test]
     fn worktree_shell_on_unix_is_the_users_shell() {
         assert_eq!(
-            file_browser_shell(false, None, false, None, Some("/bin/zsh".into())),
+            ShellTest::auto().run(false, false, None, Some("/bin/zsh".into())),
             Ok(FileBrowserShell::Native("/bin/zsh".into()))
         );
         assert_eq!(
-            file_browser_shell(false, None, false, None, None),
+            ShellTest::auto().run(false, false, None, None),
             Ok(FileBrowserShell::Native("/bin/sh".into()))
         );
     }
@@ -6145,8 +6282,11 @@ mod tests {
     fn worktree_shell_on_windows_prefers_the_panes_distro_then_git_bash() {
         let wsl = || Some(("WSL:Ubuntu".to_string(), "Ubuntu".to_string()));
         let bash = || Some(PathBuf::from(r"C:\Program Files\Git\bin\bash.exe"));
+
+        let mut t = ShellTest::auto();
+        t.wsl_target = wsl();
         assert_eq!(
-            file_browser_shell(true, wsl(), false, bash(), None),
+            t.clone().run(true, false, bash(), None),
             Ok(FileBrowserShell::Wsl {
                 domain: "WSL:Ubuntu".into(),
                 distro: "Ubuntu".into()
@@ -6154,15 +6294,69 @@ mod tests {
         );
         // An ssh pane's browser runs locally, so its distro does not help.
         assert_eq!(
-            file_browser_shell(true, wsl(), true, bash(), None),
+            t.clone().run(true, true, bash(), None),
             Ok(FileBrowserShell::GitBash(bash().unwrap()))
         );
+        // A plain Windows pane with a configured preferred distro runs the
+        // picker in that distro's registered domain.
+        t.wsl_target = None;
+        t.preferred = Some("Ubuntu".into());
+        t.registered = vec!["Ubuntu".into()];
         assert_eq!(
-            file_browser_shell(true, None, false, bash(), None),
+            t.clone().run(true, false, bash(), None),
+            Ok(FileBrowserShell::Wsl {
+                domain: "WSL:Ubuntu".into(),
+                distro: "Ubuntu".into()
+            })
+        );
+        // Without a registered domain the picker still works, through
+        // wsl.exe from the local domain.
+        t.registered = vec![];
+        assert_eq!(
+            t.clone().run(true, false, bash(), None),
+            Ok(FileBrowserShell::WslViaLocal {
+                distro: "Ubuntu".into()
+            })
+        );
+        // No distro preference: Git Bash carries the picker, or nothing.
+        t.preferred = None;
+        assert_eq!(
+            t.clone().run(true, false, bash(), None),
             Ok(FileBrowserShell::GitBash(bash().unwrap()))
         );
-        assert!(file_browser_shell(true, None, false, None, Some("/bin/sh".into())).is_err());
-        assert!(file_browser_shell(true, wsl(), true, None, None).is_err());
+        assert!(t
+            .clone()
+            .run(true, false, None, Some("/bin/sh".into()))
+            .is_err());
+        assert!(t.clone().run(true, true, None, None).is_err());
+
+        // Forced `Wsl` skips Git Bash entirely and demands a distro.
+        let mut forced = ShellTest::auto();
+        forced.choice = FileBrowserShellChoice::Wsl;
+        forced.wsl_target = wsl();
+        assert_eq!(
+            forced.clone().run(true, false, bash(), None),
+            Ok(FileBrowserShell::Wsl {
+                domain: "WSL:Ubuntu".into(),
+                distro: "Ubuntu".into()
+            })
+        );
+        forced.wsl_target = None;
+        forced.preferred = Some("Ubuntu".into());
+        assert!(forced.clone().run(true, false, None, None).is_ok());
+        forced.preferred = None;
+        assert!(forced.run(true, false, bash(), None).is_err());
+
+        // Forced `GitBash` never touches WSL, even with a distro pane.
+        let mut forced_bash = ShellTest::auto();
+        forced_bash.choice = FileBrowserShellChoice::GitBash;
+        forced_bash.wsl_target = wsl();
+        forced_bash.preferred = Some("Ubuntu".into());
+        assert_eq!(
+            forced_bash.clone().run(true, false, bash(), None),
+            Ok(FileBrowserShell::GitBash(bash().unwrap()))
+        );
+        assert!(forced_bash.run(true, false, None, None).is_err());
     }
 
     #[test]
@@ -6330,12 +6524,13 @@ mod tests {
 
     #[test]
     fn unix_cli_bin_keeps_the_native_path() {
+        // Built from the same join the code does, so the expectation holds on
+        // every platform (Windows joins with backslashes inside a /-shaped
+        // parent; `shell_path` is not asked to rewrite that on posix runs).
         let exe = PathBuf::from("/Applications/TGZTerminal.app/Contents/MacOS/wezterm-gui");
         let bin = cli_bin_for_script(Some(&exe), false, &|_| true);
-        assert_eq!(
-            bin,
-            "/Applications/TGZTerminal.app/Contents/MacOS/tgzterminal"
-        );
+        let expected = exe.parent().unwrap().join(script_cli_file_name(false));
+        assert_eq!(bin, shell_path(&expected, false));
     }
 
     #[test]

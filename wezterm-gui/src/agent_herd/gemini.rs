@@ -42,7 +42,7 @@ impl SessionSource for GeminiDetector {
                         // this session rather than show a phantom row.
                         _ => continue,
                     };
-                    if !session_is_live(&root.origin, pid, &file) {
+                    if !session_is_live(root, pid, &file) {
                         continue;
                     }
                     let session_id = json
@@ -71,6 +71,7 @@ impl SessionSource for GeminiDetector {
                         .unwrap_or(HerdStatus::Unknown);
                     sessions.push(VendorSession {
                         origin: SessionOrigin::Host,
+                        pane_hint: None,
                         pid,
                         // This store does not distinguish harness-spawned
                         // sessions from interactive ones.

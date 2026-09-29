@@ -2492,7 +2492,13 @@ impl super::TermWindow {
                             floor,
                             Instant::now() + Duration::from_secs(30),
                         ));
-                        self.resume_agent_session_by_id(&agent.provider, &session_id, cwd, None);
+                        self.resume_agent_session_by_id(
+                            &agent.provider,
+                            &session_id,
+                            cwd,
+                            Some(&agent.name),
+                            None,
+                        );
                         // Force a re-scan so the new pane binds to the agent
                         // and the Resume button flips to Focus. Invalidating
                         // the cache is what does that; setting the in-flight

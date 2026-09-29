@@ -124,6 +124,8 @@ config.file_browser = {
   list_command = { "find", ".", "-maxdepth", "3", "-type", "f" },
   split_size_percent = 30,
   reuse_editor_pane = true,
+  shell = "Auto",
+  wsl_distro = nil, -- falls back to agent_ui.launcher.wsl_distro
 }
 ```
 
@@ -133,6 +135,14 @@ config.file_browser = {
 | `list_command` | list of string | `{ "find", ".", "-maxdepth", "3", "-type", "f" }` | Accepted by the schema but **not currently read by any code**. |
 | `split_size_percent` | int | `30` | Clamped to `5..=95`. |
 | `reuse_editor_pane` | bool | `true` | Accepted by the schema but **not currently read by any code**. |
+| `shell` | string | `"Auto"` | Which shell runs the picker: `"Auto"` prefers the target pane's own distro, then Git Bash; `"Wsl"` always runs it inside WSL; `"GitBash"` demands Git for Windows. |
+| `wsl_distro` | string | unset | Distro for the picker when the target pane is not a WSL pane. Falls back to `agent_ui.launcher.wsl_distro`, then nothing (Git Bash is required). |
+
+On Windows the picker needs a POSIX shell, and none ships with the OS: a WSL
+pane runs it with the pane's own distro (so an Ubuntu tab gets Ubuntu's `git`
+and `fzf`), and `shell = "Wsl"` plus `wsl_distro` extends that to any tab —
+useful when your projects live in Ubuntu but the tab happens to be PowerShell.
+Without either, Git for Windows' `bash.exe` carries it.
 
 The file browser configuration is public schema for the browser pane behavior.
 The editor command receives the selected file path as its final argument.
@@ -152,7 +162,7 @@ config.agent_ui = {
   enable_control_actions = false,
   detect_processes = true,
   copy_scrollback_lines = 20000,
-  waiting_notification = true,
+  waiting_notification = false,
   toolbelt_position = "Top", -- or "Bottom"
   visible_identity_signals = 2,
   trust_visible_evidence = true,
@@ -276,8 +286,10 @@ config.agent_ui = {
     remote_behavior = "ForceLocal",
     project_markers = { ".git", ".hg", ".svn", ".jj" },
     domain = nil,
+    wsl_distro = nil, -- e.g. "Ubuntu": pins the distro prefer_wsl uses
     prefer_wsl = true, -- Windows default; false elsewhere
     resume_menu_sessions = 10,
+    resume_open_in = "NewTab", -- where a *resumed* session opens
     restore_last_window_sessions = 8, -- 0 hides the "Reopen last window" button
   },
 }
@@ -321,7 +333,7 @@ vendor-neutral agent.
 | `show_stop` | bool | `true` | Show Stop in expanded herd rows when agent can be interrupted. |
 | `detect_processes` | bool | `true` | When off, only user vars identify an agent — no process, title or visible-text detection, and therefore no inferred status. |
 | `copy_scrollback_lines` | int | `20000` | Maximum **physical** rows a copy action reads, counted from the bottom of the pane buffer. Wrapped output costs several rows per logical line, which is why the previous `500` truncated real sessions. Clamped to 100000 rows per action. Lower it to capture less. |
-| `waiting_notification` | bool | `true` | |
+| `waiting_notification` | bool | `false` | Off by default: short tasks end waiting for input after nearly every turn. |
 | `toolbelt_position` | enum | `"Top"` | `"Top"`, `"Bottom"` |
 | `visible_identity_signals` | int | `2` | Distinct adapter-exclusive patterns that must agree before visible text names an agent. Clamped by how many the adapter declares. |
 | `trust_visible_evidence` | bool | `true` | Whether multi-signal visible-text evidence counts as trusted for control actions. |
@@ -380,8 +392,9 @@ trusted identity evidence. Neither half is sufficient alone. Claude log
 directories are canonicalized and must resolve under `~/.claude/projects`.
 Non-Claude local session or state paths are shown as `Details` in the toolbelt.
 
-`waiting_notification` enables a throttled local toast when an agent appears to
-be waiting for input. Clicking the notification raises the window that owns the
+`waiting_notification = true` enables a throttled local toast when an agent
+appears to be waiting for input. It is off by default, because short tasks end
+waiting for input after nearly every turn and the toast turned into noise. Clicking the notification raises the window that owns the
 agent, switches to its tab and makes that exact pane active — which also counts
 as acknowledging the wait, so the row's glow and the dock badge clear. The toast
 is persistent for that reason: a banner that dismissed itself after a couple of
@@ -719,8 +732,10 @@ list. Clicking one starts that agent with its resume command
 (`claude --resume <id>`, `codex resume <id>`, …) **in the directory the session
 originally ran in** — the project-root toggle deliberately does not apply, since
 a resumed session whose relative paths have moved is not much use. Placement
-otherwise follows `open_in`, `tile`, and the rest of the launcher config, exactly
-like a fresh launch.
+follows `resume_open_in` (default `"NewTab"`), so a resumed session gets the
+whole tab to itself instead of splitting whatever pane is active; set
+`resume_open_in = "SplitPane"` for the old behavior, and the Alt-click
+inversion still swaps between the two.
 
 Each row reads `project · description`, prefixed with `[branch]` when the session
 was not on `main`/`master`. The description is Claude Code's own generated
@@ -792,13 +807,18 @@ that is not running simply contributes nothing.
 Two things work differently for a session found inside a distro:
 
 - **Liveness.** The pid in the session file belongs to the distro's pid
-  namespace and means nothing to Windows, so it is not checked. Recency of the
-  session file stands in for it, with a deliberately long window of **12 hours**.
-  The two failure modes are not symmetric: a stale row costs a line in the
-  sidebar that you can ignore or resume, whereas a missing row is the bug -- and
-  the row most likely to go missing is an agent *waiting on you*, which writes
-  nothing while it waits. Weaker than a pid check, and the strongest signal
-  available without shelling into the distro on the scan path.
+  namespace and means nothing to Windows process APIs, so the distro's own
+  `/proc/<pid>/stat` is read through the same `\\wsl.localhost\<distro>\`
+  share. A missing or zombie process is dead; Claude's `procStart` is compared
+  against the process start time so a reused pid is not mistaken for the
+  session. Only when that share cannot be read does recency of the session file
+  stand in, with a deliberately long window of **12 hours** (an agent waiting
+  on you writes nothing while it waits).
+- **Which pane.** WSL panes forward `WEZTERM_PANE` and `WEZTERM_UNIX_SOCKET`
+  into the distro through `WSLENV`, and the agent's `/proc/<pid>/environ`
+  names its pane exactly. Without that, two agents started in the same
+  directory could not be told apart, stayed unbound, and neither was recorded
+  for "Reopen last window".
 - **Working directory.** The agent records a Linux path while the pane running
   `wsl.exe` reports a Windows or UNC one. The pane's cwd is translated back to
   the distro's view before it is compared, which is what lets a WSL agent bind
@@ -823,15 +843,34 @@ else. The domain for a launch is resolved in this order:
 A configured domain name that is not registered logs a warning and falls
 through to the next rule instead of failing the click. `prefer_wsl` picks the
 **first registered** WSL domain — WSL reports distributions in its own order and
-the "default distro" flag is not carried into the domain list, so pin a specific
-one with `domain = "WSL:Ubuntu"` if you have several.
+the "default distro" flag is not carried into the domain list, so either pin a
+specific one with `domain = "WSL:Ubuntu"` or name the distro itself with
+`wsl_distro = "Ubuntu"`, which also steers resume-domain resolution and the
+worktree picker's WSL fallback.
 
 ```lua
 agent_ui = {
-  launcher = { domain = 'WSL:Ubuntu' },
+  launcher = { wsl_distro = 'Ubuntu' },
   adapters = {
     -- keep one agent on the Windows side
     codex = { launch_domain = 'local' },
+    -- name the tab title an adapter's panes get
+    claude = { tab_title = 'Claude' },
+  },
+}
+```
+
+Agents installed natively on Windows (in PowerShell or cmd, not in WSL) need
+no WSL at all: turn `prefer_wsl` off so launches stay in the Windows domain.
+Their sessions are read from the Windows home (`%USERPROFILE%\.claude` and
+friends), which is always scanned, and a resume looks for the CLI on the
+Windows `PATH` before trying any distro.
+
+```lua
+agent_ui = {
+  launcher = {
+    prefer_wsl = false,
+    domain = 'local', -- optional: launch on Windows even from a WSL tab
   },
 }
 ```
@@ -884,17 +923,17 @@ Both sources are filtered before display:
   already gated by the same adapter config).
 
 ```lua
- agent_ui = {
-   section = {
-     enabled = true,      -- show the Agents section in the sidebar at all
-     refresh_ms = 500,     -- how often the disk-scanned source re-reads, clamped 100..=10000
-     show_non_interactive = false, -- also list SDK/headless/hook agent processes
-     show_activity = true, -- transcript headline, attention, branch, subagent summary + tree
-     show_tokens = true, -- pane-reported token/cost telemetry
-     sort_attention_first = true, -- surface blocked/waiting agents at the top of the list
-   },
- }
- ```
+agent_ui = {
+  section = {
+    enabled = true,      -- show the Agents section in the sidebar at all
+    refresh_ms = 500,     -- how often the disk-scanned source re-reads, clamped 100..=10000
+    show_non_interactive = false, -- also list SDK/headless/hook agent processes
+    show_activity = true, -- transcript headline, attention, branch, subagent summary + tree
+    show_tokens = true, -- pane-reported token/cost telemetry
+    sort_attention_first = true, -- surface blocked/waiting agents at the top of the list
+  },
+}
+```
 
 The section header reads `Agents · N` (or `Agents · N · M⚠` when `M` agents
 need attention). Scroll the list with the mouse wheel when it is taller than
@@ -965,11 +1004,10 @@ control that hides from the content it overlaps is a control you cannot find.
 Agent panes are the exception and keep their floating strip: it carries five
 actions, not one, and it is the only mouse path to `Stop`.
 
-Two cases where the icon is absent, both deliberate:
+It stays at every sidebar width where its button fits: when the sidebar is
+narrow, the tab title is shortened instead. The one case where the icon is
+absent, deliberately:
 
-- **The sidebar is too narrow.** The icon costs the title 34px, and below about
-  six columns of title the row has stopped naming its tab, so the icon gives way
-  first. Widen the sidebar and it returns.
 - **The sidebar is collapsed** to the icon rail. A rail tile is ~40px and
   already carries the active-tab bar and the agent status dot.
 
@@ -1383,7 +1421,7 @@ you are not left hunting for one.
 | Tab-row Copy icon size and threshold | Hardcoded. It matches the close button's size but is centred in its own slot, and it is dropped when the title would fall below six columns. |
 | Sidebar spacing, radii and row geometry | Compile-time constants. |
 | Individual sidebar colors | No per-element keys. The whole palette is derived — see `sidebar_theme` for which source it derives from. The attention colour (waiting-queue dot, pip, selection bar, attention line) comes from the palette too, so it follows the theme rather than being separately settable. |
-| Worktree picker behavior | No config surface. |
+| Worktree picker behavior | `config.file_browser` — `shell` picks where the picker runs (`"Auto"` / `"Wsl"` / `"GitBash"`), `wsl_distro` names the distro when the target pane is not a WSL pane, `editor_command` opens selections, and `split_size_percent` sizes the split. The picker's internal script, its cache location and the fzf fallback prompt are not configurable. |
 
 Two keys are accepted by the schema but currently read by no code:
 `file_browser.list_command` and `file_browser.reuse_editor_pane`.

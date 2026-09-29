@@ -75,12 +75,7 @@ const CLOSE_ZONE_W: f32 = 34.;
 /// the Windows and Debian builds this fork also releases, and a tofu box in
 /// place of a control is worse than an unusual codepoint.
 const SIDEBAR_COPY_GLYPH: &str = "\u{f0c5}";
-/// Columns a tab title must keep before a row may also carry a Copy zone.
-///
-/// Same value, and the same reasoning, as `herd_row_columns`: below this the
-/// label has stopped naming the thing the row is for, and a row that is two
-/// icons and an empty title is worse than a row with one icon.
-const MIN_TAB_TITLE_COLS: f32 = 6.;
+
 /// Gap between the close button's right edge and the right edge of its zone.
 /// Both the hover button and the `×` inside it derive from this, and so does the
 /// text reserve — see [`sidebar_close_geometry`].
@@ -2135,16 +2130,22 @@ fn sidebar_tab_copy_geometry(
     }
 }
 
-/// Width a tab row can spare for a trailing Copy zone, or `0.` when it cannot.
+/// Width a tab row gives its trailing Copy zone, or `0.` when it cannot fit.
 ///
 /// `title_w` is what is left for the title *after* the chevron, the agent badge
 /// and the close reserve have taken their share — i.e. `SidebarRowColumns::text_w`.
-/// A second zone is 34px the title does not get, and at the sidebar's 140px drag
-/// floor the title is already down to about three columns, so the icon is what
-/// gives way. Every other sidebar control degrades the same way.
-fn sidebar_tab_copy_zone_w(title_w: f32, cell_width: f32) -> f32 {
-    if title_w - CLOSE_ZONE_W >= MIN_TAB_TITLE_COLS * cell_width {
-        CLOSE_ZONE_W
+/// The icon is kept whenever its box physically fits, and the title gives way
+/// instead: Copy is an action people reach for at any sidebar width, and an
+/// icon that vanished whenever the sidebar was narrow read as a missing
+/// feature. The title is still in the tab bar and the tooltip.
+fn sidebar_tab_copy_zone_w(title_w: f32, _cell_width: f32) -> f32 {
+    // `sidebar_tab_copy_geometry` never draws a box under 18px, and wants a
+    // little air around it. At the 140px drag floor the title area is just
+    // under a full zone, so the zone shrinks to what is there rather than
+    // letting the icon vanish at the narrowest widths.
+    const MIN_COPY_ZONE_W: f32 = 22.;
+    if title_w >= MIN_COPY_ZONE_W {
+        title_w.min(CLOSE_ZONE_W)
     } else {
         0.
     }
@@ -2686,6 +2687,15 @@ fn is_generic_shell_title(title: &str, command: Option<&str>) -> bool {
         "wezterm",
         "wezterm-gui",
         "wsl",
+        "wsl.exe",
+        // Windows-side shims that host a WSL session: they name nothing the
+        // user cares about, so a tab that "is" one of these has no real title.
+        "wslhost",
+        "wslhost.exe",
+        "wslrelay",
+        "wslrelay.exe",
+        "ubuntu",
+        "ubuntu.exe",
         "zsh",
     ];
     if generic_titles.contains(&title_lower.as_str()) {
@@ -3915,6 +3925,10 @@ fn merge_agent_adapter_config(
             .launch_domain
             .clone()
             .or_else(|| base.launch_domain.clone()),
+        tab_title: configured
+            .tab_title
+            .clone()
+            .or_else(|| base.tab_title.clone()),
     }
 }
 
@@ -4252,6 +4266,36 @@ fn window_agent_sessions(agents: &[HerdAgent]) -> Vec<SnapshotSession> {
         })
         .filter(|session| seen.insert((session.adapter_id.clone(), session.session_id.clone())))
         .collect()
+}
+
+/// The title a resumed session's tab starts with: the session's own title when
+/// it has one, so three restored tabs are not all called "Claude resume".
+///
+/// It is the pane's spawn title, which only shows while the agent has not set a
+/// title of its own -- and Claude inside WSL never does.
+fn resume_tab_title(session_title: Option<&str>, session_id: &str, adapter_label: &str) -> String {
+    const MAX_CHARS: usize = 60;
+    match session_title.map(str::trim) {
+        // A herd row with nothing better is named by its id, which is not a title.
+        Some(title) if !title.is_empty() && title != session_id => {
+            if title.chars().count() > MAX_CHARS {
+                let cut: String = title.chars().take(MAX_CHARS - 1).collect();
+                format!("{}…", cut.trim_end())
+            } else {
+                title.to_string()
+            }
+        }
+        _ => format!("{adapter_label} resume"),
+    }
+}
+
+/// The distro a resolved spawn domain runs in, or `None` when the domain is
+/// not a WSL domain (or cannot be named).
+fn spawn_domain_distro(domain: &SpawnTabDomain, config: &config::ConfigHandle) -> Option<String> {
+    match domain {
+        SpawnTabDomain::DomainName(name) => wsl_paths::distro_for_domain(name, config),
+        _ => None,
+    }
 }
 
 /// The restore row's text, e.g. `"Reopen last session (7 agents, 2 windows)"`.
@@ -5104,8 +5148,11 @@ const AGENT_STICKY_VISIBLE_TTL: Duration = Duration::from_secs(30);
 /// worker that dies, or a window that never processes the notification, would
 /// otherwise suppress every later scan and freeze the whole herd view. The
 /// value only has to be longer than a slow scan; OpenCode's store is the
-/// pathological case, at hundreds of megabytes.
-const HERD_SCAN_WATCHDOG: Duration = Duration::from_secs(15);
+/// pathological case, at hundreds of megabytes. A WSL store is read through
+/// the 9p share, where 20 s scans were measured on a slow machine: at 15 s the
+/// watchdog started a second scan on top of the first, and each slowed the
+/// other.
+const HERD_SCAN_WATCHDOG: Duration = Duration::from_secs(60);
 
 /// How long the same spinner-led line may sit on screen before it stops
 /// counting as a spinner.
@@ -6145,7 +6192,7 @@ impl crate::TermWindow {
     }
 
     /// Name of the registered domain that opens `distro`.
-    fn wsl_domain_name_for_distro(&self, distro: &str) -> Option<String> {
+    pub(crate) fn wsl_domain_name_for_distro(&self, distro: &str) -> Option<String> {
         wsl_paths::wsl_domains(&self.config)
             .into_iter()
             .find(|domain| domain.distribution.as_deref().unwrap_or(&domain.name) == distro)
@@ -6689,9 +6736,18 @@ impl crate::TermWindow {
         let domain = self.agent_launch_domain(entry, forced_local);
         let cwd = self.agent_launch_cwd(&domain, forced_local);
         let placement = self.agent_launch_placement(invert_target, override_target);
+        // A configured per-adapter title wins over the derived
+        // "Claude agent"-style label; both become the pane's spawn title,
+        // which is what names a tab whose foreground process is the wslhost
+        // shim (any WSL-hosted agent on Windows).
+        let adapter = self.agent_adapter_config_by_id(Some(&entry.adapter_id));
+        let label = adapter
+            .as_ref()
+            .and_then(|adapter| adapter.tab_title.clone())
+            .unwrap_or_else(|| format!("{} agent", entry.label));
         self.spawn_agent(
             SpawnCommand {
-                label: Some(format!("{} agent", entry.label)),
+                label: Some(label),
                 args: Some(entry.argv.clone()),
                 cwd,
                 domain,
@@ -6773,6 +6829,11 @@ impl crate::TermWindow {
     /// work, so it happens on a worker thread and is applied back on the GUI
     /// thread. Called from the click that opens the submenu, never from paint.
     pub fn kick_agent_session_scan(&mut self) {
+        // The machine-wide herd cache feeds both the live set a restore's
+        // plan is checked against and the snapshot recording gate, and the
+        // paint path only kicks it when the herd *section* is enabled. Kick
+        // it here too, so opening either dropdown is enough to get it going.
+        self.kick_agent_herd_scan();
         if self.agent_session_scan_pending {
             return;
         }
@@ -6794,7 +6855,7 @@ impl crate::TermWindow {
             return;
         };
         // Read config here; the worker has no handle on it.
-        let distros = self.wsl_distro_specs();
+        let distros = self.wsl_session_distro_specs();
 
         self.agent_session_scan_pending = true;
         let future = promise::spawn::spawn_into_new_thread(move || {
@@ -6848,6 +6909,7 @@ impl crate::TermWindow {
             &session.adapter_id,
             &session.session_id,
             session.cwd.clone(),
+            Some(&session.label),
             target,
         );
     }
@@ -6862,14 +6924,23 @@ impl crate::TermWindow {
         adapter_id: &str,
         session_id: &str,
         session_cwd: PathBuf,
+        session_title: Option<&str>,
         target: Option<AgentLaunchTarget>,
     ) {
-        let Some(spawn) =
-            self.agent_resume_spawn_command(adapter_id, session_id, session_cwd, false)
-        else {
+        let Some(spawn) = self.agent_resume_spawn_command(
+            adapter_id,
+            session_id,
+            session_cwd,
+            session_title,
+            false,
+        ) else {
             return;
         };
-        let placement = self.agent_launch_placement(false, target);
+        // A plain resume click falls back to `resume_open_in` (default
+        // `NewTab`: the session gets the whole tab) rather than the fresh-launch
+        // `open_in`, which splits. An explicit target override still wins.
+        let override_target = target.or(Some(self.config.agent_ui.launcher.resume_open_in));
+        let placement = self.agent_launch_placement(false, override_target);
         self.spawn_agent(spawn, placement);
     }
 
@@ -6928,6 +6999,24 @@ impl crate::TermWindow {
             .map(|(id, _)| id.clone())
             .collect();
 
+        // A restore that reopens nothing shows one toast and no reason; say per
+        // entry why it was dropped, for whoever has to find out.
+        for entry in &entries.sessions {
+            let key = (entry.adapter_id.clone(), entry.session_id.clone());
+            if live.contains(&key) {
+                log::info!(
+                    "restore: skipping {} {}: still running",
+                    entry.adapter_id,
+                    entry.session_id
+                );
+            } else if !enabled.contains(&entry.adapter_id) {
+                log::info!(
+                    "restore: skipping {} {}: adapter not enabled",
+                    entry.adapter_id,
+                    entry.session_id
+                );
+            }
+        }
         let plan = plan_session_restore(
             &entries.sessions,
             &live,
@@ -6937,20 +7026,50 @@ impl crate::TermWindow {
         let mut skipped = plan.skipped;
         let mut spawns = Vec::with_capacity(plan.spawn.len());
         for entry in plan.spawn {
-            // A directory that has since been deleted or unmounted cannot host a
-            // resumed agent, and spawning there fails obscurely.
-            if !entry.cwd.is_dir() {
-                skipped += 1;
-                continue;
-            }
             match self.agent_resume_spawn_command(
                 &entry.adapter_id,
                 &entry.session_id,
                 entry.cwd.clone(),
+                entry.label.as_deref(),
                 true,
             ) {
-                Some(spawn) => spawns.push(spawn),
-                None => skipped += 1,
+                Some(spawn) => {
+                    // A directory that is gone — from this side *or* from the
+                    // session's own filesystem — cannot host a resumed agent.
+                    // A WSL session records a Linux cwd, which the Windows
+                    // process can only see through the distro's UNC share;
+                    // without the second view every WSL session was skipped
+                    // here and a restore click could never restore anything.
+                    let distro = spawn_domain_distro(&spawn.domain, &self.config);
+                    let windows_view = distro.as_deref().and_then(|distro| {
+                        wsl_paths::wsl_to_windows(&entry.cwd.to_string_lossy(), distro)
+                    });
+                    if !entry.cwd.is_dir() && !windows_view.is_some_and(|path| path.is_dir()) {
+                        log::info!(
+                            "restore: skipping {} {}: cwd {} not found (distro {distro:?})",
+                            entry.adapter_id,
+                            entry.session_id,
+                            entry.cwd.display()
+                        );
+                        skipped += 1;
+                        continue;
+                    }
+                    log::info!(
+                        "restore: reopening {} {} in {:?}",
+                        entry.adapter_id,
+                        entry.session_id,
+                        spawn.domain
+                    );
+                    spawns.push(spawn);
+                }
+                None => {
+                    log::info!(
+                        "restore: skipping {} {}: no resume command resolved",
+                        entry.adapter_id,
+                        entry.session_id
+                    );
+                    skipped += 1;
+                }
             }
         }
 
@@ -6977,6 +7096,7 @@ impl crate::TermWindow {
         adapter_id: &str,
         session_id: &str,
         session_cwd: PathBuf,
+        session_title: Option<&str>,
         quiet: bool,
     ) -> Option<SpawnCommand> {
         // Ids reach argv as their own element. The transcript scan gates its own
@@ -7020,9 +7140,25 @@ impl crate::TermWindow {
             // fall back to the active pane's domain rather than refusing.
             (None, None) => SpawnTabDomain::CurrentPaneDomain,
         };
-        let cwd = self.translate_cwd_for_domain(session_cwd, &domain);
+        let mut cwd = self.translate_cwd_for_domain(session_cwd, &domain);
+        // The snapshot records the session's own view of the directory: a
+        // Linux path for a session that ran inside a distro. When that spawn
+        // goes back into a distro, `wsl.exe --cd` must be handed the Windows
+        // form — it translates Windows paths itself, while a Linux path is
+        // not a directory from this process and hangs `wsl.exe --cd`.
+        if cwd
+            .as_ref()
+            .is_some_and(|path| path.to_string_lossy().starts_with('/'))
+        {
+            if let Some(distro) = spawn_domain_distro(&domain, &self.config) {
+                let linux_path = cwd.as_ref().unwrap().to_string_lossy().to_string();
+                if let Some(windows_form) = wsl_paths::wsl_to_windows(&linux_path, &distro) {
+                    cwd = Some(windows_form);
+                }
+            }
+        }
         Some(SpawnCommand {
-            label: Some(format!("{label} resume")),
+            label: Some(resume_tab_title(session_title, session_id, &label)),
             args: Some(argv),
             cwd,
             domain,
@@ -12691,6 +12827,11 @@ impl crate::TermWindow {
         let mut panes: Vec<PaneAgentRow> = Vec::new();
 
         let tab_count = window.count_tabs();
+        let window_panes: HashSet<PaneId> = window
+            .iter_tabs()
+            .flat_map(|tab| tab.iter_panes_ignoring_zoom())
+            .map(|pos| pos.pane.pane_id())
+            .collect();
         // The mux borrow has to go before `detect_agent_pane`, which reaches
         // back into the mux for each pane.
         drop(window);
@@ -12765,6 +12906,39 @@ impl crate::TermWindow {
                 )
             })
             .unwrap_or_default();
+
+        // A session whose own environment names a pane of this window is in
+        // that pane, whether or not screen detection has recognised it yet. A
+        // WSL agent often is not recognised -- its foreground process is
+        // `wslhost.exe`, and a fresh prompt has none of the text detection
+        // looks for -- and with no row to bind to, the session rendered
+        // detached and was never recorded for "Reopen last window".
+        for session in &sessions {
+            let Some(hint) = session.pane_hint else {
+                continue;
+            };
+            if !window_panes.contains(&hint) || panes.iter().any(|row| row.pane_id == hint) {
+                continue;
+            }
+            panes.push(PaneAgentRow {
+                pane_id: hint,
+                provider: Some(session.vendor.adapter_id().to_string()),
+                title: session.vendor.label().to_string(),
+                status: crate::agent_herd::HerdStatus::Unknown,
+                model: None,
+                session_id: None,
+                cwd: None,
+                project_root: None,
+                git_branch: None,
+                pids: HashSet::new(),
+                input_tokens: None,
+                output_tokens: None,
+                cost: None,
+                activity: None,
+                can_attach: false,
+                can_open_logs: false,
+            });
+        }
 
         let mut agents = crate::agent_herd::join_sessions_with_panes(sessions, panes);
         // Apply pending resume bindings. OpenCode panes report no cwd, so the
@@ -12896,7 +13070,6 @@ impl crate::TermWindow {
         }
 
         let sessions = window_agent_sessions(agents);
-        self.agent_window_sessions = sessions.clone();
 
         // An empty set is never persisted, whether or not this window has written
         // before. The snapshot is a restore point, not a live mirror: a window
@@ -12905,9 +13078,15 @@ impl crate::TermWindow {
         // it with `[]` used to destroy it silently, and `pick_last_window` then
         // skipped the entry for being empty, so the "Reopen last window" row
         // never appeared again.
+        //
+        // The same holds for the list the close handler persists: it keeps the
+        // last non-empty set. Clearing it here meant the close-time write --
+        // the one that marks the entry `closed_cleanly` and catches changes the
+        // write throttle deferred -- found nothing to write.
         if sessions.is_empty() {
             return;
         }
+        self.agent_window_sessions = sessions.clone();
 
         if let Some((_, previous)) = &self.agent_snapshot_written {
             if *previous == sessions {
@@ -13016,6 +13195,37 @@ impl crate::TermWindow {
             .filter_map(|pane| mux.get_domain(pane.domain_id()))
             .filter_map(|domain| wsl_paths::distro_for_domain(domain.domain_name(), &self.config))
             .collect();
+        self.wsl_specs_for(&live)
+    }
+
+    /// [`Self::wsl_distro_specs`] plus every distro agents live in: those the
+    /// agent probe found a CLI in, and `agent_ui.launcher.wsl_distro`.
+    ///
+    /// For the resume submenu only. The live-pane rule above exists because the
+    /// herd scans every 500ms; this scan runs when the user opens the menu, at
+    /// most every [`Self::SESSION_SCAN_TTL`], and resuming would boot the distro
+    /// anyway. Without it, a window holding only cmd or PowerShell tabs listed
+    /// none of the sessions its agents -- all inside WSL -- had written.
+    fn wsl_session_distro_specs(&self) -> Vec<(String, Option<String>)> {
+        if !cfg!(windows) {
+            return vec![];
+        }
+        let mux = Mux::get();
+        let mut wanted: HashSet<String> = mux
+            .iter_panes()
+            .iter()
+            .filter(|pane| !pane.is_dead())
+            .filter_map(|pane| mux.get_domain(pane.domain_id()))
+            .filter_map(|domain| wsl_paths::distro_for_domain(domain.domain_name(), &self.config))
+            .collect();
+        wanted.extend(self.wsl_agent_hits().values().map(|hit| hit.distro.clone()));
+        wanted.extend(self.config.agent_ui.launcher.wsl_distro.clone());
+        self.wsl_specs_for(&wanted)
+    }
+
+    /// `(distribution, username)` for each configured WSL domain whose distro
+    /// is in `distros`.
+    fn wsl_specs_for(&self, live: &HashSet<String>) -> Vec<(String, Option<String>)> {
         if live.is_empty() {
             return vec![];
         }
@@ -13060,11 +13270,29 @@ impl crate::TermWindow {
 
         self.agent_herd_scan_started_at = Some(Instant::now());
         let future = promise::spawn::spawn_into_new_thread(move || {
+            let started = Instant::now();
             let roots = agent_session_roots(home, &distros);
             let sessions = crate::agent_herd::default_registry().collect_all_from(&roots);
+            // A scan reads every vendor's store, WSL ones through the 9p share;
+            // on a slow machine that is where the herd's latency goes.
+            if started.elapsed() > Duration::from_secs(2) {
+                log::info!(
+                    "agent herd scan took {:?} for {} roots",
+                    started.elapsed(),
+                    roots.len()
+                );
+            }
             window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
                 term_window.agent_herd_scan_started_at = None;
                 term_window.agent_herd_session_cache = Some((Instant::now(), Arc::new(sessions)));
+                // The herd, and the "Reopen last window" snapshot, are only
+                // rebuilt on paint. Without asking for one, a quiet window sat
+                // on the new sessions -- and did not start the next scan --
+                // until something else redrew it, which is how an agent started
+                // half a minute before the window closed never got recorded.
+                if let Some(window) = term_window.window.as_ref() {
+                    window.invalidate();
+                }
             })));
             Ok::<(), anyhow::Error>(())
         });
@@ -15580,6 +15808,7 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
     fn vendor_session(pid: u32, session_id: &str, cwd: &str, interactive: bool) -> VendorSession {
         VendorSession {
             origin: crate::agent_herd::vendor::SessionOrigin::Host,
+            pane_hint: None,
             pid,
             interactive,
             vendor: AgentVendor::Codex,
@@ -15933,6 +16162,31 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
             "capture order is preserved, and the cap takes the first N"
         );
         assert_eq!(plan.skipped, 4);
+    }
+
+    #[test]
+    fn resume_tab_title_prefers_the_session_title() {
+        assert_eq!(
+            resume_tab_title(Some(" What is Rust "), "f00e55e8", "Claude"),
+            "What is Rust"
+        );
+        // No title, an empty one, or the id standing in for one: the adapter.
+        assert_eq!(
+            resume_tab_title(None, "f00e55e8", "Claude"),
+            "Claude resume"
+        );
+        assert_eq!(
+            resume_tab_title(Some("  "), "f00e55e8", "Claude"),
+            "Claude resume"
+        );
+        assert_eq!(
+            resume_tab_title(Some("f00e55e8"), "f00e55e8", "Claude"),
+            "Claude resume"
+        );
+        let long = "x".repeat(80);
+        let title = resume_tab_title(Some(&long), "id", "Claude");
+        assert_eq!(title.chars().count(), 60);
+        assert!(title.ends_with('…'));
     }
 
     #[test]
@@ -17055,59 +17309,47 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
         }
     }
 
-    /// The reserve grew when it moved to the button's edge, so pin the default
-    /// sidebar width away from the point where a row would paint no text at all.
-    /// The tab row's Copy zone gives way before the title does.
-    ///
-    /// A second 34px zone is 34px the title does not get, and at the sidebar's
-    /// 140px drag floor the title is already down to about three columns.
+    /// The tab row's Copy icon stays at every width where its box fits; at the
+    /// sidebar's 140px drag floor the title gives way instead.
     #[test]
-    fn sidebar_tab_copy_zone_is_dropped_before_the_title_is() {
+    fn sidebar_tab_copy_zone_is_kept_at_narrow_widths() {
         let cell_width = 10.;
+        let reserve = sidebar_close_text_reserve(cell_width, 20., 34., sidebar_close_inset(1.));
 
-        // Default sidebar: room for both, with the title still well clear.
+        // Default sidebar: room for both.
         let default_width = config::Config::default_config().sidebar_width_px as f32;
         let content_w =
             default_width - INSET * 2. - RESIZE_GRIP_W as f32 - SIDEBAR_SCROLLBAR_GUTTER_W;
-        let reserve = sidebar_close_text_reserve(cell_width, 20., 34., sidebar_close_inset(1.));
         let title_w = content_w - PAD_X * 2. - ACTIVE_TEXT_GAP - reserve;
-        let copy_w = sidebar_tab_copy_zone_w(title_w, cell_width);
-        assert_eq!(copy_w, CLOSE_ZONE_W);
-        assert!(
-            title_w - copy_w >= MIN_TAB_TITLE_COLS * cell_width,
-            "title kept {} px, below the floor",
-            title_w - copy_w
-        );
+        assert_eq!(sidebar_tab_copy_zone_w(title_w, cell_width), CLOSE_ZONE_W);
 
-        // Drag floor: the icon goes, the title survives.
+        // Drag floor: the icon stays; the title is what gives way.
         let narrow_w = 140. - INSET * 2. - RESIZE_GRIP_W as f32 - SIDEBAR_SCROLLBAR_GUTTER_W;
         let narrow_title = narrow_w - PAD_X * 2. - ACTIVE_TEXT_GAP - reserve;
-        assert_eq!(sidebar_tab_copy_zone_w(narrow_title, cell_width), 0.);
+        let narrow_zone = sidebar_tab_copy_zone_w(narrow_title, cell_width);
+        assert!(
+            narrow_zone > 0. && narrow_zone <= CLOSE_ZONE_W,
+            "zone {narrow_zone} for a {narrow_title}px title at the drag floor"
+        );
+        // The shrunken zone still holds the geometry's smallest box.
+        let geometry = sidebar_tab_copy_geometry(cell_width, 20., 28., narrow_zone);
+        assert!(geometry.button_dx + geometry.side <= narrow_zone + 0.01);
 
-        // Exactly at the floor still qualifies; one pixel under does not.
-        let exact = CLOSE_ZONE_W + MIN_TAB_TITLE_COLS * cell_width;
-        assert_eq!(sidebar_tab_copy_zone_w(exact, cell_width), CLOSE_ZONE_W);
-        assert_eq!(sidebar_tab_copy_zone_w(exact - 1., cell_width), 0.);
-    }
-
-    /// The chevron and the agent badge come out of the same budget, so a split
-    /// agent tab loses the icon at a width where a plain tab keeps it.
-    #[test]
-    fn sidebar_tab_copy_zone_accounts_for_the_chevron_and_badge() {
-        let cell_width = 10.;
-        let cell_height = 20.;
-        // Chosen to sit between the two: plain fits, decorated does not.
-        let label_w = CLOSE_ZONE_W + MIN_TAB_TITLE_COLS * cell_width + 4.;
-
-        let plain = sidebar_row_columns(0., label_w, cell_width, cell_height, false, false);
+        // Only a zone too small for any box is dropped.
+        assert_eq!(sidebar_tab_copy_zone_w(22., cell_width), 22.);
+        assert_eq!(sidebar_tab_copy_zone_w(21., cell_width), 0.);
         assert_eq!(
-            sidebar_tab_copy_zone_w(plain.text_w, cell_width),
+            sidebar_tab_copy_zone_w(CLOSE_ZONE_W, cell_width),
             CLOSE_ZONE_W
         );
-
-        let decorated = sidebar_row_columns(0., label_w, cell_width, cell_height, true, true);
-        assert!(decorated.text_w < plain.text_w);
-        assert_eq!(sidebar_tab_copy_zone_w(decorated.text_w, cell_width), 0.);
+        assert_eq!(
+            sidebar_tab_copy_zone_w(CLOSE_ZONE_W - 1., cell_width),
+            CLOSE_ZONE_W - 1.
+        );
+        assert_eq!(
+            sidebar_tab_copy_zone_w(CLOSE_ZONE_W * 3., cell_width),
+            CLOSE_ZONE_W
+        );
     }
 
     /// The Copy box is centred in its zone; the close box is not, and should

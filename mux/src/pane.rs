@@ -237,6 +237,10 @@ pub trait Pane: Downcast + Send + Sync {
     fn get_dimensions(&self) -> RenderableDimensions;
 
     fn get_title(&self) -> String;
+    /// Record a spawn-time title for this pane, e.g. the human label behind a
+    /// `SpawnCommand::label`. Only local panes can hold it; remote panes take
+    /// the default no-op.
+    fn set_spawn_title(&self, _title: &str) {}
     fn get_progress(&self) -> Progress {
         Progress::None
     }

@@ -136,6 +136,11 @@ pub async fn spawn_command_internal(
                     )
                     .await
                     .context("split_pane")?;
+                // The label names the pane when the process tree cannot
+                // (a WSL pane's foreground process is always the wslhost shim).
+                if let Some(label) = spawn.label.as_deref() {
+                    pane.set_spawn_title(label);
+                }
                 pane.set_config(term_config);
             } else {
                 bail!("there is no active tab while splitting pane!?");
@@ -163,6 +168,11 @@ pub async fn spawn_command_internal(
             // Otherwise, we'll pick them up when we later respond to
             // the new window being created.
             if Some(window_id) == src_window_id {
+                // The label names the pane when the process tree cannot
+                // (a WSL pane's foreground process is always the wslhost shim).
+                if let Some(label) = spawn.label.as_deref() {
+                    pane.set_spawn_title(label);
+                }
                 pane.set_config(term_config);
             }
         }
