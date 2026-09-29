@@ -186,9 +186,10 @@ mod windows {
         /// Publish path as the path for class_name.
         pub fn new(path: &Path, class_name: &str) -> anyhow::Result<Self> {
             let (mutex_name, map_name) = Self::compute_names(class_name);
+            // The consumer connects to this value directly, so it must be the
+            // full path. Publishing just the file name (as this used to)
+            // leaves every reader trying to connect to a relative path.
             let path = path
-                .file_name()
-                .ok_or_else(|| anyhow::anyhow!("path has no file_name!?"))?
                 .to_str()
                 .ok_or_else(|| anyhow::anyhow!("path is not UTF8!"))?
                 .to_string();
@@ -232,7 +233,13 @@ mod windows {
 
                 let path: PathBuf = path.into();
 
-                Ok(path)
+                // Older builds published just the socket file name; join it
+                // with the runtime dir so the result is always connectable.
+                if path.is_absolute() {
+                    Ok(path)
+                } else {
+                    Ok(config::RUNTIME_DIR.join(path))
+                }
             })
         }
     }
@@ -244,6 +251,30 @@ mod windows {
             .encode_wide()
             .chain(std::iter::once(0))
             .collect()
+    }
+
+    /// Test helper: write a bare (file-name-only) value into the shared
+    /// memory, the way older builds used to publish, then hand the holder
+    /// back — the mapping only exists while its handles are open, so the
+    /// caller must keep the holder alive while resolving.
+    #[cfg(test)]
+    pub fn publish_bare_name_for_test(
+        class_name: &str,
+        bare: &str,
+    ) -> anyhow::Result<NameHolder> {
+        let (mutex_name, map_name) = NameHolder::compute_names(class_name);
+        let mutex = NamedMutex::new(&mutex_name)?;
+        mutex.with_lock(|| {
+            let mapping = FileMapping::create(&map_name, MAX_NAME)?;
+            let mut view = mapping.map()?;
+            let slice = view.slice_mut();
+            slice[0..bare.len()].copy_from_slice(bare.as_bytes());
+            slice[bare.len()] = 0;
+            Ok(NameHolder {
+                _mapping: mapping,
+                _view: view,
+            })
+        })
     }
 }
 
@@ -395,4 +426,46 @@ pub fn discover_gui_socks() -> Vec<PathBuf> {
 
 fn is_sock_dead(sock: &std::path::Path) -> bool {
     UnixStream::connect(sock).is_err()
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    /// A unique per-process class name so tests don't collide with a running
+    /// GUI publishing the same shared-memory name.
+    fn test_class_name(label: &str) -> String {
+        format!(
+            "{}-test-{}-{}",
+            label,
+            std::process::id(),
+            NAME_HOLDER_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        )
+    }
+
+    static NAME_HOLDER_COUNTER: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    #[cfg(windows)]
+    #[test]
+    fn published_socket_path_resolves_to_a_full_path() {
+        let full = config::RUNTIME_DIR.join("gui-sock-fake-full");
+        let class_name = test_class_name("full");
+        let holder = publish_gui_sock_path(&full, &class_name).unwrap();
+        let resolved = resolve_gui_sock_path(&class_name).unwrap();
+        assert!(resolved.is_absolute(), "resolved {resolved:?} is not absolute");
+        assert_eq!(resolved, full);
+        drop(holder);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bare_published_names_are_joined_with_the_runtime_dir() {
+        let class_name = test_class_name("bare");
+        let holder = windows::publish_bare_name_for_test(&class_name, "gui-sock-bare-name")
+            .expect("publishing a bare name for test");
+        let resolved = resolve_gui_sock_path(&class_name).unwrap();
+        assert_eq!(resolved, config::RUNTIME_DIR.join("gui-sock-bare-name"));
+        drop(holder);
+    }
 }

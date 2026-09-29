@@ -687,6 +687,19 @@ pub fn subagent_is_working(sub: &HerdSubagent, now: SystemTime) -> bool {
 ///
 /// Binding is by pid first (exact, via the pane's process tree), then by cwd
 /// as a fallback — but only when the cwd match is *unique*. Two agents of the
+/// True when a pane title is a generic shell or host-shim name that would
+/// make a worse label for an agent than the session id itself.
+///
+/// Windows panes default to titles like `cmd.exe`, and a WSL pane reports
+/// `wslhost.exe`; neither tells the user which agent they are looking at.
+fn is_generic_pane_title(title: &str) -> bool {
+    matches!(
+        title.trim().trim_end_matches(".exe").to_ascii_lowercase().as_str(),
+        "bash" | "cmd" | "fish" | "nu" | "powershell" | "pwsh" | "sh" | "tgzterminal" | "wezterm"
+            | "wezterm-gui" | "wsl" | "wslhost" | "wslrelay" | "ubuntu" | "zsh"
+    )
+}
+
 /// same vendor in the same directory are genuinely ambiguous, and guessing
 /// would point Stop at the wrong pane; such a session stays unbound instead.
 pub fn join_sessions_with_panes(
@@ -720,7 +733,11 @@ pub fn join_sessions_with_panes(
             name: session
                 .name
                 .clone()
-                .or_else(|| pane.map(|p| p.title.clone()))
+                .or_else(|| {
+                    pane
+                        .map(|p| p.title.clone())
+                        .filter(|title| !is_generic_pane_title(title))
+                })
                 .unwrap_or_else(|| session.session_id.clone()),
             provider: session.vendor.adapter_id().to_string(),
             vendor: session.vendor.clone(),

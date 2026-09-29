@@ -11,6 +11,93 @@ use std::time::{Duration, SystemTime};
 const OPENCODE_ACTIVE_WINDOW: Duration = Duration::from_secs(15 * 60);
 const OPENCODE_WORKING_WINDOW: Duration = Duration::from_secs(2 * 60);
 
+/// Which of the two known store layouts `opencode.db` uses.
+///
+/// OpenCode 2.x (and the desktop app) renamed `session` to `session_v2` and
+/// replaced the per-part `part` table with whole-message rows in
+/// `session_message`, each carrying its parts in the row's JSON. The column
+/// names the herd needs (`id`, `directory`, `title`, `model`, `cost`,
+/// `tokens_input`, `tokens_output`, `time_created`, `time_updated`,
+/// `time_archived`, `parent_id`) survive the rename verbatim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpencodeSchema {
+    /// `session` + `part` (OpenCode 1.x CLI).
+    Legacy,
+    /// `session_v2` + `session_message` (OpenCode 2.x CLI / desktop app).
+    V2,
+}
+
+impl OpencodeSchema {
+    fn sessions_table(self) -> &'static str {
+        match self {
+            Self::Legacy => "session",
+            Self::V2 => "session_v2",
+        }
+    }
+
+    fn events_table(self) -> &'static str {
+        match self {
+            Self::Legacy => "part",
+            Self::V2 => "session_message",
+        }
+    }
+
+    /// Secondary sort of the event rows: legacy `part` has an `id`, v2
+    /// `session_message` rows carry a `seq`.
+    fn events_order(self) -> &'static str {
+        match self {
+            Self::Legacy => "id DESC",
+            Self::V2 => "seq DESC",
+        }
+    }
+}
+
+fn detect_opencode_schema(conn: &Connection) -> Option<OpencodeSchema> {
+    let has_v2 = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master \
+             WHERE type = 'table' AND name IN ('session_v2', 'session_message')",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .ok()
+        .unwrap_or(0)
+        >= 2;
+    if has_v2 {
+        return Some(OpencodeSchema::V2);
+    }
+    let has_legacy = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master \
+             WHERE type = 'table' AND name = 'session'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .ok()
+        .unwrap_or(0)
+        > 0;
+    has_legacy.then_some(OpencodeSchema::Legacy)
+}
+
+/// Pull part-like JSON objects out of one stored row.
+///
+/// Legacy `part` rows are the part payload itself. v2 `session_message` rows
+/// are whole messages whose parts sit in an array (observed both as a bare
+/// array and as an object with a `parts` field), so every shape is tolerated
+/// rather than coupled to one build.
+fn part_objects<'a>(data: &'a serde_json::Value) -> Vec<&'a serde_json::Value> {
+    if let Some(array) = data.as_array() {
+        return array.iter().collect();
+    }
+    if let Some(parts) = data.get("parts").and_then(|parts| parts.as_array()) {
+        return parts.iter().collect();
+    }
+    if data.get("type").is_some() {
+        return vec![data];
+    }
+    Vec::new()
+}
+
 fn opencode_config_dir(home: &Path) -> PathBuf {
     home.join(".config").join("opencode")
 }
@@ -131,12 +218,6 @@ fn collect_database_sessions(home: &Path) -> Vec<VendorSession> {
         return Vec::new();
     }
 
-    let now = SystemTime::now();
-    let cutoff = now
-        .checked_sub(OPENCODE_ACTIVE_WINDOW)
-        .and_then(|at| at.duration_since(SystemTime::UNIX_EPOCH).ok())
-        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
-        .unwrap_or(0);
     let Ok(conn) = Connection::open_with_flags(
         db,
         OpenFlags::SQLITE_OPEN_READ_ONLY
@@ -145,17 +226,30 @@ fn collect_database_sessions(home: &Path) -> Vec<VendorSession> {
     ) else {
         return Vec::new();
     };
+    let Some(schema) = detect_opencode_schema(&conn) else {
+        log::debug!("opencode database has neither the session nor the session_v2 table");
+        return Vec::new();
+    };
 
-    let mut stmt = match conn.prepare(
+    let now = SystemTime::now();
+    let cutoff = now
+        .checked_sub(OPENCODE_ACTIVE_WINDOW)
+        .and_then(|at| at.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+        .unwrap_or(0);
+
+    let sessions_sql = format!(
         "SELECT id, directory, title, model, cost, tokens_input, tokens_output, \
                 time_created, time_updated \
-         FROM session \
+         FROM {} \
          WHERE parent_id IS NULL AND time_archived IS NULL AND time_updated >= ?1 \
          ORDER BY time_updated DESC LIMIT 32",
-    ) {
+        schema.sessions_table()
+    );
+    let mut stmt = match conn.prepare(&sessions_sql) {
         Ok(stmt) => stmt,
         Err(err) => {
-            log::debug!("opencode database schema not recognized: {err:#}");
+            log::debug!("opencode database session query failed: {err:#}");
             return Vec::new();
         }
     };
@@ -202,16 +296,7 @@ fn collect_database_sessions(home: &Path) -> Vec<VendorSession> {
         //   - newest part is a tool call  -> the agent is mid-action
         //   - newest part is text/reasoning/step-finish -> it has stopped
         // A session with no parts at all is just the start screen: idle.
-        let last_part_type = conn
-            .query_row(
-                "SELECT json_extract(data, '$.type') \
-                 FROM part WHERE session_id = ?1 \
-                 ORDER BY time_created DESC LIMIT 1",
-                [&session_id],
-                |row| row.get::<_, Option<String>>(0),
-            )
-            .ok()
-            .flatten();
+        let last_part_type = last_stored_part_type(&conn, &schema, &session_id);
         let status = match last_part_type.as_deref() {
             None => HerdStatus::Idle,
             Some("tool") | Some("reasoning") if age <= OPENCODE_WORKING_WINDOW => {
@@ -223,7 +308,7 @@ fn collect_database_sessions(home: &Path) -> Vec<VendorSession> {
         let model = model.and_then(|raw| model_label(&raw));
         let started_at = epoch_millis(created);
         let cost = (cost > 0.0).then(|| format!("${cost:.4}"));
-        let activity = opencode_activity(&conn, &session_id);
+        let activity = opencode_activity(&conn, schema, &session_id);
         Some(VendorSession {
             origin: SessionOrigin::Host,
             // OpenCode's current database has no process id. Binding falls back
@@ -253,6 +338,60 @@ fn collect_database_sessions(home: &Path) -> Vec<VendorSession> {
     .collect()
 }
 
+/// The type of the most recently stored part of a session, as the JSON sees
+/// it ("tool", "text", "reasoning", …).
+///
+/// Legacy `part` rows carry their type inside the row JSON; v2 message rows
+/// are whole messages, so the newest row's parts are inspected last-first.
+fn last_stored_part_type(
+    conn: &Connection,
+    schema: &OpencodeSchema,
+    session_id: &str,
+) -> Option<String> {
+    match schema {
+        OpencodeSchema::Legacy => {
+            let value: Option<String> = conn
+                .query_row(
+                    "SELECT json_extract(data, '$.type') \
+                     FROM part WHERE session_id = ?1 \
+                     ORDER BY time_created DESC LIMIT 1",
+                    [session_id],
+                    |row| row.get(0),
+                )
+                .ok()
+                .flatten();
+            value
+        }
+        OpencodeSchema::V2 => {
+            let rows: Vec<String> = {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT data FROM session_message WHERE session_id = ?1 \
+                         ORDER BY time_created DESC, seq DESC LIMIT 4",
+                    )
+                    .ok()?;
+                let mapped = stmt
+                    .query_map([session_id], |row| row.get::<_, String>(0))
+                    .ok()?;
+                mapped.filter_map(Result::ok).collect()
+            };
+            for row in rows {
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(&row) else {
+                    continue;
+                };
+                if let Some(last) = part_objects(&value)
+                    .into_iter()
+                    .rev()
+                    .find_map(|part| part.get("type").and_then(|kind| kind.as_str()))
+                {
+                    return Some(last.to_string());
+                }
+            }
+            None
+        }
+    }
+}
+
 fn epoch_millis(value: i64) -> Option<SystemTime> {
     let millis = u64::try_from(value).ok()?;
     SystemTime::UNIX_EPOCH.checked_add(Duration::from_millis(millis))
@@ -272,105 +411,149 @@ fn model_label(raw: &str) -> Option<String> {
         .map(ToString::to_string)
 }
 
-fn opencode_activity(conn: &Connection, session_id: &str) -> Option<HerdActivity> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT data, time_created FROM part \
-             WHERE session_id = ?1 ORDER BY time_created DESC, id DESC LIMIT 64",
-        )
-        .ok()?;
-    let rows = stmt
-        .query_map([session_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        })
-        .ok()?;
-    let mut events = Vec::new();
-    for row in rows.flatten() {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&row.0) else {
-            continue;
-        };
-        let Some(kind) = value.get("type").and_then(|kind| kind.as_str()) else {
-            continue;
-        };
-        let Some(at) = epoch_millis(row.1) else {
-            continue;
-        };
-        match kind {
-            "tool" => {
-                let name = value
-                    .get("tool")
-                    .and_then(|tool| tool.as_str())
-                    .unwrap_or("tool")
-                    .to_string();
-                let args = value
-                    .get("state")
-                    .and_then(|state| state.get("input"))
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null);
-                events.push(HerdEvent {
-                    at: Some(at),
-                    kind: HerdEventKind::Tool,
-                    content: HerdContent::ToolArgs { name, args },
-                    tool_use_id: value
-                        .get("callID")
-                        .and_then(|id| id.as_str())
-                        .map(str::to_string),
-                    parent_id: None,
-                });
-            }
-            "text" => {
-                let Some(text) = value.get("text").and_then(|text| text.as_str()) else {
-                    continue;
-                };
-                if text.trim().is_empty() {
-                    continue;
-                }
-                events.push(HerdEvent {
-                    at: Some(at),
-                    kind: HerdEventKind::Assistant,
-                    content: HerdContent::SingleLine(
-                        text.split_whitespace().collect::<Vec<_>>().join(" "),
-                    ),
-                    tool_use_id: None,
-                    parent_id: None,
-                });
-            }
-            "reasoning" => {
-                let Some(text) = value.get("text").and_then(|text| text.as_str()) else {
-                    continue;
-                };
-                if text.trim().is_empty() {
-                    continue;
-                }
-                events.push(HerdEvent {
-                    at: Some(at),
-                    kind: HerdEventKind::Thinking,
-                    content: HerdContent::SingleLine(
-                        text.split_whitespace().collect::<Vec<_>>().join(" "),
-                    ),
-                    tool_use_id: None,
-                    parent_id: None,
-                });
-            }
-            _ => {}
-        }
+fn opencode_activity(
+    conn: &Connection,
+    schema: OpencodeSchema,
+    session_id: &str,
+) -> Option<HerdActivity> {
+    let events = opencode_recent_events(conn, schema, session_id, 64)?;
+    // The detection path keeps a shallow window; the overlay reads deeper.
+    let mut recent = events;
+    if recent.len() > 8 {
+        recent.drain(..recent.len() - 8);
     }
-    events.reverse();
-    if events.len() > 8 {
-        events.drain(..events.len() - 8);
-    }
-    if events.is_empty() {
-        return None;
-    }
-    let current = events
+    let current = recent
         .last()
         .filter(|event| event.kind == HerdEventKind::Tool)
         .cloned();
     Some(HerdActivity {
         current,
-        recent: events,
+        recent,
         subagent_tree: Vec::new(),
     })
+}
+
+/// Map one part-shaped JSON value into a `HerdEvent`.
+///
+/// Shared by both stores: the part payloads keep the same inner shape across
+/// the legacy `part` rows and the parts array inside v2 message rows.
+fn map_part_event(value: &serde_json::Value, at: SystemTime) -> Option<HerdEvent> {
+    let kind = value.get("type").and_then(|kind| kind.as_str())?;
+    match kind {
+        "tool" => {
+            let name = value
+                .get("tool")
+                .or_else(|| value.get("name"))
+                .and_then(|tool| tool.as_str())
+                .unwrap_or("tool")
+                .to_string();
+            let args = value
+                .get("state")
+                .and_then(|state| state.get("input"))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            Some(HerdEvent {
+                at: Some(at),
+                kind: HerdEventKind::Tool,
+                content: HerdContent::ToolArgs { name, args },
+                tool_use_id: value
+                    .get("callID")
+                    .or_else(|| value.get("id"))
+                    .and_then(|id| id.as_str())
+                    .map(str::to_string),
+                parent_id: None,
+            })
+        }
+        "text" | "reasoning" => {
+            let Some(text) = value.get("text").and_then(|text| text.as_str()) else {
+                return None;
+            };
+            if text.trim().is_empty() {
+                return None;
+            }
+            let event_kind = if kind == "text" {
+                HerdEventKind::Assistant
+            } else {
+                HerdEventKind::Thinking
+            };
+            Some(HerdEvent {
+                at: Some(at),
+                kind: event_kind,
+                content: HerdContent::SingleLine(
+                    text.split_whitespace().collect::<Vec<_>>().join(" "),
+                ),
+                tool_use_id: None,
+                parent_id: None,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// The time a part happened: the part's own `time.created` when the payload
+/// carries one (v2 messages embed it), else the row's `time_created`.
+fn part_event_at(part: &serde_json::Value, row_at: i64) -> SystemTime {
+    part.get("time")
+        .and_then(|time| time.get("created"))
+        .and_then(|created| created.as_i64())
+        .and_then(epoch_millis)
+        .unwrap_or_else(|| epoch_millis(row_at).unwrap_or(SystemTime::UNIX_EPOCH))
+}
+
+/// The most recent events of a session, oldest first, capped to `cap` rows.
+fn opencode_recent_events(
+    conn: &Connection,
+    schema: OpencodeSchema,
+    session_id: &str,
+    cap: usize,
+) -> Option<Vec<HerdEvent>> {
+    let sql = format!(
+        "SELECT data, time_created FROM {} \
+         WHERE session_id = ?1 ORDER BY time_created DESC, {} LIMIT {cap}",
+        schema.events_table(),
+        schema.events_order()
+    );
+    let mut stmt = conn.prepare(&sql).ok()?;
+    let rows = stmt
+        .query_map([session_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .ok()?;
+    let rows: Vec<(String, i64)> = rows.filter_map(Result::ok).collect();
+
+    // Each row mapped to its events, newest row first.
+    let per_row: Vec<Vec<HerdEvent>> = rows
+        .into_iter()
+        .filter_map(|(data, time)| {
+            let value = serde_json::from_str::<serde_json::Value>(&data).ok()?;
+            let events: Vec<HerdEvent> = match schema {
+                OpencodeSchema::Legacy => {
+                    let at = epoch_millis(time)?;
+                    map_part_event(&value, at).into_iter().collect()
+                }
+                // A v2 row is a whole message whose JSON embeds its parts.
+                OpencodeSchema::V2 => part_objects(&value)
+                    .into_iter()
+                    .filter_map(|part| map_part_event(part, part_event_at(part, time)))
+                    .collect(),
+            };
+            (!events.is_empty()).then_some(events)
+        })
+        .collect();
+
+    // Rows arrive newest-first; walk them oldest-first so the collected
+    // vector is chronological and the parts inside each row stay in order.
+    let mut events = Vec::new();
+    for row_events in per_row.iter().rev() {
+        events.extend(row_events.iter().cloned());
+    }
+    if events.len() > cap {
+        events.drain(..events.len() - cap);
+    }
+    if events.is_empty() {
+        return None;
+    }
+    Some(events)
 }
 
 /// Re-read a live OpenCode session's activity for the agent log overlay.
@@ -388,10 +571,13 @@ pub fn read_session_activity(session_id: &str, max_events: usize) -> Option<Herd
     ) else {
         return None;
     };
-    let mut activity = opencode_activity(&conn, session_id)?;
+    let schema = detect_opencode_schema(&conn)?;
+    let mut activity = opencode_activity(&conn, schema, session_id)?;
     // The overlay wants a deep history; the detection path keeps a shallow 8.
     if max_events > activity.recent.len() {
-        if let Some(ev) = opencode_all_events(&conn, session_id, max_events) {
+        if let Some(mut ev) = opencode_recent_events(&conn, schema, session_id, max_events.max(256))
+        {
+            ev.truncate(max_events);
             activity.recent = ev;
             activity.current = activity
                 .recent
@@ -401,79 +587,6 @@ pub fn read_session_activity(session_id: &str, max_events: usize) -> Option<Herd
         }
     }
     Some(activity)
-}
-
-fn opencode_all_events(
-    conn: &Connection,
-    session_id: &str,
-    max_events: usize,
-) -> Option<Vec<HerdEvent>> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT data, time_created FROM part \
-             WHERE session_id = ?1 ORDER BY time_created DESC, id DESC LIMIT 256",
-        )
-        .ok()?;
-    let rows = stmt
-        .query_map([session_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        })
-        .ok()?;
-    let mut events = Vec::new();
-    for row in rows.flatten() {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&row.0) else {
-            continue;
-        };
-        let Some(kind) = value.get("type").and_then(|kind| kind.as_str()) else {
-            continue;
-        };
-        let Some(at) = epoch_millis(row.1) else {
-            continue;
-        };
-        let mapped = match kind {
-            "tool" => Some(HerdEvent {
-                at: Some(at),
-                kind: HerdEventKind::Tool,
-                content: HerdContent::SingleLine(
-                    value
-                        .get("tool")
-                        .and_then(|t| t.as_str())
-                        .unwrap_or("tool")
-                        .to_string(),
-                ),
-                tool_use_id: None,
-                parent_id: None,
-            }),
-            "text"
-                if !value
-                    .get("text")
-                    .and_then(|t| t.as_str())
-                    .unwrap_or("")
-                    .trim()
-                    .is_empty() =>
-            {
-                Some(HerdEvent {
-                    at: Some(at),
-                    kind: HerdEventKind::Assistant,
-                    content: HerdContent::SingleLine(
-                        value
-                            .get("text")
-                            .and_then(|t| t.as_str())
-                            .unwrap_or("")
-                            .to_string(),
-                    ),
-                    tool_use_id: None,
-                    parent_id: None,
-                })
-            }
-            _ => None,
-        };
-        if let Some(ev) = mapped {
-            events.push(ev);
-        }
-    }
-    events.reverse();
-    Some(events.into_iter().take(max_events).collect())
 }
 
 /// The user's home directory.

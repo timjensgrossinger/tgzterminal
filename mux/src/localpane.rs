@@ -37,6 +37,18 @@ use wezterm_term::{
 
 const PROC_INFO_CACHE_TTL: Duration = Duration::from_millis(300);
 
+/// True when a Windows process basename is one of the shims that host a WSL
+/// session rather than the program the user ran.
+///
+/// A `wsl.exe` pane's process tree bottoms out at `wslhost.exe` (or
+/// `wslrelay.exe` on some builds): the Linux processes live in the VM and are
+/// invisible to the Windows snapshot, so the "youngest console descendant"
+/// heuristic always lands on the shim. Used to keep that name out of titles.
+fn is_wsl_host_shim(process_name: &str) -> bool {
+    let name = process_name.trim_end_matches(".exe").to_ascii_lowercase();
+    matches!(name.as_str(), "wslhost" | "wslrelay" | "wsl")
+}
+
 #[derive(Debug)]
 enum ProcessState {
     Running {
@@ -133,6 +145,14 @@ pub struct LocalPane {
     #[cfg(unix)]
     leader: Arc<Mutex<Option<CachedLeaderInfo>>>,
     command_description: String,
+    /// Title injected at spawn time, e.g. the agent label behind a
+    /// `SpawnCommand::label`.
+    ///
+    /// The foreground-process fallback cannot name what runs *inside* a WSL
+    /// distro: the Windows snapshot only sees the host shim (`wslhost.exe`),
+    /// so a WSL-hosted agent pane used to be titled after it. The spawn-time
+    /// label is the honest substitute until the child sets an OSC title.
+    spawn_title: Mutex<Option<String>>,
 }
 
 #[async_trait(?Send)]
@@ -451,15 +471,33 @@ impl Pane for LocalPane {
         // If the title is the default pane title, then try to spice
         // things up a bit by returning the process basename instead
         if title == "wezterm" {
+            let spawn_title = self.spawn_title.lock().clone();
             if let Some(proc_name) = self.get_foreground_process_name(CachePolicy::AllowStale) {
                 let proc_name = std::path::Path::new(&proc_name);
                 if let Some(name) = proc_name.file_name() {
-                    return name.to_string_lossy().to_string();
+                    let name = name.to_string_lossy().to_string();
+                    // A WSL pane's foreground process is always the Windows
+                    // host shim, which names nothing the user cares about;
+                    // prefer the spawn-time label before showing it.
+                    if is_wsl_host_shim(&name) {
+                        if let Some(spawn_title) = spawn_title.as_ref() {
+                            return spawn_title.clone();
+                        }
+                    } else {
+                        return name.to_string();
+                    }
                 }
+            }
+            if let Some(spawn_title) = spawn_title.as_ref() {
+                return spawn_title.clone();
             }
         }
 
         title
+    }
+
+    fn set_spawn_title(&self, title: &str) {
+        *self.spawn_title.lock() = Some(title.to_string());
     }
 
     fn get_progress(&self) -> Progress {
@@ -1037,6 +1075,7 @@ impl LocalPane {
             #[cfg(unix)]
             leader: Arc::new(Mutex::new(None)),
             command_description,
+            spawn_title: Mutex::new(None),
         }
     }
 

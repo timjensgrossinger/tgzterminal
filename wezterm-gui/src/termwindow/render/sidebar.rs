@@ -2686,6 +2686,15 @@ fn is_generic_shell_title(title: &str, command: Option<&str>) -> bool {
         "wezterm",
         "wezterm-gui",
         "wsl",
+        "wsl.exe",
+        // Windows-side shims that host a WSL session: they name nothing the
+        // user cares about, so a tab that "is" one of these has no real title.
+        "wslhost",
+        "wslhost.exe",
+        "wslrelay",
+        "wslrelay.exe",
+        "ubuntu",
+        "ubuntu.exe",
         "zsh",
     ];
     if generic_titles.contains(&title_lower.as_str()) {
@@ -3915,6 +3924,10 @@ fn merge_agent_adapter_config(
             .launch_domain
             .clone()
             .or_else(|| base.launch_domain.clone()),
+        tab_title: configured
+            .tab_title
+            .clone()
+            .or_else(|| base.tab_title.clone()),
     }
 }
 
@@ -4252,6 +4265,18 @@ fn window_agent_sessions(agents: &[HerdAgent]) -> Vec<SnapshotSession> {
         })
         .filter(|session| seen.insert((session.adapter_id.clone(), session.session_id.clone())))
         .collect()
+}
+
+/// The distro a resolved spawn domain runs in, or `None` when the domain is
+/// not a WSL domain (or cannot be named).
+fn spawn_domain_distro(
+    domain: &SpawnTabDomain,
+    config: &config::ConfigHandle,
+) -> Option<String> {
+    match domain {
+        SpawnTabDomain::DomainName(name) => wsl_paths::distro_for_domain(name, config),
+        _ => None,
+    }
 }
 
 /// The restore row's text, e.g. `"Reopen last session (7 agents, 2 windows)"`.
@@ -6145,7 +6170,7 @@ impl crate::TermWindow {
     }
 
     /// Name of the registered domain that opens `distro`.
-    fn wsl_domain_name_for_distro(&self, distro: &str) -> Option<String> {
+    pub(crate) fn wsl_domain_name_for_distro(&self, distro: &str) -> Option<String> {
         wsl_paths::wsl_domains(&self.config)
             .into_iter()
             .find(|domain| domain.distribution.as_deref().unwrap_or(&domain.name) == distro)
@@ -6689,9 +6714,18 @@ impl crate::TermWindow {
         let domain = self.agent_launch_domain(entry, forced_local);
         let cwd = self.agent_launch_cwd(&domain, forced_local);
         let placement = self.agent_launch_placement(invert_target, override_target);
+        // A configured per-adapter title wins over the derived
+        // "Claude agent"-style label; both become the pane's spawn title,
+        // which is what names a tab whose foreground process is the wslhost
+        // shim (any WSL-hosted agent on Windows).
+        let adapter = self.agent_adapter_config_by_id(Some(&entry.adapter_id));
+        let label = adapter
+            .as_ref()
+            .and_then(|adapter| adapter.tab_title.clone())
+            .unwrap_or_else(|| format!("{} agent", entry.label));
         self.spawn_agent(
             SpawnCommand {
-                label: Some(format!("{} agent", entry.label)),
+                label: Some(label),
                 args: Some(entry.argv.clone()),
                 cwd,
                 domain,
@@ -6773,6 +6807,11 @@ impl crate::TermWindow {
     /// work, so it happens on a worker thread and is applied back on the GUI
     /// thread. Called from the click that opens the submenu, never from paint.
     pub fn kick_agent_session_scan(&mut self) {
+        // The machine-wide herd cache feeds both the live set a restore's
+        // plan is checked against and the snapshot recording gate, and the
+        // paint path only kicks it when the herd *section* is enabled. Kick
+        // it here too, so opening either dropdown is enough to get it going.
+        self.kick_agent_herd_scan();
         if self.agent_session_scan_pending {
             return;
         }
@@ -6869,7 +6908,11 @@ impl crate::TermWindow {
         else {
             return;
         };
-        let placement = self.agent_launch_placement(false, target);
+        // A plain resume click falls back to `resume_open_in` (default
+        // `NewTab`: the session gets the whole tab) rather than the fresh-launch
+        // `open_in`, which splits. An explicit target override still wins.
+        let override_target = target.or(Some(self.config.agent_ui.launcher.resume_open_in));
+        let placement = self.agent_launch_placement(false, override_target);
         self.spawn_agent(spawn, placement);
     }
 
@@ -6937,19 +6980,29 @@ impl crate::TermWindow {
         let mut skipped = plan.skipped;
         let mut spawns = Vec::with_capacity(plan.spawn.len());
         for entry in plan.spawn {
-            // A directory that has since been deleted or unmounted cannot host a
-            // resumed agent, and spawning there fails obscurely.
-            if !entry.cwd.is_dir() {
-                skipped += 1;
-                continue;
-            }
             match self.agent_resume_spawn_command(
                 &entry.adapter_id,
                 &entry.session_id,
                 entry.cwd.clone(),
                 true,
             ) {
-                Some(spawn) => spawns.push(spawn),
+                Some(spawn) => {
+                    // A directory that is gone — from this side *or* from the
+                    // session's own filesystem — cannot host a resumed agent.
+                    // A WSL session records a Linux cwd, which the Windows
+                    // process can only see through the distro's UNC share;
+                    // without the second view every WSL session was skipped
+                    // here and a restore click could never restore anything.
+                    let distro = spawn_domain_distro(&spawn.domain, &self.config);
+                    let windows_view = distro.as_deref().and_then(|distro| {
+                        wsl_paths::wsl_to_windows(&entry.cwd.to_string_lossy(), distro)
+                    });
+                    if !entry.cwd.is_dir() && !windows_view.is_some_and(|path| path.is_dir()) {
+                        skipped += 1;
+                        continue;
+                    }
+                    spawns.push(spawn);
+                }
                 None => skipped += 1,
             }
         }
@@ -7020,7 +7073,23 @@ impl crate::TermWindow {
             // fall back to the active pane's domain rather than refusing.
             (None, None) => SpawnTabDomain::CurrentPaneDomain,
         };
-        let cwd = self.translate_cwd_for_domain(session_cwd, &domain);
+        let mut cwd = self.translate_cwd_for_domain(session_cwd, &domain);
+        // The snapshot records the session's own view of the directory: a
+        // Linux path for a session that ran inside a distro. When that spawn
+        // goes back into a distro, `wsl.exe --cd` must be handed the Windows
+        // form — it translates Windows paths itself, while a Linux path is
+        // not a directory from this process and hangs `wsl.exe --cd`.
+        if cwd
+            .as_ref()
+            .is_some_and(|path| path.to_string_lossy().starts_with('/'))
+        {
+            if let Some(distro) = spawn_domain_distro(&domain, &self.config) {
+                let linux_path = cwd.as_ref().unwrap().to_string_lossy().to_string();
+                if let Some(windows_form) = wsl_paths::wsl_to_windows(&linux_path, &distro) {
+                    cwd = Some(windows_form);
+                }
+            }
+        }
         Some(SpawnCommand {
             label: Some(format!("{label} resume")),
             args: Some(argv),

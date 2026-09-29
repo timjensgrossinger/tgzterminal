@@ -242,6 +242,12 @@ async fn split_and_maybe_zoom(
         .context("split_pane")?;
     pane.set_config(term_config);
 
+    // The label names the pane when the process tree cannot (a WSL pane's
+    // foreground process is always the wslhost shim).
+    if let Some(label) = spawn.label.as_deref() {
+        pane.set_spawn_title(label);
+    }
+
     if zoom {
         // `Tab::toggle_zoom` zooms whichever pane is active; it cannot be
         // told a pane directly, so the new pane must be made active first.

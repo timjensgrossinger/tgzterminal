@@ -42,5 +42,35 @@ local config = {}
 -- config.sidebar_theme = 'Auto'
 
 -- ---------------------------------------------------------------------------
+-- Agents
+-- ---------------------------------------------------------------------------
+
+-- Where a resumed session (picked from the launcher's "Resume session" list)
+-- opens: 'NewTab' gives it the whole tab, 'SplitPane' splits the active pane,
+-- 'Zoomed' splits in and zooms. Fresh launches follow open_in.
+-- config.agent_ui.launcher.resume_open_in = 'NewTab'
+
+-- Pin the WSL distro agents launch into (and the worktree picker's WSL
+-- fallback uses) instead of the first registered one, e.g. 'Ubuntu'.
+-- config.agent_ui.launcher.wsl_distro = 'Ubuntu'
+
+-- Name the tab an adapter's panes get, e.g. for agents running inside WSL
+-- where the pane's process would otherwise read as the wslhost shim.
+-- config.agent_ui.adapters.claude.tab_title = 'Claude'
+
+-- ---------------------------------------------------------------------------
+-- File browser (worktree)
+-- ---------------------------------------------------------------------------
+
+-- Where the worktree picker runs: 'Auto' prefers the target pane's own
+-- distro then Git Bash, 'Wsl' always runs it inside WSL, 'GitBash' demands
+-- Git for Windows.
+-- config.file_browser.shell = 'Auto'
+
+-- Distro for the picker when the target pane is not a WSL pane; falls back
+-- to agent_ui.launcher.wsl_distro.
+-- config.file_browser.wsl_distro = 'Ubuntu'
+
+-- ---------------------------------------------------------------------------
 
 return config

@@ -124,6 +124,8 @@ config.file_browser = {
   list_command = { "find", ".", "-maxdepth", "3", "-type", "f" },
   split_size_percent = 30,
   reuse_editor_pane = true,
+  shell = "Auto",
+  wsl_distro = nil, -- falls back to agent_ui.launcher.wsl_distro
 }
 ```
 
@@ -133,6 +135,14 @@ config.file_browser = {
 | `list_command` | list of string | `{ "find", ".", "-maxdepth", "3", "-type", "f" }` | Accepted by the schema but **not currently read by any code**. |
 | `split_size_percent` | int | `30` | Clamped to `5..=95`. |
 | `reuse_editor_pane` | bool | `true` | Accepted by the schema but **not currently read by any code**. |
+| `shell` | string | `"Auto"` | Which shell runs the picker: `"Auto"` prefers the target pane's own distro, then Git Bash; `"Wsl"` always runs it inside WSL; `"GitBash"` demands Git for Windows. |
+| `wsl_distro` | string | unset | Distro for the picker when the target pane is not a WSL pane. Falls back to `agent_ui.launcher.wsl_distro`, then nothing (Git Bash is required). |
+
+On Windows the picker needs a POSIX shell, and none ships with the OS: a WSL
+pane runs it with the pane's own distro (so an Ubuntu tab gets Ubuntu's `git`
+and `fzf`), and `shell = "Wsl"` plus `wsl_distro` extends that to any tab —
+useful when your projects live in Ubuntu but the tab happens to be PowerShell.
+Without either, Git for Windows' `bash.exe` carries it.
 
 The file browser configuration is public schema for the browser pane behavior.
 The editor command receives the selected file path as its final argument.
@@ -276,8 +286,10 @@ config.agent_ui = {
     remote_behavior = "ForceLocal",
     project_markers = { ".git", ".hg", ".svn", ".jj" },
     domain = nil,
+    wsl_distro = nil, -- e.g. "Ubuntu": pins the distro prefer_wsl uses
     prefer_wsl = true, -- Windows default; false elsewhere
     resume_menu_sessions = 10,
+    resume_open_in = "NewTab", -- where a *resumed* session opens
     restore_last_window_sessions = 8, -- 0 hides the "Reopen last window" button
   },
 }
@@ -719,8 +731,10 @@ list. Clicking one starts that agent with its resume command
 (`claude --resume <id>`, `codex resume <id>`, …) **in the directory the session
 originally ran in** — the project-root toggle deliberately does not apply, since
 a resumed session whose relative paths have moved is not much use. Placement
-otherwise follows `open_in`, `tile`, and the rest of the launcher config, exactly
-like a fresh launch.
+follows `resume_open_in` (default `"NewTab"`), so a resumed session gets the
+whole tab to itself instead of splitting whatever pane is active; set
+`resume_open_in = "SplitPane"` for the old behavior, and the Alt-click
+inversion still swaps between the two.
 
 Each row reads `project · description`, prefixed with `[branch]` when the session
 was not on `main`/`master`. The description is Claude Code's own generated
@@ -823,15 +837,19 @@ else. The domain for a launch is resolved in this order:
 A configured domain name that is not registered logs a warning and falls
 through to the next rule instead of failing the click. `prefer_wsl` picks the
 **first registered** WSL domain — WSL reports distributions in its own order and
-the "default distro" flag is not carried into the domain list, so pin a specific
-one with `domain = "WSL:Ubuntu"` if you have several.
+the "default distro" flag is not carried into the domain list, so either pin a
+specific one with `domain = "WSL:Ubuntu"` or name the distro itself with
+`wsl_distro = "Ubuntu"`, which also steers resume-domain resolution and the
+worktree picker's WSL fallback.
 
 ```lua
 agent_ui = {
-  launcher = { domain = 'WSL:Ubuntu' },
+  launcher = { wsl_distro = 'Ubuntu' },
   adapters = {
     -- keep one agent on the Windows side
     codex = { launch_domain = 'local' },
+    -- name the tab title an adapter's panes get
+    claude = { tab_title = 'Claude' },
   },
 }
 ```
@@ -1383,7 +1401,7 @@ you are not left hunting for one.
 | Tab-row Copy icon size and threshold | Hardcoded. It matches the close button's size but is centred in its own slot, and it is dropped when the title would fall below six columns. |
 | Sidebar spacing, radii and row geometry | Compile-time constants. |
 | Individual sidebar colors | No per-element keys. The whole palette is derived — see `sidebar_theme` for which source it derives from. The attention colour (waiting-queue dot, pip, selection bar, attention line) comes from the palette too, so it follows the theme rather than being separately settable. |
-| Worktree picker behavior | No config surface. |
+| Worktree picker behavior | `config.file_browser` — `shell` picks where the picker runs (`"Auto"` / `"Wsl"` / `"GitBash"`), `wsl_distro` names the distro when the target pane is not a WSL pane, `editor_command` opens selections, and `split_size_percent` sizes the split. The picker's internal script, its cache location and the fzf fallback prompt are not configurable. |
 
 Two keys are accepted by the schema but currently read by no code:
 `file_browser.list_command` and `file_browser.reuse_editor_pane`.
