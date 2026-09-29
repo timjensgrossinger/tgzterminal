@@ -4267,12 +4267,30 @@ fn window_agent_sessions(agents: &[HerdAgent]) -> Vec<SnapshotSession> {
         .collect()
 }
 
+/// The title a resumed session's tab starts with: the session's own title when
+/// it has one, so three restored tabs are not all called "Claude resume".
+///
+/// It is the pane's spawn title, which only shows while the agent has not set a
+/// title of its own -- and Claude inside WSL never does.
+fn resume_tab_title(session_title: Option<&str>, session_id: &str, adapter_label: &str) -> String {
+    const MAX_CHARS: usize = 60;
+    match session_title.map(str::trim) {
+        // A herd row with nothing better is named by its id, which is not a title.
+        Some(title) if !title.is_empty() && title != session_id => {
+            if title.chars().count() > MAX_CHARS {
+                let cut: String = title.chars().take(MAX_CHARS - 1).collect();
+                format!("{}…", cut.trim_end())
+            } else {
+                title.to_string()
+            }
+        }
+        _ => format!("{adapter_label} resume"),
+    }
+}
+
 /// The distro a resolved spawn domain runs in, or `None` when the domain is
 /// not a WSL domain (or cannot be named).
-fn spawn_domain_distro(
-    domain: &SpawnTabDomain,
-    config: &config::ConfigHandle,
-) -> Option<String> {
+fn spawn_domain_distro(domain: &SpawnTabDomain, config: &config::ConfigHandle) -> Option<String> {
     match domain {
         SpawnTabDomain::DomainName(name) => wsl_paths::distro_for_domain(name, config),
         _ => None,
@@ -6890,6 +6908,7 @@ impl crate::TermWindow {
             &session.adapter_id,
             &session.session_id,
             session.cwd.clone(),
+            Some(&session.label),
             target,
         );
     }
@@ -6904,11 +6923,16 @@ impl crate::TermWindow {
         adapter_id: &str,
         session_id: &str,
         session_cwd: PathBuf,
+        session_title: Option<&str>,
         target: Option<AgentLaunchTarget>,
     ) {
-        let Some(spawn) =
-            self.agent_resume_spawn_command(adapter_id, session_id, session_cwd, false)
-        else {
+        let Some(spawn) = self.agent_resume_spawn_command(
+            adapter_id,
+            session_id,
+            session_cwd,
+            session_title,
+            false,
+        ) else {
             return;
         };
         // A plain resume click falls back to `resume_open_in` (default
@@ -7005,6 +7029,7 @@ impl crate::TermWindow {
                 &entry.adapter_id,
                 &entry.session_id,
                 entry.cwd.clone(),
+                entry.label.as_deref(),
                 true,
             ) {
                 Some(spawn) => {
@@ -7070,6 +7095,7 @@ impl crate::TermWindow {
         adapter_id: &str,
         session_id: &str,
         session_cwd: PathBuf,
+        session_title: Option<&str>,
         quiet: bool,
     ) -> Option<SpawnCommand> {
         // Ids reach argv as their own element. The transcript scan gates its own
@@ -7131,7 +7157,7 @@ impl crate::TermWindow {
             }
         }
         Some(SpawnCommand {
-            label: Some(format!("{label} resume")),
+            label: Some(resume_tab_title(session_title, session_id, &label)),
             args: Some(argv),
             cwd,
             domain,
@@ -16104,6 +16130,31 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
             "capture order is preserved, and the cap takes the first N"
         );
         assert_eq!(plan.skipped, 4);
+    }
+
+    #[test]
+    fn resume_tab_title_prefers_the_session_title() {
+        assert_eq!(
+            resume_tab_title(Some(" What is Rust "), "f00e55e8", "Claude"),
+            "What is Rust"
+        );
+        // No title, an empty one, or the id standing in for one: the adapter.
+        assert_eq!(
+            resume_tab_title(None, "f00e55e8", "Claude"),
+            "Claude resume"
+        );
+        assert_eq!(
+            resume_tab_title(Some("  "), "f00e55e8", "Claude"),
+            "Claude resume"
+        );
+        assert_eq!(
+            resume_tab_title(Some("f00e55e8"), "f00e55e8", "Claude"),
+            "Claude resume"
+        );
+        let long = "x".repeat(80);
+        let title = resume_tab_title(Some(&long), "id", "Claude");
+        assert_eq!(title.chars().count(), 60);
+        assert!(title.ends_with('…'));
     }
 
     #[test]

@@ -162,7 +162,7 @@ config.agent_ui = {
   enable_control_actions = false,
   detect_processes = true,
   copy_scrollback_lines = 20000,
-  waiting_notification = true,
+  waiting_notification = false,
   toolbelt_position = "Top", -- or "Bottom"
   visible_identity_signals = 2,
   trust_visible_evidence = true,
@@ -333,7 +333,7 @@ vendor-neutral agent.
 | `show_stop` | bool | `true` | Show Stop in expanded herd rows when agent can be interrupted. |
 | `detect_processes` | bool | `true` | When off, only user vars identify an agent — no process, title or visible-text detection, and therefore no inferred status. |
 | `copy_scrollback_lines` | int | `20000` | Maximum **physical** rows a copy action reads, counted from the bottom of the pane buffer. Wrapped output costs several rows per logical line, which is why the previous `500` truncated real sessions. Clamped to 100000 rows per action. Lower it to capture less. |
-| `waiting_notification` | bool | `true` | |
+| `waiting_notification` | bool | `false` | Off by default: short tasks end waiting for input after nearly every turn. |
 | `toolbelt_position` | enum | `"Top"` | `"Top"`, `"Bottom"` |
 | `visible_identity_signals` | int | `2` | Distinct adapter-exclusive patterns that must agree before visible text names an agent. Clamped by how many the adapter declares. |
 | `trust_visible_evidence` | bool | `true` | Whether multi-signal visible-text evidence counts as trusted for control actions. |
@@ -392,8 +392,9 @@ trusted identity evidence. Neither half is sufficient alone. Claude log
 directories are canonicalized and must resolve under `~/.claude/projects`.
 Non-Claude local session or state paths are shown as `Details` in the toolbelt.
 
-`waiting_notification` enables a throttled local toast when an agent appears to
-be waiting for input. Clicking the notification raises the window that owns the
+`waiting_notification = true` enables a throttled local toast when an agent
+appears to be waiting for input. It is off by default, because short tasks end
+waiting for input after nearly every turn and the toast turned into noise. Clicking the notification raises the window that owns the
 agent, switches to its tab and makes that exact pane active — which also counts
 as acknowledging the wait, so the row's glow and the dock badge clear. The toast
 is persistent for that reason: a banner that dismissed itself after a couple of

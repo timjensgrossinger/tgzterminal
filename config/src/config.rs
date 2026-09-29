@@ -1309,7 +1309,10 @@ pub struct AgentUiConfig {
     pub copy_scrollback_lines: usize,
 
     /// Show a throttled notification when an agent appears to wait for input.
-    #[dynamic(default = "default_true")]
+    ///
+    /// Off by default: every short task ends waiting for input, so on a busy
+    /// day the toast fires after nearly every turn and turns into noise.
+    #[dynamic(default)]
     pub waiting_notification: bool,
 
     /// Placement for the active-pane toolbelt.
@@ -1415,7 +1418,7 @@ impl Default for AgentUiConfig {
             show_stop: true,
             detect_processes: true,
             copy_scrollback_lines: default_agent_copy_scrollback_lines(),
-            waiting_notification: true,
+            waiting_notification: false,
             toolbelt_position: PaneToolbeltPosition::Top,
             adapters: default_agent_adapters(),
             launcher: AgentLauncherConfig::default(),
@@ -3676,7 +3679,7 @@ mod agent_ui_tests {
         assert!(config.agent_ui.show_stop);
         assert!(config.agent_ui.detect_processes);
         assert_eq!(config.agent_ui.copy_scrollback_lines, 20_000);
-        assert!(config.agent_ui.waiting_notification);
+        assert!(!config.agent_ui.waiting_notification);
         assert_eq!(config.agent_ui.toolbelt_position, PaneToolbeltPosition::Top);
         for adapter in [
             "claude",
