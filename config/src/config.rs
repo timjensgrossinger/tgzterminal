@@ -1118,11 +1118,21 @@ pub struct AgentLauncherConfig {
     #[dynamic(default = "default_prefer_wsl")]
     pub prefer_wsl: bool,
 
-    /// How many past sessions the launcher's "Resume session" submenu offers.
-    /// `0` hides the row entirely. Clamped to 0..=25 — the dropdown is a menu,
-    /// not a session browser, and every row costs a transcript read.
+    /// Most past sessions the launcher's "Resume session" submenu and the
+    /// sessions dropdown list. `0` hides those rows entirely. Clamped to
+    /// 0..=2000. This is a safety cap, not the list length: which sessions are
+    /// listed is decided by `resume_menu_max_age_days`, and both dropdowns
+    /// scroll once they outgrow the window.
     #[dynamic(default = "default_resume_menu_sessions")]
-    pub resume_menu_sessions: u8,
+    pub resume_menu_sessions: u16,
+
+    /// List every resumable session touched in the last this-many days. `0`
+    /// drops the age limit, leaving `resume_menu_sessions` as the only bound.
+    /// The default matches Claude Code's own transcript retention
+    /// (`cleanupPeriodDays`, 30): an older transcript has usually been deleted
+    /// already.
+    #[dynamic(default = "default_resume_menu_max_age_days")]
+    pub resume_menu_max_age_days: u16,
 
     /// Where a *resumed* session (an old session picked from the launcher's
     /// resume dropdown) opens. Fresh launches follow `open_in`; resumes follow
@@ -1143,8 +1153,12 @@ pub fn default_prefer_wsl() -> bool {
     cfg!(windows)
 }
 
-pub fn default_resume_menu_sessions() -> u8 {
-    10
+pub fn default_resume_menu_sessions() -> u16 {
+    1000
+}
+
+pub fn default_resume_menu_max_age_days() -> u16 {
+    30
 }
 
 pub fn default_restore_last_window_sessions() -> u8 {
@@ -1179,6 +1193,7 @@ impl Default for AgentLauncherConfig {
             wsl_distro: None,
             prefer_wsl: default_prefer_wsl(),
             resume_menu_sessions: default_resume_menu_sessions(),
+            resume_menu_max_age_days: default_resume_menu_max_age_days(),
             resume_open_in: default_resume_open_in(),
             restore_last_window_sessions: default_restore_last_window_sessions(),
         }
@@ -4003,6 +4018,43 @@ mod agent_ui_tests {
         assert_eq!(anim.colors, AgentAnimationColors::default());
         assert!(anim.colors.ring_a.is_none());
         assert!(anim.colors.resolve.is_none());
+    }
+
+    #[test]
+    fn resume_menu_window_defaults_to_claude_retention() {
+        let launcher = Config::default_config().agent_ui.launcher;
+
+        assert_eq!(launcher.resume_menu_max_age_days, 30);
+        assert_eq!(launcher.resume_menu_sessions, 1000);
+    }
+
+    /// `agent_ui = { launcher = { resume_menu_max_age_days = 14 } }` in Lua.
+    #[test]
+    fn resume_menu_max_age_days_is_settable_from_lua() {
+        use wezterm_dynamic::{FromDynamic, Value};
+
+        let mut table = std::collections::BTreeMap::new();
+        table.insert(
+            Value::String("resume_menu_max_age_days".to_string()),
+            // Lua integers arrive as I64 (`luahelper::lua_value_to_dynamic_impl`).
+            Value::I64(14),
+        );
+        let launcher =
+            AgentLauncherConfig::from_dynamic(&Value::Object(table.into()), Default::default())
+                .unwrap();
+        assert_eq!(launcher.resume_menu_max_age_days, 14);
+        // Naming one key must not reset its neighbour.
+        assert_eq!(
+            launcher.resume_menu_sessions,
+            default_resume_menu_sessions()
+        );
+
+        let launcher = AgentLauncherConfig::from_dynamic(
+            &Value::Object(std::collections::BTreeMap::<Value, Value>::new().into()),
+            Default::default(),
+        )
+        .unwrap();
+        assert_eq!(launcher.resume_menu_max_age_days, 30);
     }
 
     #[test]

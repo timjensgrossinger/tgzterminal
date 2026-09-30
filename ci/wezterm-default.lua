@@ -50,6 +50,12 @@ local config = {}
 -- 'Zoomed' splits in and zooms. Fresh launches follow open_in.
 -- config.agent_ui.launcher.resume_open_in = 'NewTab'
 
+-- How far back the "Resume session" list and the sessions dropdown reach, in
+-- days (0 = no age limit), and a safety cap on how many rows they may list
+-- (0 hides them). Both dropdowns scroll once the list outgrows them.
+-- config.agent_ui.launcher.resume_menu_max_age_days = 30
+-- config.agent_ui.launcher.resume_menu_sessions = 1000
+
 -- Pin the WSL distro agents launch into (and the worktree picker's WSL
 -- fallback uses) instead of the first registered one, e.g. 'Ubuntu'.
 -- config.agent_ui.launcher.wsl_distro = 'Ubuntu'

@@ -114,9 +114,17 @@ const CLOSE_TAB_MENU_MIN_W: f32 = 320.;
 /// carry a project name, an optional branch and a sentence of description, none
 /// of which fits the width a list of agent names needs.
 const AGENT_RESUME_MENU_W: f32 = 420.;
-/// Ceiling on `agent_ui.launcher.resume_menu_sessions`. Each row costs a
-/// transcript read, and a dropdown taller than this stops being a menu.
-const MAX_RESUME_MENU_SESSIONS: u8 = 25;
+/// Ceiling on `agent_ui.launcher.resume_menu_sessions`. The session list is
+/// bounded by `resume_menu_max_age_days`; this only stops a pathological
+/// transcript directory from turning one menu open into thousands of reads.
+const MAX_RESUME_MENU_SESSIONS: u16 = 2000;
+/// Sessions the first scan of a window publishes before the full list, so a
+/// menu opened for the first time shows rows at once rather than `Scanning…`
+/// for as long as a month of transcripts takes to read.
+const SESSION_SCAN_FIRST_PAGE: usize = 25;
+/// Ceiling on `agent_ui.launcher.restore_last_window_sessions`: every restored
+/// session is a new tab and a new agent process.
+const MAX_RESTORE_LAST_WINDOW_SESSIONS: u8 = 25;
 const PANE_COPY_MENU_ROW_H: f32 = 28.;
 const MAX_AGENT_PATTERN_LEN: usize = 256;
 const AGENT_PATTERN_REGEX_CACHE_LIMIT: usize = 128;
@@ -201,6 +209,74 @@ impl SidebarScrollGeometry {
             (((thumb_top - self.track_y) / scroll_range) * self.max_offset as f32).round() as usize,
         )
     }
+}
+
+/// Most rows a scrollable sidebar dropdown shows at once before it scrolls.
+/// The session menus list a month of sessions; a panel as tall as that list
+/// would stop being a menu long before it ran off the window.
+const DROPDOWN_MAX_VISIBLE_ROWS: usize = 14;
+/// Gap between a dropdown's scroll thumb and the menu's right edge.
+const DROPDOWN_SCROLLBAR_INSET: f32 = 4.;
+
+/// The slice of a dropdown's rows that is painted while it scrolls.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DropdownViewport {
+    /// First painted row: the scroll offset, clamped to `max_offset`.
+    first: usize,
+    /// One past the last painted row.
+    end: usize,
+    /// Largest offset that still fills the viewport; scrolling stops here.
+    max_offset: usize,
+}
+
+/// Fit dropdown rows of the given heights into `max_body` pixels, starting at
+/// `offset`. `None` when every row fits and nothing needs to scroll.
+///
+/// Heights are per row (a row carrying a divider is taller), so the page size
+/// is not a constant: `max_offset` is the first row from which the remainder
+/// fits, not `len - rows_per_page`.
+fn dropdown_viewport(heights: &[f32], offset: usize, max_body: f32) -> Option<DropdownViewport> {
+    let total: f32 = heights.iter().sum();
+    if heights.is_empty() || total <= max_body {
+        return None;
+    }
+
+    let mut tail = 0.;
+    let mut max_offset = heights.len();
+    for (index, height) in heights.iter().enumerate().rev() {
+        if tail + height > max_body {
+            break;
+        }
+        tail += height;
+        max_offset = index;
+    }
+    // A single row taller than the viewport still has to be reachable.
+    let max_offset = max_offset.min(heights.len() - 1);
+
+    let first = offset.min(max_offset);
+    let mut used = 0.;
+    let mut end = first;
+    for height in &heights[first..] {
+        if end > first && used + height > max_body {
+            break;
+        }
+        used += height;
+        end += 1;
+    }
+    Some(DropdownViewport {
+        first,
+        end,
+        max_offset,
+    })
+}
+
+/// Scroll geometry of the open session dropdown as last painted, so the wheel,
+/// track and thumb handlers act on what the user actually sees.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SidebarDropdownScroll {
+    geometry: SidebarScrollGeometry,
+    /// Rows one page-click moves by.
+    page_rows: usize,
 }
 
 lazy_static::lazy_static! {
@@ -6856,6 +6932,10 @@ impl crate::TermWindow {
         };
         // Read config here; the worker has no handle on it.
         let distros = self.wsl_session_distro_specs();
+        let newer_than = self.agent_resume_menu_cutoff();
+        // Only a menu with nothing to show yet gets the quick first page; a
+        // stale list already on screen is better than one cut down to a page.
+        let first_page = self.agent_session_cache.is_none() && limit > SESSION_SCAN_FIRST_PAGE;
 
         self.agent_session_scan_pending = true;
         let future = promise::spawn::spawn_into_new_thread(move || {
@@ -6865,14 +6945,42 @@ impl crate::TermWindow {
                 .into_iter()
                 .map(|root| root.home)
                 .collect();
-            let sessions =
-                crate::agent_herd::sessions::collect_recent_sessions_across(&homes, limit);
-            // The scan thread must not touch the mux or any GUI state, so the
-            // result is applied back on the GUI thread.
-            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
-                term_window.agent_session_scan_pending = false;
-                term_window.agent_session_cache = Some((Instant::now(), Arc::new(sessions)));
-            })));
+            // The scan thread must not touch the mux or any GUI state, so each
+            // result is applied back on the GUI thread, which then repaints:
+            // paint is on demand, and an open menu would otherwise sit on
+            // `Scanning…` until the pointer moved.
+            let apply = |sessions: Vec<crate::agent_herd::sessions::AgentSession>, done: bool| {
+                window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                    term_window.agent_session_scan_pending = !done;
+                    term_window.agent_session_cache = Some((Instant::now(), Arc::new(sessions)));
+                    if let Some(window) = term_window.window.as_ref() {
+                        window.invalidate();
+                    }
+                })));
+            };
+            let started = Instant::now();
+            if first_page {
+                // A month of transcripts is hundreds of head reads, and over a
+                // WSL share that is seconds. Show the newest page first; the
+                // full pass below re-reads none of it (the details cache).
+                apply(
+                    crate::agent_herd::sessions::collect_recent_sessions_since(
+                        &homes,
+                        SESSION_SCAN_FIRST_PAGE,
+                        newer_than,
+                    ),
+                    false,
+                );
+            }
+            let sessions = crate::agent_herd::sessions::collect_recent_sessions_since(
+                &homes, limit, newer_than,
+            );
+            log::debug!(
+                "agent session scan: {} sessions in {:?}",
+                sessions.len(),
+                started.elapsed()
+            );
+            apply(sessions, true);
             Ok::<(), anyhow::Error>(())
         });
         promise::spawn::spawn(async move {
@@ -6883,7 +6991,12 @@ impl crate::TermWindow {
         .detach();
     }
 
-    /// Resume the session at `index` of the last scan.
+    /// Resume the session a menu row was painted for.
+    ///
+    /// Resolved by `(adapter_id, session_id)` in the *current* scan, with
+    /// `index` as the fast path: a rescan may have landed between paint and
+    /// click and shifted every row, and resuming whatever now sits at `index`
+    /// would continue a session the user did not pick.
     ///
     /// The session's own directory is used rather than the active pane's, and
     /// the project-root toggle deliberately does not apply: a resumed session
@@ -6895,14 +7008,28 @@ impl crate::TermWindow {
     /// can forge. Here the argv comes from config, the id comes from a
     /// filesystem enumeration under the user's own agent state directories and
     /// is charset-checked before it can reach argv, and the user picked the row.
-    pub fn resume_agent_session(&mut self, index: usize, target: Option<AgentLaunchTarget>) {
+    pub fn resume_agent_session(
+        &mut self,
+        index: usize,
+        adapter_id: &str,
+        session_id: &str,
+        target: Option<AgentLaunchTarget>,
+    ) {
+        let is_row = |session: &&crate::agent_herd::sessions::AgentSession| {
+            session.adapter_id == adapter_id && session.session_id == session_id
+        };
         let Some(session) = self
             .agent_session_cache
             .as_ref()
-            .and_then(|(_, sessions)| sessions.get(index))
+            .and_then(|(_, sessions)| {
+                sessions
+                    .get(index)
+                    .filter(is_row)
+                    .or_else(|| sessions.iter().find(is_row))
+            })
             .cloned()
         else {
-            // The scan was replaced between paint and click; nothing to do.
+            // The session left the scan between paint and click; nothing to do.
             return;
         };
         self.resume_agent_session_by_id(
@@ -6950,7 +7077,7 @@ impl crate::TermWindow {
             .agent_ui
             .launcher
             .restore_last_window_sessions
-            .min(MAX_RESUME_MENU_SESSIONS) as usize
+            .min(MAX_RESTORE_LAST_WINDOW_SESSIONS) as usize
     }
 
     /// The restore offer, or `None` when there is nothing to reopen.
@@ -8638,6 +8765,86 @@ impl crate::TermWindow {
         ((list_height + GAP) / (row_height + GAP)).floor() as usize
     }
 
+    /// Set the open session dropdown's scroll offset; true when it moved.
+    ///
+    /// The sessions menu and the launcher are mutually exclusive, so at most
+    /// one of them is open and `sidebar_dropdown_scroll` describes it.
+    fn set_sidebar_dropdown_offset(&mut self, next: usize) -> bool {
+        let Some(menu) = self
+            .sessions_menu
+            .as_mut()
+            .or(self.agent_launch_menu.as_mut())
+        else {
+            return false;
+        };
+        if menu.scroll_offset == next {
+            false
+        } else {
+            menu.scroll_offset = next;
+            true
+        }
+    }
+
+    /// Scroll the open session dropdown by wheel notches, one row per notch.
+    /// Same sign as `scroll_sidebar_tabs`: positive moves toward the top.
+    pub(crate) fn scroll_sidebar_dropdown(&mut self, wheel_delta: isize) -> bool {
+        let Some(scroll) = self.sidebar_dropdown_scroll else {
+            return false;
+        };
+        let max_offset = scroll.geometry.max_offset;
+        let Some(current) = self
+            .sessions_menu
+            .as_ref()
+            .or(self.agent_launch_menu.as_ref())
+            .map(|menu| menu.scroll_offset.min(max_offset))
+        else {
+            return false;
+        };
+        let step = wheel_delta.unsigned_abs().max(1);
+        let next = if wheel_delta > 0 {
+            current.saturating_sub(step)
+        } else {
+            current.saturating_add(step).min(max_offset)
+        };
+        self.set_sidebar_dropdown_offset(next)
+    }
+
+    /// A click on the dropdown's scroll track: one page toward the pointer.
+    pub(crate) fn page_sidebar_dropdown_toward(&mut self, y: isize) -> bool {
+        let Some(scroll) = self.sidebar_dropdown_scroll else {
+            return false;
+        };
+        let page = scroll.page_rows as isize;
+        let y = y as f32;
+        if y < scroll.geometry.thumb_y {
+            self.scroll_sidebar_dropdown(page)
+        } else if y > scroll.geometry.thumb_y + scroll.geometry.thumb_h {
+            self.scroll_sidebar_dropdown(-page)
+        } else {
+            false
+        }
+    }
+
+    /// Dragging the dropdown's scroll thumb so its top sits at `thumb_top`.
+    pub(crate) fn scroll_sidebar_dropdown_thumb_to(&mut self, thumb_top: isize) -> bool {
+        let Some(next) = self
+            .sidebar_dropdown_scroll
+            .and_then(|scroll| scroll.geometry.offset_for_thumb_top(thumb_top as f32))
+        else {
+            return false;
+        };
+        self.set_sidebar_dropdown_offset(next)
+    }
+
+    /// Index of the "Resume session" row in the launcher dropdown while it is
+    /// expanded, so expanding it can scroll the sessions into view. Must track
+    /// the row order `paint_agent_launch_menu` builds: the agents (none of them
+    /// expanded — only one row expands at a time), "Project root", "Agent
+    /// insight", then this row.
+    pub(crate) fn agent_launch_menu_resume_row(&self) -> usize {
+        self.agent_launcher_entries().len() + 2
+    }
+
     pub(crate) fn scroll_sidebar_tabs(&mut self, wheel_delta: isize) -> bool {
         let total = self.sidebar_row_count();
         let visible = self.sidebar_tab_row_capacity();
@@ -10078,7 +10285,15 @@ impl crate::TermWindow {
         let menu_w = AGENT_RESUME_MENU_W.max(needed_cols);
         // Downward: the button sits in the agent section header, which is above
         // its rows, so there is room below and none above.
-        self.paint_sidebar_dropdown(layers, menu.x as f32, menu.y as f32, menu_w, true, &rows)
+        self.paint_sidebar_dropdown(
+            layers,
+            menu.x as f32,
+            menu.y as f32,
+            menu_w,
+            true,
+            &rows,
+            Some(menu.scroll_offset),
+        )
     }
 
     pub fn paint_agent_launch_menu(
@@ -10203,7 +10418,25 @@ impl crate::TermWindow {
             AGENT_LAUNCH_MENU_W
         }
         .max(needed_cols);
-        self.paint_sidebar_dropdown(layers, menu.x as f32, menu.y as f32, menu_w, false, &rows)
+        self.paint_sidebar_dropdown(
+            layers,
+            menu.x as f32,
+            menu.y as f32,
+            menu_w,
+            false,
+            &rows,
+            Some(menu.scroll_offset),
+        )
+    }
+
+    /// Oldest last-write a listed session may have, from
+    /// `resume_menu_max_age_days`; `None` when the age limit is off.
+    fn agent_resume_menu_cutoff(&self) -> Option<SystemTime> {
+        let days = self.config.agent_ui.launcher.resume_menu_max_age_days;
+        if days == 0 {
+            return None;
+        }
+        SystemTime::now().checked_sub(Duration::from_secs(u64::from(days) * 24 * 60 * 60))
     }
 
     /// How many past sessions the resume submenu may offer.
@@ -10247,7 +10480,7 @@ impl crate::TermWindow {
         }
 
         let adapters = self.merged_agent_adapters();
-        sessions
+        let mut rows: Vec<SidebarDropdownRow> = sessions
             .iter()
             .enumerate()
             .map(|(index, session)| SidebarDropdownRow {
@@ -10261,9 +10494,19 @@ impl crate::TermWindow {
                 divider_above: false,
                 indent: true,
                 trailing_chevron: false,
-                item_type: UIItemType::SidebarAgentMenuResumeSession { index },
+                item_type: UIItemType::SidebarAgentMenuResumeSession {
+                    index,
+                    adapter_id: session.adapter_id.clone(),
+                    session_id: session.session_id.clone(),
+                },
             })
-            .collect()
+            .collect();
+        if self.agent_session_scan_pending {
+            // The first page is up and the rest of the month is still being
+            // read; say so, or the short list reads as all there is.
+            rows.push(placeholder("Loading older sessions…"));
+        }
+        rows
     }
 
     /// Dropdown opened by the chevron beside the sidebar new-tab button: the
@@ -10307,6 +10550,7 @@ impl crate::TermWindow {
             AGENT_LAUNCH_MENU_W,
             false,
             &rows,
+            None,
         )
     }
 
@@ -10400,6 +10644,7 @@ impl crate::TermWindow {
             menu_w,
             downward,
             &rows,
+            None,
         )
     }
 
@@ -10456,6 +10701,7 @@ impl crate::TermWindow {
             AGENT_LAUNCH_MENU_W,
             false,
             &rows,
+            None,
         )
     }
 
@@ -10503,6 +10749,12 @@ impl crate::TermWindow {
     /// Sidebar buttons near the bottom of the window pass `false` so the menu
     /// opens upward; tab-bar close buttons near the top pass `true` so the
     /// menu opens downward.
+    ///
+    /// `scroll` opts a menu into scrolling: `Some(offset)` caps the panel at
+    /// `DROPDOWN_MAX_VISIBLE_ROWS` (or the window, whichever is shorter), paints
+    /// the rows from `offset`, and adds a scroll thumb once they overflow. The
+    /// geometry lands in `sidebar_dropdown_scroll` for the mouse handlers.
+    /// `None` paints every row, as a menu that never scrolls always has.
     fn paint_sidebar_dropdown(
         &mut self,
         layers: &mut TripleLayerQuadAllocator,
@@ -10511,7 +10763,13 @@ impl crate::TermWindow {
         width: f32,
         downward: bool,
         rows: &[SidebarDropdownRow],
+        scroll: Option<usize>,
     ) -> anyhow::Result<()> {
+        if scroll.is_some() {
+            // Recomputed below; a menu that no longer overflows must not keep
+            // the thumb of an earlier paint.
+            self.sidebar_dropdown_scroll = None;
+        }
         if rows.is_empty() {
             return Ok(());
         }
@@ -10535,8 +10793,29 @@ impl crate::TermWindow {
         let menu_w = (width * dpi_scale)
             .min(self.dimensions.pixel_width as f32 - FLOAT_GAP * 2.)
             .max(AGENT_LAUNCH_MENU_W);
-        let divider_count = rows.iter().filter(|row| row.divider_above).count();
-        let menu_h = rows.len() as f32 * row_h + divider_count as f32 * divider_band + menu_pad;
+        let row_heights: Vec<f32> = rows
+            .iter()
+            .map(|row| row_h + if row.divider_above { divider_band } else { 0. })
+            .collect();
+        let max_body = (DROPDOWN_MAX_VISIBLE_ROWS as f32 * row_h)
+            .min(self.dimensions.pixel_height as f32 - FLOAT_GAP * 2. - menu_pad)
+            .max(row_h);
+        let viewport = scroll.and_then(|offset| dropdown_viewport(&row_heights, offset, max_body));
+        // A scrolling panel keeps one fixed height, so it neither jitters as a
+        // divider scrolls in and out nor flips sides mid-scroll.
+        let menu_h = match viewport {
+            Some(_) => max_body + menu_pad,
+            None => row_heights.iter().sum::<f32>() + menu_pad,
+        };
+        let (view_first, view_end) = viewport.map_or((0, rows.len()), |v| (v.first, v.end));
+        let scrollbar_w = SIDEBAR_SCROLLBAR_W * 0.6 * dpi_scale;
+        let scrollbar_gutter = if viewport.is_some() {
+            scrollbar_w + DROPDOWN_SCROLLBAR_INSET * dpi_scale
+        } else {
+            0.
+        };
+        // Rows stop short of the gutter so the thumb never sits on a label.
+        let rows_w = menu_w - scrollbar_gutter;
 
         let max_x = (self.dimensions.pixel_width as f32 - menu_w - FLOAT_GAP).max(FLOAT_GAP);
         let max_y = (self.dimensions.pixel_height as f32 - menu_h - FLOAT_GAP).max(FLOAT_GAP);
@@ -10675,6 +10954,20 @@ impl crate::TermWindow {
             .map(|_| ())
         };
 
+        if scroll.is_some() {
+            // Behind the rows (hit-testing walks `ui_items` newest first): a
+            // wheel over the padding or a divider scrolls this menu instead of
+            // falling through to the sidebar underneath, and a click there no
+            // longer dismisses it.
+            self.ui_items.push(UIItem {
+                x: menu_x.max(0.) as usize,
+                y: menu_y.max(0.) as usize,
+                width: menu_w as usize,
+                height: menu_h.ceil() as usize,
+                item_type: UIItemType::SidebarDropdownBody,
+            });
+        }
+
         let hovered_item = self
             .last_ui_item
             .as_ref()
@@ -10685,7 +10978,7 @@ impl crate::TermWindow {
         let box_size = (cell_h_f * 0.62).clamp(9., 16.);
         let mut row_y = menu_y + menu_pad * 0.5;
 
-        for row in rows {
+        for row in &rows[view_first..view_end] {
             if row.divider_above {
                 let divider_y = row_y + divider_gap;
                 self.filled_rectangle(
@@ -10694,7 +10987,7 @@ impl crate::TermWindow {
                     euclid::rect(
                         menu_x + row_text_inset,
                         divider_y,
-                        (menu_w - row_text_inset * 2.).max(1.),
+                        (rows_w - row_text_inset * 2.).max(1.),
                         divider_h,
                     ),
                     lerp_rgba(bg, fg, 0.20),
@@ -10717,7 +11010,7 @@ impl crate::TermWindow {
                 self.sidebar_rounded_fill(
                     layers,
                     1,
-                    euclid::rect(menu_x + row_inset, row_y, menu_w - row_inset * 2., row_h),
+                    euclid::rect(menu_x + row_inset, row_y, rows_w - row_inset * 2., row_h),
                     row_radius,
                     row_bg,
                 )?;
@@ -10779,7 +11072,7 @@ impl crate::TermWindow {
                 &row.label,
                 text_x,
                 row_y + (row_h - cell_h_f) * 0.5,
-                (menu_x + menu_w - row_text_inset - chevron_w - text_x).max(1.),
+                (menu_x + rows_w - row_text_inset - chevron_w - text_x).max(1.),
                 contrast_label_color(row_bg, sb.text_active),
                 row_bg,
             )?;
@@ -10788,7 +11081,7 @@ impl crate::TermWindow {
                     self,
                     layers,
                     "›",
-                    menu_x + menu_w - row_text_inset - cell_width as f32,
+                    menu_x + rows_w - row_text_inset - cell_width as f32,
                     row_y + (row_h - cell_h_f) * 0.5,
                     cell_width as f32,
                     contrast_label_color(row_bg, sb.text_active),
@@ -10798,11 +11091,57 @@ impl crate::TermWindow {
             self.ui_items.push(UIItem {
                 x: (menu_x + row_inset) as usize,
                 y: row_y as usize,
-                width: (menu_w - row_inset * 2.) as usize,
+                width: (rows_w - row_inset * 2.) as usize,
                 height: row_h.ceil() as usize,
                 item_type,
             });
             row_y += row_h;
+        }
+
+        if let Some(viewport) = viewport {
+            let track_y = menu_y + menu_pad * 0.5;
+            let track_x = menu_x + menu_w - scrollbar_gutter;
+            // Rows per page, as seen from the scroll limit: with it the
+            // geometry's own `max_offset` matches the viewport's exactly.
+            let page_rows = rows.len() - viewport.max_offset;
+            if let Some(geometry) = SidebarScrollGeometry::new(
+                track_y,
+                max_body,
+                page_rows,
+                rows.len(),
+                viewport.first,
+                row_h * 0.75,
+            ) {
+                self.sidebar_pill_fill(
+                    layers,
+                    2,
+                    euclid::rect(track_x, geometry.thumb_y, scrollbar_w, geometry.thumb_h),
+                    scrollbar_w * 0.5,
+                    sb.text_idle.mul_alpha(0.42),
+                )?;
+                // Hit areas wider than the drawn pill, as on the tab list: a
+                // 6px target is not something a pointer can find.
+                let hit_x = (track_x - 4. * dpi_scale).max(0.);
+                let hit_w = (menu_x + menu_w - hit_x).max(1.);
+                self.ui_items.push(UIItem {
+                    x: hit_x as usize,
+                    y: geometry.track_y.round().max(0.) as usize,
+                    width: hit_w as usize,
+                    height: geometry.track_h.round().max(1.) as usize,
+                    item_type: UIItemType::SidebarDropdownScrollTrack,
+                });
+                self.ui_items.push(UIItem {
+                    x: hit_x as usize,
+                    y: geometry.thumb_y.round().max(0.) as usize,
+                    width: hit_w as usize,
+                    height: geometry.thumb_h.round().max(1.) as usize,
+                    item_type: UIItemType::SidebarDropdownScrollThumb,
+                });
+                self.sidebar_dropdown_scroll = Some(SidebarDropdownScroll {
+                    geometry,
+                    page_rows: (viewport.end - viewport.first).max(1),
+                });
+            }
         }
 
         Ok(())
@@ -20475,5 +20814,65 @@ gemini is a constellation\n";
         assert!(SidebarScrollGeometry::new(0., 100., 10, 10, 0, 10.).is_none());
         assert!(SidebarScrollGeometry::new(0., 100., 0, 10, 0, 10.).is_none());
         assert!(SidebarScrollGeometry::new(0., 0., 1, 10, 0, 10.).is_none());
+    }
+
+    #[test]
+    fn dropdown_viewport_is_none_when_every_row_fits() {
+        assert_eq!(dropdown_viewport(&[10.; 5], 0, 50.), None);
+        assert_eq!(dropdown_viewport(&[], 3, 50.), None);
+    }
+
+    #[test]
+    fn dropdown_viewport_pages_through_uniform_rows() {
+        let rows = [10.; 20];
+        assert_eq!(
+            dropdown_viewport(&rows, 0, 50.),
+            Some(DropdownViewport {
+                first: 0,
+                end: 5,
+                max_offset: 15
+            })
+        );
+        assert_eq!(
+            dropdown_viewport(&rows, 7, 50.),
+            Some(DropdownViewport {
+                first: 7,
+                end: 12,
+                max_offset: 15
+            })
+        );
+        // An offset past the end (the list shrank under a rescan) is clamped
+        // so the last page is full rather than blank.
+        assert_eq!(
+            dropdown_viewport(&rows, 99, 50.),
+            Some(DropdownViewport {
+                first: 15,
+                end: 20,
+                max_offset: 15
+            })
+        );
+    }
+
+    #[test]
+    fn dropdown_viewport_accounts_for_taller_divider_rows() {
+        // Row 2 carries a divider band: the page holding it has one row fewer,
+        // and the scroll limit is where the *remaining* heights fit.
+        let rows = [10., 10., 18., 10., 10., 10.];
+        let top = dropdown_viewport(&rows, 0, 40.).unwrap();
+        assert_eq!((top.first, top.end), (0, 3));
+        // From row 3 the tail (30px) fits; from row 2 it would not (48px).
+        assert_eq!(top.max_offset, 3);
+        let bottom = dropdown_viewport(&rows, 5, 40.).unwrap();
+        assert_eq!((bottom.first, bottom.end), (3, 6));
+    }
+
+    #[test]
+    fn dropdown_viewport_always_shows_at_least_one_row() {
+        // A viewport shorter than one row must still paint (and reach) rows.
+        let view = dropdown_viewport(&[30., 30.], 0, 20.).unwrap();
+        assert_eq!((view.first, view.end), (0, 1));
+        assert_eq!(view.max_offset, 1);
+        let view = dropdown_viewport(&[30., 30.], 1, 20.).unwrap();
+        assert_eq!((view.first, view.end), (1, 2));
     }
 }

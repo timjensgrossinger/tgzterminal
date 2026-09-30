@@ -497,15 +497,28 @@ pub enum UIItemType {
     /// The "Resume session" row in the launch dropdown: expands into the
     /// recently-used sessions found on disk.
     SidebarAgentMenuResume,
-    /// One past session under an expanded "Resume session" row. Carries an
-    /// index into the scanned session list rather than the session itself, so
-    /// hit-test items stay small.
+    /// One past session under an expanded "Resume session" row, or in the
+    /// sessions dropdown. Carries its index into the scanned session list plus
+    /// the session's own id: a rescan can land while the menu is open (the
+    /// list spans a month and takes a moment to read), and rows then shift
+    /// under the pointer. The id is what the click resolves; the index only
+    /// saves the search when nothing moved.
     SidebarAgentMenuResumeSession {
         index: usize,
+        adapter_id: String,
+        session_id: String,
     },
     /// The "Reopen last window" button: restores the previous run's agent
     /// sessions into new tabs of this window.
     SidebarAgentMenuRestoreLastWindow,
+    /// Background of a scrollable sidebar dropdown, behind its rows: catches
+    /// the wheel over padding and dividers, and keeps a click there from
+    /// dismissing the menu.
+    SidebarDropdownBody,
+    /// Scroll track of a sidebar dropdown; a click pages toward it.
+    SidebarDropdownScrollTrack,
+    /// Scroll thumb of a sidebar dropdown; dragged to scroll.
+    SidebarDropdownScrollThumb,
     /// Sidebar button in the agent section header that opens the sessions
     /// dropdown: the last window's sessions on top, recent sessions below.
     SidebarSessionsButton,
@@ -688,6 +701,9 @@ pub struct AgentLaunchMenuState {
     /// Row whose submenu is currently expanded, if any. The new-tab dropdown
     /// reuses this struct and always leaves it `None`.
     pub expanded: Option<ExpandedMenuRow>,
+    /// First row painted, for the dropdowns that scroll (the sessions menu and
+    /// the launcher). Clamped at paint time; the new-tab dropdown ignores it.
+    pub scroll_offset: usize,
 }
 
 /// Anchor for the sidebar SSH quick-launch dropdown. Mirrors
@@ -1038,6 +1054,9 @@ pub struct TermWindow {
     /// Reuses `AgentLaunchMenuState`; `expanded` is always `None` because both
     /// of its groups are already flat.
     sessions_menu: Option<AgentLaunchMenuState>,
+    /// Scroll geometry of whichever session dropdown was painted last, when
+    /// its rows overflow. Written by paint, read by the mouse handlers.
+    sidebar_dropdown_scroll: Option<crate::termwindow::render::sidebar::SidebarDropdownScroll>,
     new_tab_menu: Option<AgentLaunchMenuState>,
     close_tab_menu: Option<CloseTabMenuState>,
     /// Sidebar SSH quick-launch dropdown anchor. `None` when closed.
@@ -1510,6 +1529,7 @@ impl TermWindow {
             pane_copy_menu: None,
             agent_launch_menu: None,
             sessions_menu: None,
+            sidebar_dropdown_scroll: None,
             new_tab_menu: None,
             close_tab_menu: None,
             ssh_launch_menu: None,
@@ -2607,6 +2627,16 @@ impl TermWindow {
                 configuration()
             }
         };
+        // The session list was scanned for the old window and cap; drop it so
+        // the next open of a session menu rescans instead of serving it until
+        // the scan TTL runs out.
+        let old_launcher = &self.config.agent_ui.launcher;
+        let new_launcher = &config.agent_ui.launcher;
+        if old_launcher.resume_menu_max_age_days != new_launcher.resume_menu_max_age_days
+            || old_launcher.resume_menu_sessions != new_launcher.resume_menu_sessions
+        {
+            self.agent_session_cache = None;
+        }
         self.config = config.clone();
         self.palette.take();
 

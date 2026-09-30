@@ -69,6 +69,9 @@ impl super::TermWindow {
             | UIItemType::SidebarAgentMenuResume
             | UIItemType::SidebarAgentMenuResumeSession { .. }
             | UIItemType::SidebarAgentMenuRestoreLastWindow
+            | UIItemType::SidebarDropdownBody
+            | UIItemType::SidebarDropdownScrollTrack
+            | UIItemType::SidebarDropdownScrollThumb
             | UIItemType::SidebarAgentSectionHeader
             | UIItemType::SidebarAgentRow { .. }
             | UIItemType::SidebarAgentRowChevron { .. }
@@ -114,6 +117,9 @@ impl super::TermWindow {
             | UIItemType::SidebarAgentMenuResume
             | UIItemType::SidebarAgentMenuResumeSession { .. }
             | UIItemType::SidebarAgentMenuRestoreLastWindow
+            | UIItemType::SidebarDropdownBody
+            | UIItemType::SidebarDropdownScrollTrack
+            | UIItemType::SidebarDropdownScrollThumb
             | UIItemType::SidebarAgentSectionHeader
             | UIItemType::SidebarAgentRow { .. }
             | UIItemType::SidebarAgentRowChevron { .. }
@@ -372,6 +378,9 @@ impl super::TermWindow {
                             | UIItemType::SidebarAgentMenuResume
                             | UIItemType::SidebarAgentMenuResumeSession { .. }
                             | UIItemType::SidebarAgentMenuRestoreLastWindow
+                            | UIItemType::SidebarDropdownBody
+                            | UIItemType::SidebarDropdownScrollTrack
+                            | UIItemType::SidebarDropdownScrollThumb
                     )
             );
             if !on_sessions_menu {
@@ -394,6 +403,9 @@ impl super::TermWindow {
                             | UIItemType::SidebarAgentMenuResume
                             | UIItemType::SidebarAgentMenuResumeSession { .. }
                             | UIItemType::SidebarAgentMenuRestoreLastWindow
+                            | UIItemType::SidebarDropdownBody
+                            | UIItemType::SidebarDropdownScrollTrack
+                            | UIItemType::SidebarDropdownScrollThumb
                             | UIItemType::SidebarAgentSectionHeader
                             | UIItemType::SidebarAgentRow { .. }
                             | UIItemType::SidebarAgentRowChevron { .. }
@@ -579,6 +591,9 @@ impl super::TermWindow {
             UIItemType::SidebarScrollThumb => {
                 self.drag_sidebar_scroll_thumb(item, start_event, event, context);
             }
+            UIItemType::SidebarDropdownScrollThumb => {
+                self.drag_sidebar_dropdown_thumb(item, start_event, event, context);
+            }
             UIItemType::SidebarTab { tab_idx, .. } => {
                 self.drag_sidebar_tab(item, tab_idx, start_event, event, context);
             }
@@ -609,6 +624,18 @@ impl super::TermWindow {
         {
             self.mouse_event_sidebar_agent_section_wheel(event, context);
             return;
+        }
+        if let WMEK::VertWheel(n) = event.kind {
+            if Self::is_session_dropdown_item(&item.item_type)
+                && (self.sessions_menu.is_some() || self.agent_launch_menu.is_some())
+            {
+                // Consumed even when the menu has nothing to scroll: the
+                // wheel must not reach whatever the menu covers.
+                if self.scroll_sidebar_dropdown(n.into()) {
+                    context.invalidate();
+                }
+                return;
+            }
         }
         // A press anywhere that is not an agent action closes an open row menu.
         if matches!(event.kind, WMEK::Press(_))
@@ -702,11 +729,30 @@ impl super::TermWindow {
             UIItemType::SidebarAgentMenuResume => {
                 self.mouse_event_sidebar_agent_menu_resume(event, context);
             }
-            UIItemType::SidebarAgentMenuResumeSession { index } => {
-                self.mouse_event_sidebar_agent_menu_resume_session(index, event, context);
+            UIItemType::SidebarAgentMenuResumeSession {
+                index,
+                adapter_id,
+                session_id,
+            } => {
+                self.mouse_event_sidebar_agent_menu_resume_session(
+                    index,
+                    &adapter_id,
+                    &session_id,
+                    event,
+                    context,
+                );
             }
             UIItemType::SidebarAgentMenuRestoreLastWindow => {
                 self.mouse_event_sidebar_agent_menu_restore_last_window(event, context);
+            }
+            UIItemType::SidebarDropdownBody => {
+                context.set_cursor(Some(CursorIcon::Default));
+            }
+            UIItemType::SidebarDropdownScrollTrack => {
+                self.mouse_event_sidebar_dropdown_scroll_track(item, event, context);
+            }
+            UIItemType::SidebarDropdownScrollThumb => {
+                self.mouse_event_sidebar_dropdown_scroll_thumb(item, event, context);
             }
             UIItemType::SidebarAgentSectionHeader => {
                 self.mouse_event_sidebar_agent_section_header(event, context);
@@ -926,6 +972,7 @@ impl super::TermWindow {
                             x: item.x,
                             y: item.y,
                             expanded: None,
+                            scroll_offset: 0,
                         });
                     }
                 }
@@ -937,6 +984,7 @@ impl super::TermWindow {
                         x: item.x,
                         y: item.y,
                         expanded: None,
+                        scroll_offset: 0,
                     }),
                 };
             }
@@ -1003,6 +1051,7 @@ impl super::TermWindow {
                     x: item.x,
                     y: item.y,
                     expanded: None,
+                    scroll_offset: 0,
                 }),
             };
         }
@@ -1114,10 +1163,17 @@ impl super::TermWindow {
     ) {
         if event.kind == WMEK::Release(MousePress::Left) {
             self.pressed_ui_item = None;
+            let resume_row = self.agent_launch_menu_resume_row();
             let expand = match self.agent_launch_menu.as_mut() {
                 Some(menu) => {
                     let already = menu.expanded.as_ref() == Some(&ExpandedMenuRow::ResumeSessions);
                     menu.expanded = (!already).then_some(ExpandedMenuRow::ResumeSessions);
+                    if !already {
+                        // The sessions hang below this row, and in a list
+                        // this long they would start out of view: bring the
+                        // row to the top. Paint clamps it to what can scroll.
+                        menu.scroll_offset = resume_row;
+                    }
                     !already
                 }
                 None => false,
@@ -1134,13 +1190,15 @@ impl super::TermWindow {
     fn mouse_event_sidebar_agent_menu_resume_session(
         &mut self,
         index: usize,
+        adapter_id: &str,
+        session_id: &str,
         event: MouseEvent,
         context: &dyn WindowOps,
     ) {
         if event.kind == WMEK::Release(MousePress::Left) {
             self.close_sidebar_session_menus();
             self.pressed_ui_item = None;
-            self.resume_agent_session(index, None);
+            self.resume_agent_session(index, adapter_id, session_id, None);
         }
         context.invalidate();
     }
@@ -1154,6 +1212,67 @@ impl super::TermWindow {
     fn close_sidebar_session_menus(&mut self) {
         self.agent_launch_menu = None;
         self.sessions_menu = None;
+    }
+
+    /// Items painted inside the launcher or the sessions dropdown — the two
+    /// menus that scroll. A wheel over any of them scrolls the open one.
+    fn is_session_dropdown_item(item_type: &UIItemType) -> bool {
+        matches!(
+            item_type,
+            UIItemType::SidebarAgentMenuItem { .. }
+                | UIItemType::SidebarAgentMenuProjectRootToggle
+                | UIItemType::SidebarAgentMenuHerd
+                | UIItemType::SidebarAgentMenuTarget { .. }
+                | UIItemType::SidebarAgentMenuResume
+                | UIItemType::SidebarAgentMenuResumeSession { .. }
+                | UIItemType::SidebarAgentMenuRestoreLastWindow
+                | UIItemType::SidebarDropdownBody
+                | UIItemType::SidebarDropdownScrollTrack
+                | UIItemType::SidebarDropdownScrollThumb
+        )
+    }
+
+    fn mouse_event_sidebar_dropdown_scroll_track(
+        &mut self,
+        item: UIItem,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        if event.kind == WMEK::Press(MousePress::Left) {
+            if self.page_sidebar_dropdown_toward(event.coords.y) {
+                context.invalidate();
+            }
+        }
+        self.pressed_ui_item.replace(item.item_type);
+        context.set_cursor(Some(CursorIcon::Default));
+    }
+
+    fn mouse_event_sidebar_dropdown_scroll_thumb(
+        &mut self,
+        item: UIItem,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        if event.kind == WMEK::Press(MousePress::Left) {
+            self.pressed_ui_item.replace(item.item_type.clone());
+            self.dragging.replace((item, event));
+        }
+        context.set_cursor(Some(CursorIcon::Default));
+    }
+
+    fn drag_sidebar_dropdown_thumb(
+        &mut self,
+        item: UIItem,
+        start_event: MouseEvent,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        let drag_delta_y = event.coords.y.saturating_sub(start_event.coords.y);
+        let thumb_top = item.y as isize + drag_delta_y;
+        if self.scroll_sidebar_dropdown_thumb_to(thumb_top) {
+            context.invalidate();
+        }
+        self.dragging.replace((item, start_event));
     }
 
     /// Open or close the sessions dropdown.
@@ -1182,6 +1301,7 @@ impl super::TermWindow {
                         x: item.x,
                         y: item.y,
                         expanded: None,
+                        scroll_offset: 0,
                     })
                 }
             };

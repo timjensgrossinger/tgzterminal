@@ -288,7 +288,8 @@ config.agent_ui = {
     domain = nil,
     wsl_distro = nil, -- e.g. "Ubuntu": pins the distro prefer_wsl uses
     prefer_wsl = true, -- Windows default; false elsewhere
-    resume_menu_sessions = 10,
+    resume_menu_sessions = 1000, -- safety cap; 0 hides the session rows
+    resume_menu_max_age_days = 30, -- list sessions from the last N days; 0 = no limit
     resume_open_in = "NewTab", -- where a *resumed* session opens
     restore_last_window_sessions = 8, -- 0 hides the "Reopen last window" button
   },
@@ -726,9 +727,12 @@ text, and it always follows an explicit click.
 
 #### Resuming a past session
 
-The launcher dropdown's **Resume session** row expands into the most recently
-used agent sessions found on disk, newest first, mixing every vendor into one
-list. Clicking one starts that agent with its resume command
+The launcher dropdown's **Resume session** row expands into every agent
+session found on disk that was used in the last `resume_menu_max_age_days`
+(default 30, matching Claude Code's own transcript retention), newest first,
+mixing every vendor into one list. The same list fills the sessions dropdown
+below. Both dropdowns show at most 14 rows at once and scroll past that — mouse
+wheel, dragging the thumb, or clicking the track to page. Clicking one starts that agent with its resume command
 (`claude --resume <id>`, `codex resume <id>`, …) **in the directory the session
 originally ran in** — the project-root toggle deliberately does not apply, since
 a resumed session whose relative paths have moved is not much use. Placement
@@ -742,8 +746,12 @@ was not on `main`/`master`. The description is Claude Code's own generated
 session title where one exists, and otherwise the first thing the user actually
 asked, trimmed to ten words.
 
-- `resume_menu_sessions` (default `10`, max `25`, `0` hides the row) caps how
-  many sessions are offered.
+- `resume_menu_max_age_days` (default `30`, `0` removes the age limit) is how
+  far back the list reaches. Settable like any other key, e.g.
+  `config.agent_ui.launcher.resume_menu_max_age_days = 14`; a config reload
+  takes effect the next time a session dropdown opens.
+- `resume_menu_sessions` (default `1000`, max `2000`, `0` hides the rows) is a
+  safety cap on how many sessions are offered, whatever their age.
 - `restore_last_window_sessions` (default `8`, max `25`, `0` hides the button)
   caps how many sessions one restore click may bring back.
 

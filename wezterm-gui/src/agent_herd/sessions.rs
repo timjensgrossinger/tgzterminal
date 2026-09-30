@@ -29,8 +29,9 @@
 //! callers scan on a worker thread and cache the result.
 
 use super::{transcript, HerdActivity, HerdContent, HerdEvent, HerdEventKind, SubagentNode};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
 use std::time::SystemTime;
 
 /// Longest plausible session id, and the alphabet it may use.
@@ -43,7 +44,9 @@ const MAX_SESSION_ID_LEN: usize = 128;
 
 /// Branch names that are not worth showing: on the default branch the prefix is
 /// noise, and every row would carry it.
-const UNINTERESTING_BRANCHES: &[&str] = &["main", "master", "trunk", "default"];
+///
+/// `HEAD` is what Claude records for a detached checkout: not a branch at all.
+const UNINTERESTING_BRANCHES: &[&str] = &["main", "master", "trunk", "default", "HEAD"];
 
 /// Shown when a session's own store records no usable description — a Claude
 /// transcript whose only turn was `/clear`, or an OpenCode session never given a
@@ -149,6 +152,39 @@ pub fn collect_recent_sessions(home: &Path, limit: usize) -> Vec<AgentSession> {
 /// Candidates from every home are pooled before the sort, so the result is one
 /// newest-first list rather than a list per home.
 pub fn collect_recent_sessions_across(homes: &[PathBuf], limit: usize) -> Vec<AgentSession> {
+    collect_recent_sessions_since(homes, limit, None)
+}
+
+/// Head-read results, keyed by transcript path and valid for one mtime.
+///
+/// The session menus list everything from the last month, which can be
+/// hundreds of transcripts, and over a WSL distro's `\\wsl.localhost\` share
+/// every head read is a 9P round trip. A rescan (the menu is re-opened after
+/// the GUI's TTL) then costs a `stat` sweep plus reads of whatever changed.
+/// Failed reads are remembered too, so an unreadable file is not retried
+/// until it is written again.
+///
+/// Pruned only once it outgrows [`DETAILS_CACHE_CAP`], and then to the
+/// candidates of the scan that tipped it over. Pruning on every scan would let
+/// two scans over different homes (two windows, one seeing a WSL distro the
+/// other does not) evict each other's entries on every open.
+static DETAILS_CACHE: LazyLock<Mutex<HashMap<PathBuf, (SystemTime, Option<AgentSession>)>>> =
+    LazyLock::new(Default::default);
+
+/// Entries [`DETAILS_CACHE`] may hold before it is pruned.
+const DETAILS_CACHE_CAP: usize = 4096;
+
+/// Like [`collect_recent_sessions_across`], restricted to sessions last touched
+/// at or after `newer_than`.
+///
+/// The cutoff is applied to the cheap `stat` sweep, before the sort and before
+/// any transcript is opened, so an old session costs nothing but its `stat`.
+/// `limit` stays a hard bound on top of it.
+pub fn collect_recent_sessions_since(
+    homes: &[PathBuf],
+    limit: usize,
+    newer_than: Option<SystemTime>,
+) -> Vec<AgentSession> {
     if limit == 0 {
         return Vec::new();
     }
@@ -158,8 +194,11 @@ pub fn collect_recent_sessions_across(homes: &[PathBuf], limit: usize) -> Vec<Ag
         let home = home.as_path();
         collect_claude_candidates(home, &mut candidates);
         collect_codex_candidates(home, &mut candidates);
-        collect_opencode_candidates(home, limit, &mut candidates);
+        collect_opencode_candidates(home, limit, newer_than, &mut candidates);
         collect_copilot_candidates(home, &mut candidates);
+    }
+    if let Some(cutoff) = newer_than {
+        candidates.retain(|candidate| candidate.modified() >= cutoff);
     }
 
     candidates.sort_by(|a, b| {
@@ -174,15 +213,44 @@ pub fn collect_recent_sessions_across(homes: &[PathBuf], limit: usize) -> Vec<Ag
     // candidates are already newest-first the first one seen is the one to keep.
     let mut seen = HashSet::new();
     let mut sessions = Vec::new();
+    // Held for the whole labelling pass: this runs on a worker thread, and two
+    // windows scanning at once then share reads instead of racing to repeat
+    // them. A poisoned lock only means another scan panicked mid-insert; the
+    // map itself is still a valid cache.
+    let mut cache = DETAILS_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if cache.len() > DETAILS_CACHE_CAP {
+        let live_paths: HashSet<&Path> = candidates
+            .iter()
+            .filter_map(|candidate| match candidate {
+                Candidate::Deferred { path, .. } => Some(path.as_path()),
+                Candidate::Ready(_) => None,
+            })
+            .collect();
+        cache.retain(|path, _| live_paths.contains(path.as_path()));
+    }
     for candidate in candidates {
         if sessions.len() >= limit {
             break;
         }
         let session = match candidate {
-            Candidate::Deferred { .. } => match read_candidate(&candidate) {
-                Some(session) => session,
-                None => continue,
-            },
+            Candidate::Deferred {
+                ref path, modified, ..
+            } => {
+                let details = match cache.get(path) {
+                    Some((cached_at, details)) if *cached_at == modified => details.clone(),
+                    _ => {
+                        let details = read_candidate(&candidate);
+                        cache.insert(path.clone(), (modified, details.clone()));
+                        details
+                    }
+                };
+                match details {
+                    Some(session) => session,
+                    None => continue,
+                }
+            }
             Candidate::Ready(session) => session,
         };
         if !session_id_is_sane(&session.session_id) {
@@ -356,8 +424,18 @@ fn collect_claude_candidates(home: &Path, out: &mut Vec<Candidate>) {
 /// so the whole head budget is spent looking for it before falling back to the
 /// first prompt the user actually typed. There is deliberately no search for a
 /// `"type":"summary"` entry: current Claude Code does not write one.
+///
+/// A session nobody typed into is not offered: a headless run (see
+/// [`claude_entrypoint_is_headless`]) or a scheduled task (see
+/// [`is_claude_scheduled_task`]). Nobody resumes a `claude -p` run, a plugin's
+/// background agent or last night's cron job, and on a machine with claude-mem
+/// and a scheduled sweep installed they outnumber the real sessions four to
+/// one.
 fn read_claude_details(path: &Path) -> Option<SessionDetails> {
-    let head = claude_head_scan(path);
+    let head = claude_head_scan(path, true);
+    if head.headless {
+        return None;
+    }
     Some(SessionDetails {
         cwd: head.cwd?,
         git_branch: head.git_branch,
@@ -371,6 +449,35 @@ struct ClaudeHead {
     cwd: Option<PathBuf>,
     git_branch: Option<String>,
     label: Option<String>,
+    /// The session was started without a human at the keyboard: a headless
+    /// entrypoint, or a scheduled task's automated run.
+    headless: bool,
+}
+
+/// Opening tag the Claude desktop app's task scheduler wraps an automated
+/// run's prompt in: `<scheduled-task name="team-jira-sweep" file="…/SKILL.md">
+/// This is an automated run of a scheduled task. The user is not present…`.
+const CLAUDE_SCHEDULED_TASK_TAG: &str = "<scheduled-task";
+
+/// True when `prompt` is a scheduled task's automated run.
+///
+/// The entrypoint cannot tell these apart: the desktop app starts every
+/// session, real or scheduled, as `claude-desktop` with `promptSource: "sdk"`.
+/// The prompt is the only record of it.
+fn is_claude_scheduled_task(prompt: &str) -> bool {
+    prompt.trim_start().starts_with(CLAUDE_SCHEDULED_TASK_TAG)
+}
+
+/// True for a Claude Code `entrypoint` that means no interactive user.
+///
+/// Observed values: `cli` (the terminal UI) and `claude-desktop` are people;
+/// `sdk-cli` is `claude -p` and anything built on it (claude-mem's observer, a
+/// session-note hook), `sdk-ts` an Agent SDK program. The `sdk-` prefix covers
+/// the Python SDK as well. Anything else, including a missing field (older
+/// transcripts), counts as interactive: hiding a real session is the worse
+/// mistake.
+fn claude_entrypoint_is_headless(entrypoint: &str) -> bool {
+    entrypoint.starts_with("sdk-")
 }
 
 /// Claude's own short description of a session, read from its transcript head.
@@ -380,19 +487,45 @@ struct ClaudeHead {
 /// which is why the herd asks here instead. Bounded head read with an early
 /// break, and it runs on the herd's scan thread, never on the paint path.
 pub fn claude_transcript_label(path: &Path) -> Option<String> {
-    claude_head_scan(path).label
+    // A live headless session still gets its label in the herd: it is running,
+    // so it belongs there whether or not anyone would resume it.
+    claude_head_scan(path, false).label
 }
 
-fn claude_head_scan(path: &Path) -> ClaudeHead {
+/// `stop_at_headless` ends the scan as soon as the transcript turns out to be
+/// headless, for callers that drop such sessions anyway: without it, each of
+/// them costs a full head read looking for a title that is never used.
+fn claude_head_scan(path: &Path, stop_at_headless: bool) -> ClaudeHead {
     let mut cwd = None;
     let mut git_branch = None;
     let mut title = None;
     let mut prompt = None;
+    let mut entrypoint_seen = false;
+    let mut headless = false;
 
     for line in transcript::head_lines(path, transcript::HEAD_LINES) {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
         };
+        if !entrypoint_seen {
+            if let Some(entrypoint) = value.get("entrypoint").and_then(|value| value.as_str()) {
+                entrypoint_seen = true;
+                headless |= claude_entrypoint_is_headless(entrypoint);
+            }
+        }
+        // A scheduled run's prompt is queued before the session starts, so the
+        // very first record already says so; the first user turn repeats it,
+        // for transcripts written without the queue record.
+        let queued_prompt = (value.get("type").and_then(|value| value.as_str())
+            == Some("queue-operation"))
+        .then(|| value.get("content").and_then(|value| value.as_str()))
+        .flatten();
+        if queued_prompt.is_some_and(is_claude_scheduled_task) {
+            headless = true;
+        }
+        if headless && stop_at_headless {
+            break;
+        }
         if cwd.is_none() {
             cwd = value
                 .get("cwd")
@@ -427,9 +560,14 @@ fn claude_head_scan(path: &Path) -> ClaudeHead {
                     .and_then(|value| value.as_bool())
                     .unwrap_or(false);
                 if prompt.is_none() && !is_meta && !is_sidechain {
-                    prompt = claude_message_text(&value)
-                        .as_deref()
-                        .and_then(transcript::describe_prompt);
+                    let text = claude_message_text(&value);
+                    if text.as_deref().is_some_and(is_claude_scheduled_task) {
+                        headless = true;
+                        if stop_at_headless {
+                            break;
+                        }
+                    }
+                    prompt = text.as_deref().and_then(transcript::describe_prompt);
                 }
             }
             _ => {}
@@ -445,6 +583,7 @@ fn claude_head_scan(path: &Path) -> ClaudeHead {
         cwd,
         git_branch,
         label: title.or(prompt),
+        headless,
     }
 }
 
@@ -540,6 +679,24 @@ fn collect_codex_candidates(home: &Path, out: &mut Vec<Candidate>) {
 /// Line one is a `session_meta` carrying both the id and the cwd. The label is
 /// the first genuine user message: Codex replays the project's `AGENTS.md` as a
 /// synthetic first user turn, so that one has to be skipped.
+/// True for a Codex `session_meta.source` that means no interactive user.
+///
+/// `"cli"` (the TUI) and `"vscode"` are people. A subagent thread — Codex's
+/// guardian, or a worker spawned by another thread — records an object
+/// `{"subagent": …}` and is resumed through its parent, never on its own.
+/// `"exec"` (`codex exec`) and `"mcp"` (a session served to an MCP client)
+/// come from Codex's `SessionSource` enum rather than observed rollouts; like
+/// `claude -p`, nobody resumes them. A missing or unknown source counts as
+/// interactive.
+fn codex_source_is_headless(source: &serde_json::Value) -> bool {
+    match source {
+        serde_json::Value::String(source) => matches!(source.as_str(), "exec" | "mcp"),
+        serde_json::Value::Object(source) => source.contains_key("subagent"),
+        _ => false,
+    }
+}
+
+/// A non-interactive rollout (see [`codex_source_is_headless`]) is not offered.
 fn read_codex_details(path: &Path) -> Option<SessionDetails> {
     let mut cwd = None;
     let mut session_id = None;
@@ -550,6 +707,13 @@ fn read_codex_details(path: &Path) -> Option<SessionDetails> {
             continue;
         };
         let payload = value.get("payload");
+        if value.get("type").and_then(|value| value.as_str()) == Some("session_meta")
+            && payload
+                .and_then(|payload| payload.get("source"))
+                .is_some_and(codex_source_is_headless)
+        {
+            return None;
+        }
         if cwd.is_none() {
             cwd = payload
                 .and_then(|payload| payload.get("cwd"))
@@ -610,7 +774,12 @@ fn read_codex_details(path: &Path) -> Option<SessionDetails> {
 /// the more polite interface, but it is scoped to the current directory — it
 /// cannot answer "sessions across all projects" without one process spawn per
 /// project, so the database it is.
-fn collect_opencode_candidates(home: &Path, limit: usize, out: &mut Vec<Candidate>) {
+fn collect_opencode_candidates(
+    home: &Path,
+    limit: usize,
+    newer_than: Option<SystemTime>,
+    out: &mut Vec<Candidate>,
+) {
     let db = home
         .join(".local")
         .join("share")
@@ -621,11 +790,17 @@ fn collect_opencode_candidates(home: &Path, limit: usize, out: &mut Vec<Candidat
     }
     // `parent_id IS NULL` drops child sessions (OpenCode's subagents), which are
     // not independently resumable. `time_archived IS NULL` drops the ones the
-    // user has already filed away. Times are epoch milliseconds.
+    // user has already filed away. Times are epoch milliseconds. The age
+    // cutoff goes into the query rather than a later filter so that `LIMIT`
+    // counts only sessions that can actually be offered.
     const QUERY: &str = "SELECT id, directory, title, time_updated \
                          FROM session \
                          WHERE parent_id IS NULL AND time_archived IS NULL \
+                         AND time_updated >= ?2 \
                          ORDER BY time_updated DESC LIMIT ?1";
+    let cutoff_ms = newer_than
+        .and_then(|cutoff| cutoff.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map_or(0, |since| since.as_millis().min(i64::MAX as u128) as i64);
 
     let mut read = || -> rusqlite::Result<()> {
         let conn = rusqlite::Connection::open_with_flags(
@@ -635,7 +810,7 @@ fn collect_opencode_candidates(home: &Path, limit: usize, out: &mut Vec<Candidat
                 | rusqlite::OpenFlags::SQLITE_OPEN_URI,
         )?;
         let mut stmt = conn.prepare(QUERY)?;
-        let rows = stmt.query_map([limit as i64], |row| {
+        let rows = stmt.query_map([limit as i64, cutoff_ms], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -1118,6 +1293,81 @@ mod tests {
     }
 
     #[test]
+    fn sessions_older_than_the_cutoff_are_not_offered() {
+        let dir = tempfile::tempdir().unwrap();
+        claude_session(
+            dir.path(),
+            "-old",
+            "aaaa-0001",
+            &[user_line("/old", "main", "something from last quarter")],
+            1_000,
+        );
+        claude_session(
+            dir.path(),
+            "-new",
+            "aaaa-0002",
+            &[user_line("/new", "main", "something from this morning")],
+            5_000,
+        );
+        let homes = [dir.path().to_path_buf()];
+
+        let cutoff = UNIX_EPOCH + Duration::from_secs(2_000);
+        let recent = collect_recent_sessions_since(&homes, 10, Some(cutoff));
+        assert_eq!(
+            recent
+                .iter()
+                .map(|s| s.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["aaaa-0002"]
+        );
+
+        // A session touched exactly at the cutoff is still inside the window.
+        let at_cutoff = UNIX_EPOCH + Duration::from_secs(1_000);
+        assert_eq!(
+            collect_recent_sessions_since(&homes, 10, Some(at_cutoff)).len(),
+            2
+        );
+        assert_eq!(collect_recent_sessions_since(&homes, 10, None).len(), 2);
+    }
+
+    #[test]
+    fn a_transcript_is_reread_only_when_its_mtime_moves() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = |title: &str, mtime: u64| {
+            claude_session(
+                dir.path(),
+                "-repo",
+                "aaaa-cafe",
+                &[
+                    user_line("/repo", "main", "please do the thing with the stuff"),
+                    title_line(title),
+                ],
+                mtime,
+            )
+        };
+
+        session("First title of this session", 1_000);
+        assert_eq!(
+            collect_recent_sessions(dir.path(), 10)[0].label,
+            "First title of this session"
+        );
+
+        // Same mtime: the cached head read answers, the file is not reopened.
+        session("Second title of this session", 1_000);
+        assert_eq!(
+            collect_recent_sessions(dir.path(), 10)[0].label,
+            "First title of this session"
+        );
+
+        // Written again: the new content is read.
+        session("Second title of this session", 2_000);
+        assert_eq!(
+            collect_recent_sessions(dir.path(), 10)[0].label,
+            "Second title of this session"
+        );
+    }
+
+    #[test]
     fn ai_title_is_found_far_into_the_head() {
         let dir = tempfile::tempdir().unwrap();
         let mut lines = vec![user_line("/repo", "main", "kick things off here please")];
@@ -1357,6 +1607,197 @@ mod tests {
         );
         assert_eq!(sessions[0].label, "fix the sidebar pill hitbox jumping");
         assert_eq!(sessions[0].cwd, PathBuf::from("/repo"));
+    }
+
+    fn entrypoint_line(cwd: &str, entrypoint: &str, text: &str) -> String {
+        serde_json::json!({
+            "type": "user",
+            "cwd": cwd,
+            "gitBranch": "HEAD",
+            "entrypoint": entrypoint,
+            "message": { "content": [{ "type": "text", "text": text }] },
+        })
+        .to_string()
+    }
+
+    /// `claude -p` runs and Agent SDK programs (claude-mem's observer, a
+    /// session-note hook) are not offered; terminal and desktop sessions are,
+    /// and so is a transcript too old to record an entrypoint at all.
+    #[test]
+    fn headless_claude_sessions_are_not_offered() {
+        let dir = tempfile::tempdir().unwrap();
+        let cases = [
+            ("aaaa-0c11", Some("cli"), 1_000),
+            ("aaaa-0de5", Some("claude-desktop"), 2_000),
+            ("aaaa-5dc1", Some("sdk-cli"), 3_000),
+            ("aaaa-5d75", Some("sdk-ts"), 4_000),
+            ("aaaa-01d0", None, 5_000),
+        ];
+        for (id, entrypoint, mtime) in cases {
+            let line = match entrypoint {
+                Some(entrypoint) => entrypoint_line("/repo", entrypoint, "work on the resume menu"),
+                None => user_line("/repo", "main", "work on the resume menu"),
+            };
+            claude_session(dir.path(), "-repo", id, &[line], mtime);
+        }
+
+        let mut offered: Vec<_> = collect_recent_sessions(dir.path(), 10)
+            .into_iter()
+            .map(|session| session.session_id)
+            .collect();
+        offered.sort();
+        assert_eq!(offered, vec!["aaaa-01d0", "aaaa-0c11", "aaaa-0de5"]);
+    }
+
+    /// The desktop app's scheduled tasks start as `claude-desktop`, exactly
+    /// like a person's session; only the prompt says it was a cron run.
+    #[test]
+    fn scheduled_task_runs_are_not_offered() {
+        let dir = tempfile::tempdir().unwrap();
+        let scheduled = "<scheduled-task name=\"team-jira-sweep\" \
+            file=\"/Users/me/.claude/scheduled-tasks/team-jira-sweep/SKILL.md\">\n\
+            This is an automated run of a scheduled task. The user is not present.";
+        let queued = serde_json::json!({
+            "type": "queue-operation",
+            "operation": "enqueue",
+            "content": scheduled,
+        })
+        .to_string();
+        // Queue record plus first turn, as the desktop app writes it.
+        claude_session(
+            dir.path(),
+            "-chat",
+            "aaaa-c201",
+            &[
+                queued,
+                entrypoint_line("/chat", "claude-desktop", scheduled),
+            ],
+            1_000,
+        );
+        // First turn only.
+        claude_session(
+            dir.path(),
+            "-chat",
+            "aaaa-c202",
+            &[entrypoint_line("/chat", "claude-desktop", scheduled)],
+            2_000,
+        );
+        // A person in the desktop app, mentioning the tag in passing.
+        claude_session(
+            dir.path(),
+            "-chat",
+            "aaaa-0de5",
+            &[entrypoint_line(
+                "/chat",
+                "claude-desktop",
+                "why does my <scheduled-task> sweep keep failing",
+            )],
+            3_000,
+        );
+
+        let offered: Vec<_> = collect_recent_sessions(dir.path(), 10)
+            .into_iter()
+            .map(|session| session.session_id)
+            .collect();
+        assert_eq!(offered, vec!["aaaa-0de5"]);
+    }
+
+    #[test]
+    fn headless_claude_sessions_keep_their_label_in_the_herd() {
+        let dir = tempfile::tempdir().unwrap();
+        claude_session(
+            dir.path(),
+            "-vault",
+            "aaaa-5dc1",
+            &[entrypoint_line(
+                "/vault",
+                "sdk-cli",
+                "write one session note please",
+            )],
+            1_000,
+        );
+        let path = dir.path().join(".claude/projects/-vault/aaaa-5dc1.jsonl");
+        assert_eq!(
+            claude_transcript_label(&path).as_deref(),
+            Some("write one session note please")
+        );
+    }
+
+    #[test]
+    fn a_detached_head_is_not_shown_as_a_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        claude_session(
+            dir.path(),
+            "-repo",
+            "aaaa-4ead",
+            &[entrypoint_line(
+                "/repo",
+                "cli",
+                "look at the detached checkout",
+            )],
+            1_000,
+        );
+        let sessions = collect_recent_sessions(dir.path(), 10);
+        assert_eq!(
+            sessions[0].menu_label(),
+            "repo · look at the detached checkout"
+        );
+    }
+
+    /// Subagent threads, `codex exec` and MCP-served sessions are not offered.
+    #[test]
+    fn headless_codex_rollouts_are_not_offered() {
+        let dir = tempfile::tempdir().unwrap();
+        let sources = [
+            (
+                "019f0001-0000-0000-0000-000000000001",
+                serde_json::json!("cli"),
+            ),
+            (
+                "019f0001-0000-0000-0000-000000000002",
+                serde_json::json!("vscode"),
+            ),
+            (
+                "019f0001-0000-0000-0000-000000000003",
+                serde_json::json!("exec"),
+            ),
+            (
+                "019f0001-0000-0000-0000-000000000004",
+                serde_json::json!("mcp"),
+            ),
+            (
+                "019f0001-0000-0000-0000-000000000005",
+                serde_json::json!({ "subagent": { "other": "guardian" } }),
+            ),
+        ];
+        for (index, (id, source)) in sources.iter().enumerate() {
+            let path = dir
+                .path()
+                .join(format!(".codex/sessions/2026/07/03/rollout-{index}.jsonl"));
+            let meta = serde_json::json!({
+                "type": "session_meta",
+                "payload": { "session_id": id, "cwd": "/repo", "source": source },
+            });
+            let prompt = serde_json::json!({
+                "type": "event_msg",
+                "payload": { "type": "user_message", "message": "fix the sidebar pill hitbox" },
+            });
+            write(&path, &format!("{meta}\n{prompt}\n"));
+            set_mtime(&path, 1_000 + index as u64);
+        }
+
+        let mut offered: Vec<_> = collect_recent_sessions(dir.path(), 10)
+            .into_iter()
+            .map(|session| session.session_id)
+            .collect();
+        offered.sort();
+        assert_eq!(
+            offered,
+            vec![
+                "019f0001-0000-0000-0000-000000000001",
+                "019f0001-0000-0000-0000-000000000002",
+            ]
+        );
     }
 
     /// Codex opens a new rollout file each time a session is resumed, so the
