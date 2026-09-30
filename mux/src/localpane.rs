@@ -45,8 +45,67 @@ const PROC_INFO_CACHE_TTL: Duration = Duration::from_millis(300);
 /// invisible to the Windows snapshot, so the "youngest console descendant"
 /// heuristic always lands on the shim. Used to keep that name out of titles.
 fn is_wsl_host_shim(process_name: &str) -> bool {
-    let name = process_name.trim_end_matches(".exe").to_ascii_lowercase();
-    matches!(name.as_str(), "wslhost" | "wslrelay" | "wsl")
+    // Lowercase before trimming: image names are not case-normalized, and
+    // `WSL.EXE` must not keep its suffix.
+    let name = process_name.to_ascii_lowercase();
+    let name = name.trim_end_matches(".exe");
+    matches!(name, "wslhost" | "wslrelay" | "wsl")
+}
+
+/// Whether `proc` is a WSL host shim, judged by its image basename (falling
+/// back to its COMM name when the image path is unknown).
+///
+/// Splits on both separators rather than using `Path::file_name`, which on a
+/// non-Windows host treats `C:\...\wsl.exe` as a single component.
+fn process_is_wsl_host_shim(proc: &LocalProcessInfo) -> bool {
+    let exe = proc.executable.to_string_lossy();
+    match exe
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|name| !name.is_empty())
+    {
+        Some(name) => is_wsl_host_shim(name),
+        None => is_wsl_host_shim(&proc.name),
+    }
+}
+
+/// Infer the "foreground" process of a pane from its process tree.
+///
+/// Windows doesn't have any job control or session concept, so the
+/// equivalent to the process group leader is taken to be the most recently
+/// spawned program running in the console.
+///
+/// A WSL host shim is a candidate itself, but its children are not visited.
+/// The Linux programs a WSL pane runs live in the VM and never appear in the
+/// Windows snapshot; the only Windows processes below the shim are interop
+/// helpers those programs started — an MCP server launched as
+/// `cmd.exe /c java.exe`, `code`, `explorer.exe`. None of them is what the user
+/// is running in the pane, yet being the youngest they used to win, and the
+/// pane was titled `java.exe` a few seconds after an agent started.
+fn foreground_process(root: &LocalProcessInfo) -> LocalProcessInfo {
+    fn find_youngest<'a>(proc: &'a LocalProcessInfo, youngest: &mut &'a LocalProcessInfo) {
+        if proc.start_time >= youngest.start_time {
+            *youngest = proc;
+        }
+
+        if process_is_wsl_host_shim(proc) {
+            return;
+        }
+
+        for child in proc.children.values() {
+            #[cfg(windows)]
+            if child.console == 0 {
+                continue;
+            }
+            find_youngest(child, youngest);
+        }
+    }
+
+    let mut youngest = root;
+    find_youngest(root, &mut youngest);
+    let mut foreground = youngest.clone();
+    foreground.children.clear();
+    foreground
 }
 
 #[derive(Debug)]
@@ -1140,33 +1199,7 @@ impl LocalPane {
             if expired {
                 log::trace!("CachedProcInfo expired, refresh");
                 let root = LocalProcessInfo::with_root_pid(*pid)?;
-
-                // Windows doesn't have any job control or session concept,
-                // so we infer that the equivalent to the process group
-                // leader is the most recently spawned program running
-                // in the console
-                let mut youngest = &root;
-
-                fn find_youngest<'a>(
-                    proc: &'a LocalProcessInfo,
-                    youngest: &mut &'a LocalProcessInfo,
-                ) {
-                    if proc.start_time >= youngest.start_time {
-                        *youngest = proc;
-                    }
-
-                    for child in proc.children.values() {
-                        #[cfg(windows)]
-                        if child.console == 0 {
-                            continue;
-                        }
-                        find_youngest(child, youngest);
-                    }
-                }
-
-                find_youngest(&root, &mut youngest);
-                let mut foreground = youngest.clone();
-                foreground.children.clear();
+                let foreground = foreground_process(&root);
 
                 proc_list.replace(CachedProcInfo {
                     root,
@@ -1198,5 +1231,84 @@ impl Drop for LocalPane {
         if let ProcessState::Running { signaller, .. } = &mut *self.process.lock() {
             let _ = signaller.kill();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use procinfo::LocalProcessStatus;
+    use std::path::PathBuf;
+
+    fn proc(
+        pid: u32,
+        exe: &str,
+        start_time: u64,
+        children: Vec<LocalProcessInfo>,
+    ) -> LocalProcessInfo {
+        LocalProcessInfo {
+            pid,
+            ppid: 0,
+            name: exe.to_string(),
+            executable: PathBuf::from(format!(r"C:\Windows\System32\{exe}")),
+            argv: vec![exe.to_string()],
+            cwd: PathBuf::new(),
+            status: LocalProcessStatus::Run,
+            start_time,
+            #[cfg(windows)]
+            console: 1,
+            children: children
+                .into_iter()
+                .map(|child| (child.pid, child))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn interop_children_of_a_wsl_pane_are_not_its_foreground() {
+        // What a WSL agent pane looks like once Claude starts an MCP server
+        // through `cmd.exe /c java.exe`: java is the youngest process.
+        let java = proc(4, "java.exe", 40, vec![]);
+        let cmd = proc(3, "cmd.exe", 30, vec![java]);
+        let inner = proc(2, "wsl.exe", 20, vec![cmd]);
+        let root = proc(1, "wsl.exe", 10, vec![inner]);
+
+        let foreground = foreground_process(&root);
+        assert_eq!(foreground.name, "wsl.exe");
+        assert_eq!(foreground.pid, 1);
+        assert!(foreground.children.is_empty());
+    }
+
+    #[test]
+    fn a_shim_below_a_native_shell_stops_the_descent() {
+        let cmd = proc(3, "cmd.exe", 30, vec![]);
+        let wsl = proc(2, "wsl.exe", 20, vec![cmd]);
+        let root = proc(1, "pwsh.exe", 10, vec![wsl]);
+
+        assert_eq!(foreground_process(&root).name, "wsl.exe");
+    }
+
+    #[test]
+    fn without_a_shim_the_youngest_process_still_wins() {
+        let java = proc(3, "java.exe", 30, vec![]);
+        let node = proc(2, "node.exe", 20, vec![java]);
+        let root = proc(1, "pwsh.exe", 10, vec![node]);
+
+        assert_eq!(foreground_process(&root).name, "java.exe");
+    }
+
+    #[test]
+    fn shim_is_matched_by_image_basename_case_insensitively() {
+        let mut shim = proc(1, "WSLHost.EXE", 10, vec![]);
+        assert!(process_is_wsl_host_shim(&shim));
+        shim.executable = PathBuf::new();
+        shim.name = "wsl".to_string();
+        assert!(process_is_wsl_host_shim(&shim));
+        assert!(!process_is_wsl_host_shim(&proc(
+            2,
+            "wslview.exe",
+            10,
+            vec![]
+        )));
     }
 }
