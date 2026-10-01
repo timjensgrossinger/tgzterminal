@@ -1013,6 +1013,17 @@ enum EventState {
     InProgressWithQueued(Option<PaneId>),
 }
 
+/// One finished scan for the session menus.
+pub(crate) struct AgentSessionScan {
+    /// When the scan that produced this began. A result from an older scan
+    /// never replaces a newer one, so a scan abandoned by the watchdog that
+    /// lands late cannot put a stale list back.
+    started_at: Instant,
+    /// When it landed; the TTL counts from here.
+    scanned_at: Instant,
+    sessions: Arc<Vec<AgentSession>>,
+}
+
 pub struct TermWindow {
     pub window: Option<Window>,
     pub config: ConfigHandle,
@@ -1110,17 +1121,19 @@ pub struct TermWindow {
     /// changes. Building probes `$PATH` for `mosh`/`et`, so this must never
     /// be recomputed per frame.
     ssh_launcher_cache: RefCell<Option<(usize, Arc<Vec<SshQuickLaunchEntry>>)>>,
-    /// Past sessions offered by the launcher's "Resume session" submenu, with
-    /// the instant they were scanned.
+    /// Past sessions offered by the session menus, and the scan they came from.
     ///
     /// Finding these means statting every transcript on disk and reading the
     /// head of the newest few, so the scan runs on a worker thread and lands
     /// here; the render path only ever reads this. Owned rather than a `RefCell`
     /// because it is written from the notification handler, not from paint.
-    agent_session_cache: Option<(Instant, Arc<Vec<AgentSession>>)>,
-    /// A scan is in flight. Keeps a held-open submenu from queueing a new scan
-    /// per frame, and tells the renderer to show progress instead of "none".
-    agent_session_scan_pending: bool,
+    agent_session_cache: Option<AgentSessionScan>,
+    /// When the in-flight session scan started. A timestamp, not a bool, for
+    /// the same reason as `agent_herd_scan_started_at`: a scan that never
+    /// reports back (a panicked worker, a read stuck on a WSL share) used to
+    /// leave the flag set for the life of the window, and every later open of
+    /// a session menu served the list from before it.
+    agent_session_scan_started_at: Option<Instant>,
     /// Agent sessions running in *this* window right now, in tab order.
     ///
     /// Recomputed from the herd join every paint, which is why it must stay a
@@ -1486,6 +1499,8 @@ impl TermWindow {
         let render_state = None;
 
         let connection_name = Connection::get().unwrap().name();
+        // The resume menus read these distros' sessions; once per process.
+        wsl_paths::load_session_distros();
 
         let myself = Self {
             created: Instant::now(),
@@ -1552,7 +1567,7 @@ impl TermWindow {
             wsl_agent_probe_started_at: Cell::new(None),
             ssh_launcher_cache: RefCell::new(None),
             agent_session_cache: None,
-            agent_session_scan_pending: false,
+            agent_session_scan_started_at: None,
             agent_window_sessions: Vec::new(),
             agent_snapshot_written: None,
             // Read once here, never from paint: the launcher's restore row only

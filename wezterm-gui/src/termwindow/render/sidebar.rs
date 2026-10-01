@@ -5596,6 +5596,33 @@ pub(crate) fn herd_scan_is_due(
     !cache_is_fresh
 }
 
+/// Whether a scan that began at `scan_started` may replace the one whose
+/// result is on screen, which began at `current`.
+///
+/// Not "the last to land wins": once the watchdog has given up on a scan and
+/// started another, the abandoned one can still land, later and with older
+/// data.
+fn session_scan_supersedes(current: Option<Instant>, scan_started: Instant) -> bool {
+    current.map_or(true, |current| scan_started >= current)
+}
+
+/// WSL distros the session menus read: every distro an agent is known to
+/// run in, not only those with a live pane (see
+/// `wsl_paths::remember_session_distros`).
+fn session_scan_distros(
+    live: impl IntoIterator<Item = String>,
+    probe_found: impl IntoIterator<Item = String>,
+    configured: Option<String>,
+    remembered: impl IntoIterator<Item = String>,
+) -> HashSet<String> {
+    live.into_iter()
+        .chain(probe_found)
+        .chain(configured)
+        .chain(remembered)
+        .filter(|distro| !distro.is_empty())
+        .collect()
+}
+
 /// Whether a cached detection may be returned without re-reading the pane.
 ///
 /// An entry whose status is *held* -- by the grace, or by an activity
@@ -6213,11 +6240,11 @@ impl crate::TermWindow {
             // on a cold start: the probe must know what is running to avoid
             // booting distros.
             let started = Instant::now();
-            let distros = match wsl_paths::load_distros_with_state() {
-                Ok(distros) => distros,
+            let (distros, listed) = match wsl_paths::load_distros_with_state() {
+                Ok(distros) => (distros, true),
                 Err(err) => {
                     log::info!("wsl agent probe: could not list distros: {err:#}");
-                    vec![]
+                    (vec![], false)
                 }
             };
             if !distros.is_empty() {
@@ -6250,8 +6277,20 @@ impl crate::TermWindow {
             }
             window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
                 term_window.wsl_agent_probe_started_at.set(None);
-                *term_window.wsl_agent_probe.borrow_mut() =
-                    Some((Instant::now(), programs, Arc::new(hits)));
+                // No distro list says nothing about what is installed: keep
+                // the last answer for the same programs rather than publish
+                // an empty one for a whole TTL.
+                let previous = term_window
+                    .wsl_agent_probe
+                    .borrow()
+                    .as_ref()
+                    .filter(|(_, probed, _)| *probed == programs)
+                    .map(|(_, _, hits)| Arc::clone(hits));
+                let hits = match previous {
+                    Some(previous) if !listed => previous,
+                    _ => Arc::new(hits),
+                };
+                *term_window.wsl_agent_probe.borrow_mut() = Some((Instant::now(), programs, hits));
                 term_window.launcher_cache.borrow_mut().take();
                 if let Some(window) = term_window.window.as_ref() {
                     window.invalidate();
@@ -6891,12 +6930,27 @@ impl crate::TermWindow {
         )
     }
 
-    /// How long a session scan stays fresh.
+    /// How long a session scan stays fresh: only long enough to absorb a
+    /// double-click.
     ///
-    /// Long enough that reopening the submenu to pick a different row is free,
-    /// short enough that a session finished in another window shows up without
-    /// restarting the terminal.
-    const SESSION_SCAN_TTL: Duration = Duration::from_secs(10);
+    /// Every menu open rescans. The list it replaces stays on screen until the
+    /// rescan lands, and a rescan is a `stat` sweep plus reads of what changed
+    /// (see `sessions::DETAILS_CACHE`). A longer TTL served the previous list
+    /// to an open made right after an agent exited.
+    const SESSION_SCAN_TTL: Duration = Duration::from_secs(2);
+
+    /// A session scan that has not reported back after this long is presumed
+    /// dead and no longer blocks the next one (see `herd_scan_is_due`).
+    ///
+    /// Generous, because a first scan over a WSL share may boot the distro and
+    /// then read hundreds of transcript heads.
+    const SESSION_SCAN_WATCHDOG: Duration = Duration::from_secs(60);
+
+    /// A session scan is running and has not outlived the watchdog.
+    fn agent_session_scan_in_flight(&self) -> bool {
+        self.agent_session_scan_started_at
+            .is_some_and(|started_at| started_at.elapsed() < Self::SESSION_SCAN_WATCHDOG)
+    }
 
     /// Start a background scan for resumable sessions unless one is already in
     /// flight or the cached answer is still fresh.
@@ -6910,15 +6964,22 @@ impl crate::TermWindow {
         // paint path only kicks it when the herd *section* is enabled. Kick
         // it here too, so opening either dropdown is enough to get it going.
         self.kick_agent_herd_scan();
-        if self.agent_session_scan_pending {
+        if !herd_scan_is_due(
+            self.agent_session_scan_started_at,
+            self.agent_session_cache
+                .as_ref()
+                .map(|scan| scan.scanned_at),
+            Self::SESSION_SCAN_TTL,
+            Self::SESSION_SCAN_WATCHDOG,
+            Instant::now(),
+        ) {
             return;
         }
-        let fresh = self
-            .agent_session_cache
-            .as_ref()
-            .is_some_and(|(scanned_at, _)| scanned_at.elapsed() < Self::SESSION_SCAN_TTL);
-        if fresh {
-            return;
+        if let Some(stuck) = self.agent_session_scan_started_at {
+            log::warn!(
+                "agent session scan started {:?} ago never reported back; starting another",
+                stuck.elapsed()
+            );
         }
         let limit = self.agent_resume_menu_limit();
         if limit == 0 {
@@ -6937,7 +6998,8 @@ impl crate::TermWindow {
         // stale list already on screen is better than one cut down to a page.
         let first_page = self.agent_session_cache.is_none() && limit > SESSION_SCAN_FIRST_PAGE;
 
-        self.agent_session_scan_pending = true;
+        let started = Instant::now();
+        self.agent_session_scan_started_at = Some(started);
         let future = promise::spawn::spawn_into_new_thread(move || {
             // Same roots the herd scan uses: on Windows the transcripts are
             // inside the distro, not under the Windows home.
@@ -6951,14 +7013,31 @@ impl crate::TermWindow {
             // `Scanning…` until the pointer moved.
             let apply = |sessions: Vec<crate::agent_herd::sessions::AgentSession>, done: bool| {
                 window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
-                    term_window.agent_session_scan_pending = !done;
-                    term_window.agent_session_cache = Some((Instant::now(), Arc::new(sessions)));
+                    // Clear only our own marker: after the watchdog, a newer
+                    // scan owns it.
+                    if done && term_window.agent_session_scan_started_at == Some(started) {
+                        term_window.agent_session_scan_started_at = None;
+                    }
+                    let current = term_window
+                        .agent_session_cache
+                        .as_ref()
+                        .map(|scan| scan.started_at);
+                    if !session_scan_supersedes(current, started) {
+                        return;
+                    }
+                    term_window.agent_session_cache = Some(crate::termwindow::AgentSessionScan {
+                        started_at: started,
+                        scanned_at: Instant::now(),
+                        sessions: Arc::new(sessions),
+                    });
                     if let Some(window) = term_window.window.as_ref() {
                         window.invalidate();
                     }
                 })));
             };
-            let started = Instant::now();
+            // Before the reads, which may be slow: a distro seen now is kept
+            // even if this scan never finishes.
+            wsl_paths::persist_session_distros();
             if first_page {
                 // A month of transcripts is hundreds of head reads, and over a
                 // WSL share that is seconds. Show the newest page first; the
@@ -6972,13 +7051,28 @@ impl crate::TermWindow {
                     false,
                 );
             }
-            let sessions = crate::agent_herd::sessions::collect_recent_sessions_since(
-                &homes, limit, newer_than,
-            );
-            log::debug!(
-                "agent session scan: {} sessions in {:?}",
-                sessions.len(),
-                started.elapsed()
+            let (sessions, stats) =
+                crate::agent_herd::sessions::scan_recent_sessions(&homes, limit, newer_than);
+            // One line per menu open, at info so it reaches the log file: a
+            // session missing from the menu is otherwise indistinguishable
+            // from one in a home that was never scanned.
+            log::info!(
+                "agent session scan: {} listed of {} candidates in {:?} \
+                 (headless {}, no cwd {}, unreadable {}, bad id {}, duplicate {}; {} reads) from {}",
+                stats.listed,
+                stats.candidates,
+                started.elapsed(),
+                stats.headless,
+                stats.no_cwd,
+                stats.unreadable,
+                stats.bad_id,
+                stats.duplicates,
+                stats.reads,
+                homes
+                    .iter()
+                    .map(|home| home.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             );
             apply(sessions, true);
             Ok::<(), anyhow::Error>(())
@@ -7021,11 +7115,11 @@ impl crate::TermWindow {
         let Some(session) = self
             .agent_session_cache
             .as_ref()
-            .and_then(|(_, sessions)| {
-                sessions
+            .and_then(|scan| {
+                scan.sessions
                     .get(index)
                     .filter(is_row)
-                    .or_else(|| sessions.iter().find(is_row))
+                    .or_else(|| scan.sessions.iter().find(is_row))
             })
             .cloned()
         else {
@@ -10468,11 +10562,11 @@ impl crate::TermWindow {
             item_type: UIItemType::SidebarAgentMenuResume,
         };
 
-        let Some((_, sessions)) = self.agent_session_cache.as_ref() else {
+        let Some(sessions) = self.agent_session_cache.as_ref().map(|scan| &scan.sessions) else {
             return vec![placeholder("Scanning…")];
         };
         if sessions.is_empty() {
-            return vec![placeholder(if self.agent_session_scan_pending {
+            return vec![placeholder(if self.agent_session_scan_in_flight() {
                 "Scanning…"
             } else {
                 "No past sessions"
@@ -10501,7 +10595,7 @@ impl crate::TermWindow {
                 },
             })
             .collect();
-        if self.agent_session_scan_pending {
+        if self.agent_session_scan_in_flight() {
             // The first page is up and the rest of the month is still being
             // read; say so, or the short list reads as all there is.
             rows.push(placeholder("Loading older sessions…"));
@@ -13609,39 +13703,57 @@ impl crate::TermWindow {
         if !cfg!(windows) {
             return vec![];
         }
+        let live = self.live_wsl_distros();
+        // Memory only; this runs on the herd's cadence.
+        wsl_paths::remember_session_distros(live.iter().cloned());
+        self.wsl_specs_for(&live)
+    }
+
+    /// Distros a live pane of this process is running in.
+    fn live_wsl_distros(&self) -> HashSet<String> {
         let mux = Mux::get();
-        let live: HashSet<String> = mux
-            .iter_panes()
+        mux.iter_panes()
             .iter()
             .filter(|pane| !pane.is_dead())
             .filter_map(|pane| mux.get_domain(pane.domain_id()))
             .filter_map(|domain| wsl_paths::distro_for_domain(domain.domain_name(), &self.config))
-            .collect();
-        self.wsl_specs_for(&live)
+            .collect()
     }
 
     /// [`Self::wsl_distro_specs`] plus every distro agents live in: those the
-    /// agent probe found a CLI in, and `agent_ui.launcher.wsl_distro`.
+    /// agent probe found a CLI in, `agent_ui.launcher.wsl_distro`, and every
+    /// distro remembered from earlier (this process or a previous one).
     ///
-    /// For the resume submenu only. The live-pane rule above exists because the
-    /// herd scans every 500ms; this scan runs when the user opens the menu, at
-    /// most every [`Self::SESSION_SCAN_TTL`], and resuming would boot the distro
-    /// anyway. Without it, a window holding only cmd or PowerShell tabs listed
-    /// none of the sessions its agents -- all inside WSL -- had written.
+    /// For the session menus only. The live-pane rule above exists because the
+    /// herd scans every 500ms; this scan runs when the user opens a menu, and
+    /// resuming would boot the distro anyway. Without it, a window holding only
+    /// cmd or PowerShell tabs listed none of the sessions its agents -- all
+    /// inside WSL -- had written, and `exit` in the last agent pane of a distro
+    /// took that distro's sessions out of the menu with it.
     fn wsl_session_distro_specs(&self) -> Vec<(String, Option<String>)> {
         if !cfg!(windows) {
             return vec![];
         }
-        let mux = Mux::get();
-        let mut wanted: HashSet<String> = mux
-            .iter_panes()
-            .iter()
-            .filter(|pane| !pane.is_dead())
-            .filter_map(|pane| mux.get_domain(pane.domain_id()))
-            .filter_map(|domain| wsl_paths::distro_for_domain(domain.domain_name(), &self.config))
+        let live = self.live_wsl_distros();
+        let probe_found: Vec<String> = self
+            .wsl_agent_hits()
+            .values()
+            .map(|hit| hit.distro.clone())
+            .chain(wsl_paths::distros_with_agents())
             .collect();
-        wanted.extend(self.wsl_agent_hits().values().map(|hit| hit.distro.clone()));
-        wanted.extend(self.config.agent_ui.launcher.wsl_distro.clone());
+        let configured = self.config.agent_ui.launcher.wsl_distro.clone();
+        wsl_paths::remember_session_distros(
+            live.iter()
+                .cloned()
+                .chain(probe_found.iter().cloned())
+                .chain(configured.clone()),
+        );
+        let wanted = session_scan_distros(
+            live,
+            probe_found,
+            configured,
+            wsl_paths::remembered_session_distros(),
+        );
         self.wsl_specs_for(&wanted)
     }
 
@@ -15918,6 +16030,80 @@ mod tests {
             watchdog,
             now
         ));
+    }
+
+    /// The same freeze in the session menus: a scan that never reported back
+    /// left every later open serving the list from before it.
+    #[test]
+    fn a_lost_session_scan_does_not_freeze_the_session_menus() {
+        use crate::termwindow::TermWindow;
+        let now = Instant::now();
+        let ttl = TermWindow::SESSION_SCAN_TTL;
+        let watchdog = TermWindow::SESSION_SCAN_WATCHDOG;
+
+        // A menu opened a few seconds after the last scan rescans: that is
+        // how a session exited in between gets listed.
+        assert!(herd_scan_is_due(
+            None,
+            Some(now - Duration::from_secs(3)),
+            ttl,
+            watchdog,
+            now
+        ));
+        // A scan past the watchdog no longer blocks the next one.
+        assert!(herd_scan_is_due(
+            Some(now - watchdog - Duration::from_secs(1)),
+            Some(now - Duration::from_secs(120)),
+            ttl,
+            watchdog,
+            now
+        ));
+        assert!(!herd_scan_is_due(
+            Some(now - Duration::from_secs(5)),
+            Some(now - Duration::from_secs(120)),
+            ttl,
+            watchdog,
+            now
+        ));
+    }
+
+    #[test]
+    fn an_abandoned_session_scan_landing_late_does_not_replace_a_newer_list() {
+        let old = Instant::now();
+        let new = old + Duration::from_secs(61);
+        assert!(session_scan_supersedes(None, old));
+        assert!(session_scan_supersedes(Some(old), new));
+        // The first page and the full pass of one scan share its start.
+        assert!(session_scan_supersedes(Some(new), new));
+        assert!(!session_scan_supersedes(Some(new), old));
+    }
+
+    #[test]
+    fn a_distro_stays_scanned_after_its_last_agent_pane_closes() {
+        // `exit` in the last agent pane of a distro: nothing live, and the
+        // probe (timed out) holds no hit. Remembered, it is still read.
+        let wanted = session_scan_distros(
+            Vec::<String>::new(),
+            Vec::<String>::new(),
+            None,
+            ["Ubuntu".to_string()],
+        );
+        assert_eq!(wanted, HashSet::from(["Ubuntu".to_string()]));
+
+        let wanted = session_scan_distros(
+            ["Debian".to_string()],
+            ["Ubuntu".to_string(), String::new()],
+            Some("Arch".to_string()),
+            ["Ubuntu".to_string()],
+        );
+        assert_eq!(
+            wanted,
+            HashSet::from([
+                "Arch".to_string(),
+                "Debian".to_string(),
+                "Ubuntu".to_string()
+            ])
+        );
     }
 
     #[test]

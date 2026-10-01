@@ -22,6 +22,7 @@
 //! spawns on the calling thread.
 
 use config::{WslDistro, WslDomain};
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
@@ -359,7 +360,23 @@ pub(crate) fn probe_wsl_agents(
                         },
                     );
                 }
-                found.unwrap_or_default()
+                let last = found
+                    .is_none()
+                    .then(|| {
+                        PROBED_DISTROS
+                            .lock()
+                            .unwrap()
+                            .get(&distro.name)
+                            .map(|probed| probed.found.clone())
+                    })
+                    .flatten();
+                if last.is_some() {
+                    log::info!(
+                        "wsl agent probe: {} gave no answer; keeping its last one",
+                        distro.name
+                    );
+                }
+                answer_or_last_known(found, last)
             }
         };
         for (program, shell) in found {
@@ -372,6 +389,128 @@ pub(crate) fn probe_wsl_agents(
         }
     }
     hits
+}
+
+/// A distro's answer, or what it answered last time when it gave none.
+///
+/// A probe that times out says nothing about what is installed, yet an empty
+/// answer used to replace the last good one for a whole probe TTL: every
+/// WSL-only agent vanished from the launcher, and once the last pane in the
+/// distro had closed the resume menus stopped reading it too, so its sessions
+/// (the one just exited included) went missing.
+fn answer_or_last_known(
+    answer: Option<std::collections::HashMap<String, WslProbeShell>>,
+    last: Option<std::collections::HashMap<String, WslProbeShell>>,
+) -> std::collections::HashMap<String, WslProbeShell> {
+    answer.or(last).unwrap_or_default()
+}
+
+/// Every distro a probe has found an agent CLI in.
+///
+/// Wider than the probe's hits, which keep only the first distro per program:
+/// an agent installed in two distros has sessions in both.
+pub(crate) fn distros_with_agents() -> Vec<String> {
+    PROBED_DISTROS
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, probed)| !probed.found.is_empty())
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
+/// Most distros [`remember_session_distros`] keeps: far more than anyone
+/// registers, and only a bound on a list that is never pruned.
+const MAX_SESSION_DISTROS: usize = 16;
+
+/// WSL distros agents have run in, so the resume menus keep reading their
+/// session files once the last pane there has closed.
+///
+/// The herd reads only distros with a live pane, because it scans every 500ms
+/// and reading a stopped distro's share boots it. The resume menus scan when
+/// the user opens one, so they can afford a stopped distro, but had no way to
+/// know about it: an agent pane *is* the agent, so `exit` closed the last pane
+/// in its distro, and unless the WSL probe happened to hold a hit for it, the
+/// distro and every session in it dropped out of the menu.
+#[derive(Default)]
+struct SessionDistros {
+    known: BTreeSet<String>,
+    /// What the state file holds; `None` until it has been read.
+    saved: Option<BTreeSet<String>>,
+}
+
+impl SessionDistros {
+    /// Add `names`, up to [`MAX_SESSION_DISTROS`].
+    fn remember(&mut self, names: impl IntoIterator<Item = String>) {
+        for name in names {
+            if self.known.len() >= MAX_SESSION_DISTROS {
+                break;
+            }
+            if !name.is_empty() {
+                self.known.insert(name);
+            }
+        }
+    }
+
+    /// The set to write, when it differs from what the file holds.
+    fn unsaved(&self) -> Option<BTreeSet<String>> {
+        let saved = self.saved.as_ref()?;
+        (*saved != self.known).then(|| self.known.clone())
+    }
+}
+
+static SESSION_DISTROS: LazyLock<Mutex<SessionDistros>> = LazyLock::new(Default::default);
+
+/// [`SESSION_DISTROS`], locked. Taken from paint, so a poisoned lock (a panic
+/// mid-insert, which leaves a valid set) must not become a panic there.
+fn session_distros() -> std::sync::MutexGuard<'static, SessionDistros> {
+    SESSION_DISTROS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Seed the remembered distros from the state file, once per process.
+///
+/// Reads one small local file; call at window creation, never from paint.
+pub(crate) fn load_session_distros() {
+    if !cfg!(windows) || session_distros().saved.is_some() {
+        return;
+    }
+    let saved: BTreeSet<String> = super::tgz_ui_state::load_wsl_session_distros()
+        .into_iter()
+        .collect();
+    let mut distros = session_distros();
+    if distros.saved.is_none() {
+        distros.remember(saved.iter().cloned());
+        distros.saved = Some(saved);
+    }
+}
+
+/// Remember distros agents run in. Memory only, so the paint path may call it.
+pub(crate) fn remember_session_distros(names: impl IntoIterator<Item = String>) {
+    if cfg!(windows) {
+        session_distros().remember(names);
+    }
+}
+
+/// Every distro remembered so far, this process and earlier ones.
+pub(crate) fn remembered_session_distros() -> BTreeSet<String> {
+    session_distros().known.clone()
+}
+
+/// Write the remembered distros out if they grew since the file was read.
+///
+/// Blocking file I/O: worker thread only. The lock is not held across the
+/// write, because the herd path takes it from paint.
+pub(crate) fn persist_session_distros() {
+    if !cfg!(windows) {
+        return;
+    }
+    let Some(unsaved) = session_distros().unsaved() else {
+        return;
+    };
+    super::tgz_ui_state::save_wsl_session_distros(&unsaved);
+    session_distros().saved = Some(unsaved);
 }
 
 /// Ask one distro which of `programs` it has, trying `bash -lic` and then
@@ -648,6 +787,39 @@ fn strip_mnt_drive(path: &str) -> Option<(char, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_probe_with_no_answer_keeps_the_last_one() {
+        let last = std::collections::HashMap::from([(
+            "claude".to_string(),
+            WslProbeShell::BashInteractive,
+        )]);
+        assert_eq!(answer_or_last_known(None, Some(last.clone())), last);
+        // A real answer, even an empty one, is news and replaces it.
+        let empty = std::collections::HashMap::new();
+        assert!(answer_or_last_known(Some(empty), Some(last)).is_empty());
+        assert!(answer_or_last_known(None, None).is_empty());
+    }
+
+    #[test]
+    fn session_distros_are_bounded_and_written_only_when_they_grow() {
+        let mut distros = SessionDistros::default();
+        distros.remember(["Ubuntu".to_string()]);
+        // Not read from the file yet: writing now would drop what it holds.
+        assert_eq!(distros.unsaved(), None);
+
+        distros.saved = Some(BTreeSet::from(["Ubuntu".to_string()]));
+        assert_eq!(distros.unsaved(), None);
+        distros.remember(["Ubuntu".to_string(), String::new(), "Debian".to_string()]);
+        assert_eq!(
+            distros.unsaved(),
+            Some(BTreeSet::from(["Debian".to_string(), "Ubuntu".to_string()]))
+        );
+
+        distros.remember((0..40).map(|n| format!("distro-{n}")));
+        assert_eq!(distros.known.len(), MAX_SESSION_DISTROS);
+        assert!(distros.known.contains("Ubuntu") && distros.known.contains("Debian"));
+    }
 
     fn distro(name: &str, state: &str, is_default: bool) -> WslDistro {
         WslDistro {

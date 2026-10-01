@@ -155,38 +155,98 @@ pub fn collect_recent_sessions_across(homes: &[PathBuf], limit: usize) -> Vec<Ag
     collect_recent_sessions_since(homes, limit, None)
 }
 
+/// Why a candidate found on disk was not offered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Skip {
+    /// Nobody typed into it: a headless run, a scheduled task, a subagent.
+    Headless,
+    /// The store records no directory, and a resume must not guess one.
+    NoCwd,
+    /// Nothing in the head parsed, or it lacks the id a resume needs.
+    Unreadable,
+}
+
+/// What one scan saw, so a log line can say why a session is not listed.
+///
+/// A session missing from the menu is otherwise indistinguishable from one
+/// that was never found: these counts tell a filtered transcript from a home
+/// that was not scanned at all.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SessionScanStats {
+    /// Candidates inside the age window, before the `limit` cut.
+    pub candidates: usize,
+    pub listed: usize,
+    pub headless: usize,
+    pub no_cwd: usize,
+    pub unreadable: usize,
+    /// An id [`session_id_is_sane`] refused.
+    pub bad_id: usize,
+    /// Another transcript of a session already listed (Codex resumes).
+    pub duplicates: usize,
+    /// Head reads actually performed; the rest came from [`DETAILS_CACHE`].
+    pub reads: usize,
+}
+
+impl SessionScanStats {
+    fn count(&mut self, skip: Skip) {
+        match skip {
+            Skip::Headless => self.headless += 1,
+            Skip::NoCwd => self.no_cwd += 1,
+            Skip::Unreadable => self.unreadable += 1,
+        }
+    }
+}
+
 /// Head-read results, keyed by transcript path and valid for one mtime.
 ///
 /// The session menus list everything from the last month, which can be
 /// hundreds of transcripts, and over a WSL distro's `\\wsl.localhost\` share
-/// every head read is a 9P round trip. A rescan (the menu is re-opened after
-/// the GUI's TTL) then costs a `stat` sweep plus reads of whatever changed.
-/// Failed reads are remembered too, so an unreadable file is not retried
-/// until it is written again.
+/// every head read is a 9P round trip. A rescan (every menu open) then costs a
+/// `stat` sweep plus reads of whatever changed. Skips are remembered too, so a
+/// headless or unreadable file is not re-read until it is written again.
 ///
 /// Pruned only once it outgrows [`DETAILS_CACHE_CAP`], and then to the
 /// candidates of the scan that tipped it over. Pruning on every scan would let
 /// two scans over different homes (two windows, one seeing a WSL distro the
 /// other does not) evict each other's entries on every open.
-static DETAILS_CACHE: LazyLock<Mutex<HashMap<PathBuf, (SystemTime, Option<AgentSession>)>>> =
+static DETAILS_CACHE: LazyLock<Mutex<HashMap<PathBuf, (SystemTime, Result<AgentSession, Skip>)>>> =
     LazyLock::new(Default::default);
 
 /// Entries [`DETAILS_CACHE`] may hold before it is pruned.
 const DETAILS_CACHE_CAP: usize = 4096;
 
+/// [`DETAILS_CACHE`], locked. A poisoned lock only means another scan panicked
+/// mid-insert; the map itself is still a valid cache.
+fn details_cache(
+) -> std::sync::MutexGuard<'static, HashMap<PathBuf, (SystemTime, Result<AgentSession, Skip>)>> {
+    DETAILS_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Like [`collect_recent_sessions_across`], restricted to sessions last touched
 /// at or after `newer_than`.
-///
-/// The cutoff is applied to the cheap `stat` sweep, before the sort and before
-/// any transcript is opened, so an old session costs nothing but its `stat`.
-/// `limit` stays a hard bound on top of it.
 pub fn collect_recent_sessions_since(
     homes: &[PathBuf],
     limit: usize,
     newer_than: Option<SystemTime>,
 ) -> Vec<AgentSession> {
+    scan_recent_sessions(homes, limit, newer_than).0
+}
+
+/// [`collect_recent_sessions_since`], plus what the scan saw on the way.
+///
+/// The cutoff is applied to the cheap `stat` sweep, before the sort and before
+/// any transcript is opened, so an old session costs nothing but its `stat`.
+/// `limit` stays a hard bound on top of it.
+pub fn scan_recent_sessions(
+    homes: &[PathBuf],
+    limit: usize,
+    newer_than: Option<SystemTime>,
+) -> (Vec<AgentSession>, SessionScanStats) {
+    let mut stats = SessionScanStats::default();
     if limit == 0 {
-        return Vec::new();
+        return (Vec::new(), stats);
     }
 
     let mut candidates = Vec::new();
@@ -200,6 +260,7 @@ pub fn collect_recent_sessions_since(
     if let Some(cutoff) = newer_than {
         candidates.retain(|candidate| candidate.modified() >= cutoff);
     }
+    stats.candidates = candidates.len();
 
     candidates.sort_by(|a, b| {
         b.modified()
@@ -213,22 +274,18 @@ pub fn collect_recent_sessions_since(
     // candidates are already newest-first the first one seen is the one to keep.
     let mut seen = HashSet::new();
     let mut sessions = Vec::new();
-    // Held for the whole labelling pass: this runs on a worker thread, and two
-    // windows scanning at once then share reads instead of racing to repeat
-    // them. A poisoned lock only means another scan panicked mid-insert; the
-    // map itself is still a valid cache.
-    let mut cache = DETAILS_CACHE
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if cache.len() > DETAILS_CACHE_CAP {
-        let live_paths: HashSet<&Path> = candidates
-            .iter()
-            .filter_map(|candidate| match candidate {
-                Candidate::Deferred { path, .. } => Some(path.as_path()),
-                Candidate::Ready(_) => None,
-            })
-            .collect();
-        cache.retain(|path, _| live_paths.contains(path.as_path()));
+    {
+        let mut cache = details_cache();
+        if cache.len() > DETAILS_CACHE_CAP {
+            let live_paths: HashSet<&Path> = candidates
+                .iter()
+                .filter_map(|candidate| match candidate {
+                    Candidate::Deferred { path, .. } => Some(path.as_path()),
+                    Candidate::Ready(_) => None,
+                })
+                .collect();
+            cache.retain(|path, _| live_paths.contains(path.as_path()));
+        }
     }
     for candidate in candidates {
         if sessions.len() >= limit {
@@ -238,29 +295,46 @@ pub fn collect_recent_sessions_since(
             Candidate::Deferred {
                 ref path, modified, ..
             } => {
-                let details = match cache.get(path) {
-                    Some((cached_at, details)) if *cached_at == modified => details.clone(),
-                    _ => {
+                // Locked per lookup and per insert, never across the read: over
+                // a WSL share one read can stall for seconds or not return at
+                // all, and holding the lock through it stalled every other
+                // window's scan behind it. Two windows scanning at once may now
+                // read the same file twice, which is the cheaper failure.
+                let cached = details_cache()
+                    .get(path)
+                    .filter(|(cached_at, _)| *cached_at == modified)
+                    .map(|(_, details)| details.clone());
+                let details = match cached {
+                    Some(details) => details,
+                    None => {
+                        stats.reads += 1;
                         let details = read_candidate(&candidate);
-                        cache.insert(path.clone(), (modified, details.clone()));
+                        details_cache().insert(path.clone(), (modified, details.clone()));
                         details
                     }
                 };
                 match details {
-                    Some(session) => session,
-                    None => continue,
+                    Ok(session) => session,
+                    Err(skip) => {
+                        stats.count(skip);
+                        continue;
+                    }
                 }
             }
             Candidate::Ready(session) => session,
         };
         if !session_id_is_sane(&session.session_id) {
+            stats.bad_id += 1;
             continue;
         }
         if seen.insert((session.adapter_id.clone(), session.session_id.clone())) {
             sessions.push(session);
+        } else {
+            stats.duplicates += 1;
         }
     }
-    sessions
+    stats.listed = sessions.len();
+    (sessions, stats)
 }
 
 /// Build a finished session from fields a vendor already knew.
@@ -292,7 +366,7 @@ fn ready_session(
 /// A candidate whose directory cannot be determined is dropped rather than
 /// guessed at: without a `cwd` the resume would start in the wrong place, which
 /// is worse than not offering the row.
-fn read_candidate(candidate: &Candidate) -> Option<AgentSession> {
+fn read_candidate(candidate: &Candidate) -> Result<AgentSession, Skip> {
     let Candidate::Deferred {
         adapter_id,
         session_id,
@@ -300,13 +374,13 @@ fn read_candidate(candidate: &Candidate) -> Option<AgentSession> {
         modified,
     } = candidate
     else {
-        return None;
+        return Err(Skip::Unreadable);
     };
     let details = match *adapter_id {
         "claude" => read_claude_details(path),
         "codex" => read_codex_details(path),
         "copilot" => read_copilot_workspace(path),
-        _ => None,
+        _ => Err(Skip::Unreadable),
     }?;
     // Claude and Copilot name their file (or directory) after the session; Codex
     // records the id inside.
@@ -314,7 +388,7 @@ fn read_candidate(candidate: &Candidate) -> Option<AgentSession> {
         .session_id
         .clone()
         .unwrap_or_else(|| session_id.clone());
-    Some(ready_session(
+    Ok(ready_session(
         adapter_id,
         session_id,
         details.cwd,
@@ -431,13 +505,16 @@ fn collect_claude_candidates(home: &Path, out: &mut Vec<Candidate>) {
 /// background agent or last night's cron job, and on a machine with claude-mem
 /// and a scheduled sweep installed they outnumber the real sessions four to
 /// one.
-fn read_claude_details(path: &Path) -> Option<SessionDetails> {
+fn read_claude_details(path: &Path) -> Result<SessionDetails, Skip> {
     let head = claude_head_scan(path, true);
     if head.headless {
-        return None;
+        return Err(Skip::Headless);
     }
-    Some(SessionDetails {
-        cwd: head.cwd?,
+    if !head.parsed {
+        return Err(Skip::Unreadable);
+    }
+    Ok(SessionDetails {
+        cwd: head.cwd.ok_or(Skip::NoCwd)?,
         git_branch: head.git_branch,
         label: head.label,
         session_id: None,
@@ -452,6 +529,9 @@ struct ClaudeHead {
     /// The session was started without a human at the keyboard: a headless
     /// entrypoint, or a scheduled task's automated run.
     headless: bool,
+    /// At least one head line was JSON. Without one the file is unreadable,
+    /// not merely short of a directory.
+    parsed: bool,
 }
 
 /// Opening tag the Claude desktop app's task scheduler wraps an automated
@@ -502,11 +582,13 @@ fn claude_head_scan(path: &Path, stop_at_headless: bool) -> ClaudeHead {
     let mut prompt = None;
     let mut entrypoint_seen = false;
     let mut headless = false;
+    let mut parsed = false;
 
     for line in transcript::head_lines(path, transcript::HEAD_LINES) {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
         };
+        parsed = true;
         if !entrypoint_seen {
             if let Some(entrypoint) = value.get("entrypoint").and_then(|value| value.as_str()) {
                 entrypoint_seen = true;
@@ -584,6 +666,7 @@ fn claude_head_scan(path: &Path, stop_at_headless: bool) -> ClaudeHead {
         git_branch,
         label: title.or(prompt),
         headless,
+        parsed,
     }
 }
 
@@ -697,22 +780,24 @@ fn codex_source_is_headless(source: &serde_json::Value) -> bool {
 }
 
 /// A non-interactive rollout (see [`codex_source_is_headless`]) is not offered.
-fn read_codex_details(path: &Path) -> Option<SessionDetails> {
+fn read_codex_details(path: &Path) -> Result<SessionDetails, Skip> {
     let mut cwd = None;
     let mut session_id = None;
     let mut label = None;
+    let mut parsed = false;
 
     for line in transcript::head_lines(path, transcript::HEAD_LINES) {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
         };
+        parsed = true;
         let payload = value.get("payload");
         if value.get("type").and_then(|value| value.as_str()) == Some("session_meta")
             && payload
                 .and_then(|payload| payload.get("source"))
                 .is_some_and(codex_source_is_headless)
         {
-            return None;
+            return Err(Skip::Headless);
         }
         if cwd.is_none() {
             cwd = payload
@@ -744,12 +829,16 @@ fn read_codex_details(path: &Path) -> Option<SessionDetails> {
         }
     }
 
-    Some(SessionDetails {
-        cwd: cwd?,
+    if !parsed {
+        return Err(Skip::Unreadable);
+    }
+    Ok(SessionDetails {
+        cwd: cwd.ok_or(Skip::NoCwd)?,
         // Codex's `session_meta` records no branch, so rows are unprefixed.
         git_branch: None,
         label,
-        session_id: Some(session_id?),
+        // The filename carries no id to fall back on.
+        session_id: Some(session_id.ok_or(Skip::Unreadable)?),
     })
 }
 
@@ -983,7 +1072,7 @@ fn collect_copilot_candidates(home: &Path, out: &mut Vec<Candidate>) {
 /// Deserialized into a struct of `Option`s so that unknown, added or reordered
 /// keys are ignored rather than failing the read — the file's schema is not
 /// documented even though its location is.
-fn read_copilot_workspace(path: &Path) -> Option<SessionDetails> {
+fn read_copilot_workspace(path: &Path) -> Result<SessionDetails, Skip> {
     #[derive(serde::Deserialize)]
     struct Raw {
         cwd: Option<String>,
@@ -992,14 +1081,15 @@ fn read_copilot_workspace(path: &Path) -> Option<SessionDetails> {
         name: Option<String>,
     }
 
-    let text = std::fs::read_to_string(path).ok()?;
-    let raw: Raw = serde_yaml::from_str(&text).ok()?;
+    let text = std::fs::read_to_string(path).map_err(|_| Skip::Unreadable)?;
+    let raw: Raw = serde_yaml::from_str(&text).map_err(|_| Skip::Unreadable)?;
     let cwd = raw
         .cwd
         .or(raw.git_root)
         .map(PathBuf::from)
-        .filter(|cwd| cwd.as_os_str().len() > 0)?;
-    Some(SessionDetails {
+        .filter(|cwd| cwd.as_os_str().len() > 0)
+        .ok_or(Skip::NoCwd)?;
+    Ok(SessionDetails {
         cwd,
         git_branch: raw.branch.filter(|branch| !branch.trim().is_empty()),
         label: raw
@@ -1839,6 +1929,77 @@ mod tests {
     fn a_missing_store_yields_no_sessions() {
         let dir = tempfile::tempdir().unwrap();
         assert!(collect_recent_sessions(dir.path(), 10).is_empty());
+    }
+
+    #[test]
+    fn scan_stats_say_why_a_session_is_not_listed() {
+        let dir = tempfile::tempdir().unwrap();
+        claude_session(
+            dir.path(),
+            "-repo",
+            "aaaa-0001",
+            &[user_line("/repo", "main", "a session somebody typed into")],
+            4_000,
+        );
+        let headless = serde_json::json!({
+            "type": "user",
+            "cwd": "/repo",
+            "entrypoint": "sdk-cli",
+            "message": { "content": "summarise the observer queue please" },
+        });
+        claude_session(
+            dir.path(),
+            "-repo",
+            "aaaa-0002",
+            &[headless.to_string()],
+            3_000,
+        );
+        claude_session(
+            dir.path(),
+            "-repo",
+            "aaaa-0003",
+            &[title_line("Has a title but no directory")],
+            2_000,
+        );
+        claude_session(
+            dir.path(),
+            "-repo",
+            "aaaa-0004",
+            &["not json".into()],
+            1_500,
+        );
+        // Codex takes its id from inside the file, so only there can a
+        // filename-safe candidate still carry an id argv must never see.
+        let path = dir
+            .path()
+            .join(".codex/sessions/2026/07/03/rollout-2026-07-03T16-25-16-bad.jsonl");
+        let meta = serde_json::json!({
+            "type": "session_meta",
+            "payload": { "session_id": "--dangerously-skip-permissions", "cwd": "/repo" },
+        });
+        write(&path, &format!("{meta}\n"));
+        set_mtime(&path, 1_000);
+
+        let (sessions, stats) = scan_recent_sessions(&[dir.path().to_path_buf()], 10, None);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(
+            stats,
+            SessionScanStats {
+                candidates: 5,
+                listed: 1,
+                headless: 1,
+                no_cwd: 1,
+                unreadable: 1,
+                bad_id: 1,
+                duplicates: 0,
+                reads: 5,
+            }
+        );
+
+        // A rescan with nothing written reads nothing, and still explains
+        // every row it did not list.
+        let (_, again) = scan_recent_sessions(&[dir.path().to_path_buf()], 10, None);
+        assert_eq!(again, SessionScanStats { reads: 0, ..stats });
     }
 
     #[test]

@@ -7,7 +7,7 @@
 //! falls back to the Lua config defaults.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::PathBuf;
 
 /// On-disk shape. Fields are optional so absent keys fall back to config
@@ -35,6 +35,12 @@ struct TgzUiState {
     /// (every project's agents). `None` falls back to the current-project view.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     agent_section_view: Option<String>,
+
+    /// WSL distros agents have run in (Windows only). The resume menus keep
+    /// scanning these after their last pane closes, and after a restart, so a
+    /// finished session stays listed. See `wsl_paths::remember_session_distros`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    wsl_session_distros: Option<Vec<String>>,
 }
 
 fn state_path() -> PathBuf {
@@ -117,6 +123,19 @@ pub fn save_agent_section_view(value: crate::agent_herd::HerdView) {
         crate::agent_herd::HerdView::CurrentProject => "current".to_string(),
         crate::agent_herd::HerdView::AllGrouped => "all".to_string(),
     });
+    write_state(&state);
+}
+
+/// Persisted WSL distros agents have run in; empty when unset.
+pub fn load_wsl_session_distros() -> Vec<String> {
+    read_state().wsl_session_distros.unwrap_or_default()
+}
+
+/// Persist the WSL distros agents have run in. Best-effort.
+pub fn save_wsl_session_distros(distros: &BTreeSet<String>) {
+    let mut state = read_state();
+    // A `BTreeSet` iterates sorted, so the file stays stable across writes.
+    state.wsl_session_distros = Some(distros.iter().cloned().collect());
     write_state(&state);
 }
 
@@ -302,12 +321,31 @@ mod tests {
             sidebar_expanded_tabs: Some(vec![0, 2]),
             agent_section_collapsed: None,
             agent_section_view: None,
+            wsl_session_distros: Some(vec!["Ubuntu".into()]),
         };
         let json = serde_json::to_string_pretty(&state).unwrap();
         let parsed: TgzUiState = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.sidebar_auto_hide, Some(false));
         assert_eq!(parsed.agent_launcher_project_root, Some(true));
         assert_eq!(parsed.sidebar_expanded_tabs, Some(vec![0, 2]));
+        assert_eq!(parsed.wsl_session_distros, Some(vec!["Ubuntu".into()]));
+    }
+
+    #[test]
+    fn json_round_trip_preserves_wsl_session_distros() {
+        let state = TgzUiState {
+            wsl_session_distros: Some(vec!["Debian".into(), "Ubuntu-24.04".into()]),
+            ..TgzUiState::default()
+        };
+        let json = serde_json::to_string_pretty(&state).unwrap();
+        let parsed: TgzUiState = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            parsed.wsl_session_distros,
+            Some(vec!["Debian".into(), "Ubuntu-24.04".into()])
+        );
+        // A file written before the key existed still parses.
+        let old: TgzUiState = serde_json::from_str(r#"{"sidebar_auto_hide":true}"#).unwrap();
+        assert_eq!(old.wsl_session_distros, None);
     }
 
     #[test]
@@ -339,6 +377,7 @@ mod tests {
             sidebar_expanded_tabs: Some(vec![0]),
             agent_section_collapsed: None,
             agent_section_view: None,
+            wsl_session_distros: Some(vec!["Ubuntu".into()]),
         });
         assert_eq!(overrides, Value::Null);
     }
