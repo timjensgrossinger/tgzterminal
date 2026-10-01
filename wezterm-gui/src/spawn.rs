@@ -3,6 +3,7 @@ use config::keyassignment::SpawnCommand;
 use config::TermConfig;
 use mux::activity::Activity;
 use mux::domain::SplitSource;
+use mux::pane::SpawnTitlePolicy;
 use mux::tab::SplitRequest;
 use mux::window::WindowId as MuxWindowId;
 use mux::Mux;
@@ -24,11 +25,38 @@ pub fn spawn_command_impl(
     src_window_id: Option<MuxWindowId>,
     term_config: Arc<TermConfig>,
 ) {
+    spawn_command_impl_with_title(
+        spawn,
+        spawn_where,
+        size,
+        src_window_id,
+        term_config,
+        SpawnTitlePolicy::ShimFallback,
+    )
+}
+
+/// [`spawn_command_impl`], with the policy the spawn's label is recorded
+/// under (see [`SpawnTitlePolicy`]).
+pub fn spawn_command_impl_with_title(
+    spawn: &SpawnCommand,
+    spawn_where: SpawnWhere,
+    size: TerminalSize,
+    src_window_id: Option<MuxWindowId>,
+    term_config: Arc<TermConfig>,
+    title_policy: SpawnTitlePolicy,
+) {
     let spawn = spawn.clone();
 
     promise::spawn::spawn(async move {
-        if let Err(err) =
-            spawn_command_internal(spawn, spawn_where, size, src_window_id, term_config).await
+        if let Err(err) = spawn_command_internal_with_title(
+            spawn,
+            spawn_where,
+            size,
+            src_window_id,
+            term_config,
+            title_policy,
+        )
+        .await
         {
             log::error!("Failed to spawn: {:#}", err);
             wezterm_toast_notification::show(wezterm_toast_notification::ToastNotification {
@@ -93,6 +121,29 @@ pub async fn spawn_command_internal(
     src_window_id: Option<MuxWindowId>,
     term_config: Arc<TermConfig>,
 ) -> anyhow::Result<()> {
+    spawn_command_internal_with_title(
+        spawn,
+        spawn_where,
+        size,
+        src_window_id,
+        term_config,
+        SpawnTitlePolicy::ShimFallback,
+    )
+    .await
+}
+
+/// [`spawn_command_internal`], with the policy the spawn's label is recorded
+/// under. Every labelled spawn records its label; only the agent launcher asks
+/// for [`SpawnTitlePolicy::WhileForeground`], so a `launch_menu` label never
+/// replaces a tab's process name.
+pub async fn spawn_command_internal_with_title(
+    spawn: SpawnCommand,
+    spawn_where: SpawnWhere,
+    size: TerminalSize,
+    src_window_id: Option<MuxWindowId>,
+    term_config: Arc<TermConfig>,
+    title_policy: SpawnTitlePolicy,
+) -> anyhow::Result<()> {
     let mux = Mux::get();
     let activity = Activity::new();
 
@@ -139,7 +190,7 @@ pub async fn spawn_command_internal(
                 // The label names the pane when the process tree cannot
                 // (a WSL pane's foreground process is always the wslhost shim).
                 if let Some(label) = spawn.label.as_deref() {
-                    pane.set_spawn_title(label);
+                    pane.set_spawn_title(label, title_policy);
                 }
                 pane.set_config(term_config);
             } else {
@@ -171,7 +222,7 @@ pub async fn spawn_command_internal(
                 // The label names the pane when the process tree cannot
                 // (a WSL pane's foreground process is always the wslhost shim).
                 if let Some(label) = spawn.label.as_deref() {
-                    pane.set_spawn_title(label);
+                    pane.set_spawn_title(label, title_policy);
                 }
                 pane.set_config(term_config);
             }

@@ -352,7 +352,7 @@ Each adapter accepts `enabled`, `label`, `short_label`, `color`,
 `waiting_patterns`, `waiting_when_quiet`, `chrome_patterns`,
 `strip_patterns`, and `model_patterns`. It may also accept action templates:
 `resume_command`, `resume_latest_command`, `attach_command`, `detail_paths`,
-`launch_command`, and `launch_domain`. Pattern entries
+`launch_command`, `launch_domain`, and `tab_title`. Pattern entries
 are literal case-insensitive fragments by default. Entries prefixed with `re:`
 are treated as regexes, but long or invalid regexes are ignored to keep passive
 detection bounded. Built-in detection defaults cover Claude, Codex, Gemini,
@@ -366,6 +366,13 @@ OpenCode draws no glyph or placeholder in-session — and is only honoured when
 the pane's identity is strong (user variable, process name, title phrase or
 visible chrome match). A pane that merely *displays* adapter-related text
 never qualifies, and a plain shell is never affected.
+
+`tab_title` names the tab of an agent the launcher starts (default
+`"<Label> agent"`, e.g. `"Codex agent"`). It shows for as long as the agent is
+the pane's foreground process and has not set a title of its own, on every
+platform — Claude Code sets one almost at once, Codex and others often never
+do. A program the agent runs in the foreground (an editor, say) shows its own
+name meanwhile.
 
 Action templates are argv/path arrays expanded only when the user clicks a
 toolbelt action. Supported variables are `{session_id}`, `{cwd}`, `{home}`,
@@ -739,7 +746,9 @@ a resumed session whose relative paths have moved is not much use. Placement
 follows `resume_open_in` (default `"NewTab"`), so a resumed session gets the
 whole tab to itself instead of splitting whatever pane is active; set
 `resume_open_in = "SplitPane"` for the old behavior, and the Alt-click
-inversion still swaps between the two.
+inversion still swaps between the two. The new tab is named after the session
+(its title, else `"<Label> resume"`) until the agent sets a title of its own;
+"Reopen last window" names its tabs the same way.
 
 Each row reads `project · description`, prefixed with `[branch]` when the session
 was not on `main`/`master`. The description is Claude Code's own generated
@@ -862,7 +871,8 @@ agent_ui = {
   adapters = {
     -- keep one agent on the Windows side
     codex = { launch_domain = 'local' },
-    -- name the tab title an adapter's panes get
+    -- name the tab an adapter's panes get (all platforms; a WSL pane's
+    -- process tree only shows the wslhost shim, so this is what it reads)
     claude = { tab_title = 'Claude' },
   },
 }

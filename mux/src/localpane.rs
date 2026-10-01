@@ -1,7 +1,7 @@
 use crate::domain::DomainId;
 use crate::pane::{
     CachePolicy, CloseReason, ForEachPaneLogicalLine, LogicalLine, Pane, PaneId, Pattern,
-    SearchResult, WithPaneLines,
+    SearchResult, SpawnTitlePolicy, WithPaneLines,
 };
 use crate::renderable::*;
 use crate::tmux::{TmuxDomain, TmuxDomainState};
@@ -66,6 +66,38 @@ fn process_is_wsl_host_shim(proc: &LocalProcessInfo) -> bool {
     {
         Some(name) => is_wsl_host_shim(name),
         None => is_wsl_host_shim(&proc.name),
+    }
+}
+
+/// The title of a pane whose terminal title is still the default, from the
+/// foreground process (`proc_name`, its executable path) and the spawn-time
+/// title.
+///
+/// A [`SpawnTitlePolicy::WhileForeground`] title names the pane for as long as
+/// the spawned process is in the foreground, on every platform: that is how an
+/// agent tab reads as its session or adapter title instead of `codex` or
+/// `node`. Otherwise the process basename wins, except over a WSL host shim,
+/// which names nothing the user cares about. `None` keeps the default title.
+fn default_pane_title(
+    proc_name: Option<&str>,
+    spawn_title: Option<&(String, SpawnTitlePolicy)>,
+    spawned_is_foreground: bool,
+) -> Option<String> {
+    if let Some((title, SpawnTitlePolicy::WhileForeground)) = spawn_title {
+        if spawned_is_foreground {
+            return Some(title.clone());
+        }
+    }
+    let spawn_title = spawn_title.map(|(title, _)| title.clone());
+    // Both separators, as in `process_is_wsl_host_shim`: `Path::file_name` on
+    // a non-Windows host treats `C:\...\wsl.exe` as a single component.
+    match proc_name
+        .and_then(|path| path.rsplit(['/', '\\']).next())
+        .filter(|name| !name.is_empty())
+    {
+        Some(name) if is_wsl_host_shim(name) => spawn_title,
+        Some(name) => Some(name.to_string()),
+        None => spawn_title,
     }
 }
 
@@ -211,7 +243,9 @@ pub struct LocalPane {
     /// distro: the Windows snapshot only sees the host shim (`wslhost.exe`),
     /// so a WSL-hosted agent pane used to be titled after it. The spawn-time
     /// label is the honest substitute until the child sets an OSC title.
-    spawn_title: Mutex<Option<String>>,
+    /// The policy says whether it also outranks an ordinary process name;
+    /// see [`default_pane_title`].
+    spawn_title: Mutex<Option<(String, SpawnTitlePolicy)>>,
 }
 
 #[async_trait(?Send)]
@@ -531,32 +565,24 @@ impl Pane for LocalPane {
         // things up a bit by returning the process basename instead
         if title == "wezterm" {
             let spawn_title = self.spawn_title.lock().clone();
-            if let Some(proc_name) = self.get_foreground_process_name(CachePolicy::AllowStale) {
-                let proc_name = std::path::Path::new(&proc_name);
-                if let Some(name) = proc_name.file_name() {
-                    let name = name.to_string_lossy().to_string();
-                    // A WSL pane's foreground process is always the Windows
-                    // host shim, which names nothing the user cares about;
-                    // prefer the spawn-time label before showing it.
-                    if is_wsl_host_shim(&name) {
-                        if let Some(spawn_title) = spawn_title.as_ref() {
-                            return spawn_title.clone();
-                        }
-                    } else {
-                        return name.to_string();
-                    }
-                }
-            }
-            if let Some(spawn_title) = spawn_title.as_ref() {
-                return spawn_title.clone();
+            let spawned_is_foreground =
+                matches!(spawn_title, Some((_, SpawnTitlePolicy::WhileForeground)))
+                    && self.spawned_process_is_foreground();
+            let proc_name = self.get_foreground_process_name(CachePolicy::AllowStale);
+            if let Some(name) = default_pane_title(
+                proc_name.as_deref(),
+                spawn_title.as_ref(),
+                spawned_is_foreground,
+            ) {
+                return name;
             }
         }
 
         title
     }
 
-    fn set_spawn_title(&self, title: &str) {
-        *self.spawn_title.lock() = Some(title.to_string());
+    fn set_spawn_title(&self, title: &str, policy: SpawnTitlePolicy) {
+        *self.spawn_title.lock() = Some((title.to_string(), policy));
     }
 
     fn get_progress(&self) -> Progress {
@@ -1222,6 +1248,32 @@ impl LocalPane {
             None
         }
     }
+
+    /// Whether the process this pane spawned is the one in the foreground: on
+    /// unix the terminal's foreground process group is the child's own, on
+    /// Windows the inferred foreground process is the child itself. Cached
+    /// reads only, because `get_title` runs for every tab on every frame.
+    fn spawned_process_is_foreground(&self) -> bool {
+        let child = match &*self.process.lock() {
+            ProcessState::Running { pid: Some(pid), .. } => *pid,
+            _ => return false,
+        };
+
+        #[cfg(unix)]
+        {
+            return self.get_leader(CachePolicy::AllowStale).pid == child;
+        }
+
+        #[cfg(windows)]
+        {
+            return self
+                .divine_foreground_process(CachePolicy::AllowStale)
+                .is_some_and(|fg| fg.pid == child);
+        }
+
+        #[allow(unreachable_code)]
+        false
+    }
 }
 
 impl Drop for LocalPane {
@@ -1310,5 +1362,65 @@ mod tests {
             10,
             vec![]
         )));
+    }
+
+    fn spawn_title(title: &str, policy: SpawnTitlePolicy) -> Option<(String, SpawnTitlePolicy)> {
+        Some((title.to_string(), policy))
+    }
+
+    #[test]
+    fn an_agent_title_names_the_pane_while_the_agent_is_foreground() {
+        let agent = spawn_title("What is Rust", SpawnTitlePolicy::WhileForeground);
+        assert_eq!(
+            default_pane_title(Some("/opt/homebrew/bin/codex"), agent.as_ref(), true),
+            Some("What is Rust".to_string())
+        );
+        // The agent ran a foreground child: that child is what the pane shows.
+        assert_eq!(
+            default_pane_title(Some("/usr/bin/vim"), agent.as_ref(), false),
+            Some("vim".to_string())
+        );
+    }
+
+    #[test]
+    fn a_fallback_title_never_replaces_a_process_name() {
+        // An upstream launch_menu label: the process name keeps winning, even
+        // while the spawned shell is itself the foreground.
+        let label = spawn_title("Dev shell", SpawnTitlePolicy::ShimFallback);
+        assert_eq!(
+            default_pane_title(Some("/bin/zsh"), label.as_ref(), true),
+            Some("zsh".to_string())
+        );
+        assert_eq!(
+            default_pane_title(Some(r"C:\Windows\System32\cmd.exe"), label.as_ref(), true),
+            Some("cmd.exe".to_string())
+        );
+    }
+
+    #[test]
+    fn a_spawn_title_stands_in_for_a_wsl_shim_or_no_process() {
+        let label = spawn_title("Claude agent", SpawnTitlePolicy::ShimFallback);
+        assert_eq!(
+            default_pane_title(
+                Some(r"C:\Windows\System32\wslhost.exe"),
+                label.as_ref(),
+                false
+            ),
+            Some("Claude agent".to_string())
+        );
+        assert_eq!(
+            default_pane_title(None, label.as_ref(), false),
+            Some("Claude agent".to_string())
+        );
+        // Without a spawn title a shim names nothing: keep the default title.
+        assert_eq!(
+            default_pane_title(Some(r"C:\Windows\System32\wslhost.exe"), None, false),
+            None
+        );
+        assert_eq!(
+            default_pane_title(Some("/bin/zsh"), None, false),
+            Some("zsh".to_string())
+        );
+        assert_eq!(default_pane_title(None, None, false), None);
     }
 }

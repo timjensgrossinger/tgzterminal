@@ -30,7 +30,7 @@ use config::{
     TabBarColors,
 };
 use finl_unicode::grapheme_clusters::Graphemes;
-use mux::pane::{CachePolicy, Pane, PaneId};
+use mux::pane::{CachePolicy, Pane, PaneId, SpawnTitlePolicy};
 use mux::renderable::RenderableDimensions;
 use mux::tab::{PositionedPane, SplitDirection};
 use mux::Mux;
@@ -8479,7 +8479,7 @@ impl crate::TermWindow {
             return;
         };
         let label = adapter_label(&adapter, adapter_id);
-        self.spawn_command(
+        self.spawn_command_with_title(
             &SpawnCommand {
                 label: Some(format!("{label} Resume")),
                 args: Some(argv),
@@ -8488,6 +8488,7 @@ impl crate::TermWindow {
                 ..Default::default()
             },
             SpawnWhere::NewTab,
+            SpawnTitlePolicy::WhileForeground,
         );
         self.set_agent_feedback(format!(
             "Started {} resume",
@@ -8544,7 +8545,7 @@ impl crate::TermWindow {
             return;
         };
         let label = adapter_label(&adapter, adapter_id);
-        self.spawn_command(
+        self.spawn_command_with_title(
             &SpawnCommand {
                 label: Some(format!("{label} Attach")),
                 args: Some(argv),
@@ -8553,6 +8554,7 @@ impl crate::TermWindow {
                 ..Default::default()
             },
             SpawnWhere::NewTab,
+            SpawnTitlePolicy::WhileForeground,
         );
         self.set_agent_feedback(format!(
             "Started {} attach",

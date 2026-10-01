@@ -120,6 +120,23 @@ pub enum CloseReason {
     Pane,
 }
 
+/// When a spawn-time title (see [`Pane::set_spawn_title`]) may name a pane
+/// that has not set a title of its own.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SpawnTitlePolicy {
+    /// Only when the process tree names nothing useful: the foreground process
+    /// is a WSL host shim, or cannot be determined. Every labelled spawn gets
+    /// this, so an upstream `launch_menu` label never replaces a tab's
+    /// process name.
+    ShimFallback,
+    /// Also over the foreground process name, for as long as the process the
+    /// pane spawned is itself the foreground. Agent launches use it so a tab
+    /// reads as its session or adapter title rather than `codex` or `node`;
+    /// once the agent runs a foreground child (an editor, say), that child's
+    /// name shows as usual.
+    WhileForeground,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct LogicalLine {
     pub physical_lines: Vec<Line>,
@@ -238,9 +255,9 @@ pub trait Pane: Downcast + Send + Sync {
 
     fn get_title(&self) -> String;
     /// Record a spawn-time title for this pane, e.g. the human label behind a
-    /// `SpawnCommand::label`. Only local panes can hold it; remote panes take
-    /// the default no-op.
-    fn set_spawn_title(&self, _title: &str) {}
+    /// `SpawnCommand::label`, and when it may stand in for the process name.
+    /// Only local panes can hold it; remote panes take the default no-op.
+    fn set_spawn_title(&self, _title: &str, _policy: SpawnTitlePolicy) {}
     fn get_progress(&self) -> Progress {
         Progress::None
     }

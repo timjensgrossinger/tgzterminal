@@ -15,7 +15,7 @@ use anyhow::{anyhow, Context};
 use config::keyassignment::SpawnCommand;
 use config::{AgentLaunchTarget, AgentTilePolicy, TermConfig};
 use mux::domain::SplitSource;
-use mux::pane::PaneId;
+use mux::pane::{PaneId, SpawnTitlePolicy};
 use mux::tab::{SplitDirection, SplitRequest, SplitSize as MuxSplitSize};
 use mux::Mux;
 use std::sync::Arc;
@@ -242,10 +242,11 @@ async fn split_and_maybe_zoom(
         .context("split_pane")?;
     pane.set_config(term_config);
 
-    // The label names the pane when the process tree cannot (a WSL pane's
+    // The label names the pane while the agent is its foreground process, on
+    // every platform -- and when the process tree cannot (a WSL pane's
     // foreground process is always the wslhost shim).
     if let Some(label) = spawn.label.as_deref() {
-        pane.set_spawn_title(label);
+        pane.set_spawn_title(label, SpawnTitlePolicy::WhileForeground);
     }
 
     if zoom {
@@ -265,7 +266,13 @@ impl super::TermWindow {
     pub(crate) fn spawn_agent(&self, spawn: SpawnCommand, placement: AgentPlacement) {
         match placement {
             AgentPlacement::NewTab => {
-                self.spawn_command(&spawn, SpawnWhere::NewTab);
+                // The label (adapter `tab_title`, or the session title for a
+                // resume) names the tab while the agent is its foreground.
+                self.spawn_command_with_title(
+                    &spawn,
+                    SpawnWhere::NewTab,
+                    SpawnTitlePolicy::WhileForeground,
+                );
             }
             AgentPlacement::Split {
                 pane_id,
@@ -308,12 +315,13 @@ impl super::TermWindow {
             let mut restored = 0usize;
             let mut failed = 0usize;
             for spawn in spawns {
-                match crate::spawn::spawn_command_internal(
+                match crate::spawn::spawn_command_internal_with_title(
                     spawn,
                     SpawnWhere::NewTab,
                     size,
                     Some(window_id),
                     term_config.clone(),
+                    SpawnTitlePolicy::WhileForeground,
                 )
                 .await
                 {
