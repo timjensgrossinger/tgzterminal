@@ -1219,6 +1219,120 @@ Note: because bound key assignments are handled before the strip, a bound
 clipboard-paste shortcut still pastes into the pane rather than the strip while
 the strip is focused; use the overlay composer if you need paste-into-buffer.
 
+## Changes Panel (diffs beside a pane)
+
+```lua
+config.diff_panel = {
+  enabled = true,
+  position = "Right",      -- or "Left"
+  raised_mode = "Float",   -- or "Auto", "Reserve"
+  width_px = 840,
+  snap_px = 56,
+  refresh_ms = 2000,
+  max_file_bytes = 1048576,
+  snapshot_max_files = 5000,
+}
+```
+
+The Changes panel lists the working-copy changes for the active pane's
+directory: one folding section per file, with added and removed lines and both
+line numbers. It reads the directory, not the agent, so it works with any agent
+and with a plain shell.
+
+It is hidden until switched on for a pane, with the **Changes** button on an
+agent pane's toolbelt or the `ToggleDiffPanel` action (also in the command
+palette as "Toggle Changes Panel"). There is no default key binding:
+
+```lua
+config.keys = {
+  { key = "g", mods = "CTRL|SHIFT", action = wezterm.action.ToggleDiffPanel },
+}
+```
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `true` | Offer the panel at all. `false` removes the toolbelt button and makes `ToggleDiffPanel` do nothing. |
+| `position` | `"Right"` | Which side of the terminal area the panel docks to. With the sidebar on the same side, the panel sits inside it. |
+| `raised_mode` | `"Float"` | What a panel shorter than the pane does to the terminal; see below. |
+| `width_px` | `840` | Initial width, calibrated for a 2x display like `sidebar_width_px`. A drag overrides it. |
+| `snap_px` | `56` | How close (at 2x) the dragged bottom edge must come to the bottom, or to the docked input strip, to snap onto it. |
+| `refresh_ms` | `2000` | How often the visible panel re-reads the directory. A tree that is slow to diff is re-read less often than this. |
+| `max_file_bytes` | `1048576` | Files larger than this are listed without a diff. |
+| `snapshot_max_files` | `5000` | Most files a snapshot baseline may record (see "No version control"). |
+
+### Size and position
+
+Drag the edge facing the terminal to change the width, the bottom edge to
+change the height, or the corner between them for both. The size is remembered
+across restarts. While dragging, the terminal keeps its size; it reflows once,
+on release.
+
+A bottom edge released within `snap_px` of the bottom snaps to it, and the
+panel then runs the full height. With the docked input strip showing
+(`rich_input.docked`), the edge also snaps onto the top of the strip.
+
+A panel snapped to the bottom always takes its columns from the terminal, so
+the pane's text reflows beside it like a split. A *raised* panel follows
+`raised_mode`:
+
+- `"Float"` (default): the terminal keeps its full width and the panel floats
+  over its top corner. An agent's own prompt at the bottom spans the window
+  while the panel is raised and narrows when the panel is snapped to the
+  bottom; the output behind a raised panel is covered.
+- `"Auto"`: by size. A panel up to 40% of the height floats; a taller one
+  takes its columns, so the text moves beside it.
+- `"Reserve"`: the panel keeps its columns, so nothing is covered.
+  The space under it stays empty, except that a docked input strip widens to
+  span the terminal and the panel.
+
+Under the header, one line sums up the set: how many files, and how many of
+them were modified, added, deleted, renamed or left in conflict.
+
+Below it is the file index: one chip per changed file, wrapping onto up to
+three rows, each with the file's status, name and line counts. Clicking a chip
+scrolls to that file's diff. When more files changed than fit, a `+N more`
+marker ends the strip: click it to show every file's chip, and `less` to fold
+the index back. The index is hidden when
+only one file changed.
+
+Files are ordered by when they were last written, newest first, so a file an
+agent has just touched rises to the top of both the index and the list. A file
+written in the last 20 seconds carries a dot. If you have scrolled down, your
+place is kept when the order changes.
+
+### Where the changes come from
+
+| Directory | Source | Compared with |
+| --- | --- | --- |
+| Inside a Git repository | `git diff HEAD` plus untracked files | The last commit |
+| Inside a Subversion working copy | `svn status` and `svn diff` | The pristine BASE |
+| Neither | A snapshot taken by the panel | The directory as it was when the panel first opened there |
+
+Git and Subversion are read with their command-line clients, which must be
+installed. Nothing is written to the repository, and Git is run with
+`--no-optional-locks` so it never contends with an agent for the index.
+
+### No version control
+
+With neither Git nor Subversion there is no "before" to compare with, so the
+first time the panel opens in such a directory it records one, and shows what
+changes from then on. **Reset** in the panel header makes the present the new
+baseline.
+
+The baseline honours `.gitignore` and `.ignore` files and skips
+`node_modules`, `target`, `.venv` and similar. It holds a copy of each text
+file up to `max_file_bytes`, kept under `diff-snapshots` in the data directory,
+readable by you alone. Baselines unused for 30 days are removed. A directory
+with more than `snapshot_max_files` files is refused: open the panel in a
+project folder rather than in your home directory.
+
+### Limits
+
+- Panes on an SSH or multiplexer domain show "not available for remote panes
+  yet": the files are not on this machine.
+- Long lines are cut at the panel's edge; there is no horizontal scrolling.
+- At most 4000 diff lines are shown per file.
+
 ## SSH Quick-Launch (mosh / Eternal Terminal)
 
 TGZTerminal adds a standalone sidebar button (below the agent launcher)

@@ -208,6 +208,97 @@ impl Default for PaneToolbeltConfig {
     }
 }
 
+/// Which window edge the diff panel docks to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromDynamic, ToDynamic)]
+pub enum DiffPanelPosition {
+    Left,
+    Right,
+}
+
+impl Default for DiffPanelPosition {
+    fn default() -> Self {
+        Self::Right
+    }
+}
+
+/// What a diff panel that is dragged shorter than the pane does to the
+/// terminal beside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromDynamic, ToDynamic)]
+pub enum DiffPanelRaisedMode {
+    /// The terminal keeps its full width and the panel floats over its top
+    /// corner. Only a panel snapped to the bottom takes columns away.
+    Float,
+    /// The panel always takes its columns from the terminal, so nothing is
+    /// ever covered; the space under a short panel stays empty.
+    Reserve,
+    /// By size: a short panel floats, so the text below it keeps the full
+    /// width; a tall one takes its columns, so the text moves beside it.
+    Auto,
+}
+
+impl Default for DiffPanelRaisedMode {
+    fn default() -> Self {
+        Self::Float
+    }
+}
+
+/// The "Changes" panel: working-copy changes for the active pane's directory.
+#[derive(Debug, Clone, FromDynamic, ToDynamic)]
+pub struct DiffPanelConfig {
+    /// Offer the panel at all (toolbelt button, `ToggleDiffPanel`). The panel
+    /// itself stays hidden until toggled for a pane.
+    #[dynamic(default = "default_true")]
+    pub enabled: bool,
+
+    /// Which side of the terminal area the panel docks to.
+    #[dynamic(default)]
+    pub position: DiffPanelPosition,
+
+    /// Initial panel width in pixels, calibrated for a 2x (Retina) display;
+    /// scales with display density like `sidebar_width_px`. A drag-resize
+    /// overrides it and is remembered across restarts.
+    #[dynamic(default = "default_diff_panel_width_px")]
+    pub width_px: usize,
+
+    /// Behaviour of a panel dragged shorter than the pane.
+    #[dynamic(default)]
+    pub raised_mode: DiffPanelRaisedMode,
+
+    /// How close (in pixels at 2x) the dragged bottom edge must come to the
+    /// bottom, or to the docked input strip, to snap onto it.
+    #[dynamic(default = "default_diff_panel_snap_px")]
+    pub snap_px: usize,
+
+    /// How often the visible panel re-reads the working copy, in
+    /// milliseconds.
+    #[dynamic(default = "default_diff_panel_refresh_ms")]
+    pub refresh_ms: u64,
+
+    /// Files larger than this are listed but not diffed.
+    #[dynamic(default = "default_diff_panel_max_file_bytes")]
+    pub max_file_bytes: usize,
+
+    /// Upper bound on files recorded in a snapshot baseline, used when the
+    /// directory is under neither Git nor Subversion.
+    #[dynamic(default = "default_diff_panel_snapshot_max_files")]
+    pub snapshot_max_files: usize,
+}
+
+impl Default for DiffPanelConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            position: DiffPanelPosition::default(),
+            width_px: default_diff_panel_width_px(),
+            raised_mode: DiffPanelRaisedMode::default(),
+            snap_px: default_diff_panel_snap_px(),
+            refresh_ms: default_diff_panel_refresh_ms(),
+            max_file_bytes: default_diff_panel_max_file_bytes(),
+            snapshot_max_files: default_diff_panel_snapshot_max_files(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, FromDynamic, ToDynamic)]
 pub struct RichInputConfig {
     /// Enable the optional multiline input composer overlay.
@@ -2030,6 +2121,10 @@ pub struct Config {
     #[dynamic(default)]
     pub rich_input: RichInputConfig,
 
+    /// The "Changes" panel showing working-copy diffs beside the active pane.
+    #[dynamic(default)]
+    pub diff_panel: DiffPanelConfig,
+
     #[dynamic(default = "default_true")]
     pub enable_scroll_bar: bool,
 
@@ -3556,6 +3651,26 @@ fn default_rich_input_dock_rows() -> usize {
     3
 }
 
+fn default_diff_panel_width_px() -> usize {
+    840
+}
+
+fn default_diff_panel_snap_px() -> usize {
+    56
+}
+
+fn default_diff_panel_refresh_ms() -> u64 {
+    2000
+}
+
+fn default_diff_panel_max_file_bytes() -> usize {
+    1024 * 1024
+}
+
+fn default_diff_panel_snapshot_max_files() -> usize {
+    5000
+}
+
 fn default_update_interval() -> u64 {
     86400
 }
@@ -4420,6 +4535,16 @@ mod agent_ui_tests {
                 value
             );
         }
+    }
+
+    #[test]
+    fn diff_panel_defaults_to_a_floating_panel_on_the_right() {
+        let config = Config::default_config();
+
+        assert!(config.diff_panel.enabled);
+        assert_eq!(config.diff_panel.position, DiffPanelPosition::Right);
+        assert_eq!(config.diff_panel.raised_mode, DiffPanelRaisedMode::Float);
+        assert_eq!(config.diff_panel.width_px, 840);
     }
 
     #[test]

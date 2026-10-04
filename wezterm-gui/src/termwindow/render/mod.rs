@@ -42,6 +42,7 @@ const SCROLL_BAR_GRAB_SLOP_PX: f32 = 6.;
 
 pub mod borders;
 pub mod corners;
+pub mod diff_panel;
 pub mod draw;
 pub mod fancy_tab_bar;
 pub mod paint;
@@ -413,6 +414,7 @@ impl crate::TermWindow {
             - self.terminal_size.pixel_width as f32
             - padding_left
             - self.sidebar_reserved_width() as f32
+            - self.diff_panel_reserved_width() as f32
             - if self.show_scroll_bar {
                 effective_right_padding(&self.config, h_context) as f32
             } else {
@@ -450,7 +452,7 @@ impl crate::TermWindow {
             };
 
         (
-            padding_left + left_gap + sidebar_left_offset,
+            padding_left + left_gap + sidebar_left_offset + self.diff_panel_left_reserved() as f32,
             padding_top + top_gap,
         )
     }

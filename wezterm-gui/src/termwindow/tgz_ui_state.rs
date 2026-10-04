@@ -41,6 +41,15 @@ struct TgzUiState {
     /// finished session stays listed. See `wsl_paths::remember_session_distros`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     wsl_session_distros: Option<Vec<String>>,
+
+    /// Dragged width of the Changes panel, in physical pixels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    diff_panel_width: Option<usize>,
+
+    /// Dragged height of the Changes panel in physical pixels; 0 means it is
+    /// snapped to the bottom. `None` when the user has never dragged it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    diff_panel_height: Option<usize>,
 }
 
 fn state_path() -> PathBuf {
@@ -144,6 +153,21 @@ pub fn save_sidebar_auto_hide(value: bool) {
     *PERSISTED_SIDEBAR_AUTO_HIDE.lock().unwrap() = Some(Some(value));
     let mut state = read_state();
     state.sidebar_auto_hide = Some(value);
+    write_state(&state);
+}
+
+/// Persisted Changes panel size as `(width, height)`; a height of 0 means
+/// "snapped to the bottom". Either is `None` until the user drags that edge.
+pub fn load_diff_panel_size() -> (Option<usize>, Option<usize>) {
+    let state = read_state();
+    (state.diff_panel_width, state.diff_panel_height)
+}
+
+/// Persist the Changes panel size. Best-effort.
+pub fn save_diff_panel_size(width: Option<usize>, height: Option<usize>) {
+    let mut state = read_state();
+    state.diff_panel_width = width;
+    state.diff_panel_height = height;
     write_state(&state);
 }
 
@@ -322,10 +346,14 @@ mod tests {
             agent_section_collapsed: None,
             agent_section_view: None,
             wsl_session_distros: Some(vec!["Ubuntu".into()]),
+            diff_panel_width: Some(640),
+            diff_panel_height: Some(0),
         };
         let json = serde_json::to_string_pretty(&state).unwrap();
         let parsed: TgzUiState = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.sidebar_auto_hide, Some(false));
+        assert_eq!(parsed.diff_panel_width, Some(640));
+        assert_eq!(parsed.diff_panel_height, Some(0));
         assert_eq!(parsed.agent_launcher_project_root, Some(true));
         assert_eq!(parsed.sidebar_expanded_tabs, Some(vec![0, 2]));
         assert_eq!(parsed.wsl_session_distros, Some(vec!["Ubuntu".into()]));
@@ -378,6 +406,8 @@ mod tests {
             agent_section_collapsed: None,
             agent_section_view: None,
             wsl_session_distros: Some(vec!["Ubuntu".into()]),
+            diff_panel_width: Some(640),
+            diff_panel_height: None,
         });
         assert_eq!(overrides, Value::Null);
     }

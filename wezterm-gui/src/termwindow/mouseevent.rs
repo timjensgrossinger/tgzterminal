@@ -57,9 +57,15 @@ impl super::TermWindow {
             | UIItemType::SidebarCloseTab(_)
             | UIItemType::CloseTabMenuItem { .. }
             | UIItemType::SidebarResize { .. }
+            | UIItemType::DiffPanelResize { .. }
+            | UIItemType::DiffPanelBody
+            | UIItemType::DiffPanelButton(_)
+            | UIItemType::DiffPanelFile { .. }
+            | UIItemType::DiffPanelChip { .. }
             | UIItemType::SidebarSearch
             | UIItemType::SidebarAutoHideToggle
             | UIItemType::SidebarWorktreeButton
+            | UIItemType::SidebarDiffPanelButton
             | UIItemType::SidebarAgentLaunchButton
             | UIItemType::SidebarSessionsButton
             | UIItemType::SidebarAgentMenuItem { .. }
@@ -105,9 +111,15 @@ impl super::TermWindow {
             | UIItemType::SidebarCloseTab(_)
             | UIItemType::CloseTabMenuItem { .. }
             | UIItemType::SidebarResize { .. }
+            | UIItemType::DiffPanelResize { .. }
+            | UIItemType::DiffPanelBody
+            | UIItemType::DiffPanelButton(_)
+            | UIItemType::DiffPanelFile { .. }
+            | UIItemType::DiffPanelChip { .. }
             | UIItemType::SidebarSearch
             | UIItemType::SidebarAutoHideToggle
             | UIItemType::SidebarWorktreeButton
+            | UIItemType::SidebarDiffPanelButton
             | UIItemType::SidebarAgentLaunchButton
             | UIItemType::SidebarSessionsButton
             | UIItemType::SidebarAgentMenuItem { .. }
@@ -223,6 +235,9 @@ impl super::TermWindow {
                         self.pressed_ui_item = None;
                         if matches!(item.item_type, UIItemType::SidebarResize { .. }) {
                             self.finish_sidebar_resize();
+                        }
+                        if matches!(item.item_type, UIItemType::DiffPanelResize { .. }) {
+                            self.finish_diff_panel_resize();
                         }
                         if let Some(tab_idx) = dropped_tab {
                             self.sidebar_drop_flash = Some((tab_idx, Instant::now()));
@@ -588,6 +603,9 @@ impl super::TermWindow {
             UIItemType::SidebarResize { start_width } => {
                 self.drag_sidebar_resize(start_width, start_event, event, context);
             }
+            UIItemType::DiffPanelResize { edge, .. } => {
+                self.drag_diff_panel_resize(edge, item, start_event, event, context);
+            }
             UIItemType::SidebarScrollThumb => {
                 self.drag_sidebar_scroll_thumb(item, start_event, event, context);
             }
@@ -696,6 +714,27 @@ impl super::TermWindow {
             UIItemType::SidebarScrollThumb => {
                 self.mouse_event_sidebar_scroll_thumb(item, event, context);
             }
+            UIItemType::DiffPanelResize { edge, .. } => {
+                self.mouse_event_diff_panel_resize(edge, item, event, context);
+            }
+            UIItemType::DiffPanelBody => {
+                self.mouse_event_diff_panel(None, pane, event, context);
+            }
+            UIItemType::DiffPanelButton(action) => {
+                self.mouse_event_diff_panel(Some(Ok(action)), pane, event, context);
+            }
+            UIItemType::DiffPanelFile { index } => {
+                self.mouse_event_diff_panel(Some(Err(index)), pane, event, context);
+            }
+            UIItemType::DiffPanelChip { index } => {
+                if event.kind == WMEK::Release(MousePress::Left) {
+                    self.pressed_ui_item = None;
+                    self.diff_panel_jump_to_file(pane.pane_id(), index);
+                    context.invalidate();
+                } else {
+                    self.mouse_event_diff_panel(None, pane, event, context);
+                }
+            }
             UIItemType::SidebarResize { .. } => {
                 self.mouse_event_sidebar_resize(item, event, context);
             }
@@ -707,6 +746,13 @@ impl super::TermWindow {
             }
             UIItemType::SidebarWorktreeButton => {
                 self.mouse_event_sidebar_worktree_button(pane, event, context);
+            }
+            UIItemType::SidebarDiffPanelButton => {
+                if event.kind == WMEK::Release(MousePress::Left) {
+                    self.pressed_ui_item = None;
+                    self.toggle_diff_panel_pane(pane.pane_id());
+                }
+                context.invalidate();
             }
             UIItemType::SidebarAgentLaunchButton => {
                 self.mouse_event_sidebar_agent_launch_button(item, event, context);
@@ -1609,6 +1655,9 @@ impl super::TermWindow {
                                 {
                                     self.set_modal(std::rc::Rc::new(modal));
                                 }
+                            }
+                            PaneToolbeltAction::Diff => {
+                                self.toggle_diff_panel_pane(pane.pane_id());
                             }
                             PaneToolbeltAction::DockInput => {
                                 // The toolbelt only renders on agent panes, so

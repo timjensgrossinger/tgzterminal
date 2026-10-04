@@ -168,7 +168,7 @@ impl super::TermWindow {
         } else {
             0.
         };
-        let sidebar_width = self.sidebar_reserved_width();
+        let sidebar_width = self.sidebar_reserved_width() + self.diff_panel_layout_width();
         // Rows reserved at the bottom for the persistent docked input strip.
         let docked_input_height = self.docked_input_pixel_height();
 
@@ -509,7 +509,7 @@ impl super::TermWindow {
             0
         };
         let docked_input_height = self.docked_input_pixel_height() as usize;
-        let sidebar_width = self.sidebar_reserved_width();
+        let sidebar_width = self.sidebar_reserved_width() + self.diff_panel_layout_width();
 
         let h_context = DimensionContext {
             dpi: self.dimensions.dpi as f32,

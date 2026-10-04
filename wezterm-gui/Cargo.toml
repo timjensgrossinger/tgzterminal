@@ -56,6 +56,7 @@ futures.workspace = true
 hdrhistogram.workspace = true
 hostname.workspace = true
 http_req.workspace = true
+ignore.workspace = true
 image.workspace = true
 lazy_static.workspace = true
 lfucache.workspace = true
@@ -84,7 +85,9 @@ rusqlite = {workspace=true, features = ["bundled"]}
 serde = {workspace=true, features = ["rc", "derive"]}
 serde_json.workspace = true
 serde_yaml.workspace = true
+sha2.workspace = true
 shlex.workspace = true
+similar.workspace = true
 smol.workspace = true
 tabout.workspace = true
 tempfile.workspace = true

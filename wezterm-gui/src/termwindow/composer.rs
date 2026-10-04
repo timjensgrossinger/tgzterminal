@@ -1011,7 +1011,10 @@ impl TermWindow {
         let dimensions = self.dimensions;
         let (padding_left, padding_top) = self.padding_left_top();
         let border = self.get_os_border();
-        let avail_pixel_width = self.terminal_size.cols as f32 * cell_w;
+        // A Changes panel that stops above the strip hands its width to it.
+        let (strip_shift, strip_extra) = self.diff_panel_strip_extra();
+        let padding_left = padding_left - strip_shift;
+        let avail_pixel_width = self.terminal_size.cols as f32 * cell_w + strip_extra;
 
         let bottom_bar_height =
             if self.show_tab_bar && !self.sidebar_is_active() && self.config.tab_bar_at_bottom {

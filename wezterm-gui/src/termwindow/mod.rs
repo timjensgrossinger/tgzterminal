@@ -391,6 +391,28 @@ pub enum TermWindowNotif {
     },
 }
 
+/// Which edge of the Changes panel a drag is moving.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiffPanelEdge {
+    /// The edge facing the terminal: changes the width.
+    Width,
+    /// The bottom edge: changes the height.
+    Height,
+    /// The corner where the two meet: changes both.
+    Corner,
+}
+
+/// A button in the Changes panel's header.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiffPanelAction {
+    Close,
+    Refresh,
+    /// Snapshot source only: make the directory as it is now the baseline.
+    ResetBaseline,
+    /// Show every file's chip in the index, or go back to the first rows.
+    ToggleChips,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PaneToolbeltAction {
     Interrupt,
@@ -398,6 +420,8 @@ pub enum PaneToolbeltAction {
     Compose,
     /// Toggle the persistent docked input strip for this (agent) pane.
     DockInput,
+    /// Show or hide the Changes panel for this pane.
+    Diff,
     Attach,
     Resume,
     OpenLogs,
@@ -474,9 +498,31 @@ pub enum UIItemType {
     SidebarResize {
         start_width: usize,
     },
+    /// A draggable edge of the Changes panel. `start_reserved` is the width
+    /// the terminal had given up when the drag began; layout keeps using it
+    /// until release so the pane reflows once rather than per pixel.
+    DiffPanelResize {
+        edge: DiffPanelEdge,
+        start_reserved: usize,
+    },
+    /// The Changes panel's surface: swallows clicks and the wheel so they do
+    /// not reach the pane a floating panel covers.
+    DiffPanelBody,
+    DiffPanelButton(DiffPanelAction),
+    /// A file's header row in the Changes panel: click to fold its diff.
+    DiffPanelFile {
+        index: usize,
+    },
+    /// A file's chip in the Changes panel's index: click to jump to its diff.
+    DiffPanelChip {
+        index: usize,
+    },
     SidebarSearch,
     SidebarAutoHideToggle,
     SidebarWorktreeButton,
+    /// Square button beside Worktree: shows or hides the Changes panel for
+    /// the active pane.
+    SidebarDiffPanelButton,
     /// Sidebar button that starts a fresh agent session.
     SidebarAgentLaunchButton,
     /// A single agent row in the launch dropdown.
@@ -1214,6 +1260,9 @@ pub struct TermWindow {
     /// Persistent Warp-style docked input strip state (rich_input.docked).
     docked_input: crate::termwindow::composer::DockedInput,
 
+    /// The Changes (diff) panel: which panes show it, and its dragged size.
+    diff_panel: crate::termwindow::render::diff_panel::DiffPanelState,
+
     event_states: HashMap<String, EventState>,
     pub current_event: Option<Value>,
     has_animation: RefCell<Option<Instant>>,
@@ -1578,6 +1627,7 @@ impl TermWindow {
                 .map(Arc::new),
             composer_history: RefCell::new(Vec::new()),
             docked_input: crate::termwindow::composer::DockedInput::new(),
+            diff_panel: crate::termwindow::render::diff_panel::DiffPanelState::load(),
             sidebar_scroll_offset: 0,
             sidebar_drop_flash: None,
             sidebar_expanded_tabs: tgz_ui_state::load_sidebar_expanded_tabs().unwrap_or_default(),
@@ -5581,6 +5631,9 @@ done
             }
             ToggleDockedInput => {
                 self.toggle_docked_input();
+            }
+            ToggleDiffPanel => {
+                self.toggle_diff_panel_pane(pane.pane_id());
             }
             PromptInputLine(args) => self.show_prompt_input_line(args),
             InputSelector(args) => self.show_input_selector(args),

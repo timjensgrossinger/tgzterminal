@@ -52,7 +52,7 @@ use window::{MousePress, RectF, WindowOps};
 
 const INSET: f32 = 8.;
 const GAP: f32 = 4.;
-const PAD_X: f32 = 10.;
+pub(crate) const PAD_X: f32 = 10.;
 const ACTIVE_RAIL_W: f32 = 3.;
 const ACTIVE_TEXT_GAP: f32 = 7.;
 /// Horizontal step a pane row is inset from its parent tab row.
@@ -61,7 +61,7 @@ const PANE_ROW_INDENT: f32 = 14.;
 const CHEVRON_GAP: f32 = 4.;
 const ACTION_ICON_W: f32 = 16.;
 const ACTION_ICON_GAP: f32 = 8.;
-const RADIUS: f32 = 10.;
+pub(crate) const RADIUS: f32 = 10.;
 /// Corner radius of the working-agent throbber ring. One step outside
 /// [`RADIUS`] so the ring reads as sitting around the row rather than on it.
 const RING_RADIUS: f32 = 11.;
@@ -96,7 +96,7 @@ const WSL_AGENT_PROBE_WATCHDOG: Duration = Duration::from_secs(150);
 const AUTO_HIDE_RESIZE_GRIP_W: usize = 8;
 const MIN_AUTO_HIDE_RAIL_W: usize = 48;
 const PANE_TOOLBELT_H: f32 = 32.;
-const FLOAT_GAP: f32 = 6.;
+pub(crate) const FLOAT_GAP: f32 = 6.;
 const PANE_TOOLBELT_MIN_BUTTON_W: f32 = 88.;
 const PANE_TOOLBELT_BUTTON_PAD_X: f32 = 24.;
 const PANE_TOOLBELT_DOT_SIZE: f32 = 7.;
@@ -285,7 +285,7 @@ lazy_static::lazy_static! {
         Mutex::new(HashMap::new());
 }
 
-fn lerp_rgba(a: LinearRgba, b: LinearRgba, t: f32) -> LinearRgba {
+pub(crate) fn lerp_rgba(a: LinearRgba, b: LinearRgba, t: f32) -> LinearRgba {
     LinearRgba(
         a.0 + (b.0 - a.0) * t,
         a.1 + (b.1 - a.1) * t,
@@ -416,20 +416,20 @@ enum AgentRowRing {
 /// keeps deriving from it exactly as it did before; only the unconfigured case
 /// picks up the fork's near-black scheme.
 #[derive(Clone, Copy, Debug)]
-struct SidebarPalette {
-    surface: LinearRgba,
-    row_fill: LinearRgba,
-    row_border: LinearRgba,
-    active_fill: LinearRgba,
-    hover_fill: LinearRgba,
-    pressed_fill: LinearRgba,
+pub(crate) struct SidebarPalette {
+    pub(crate) surface: LinearRgba,
+    pub(crate) row_fill: LinearRgba,
+    pub(crate) row_border: LinearRgba,
+    pub(crate) active_fill: LinearRgba,
+    pub(crate) hover_fill: LinearRgba,
+    pub(crate) pressed_fill: LinearRgba,
     search_fill: LinearRgba,
     focused_search_fill: LinearRgba,
-    divider: LinearRgba,
-    menu_border: LinearRgba,
-    text_active: LinearRgba,
-    text_idle: LinearRgba,
-    text_meta: LinearRgba,
+    pub(crate) divider: LinearRgba,
+    pub(crate) menu_border: LinearRgba,
+    pub(crate) text_active: LinearRgba,
+    pub(crate) text_idle: LinearRgba,
+    pub(crate) text_meta: LinearRgba,
     /// Fill behind a row whose agent is working, one shade under `row_fill` so
     /// the throbber ring has something to sit on.
     working_fill: LinearRgba,
@@ -1005,7 +1005,7 @@ fn contrast_ratio(a: f32, b: f32) -> f32 {
 /// ~0.41) a near-white scheme foreground, painting the tab glyph light on
 /// light and all but erasing it. Comparing both candidates' contrast against
 /// the fill has no such blind band — mid-grey now takes the ink.
-fn contrast_label_color(bg: LinearRgba, fg: LinearRgba) -> LinearRgba {
+pub(crate) fn contrast_label_color(bg: LinearRgba, fg: LinearRgba) -> LinearRgba {
     let bg_lum = bg.relative_luminance();
     if contrast_ratio(bg_lum, fg.relative_luminance())
         >= contrast_ratio(bg_lum, LABEL_INK.relative_luminance())
@@ -1912,6 +1912,7 @@ fn pane_toolbelt_button_area(buttons: &[(&str, PaneToolbeltAction, f32)]) -> f32
 const PANE_TOOLBELT_TRIM_ORDER: &[PaneToolbeltAction] = &[
     PaneToolbeltAction::DockInput,
     PaneToolbeltAction::Compose,
+    PaneToolbeltAction::Diff,
     PaneToolbeltAction::OpenLogs,
     PaneToolbeltAction::Attach,
     PaneToolbeltAction::Resume,
@@ -1946,7 +1947,7 @@ fn trim_pane_toolbelt_buttons(buttons: &mut Vec<(&str, PaneToolbeltAction, f32)>
 /// therefore derive its cell count from the same pixel width it passes down.
 /// Returns 0 — draw nothing — for a region narrower than one cell, rather than
 /// forcing a cell that cannot fit.
-fn sidebar_text_cols(pixel_width: f32, cell_width: usize) -> usize {
+pub(crate) fn sidebar_text_cols(pixel_width: f32, cell_width: usize) -> usize {
     if cell_width == 0 || !pixel_width.is_finite() || pixel_width < cell_width as f32 {
         return 0;
     }
@@ -1958,7 +1959,7 @@ fn sidebar_text_cols(pixel_width: f32, cell_width: usize) -> usize {
 /// Column-aware rather than char-aware: `Line::resize` truncates the *cell*
 /// vector, so cutting a double-width grapheme leaves the wide cell as the last
 /// cell and it paints a full cell past the region.
-fn truncate_to_cols(text: &str, cols: usize) -> &str {
+pub(crate) fn truncate_to_cols(text: &str, cols: usize) -> &str {
     if cols == 0 {
         return "";
     }
@@ -9493,7 +9494,7 @@ impl crate::TermWindow {
 
     /// The sidebar's resolved colours. See [`SidebarPalette`] for why this is
     /// not simply `TabBarColors`.
-    fn sidebar_palette(&self) -> SidebarPalette {
+    pub(crate) fn sidebar_palette(&self) -> SidebarPalette {
         let ring = RingColors::resolve(
             self.config.agent_ui.ring_colors,
             &self.config.agent_ui.resolved_animations().colors,
@@ -9821,7 +9822,9 @@ impl crate::TermWindow {
         let pane_x = border.left.get() as f32 + padding_left + pos.left as f32 * cell_w_f;
         let pane_y =
             border.top.get() as f32 + top_bar_height + padding_top + pos.top as f32 * cell_h_f;
-        let pane_w = pos.pixel_width as f32;
+        // A floating Changes panel covers this pane's top corner: keep the
+        // strip, which carries the panel's own toggle, clear of it.
+        let pane_w = self.diff_panel_clear_width(pane_x, pos.pixel_width as f32);
         let pane_h = pos.pixel_height as f32;
         if pane_w < 140. || pane_h < strip_h + FLOAT_GAP * 2. {
             return Ok(());
@@ -9833,7 +9836,7 @@ impl crate::TermWindow {
         };
         let adapter =
             agent.and_then(|agent| self.agent_adapter_config_by_id(agent.adapter_id.as_deref()));
-        let buttons: Vec<(&str, PaneToolbeltAction)> = pane_toolbelt_buttons(
+        let mut buttons: Vec<(&str, PaneToolbeltAction)> = pane_toolbelt_buttons(
             &self.config.agent_ui,
             &kind,
             adapter.as_ref(),
@@ -9842,6 +9845,11 @@ impl crate::TermWindow {
         );
         if buttons.is_empty() {
             return Ok(());
+        }
+        // Appended here rather than in `pane_toolbelt_buttons`: it is not an
+        // agent capability, so it rides on whatever strip the agent earned.
+        if self.config.diff_panel.enabled {
+            buttons.push(("Changes", PaneToolbeltAction::Diff));
         }
 
         let label_fallbacks = &layout.label_fallbacks;
@@ -13018,8 +13026,19 @@ impl crate::TermWindow {
             // Always reserve the agent launcher area even when no adapter is
             // installed: the button opens a dropdown whose "Agent insight" and
             // "Resume session" rows are useful without any adapter.
-            let bottom_row =
+            let mut bottom_row =
                 sidebar_bottom_row_layout(item_x, item_w, content_x, content_w, dot_size, true);
+            // The Changes toggle is a square carved off the Worktree pill's
+            // right end, so the row keeps its height and the launcher its half.
+            let changes_side = row_height as f32;
+            let changes_x = (self.config.diff_panel.enabled
+                && bottom_row.worktree_fill_w > changes_side * 2. + GAP)
+                .then(|| {
+                    bottom_row.worktree_fill_w -= changes_side + GAP;
+                    bottom_row.worktree_text_w =
+                        (bottom_row.worktree_text_w - changes_side - GAP).max(0.);
+                    bottom_row.worktree_fill_x + bottom_row.worktree_fill_w + GAP
+                });
 
             let worktree_type = UIItemType::SidebarWorktreeButton;
             let worktree_hovered = hovered_item.as_ref() == Some(&worktree_type);
@@ -13102,6 +13121,61 @@ impl crate::TermWindow {
                 height: row_height,
                 item_type: worktree_type,
             });
+
+            if let Some(changes_x) = changes_x {
+                let changes_type = UIItemType::SidebarDiffPanelButton;
+                let changes_hovered = hovered_item.as_ref() == Some(&changes_type);
+                let changes_pressed = changes_hovered
+                    && left_pressed
+                    && self.pressed_ui_item.as_ref() == Some(&changes_type);
+                let changes_on = self.diff_panel_shown();
+                let changes_bg = if changes_pressed {
+                    pressed_fill
+                } else if changes_hovered {
+                    hover_fill
+                } else if changes_on {
+                    sb.active_fill
+                } else {
+                    search_fill
+                };
+                let changes_offset = if changes_pressed { 1. } else { 0. };
+                self.sidebar_bordered_fill(
+                    layers,
+                    1,
+                    euclid::rect(
+                        changes_x,
+                        worktree_y + changes_offset,
+                        changes_side,
+                        row_height as f32,
+                    ),
+                    RADIUS * dpi_scale,
+                    dpi_scale.max(1.),
+                    changes_bg,
+                    sb.row_border,
+                )?;
+                render_text(
+                    self,
+                    layers,
+                    "\u{00b1}",
+                    &CellAttributes::default(),
+                    changes_x + (changes_side - cell_width as f32) * 0.5,
+                    worktree_y + changes_offset + (row_height as f32 - cell_height as f32) * 0.5,
+                    cell_width as f32,
+                    if changes_hovered || changes_on {
+                        hover_fg
+                    } else {
+                        inactive_fg.mul_alpha(0.86)
+                    },
+                    changes_bg,
+                )?;
+                self.ui_items.push(UIItem {
+                    x: changes_x as usize,
+                    y: worktree_y as usize,
+                    width: changes_side as usize,
+                    height: row_height,
+                    item_type: changes_type,
+                });
+            }
 
             {
                 let agent_type = UIItemType::SidebarAgentLaunchButton;

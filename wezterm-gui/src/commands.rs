@@ -2104,6 +2104,16 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             menubar: &["Edit"],
             icon: None,
         },
+        ToggleDiffPanel => CommandDef {
+            brief: "Toggle Changes Panel".into(),
+            doc: "Shows or hides the Changes panel, which lists the working-copy \
+                  changes for the active pane's directory"
+                .into(),
+            keys: vec![],
+            args: &[ArgType::ActivePane],
+            menubar: &["View"],
+            icon: None,
+        },
     })
 }
 
@@ -2154,6 +2164,7 @@ fn compute_default_actions() -> Vec<KeyAssignment> {
         ActivateComposer,
         ToggleDockedInput,
         // ----------------- View
+        ToggleDiffPanel,
         DecreaseFontSize,
         IncreaseFontSize,
         ResetFontSize,

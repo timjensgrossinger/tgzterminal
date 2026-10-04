@@ -294,6 +294,11 @@ impl crate::TermWindow {
             self.paint_tab_bar(&mut layers).context("paint_tab_bar")?;
         }
 
+        // Before the menus so they still float above it, after the panes and
+        // the sidebar so a floating panel wins clicks over what it covers.
+        self.paint_diff_panel(&mut layers)
+            .context("paint_diff_panel")?;
+
         // After the sidebar: the launch menu floats above it, and hit testing
         // walks ui_items in reverse, so its rows must be pushed last to win
         // clicks over the sidebar rows underneath.
@@ -349,10 +354,9 @@ impl crate::TermWindow {
             return Ok(());
         };
 
-        let thumb_x = self
-            .dimensions
-            .pixel_width
-            .saturating_sub(padding as usize + border.right.get());
+        let thumb_x = self.dimensions.pixel_width.saturating_sub(
+            padding as usize + border.right.get() + self.diff_panel_right_reserved(),
+        );
         let mouse_over_scrollbar = self.current_mouse_event.as_ref().is_some_and(|event| {
             event.coords.x >= thumb_x as isize
                 && event.coords.x <= (thumb_x + padding as usize + border.right.get()) as isize
@@ -375,8 +379,10 @@ impl crate::TermWindow {
         } else {
             (6. * dpi_scale).clamp(5., 9.)
         };
-        let visual_right =
-            self.dimensions.pixel_width as f32 - border.right.get() as f32 - edge_gap;
+        let visual_right = self.dimensions.pixel_width as f32
+            - border.right.get() as f32
+            - self.diff_panel_right_reserved() as f32
+            - edge_gap;
         let visible_track_x = visual_right - track_width;
         let foreground = self.palette().foreground.to_linear();
         let color = foreground.mul_alpha(if expanded { 0.56 } else { 0.44 });

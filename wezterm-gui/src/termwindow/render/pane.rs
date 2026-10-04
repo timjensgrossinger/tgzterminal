@@ -246,7 +246,7 @@ impl crate::TermWindow {
             let thumb_x = self
                 .dimensions
                 .pixel_width
-                .saturating_sub(padding + border.right.get());
+                .saturating_sub(padding + border.right.get() + self.diff_panel_right_reserved());
             let (hit_top, hit_height) = geometry.thumb_hit();
 
             // Register the scroll bar location

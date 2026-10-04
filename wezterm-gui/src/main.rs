@@ -39,6 +39,7 @@ mod brand;
 mod colorease;
 mod commands;
 mod customglyph;
+mod diff_panel;
 mod download;
 mod frontend;
 mod glyphcache;

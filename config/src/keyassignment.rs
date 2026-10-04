@@ -651,6 +651,8 @@ pub enum KeyAssignment {
     ActivateCommandPalette,
     ActivateComposer,
     ToggleDockedInput,
+    /// Show or hide the Changes (diff) panel for the active pane.
+    ToggleDiffPanel,
     ActivateWindow(usize),
     ActivateWindowRelative(isize),
     ActivateWindowRelativeNoWrap(isize),
