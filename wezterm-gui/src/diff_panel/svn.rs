@@ -42,6 +42,14 @@ fn parse_status(output: &str) -> Vec<(String, SvnState)> {
         .collect()
 }
 
+/// A changed or conflicted property (second status column) with nothing in
+/// the first: `svn diff` still has something to say about it.
+fn has_property_changes(output: &str) -> bool {
+    output
+        .lines()
+        .any(|line| matches!(line.as_bytes(), [b' ', b'M' | b'C', ..]))
+}
+
 pub fn scan(root: &Path, runner: &Runner, limits: Limits) -> Scan {
     let status = match runner.run("svn", &["status"], root) {
         Ok(out) => out,
@@ -61,10 +69,20 @@ pub fn scan(root: &Path, runner: &Runner, limits: Limits) -> Scan {
     }
     let states = parse_status(&status.stdout);
 
+    // Nothing tracked changed: there is no diff to ask for. In a workspace of
+    // many module checkouts most are clean, and this halves what they cost.
+    let tracked_changes = states
+        .iter()
+        .any(|(_, state)| matches!(state, SvnState::Tracked(_)))
+        || has_property_changes(&status.stdout);
     // `--internal-diff`: never hand off to a diff tool the user configured.
-    let diff = match runner.run("svn", &["diff", "--internal-diff"], root) {
-        Ok(out) => out,
-        Err(err) => return Scan::Unavailable(format!("Could not run svn: {err}")),
+    let diff = if tracked_changes {
+        match runner.run("svn", &["diff", "--internal-diff"], root) {
+            Ok(out) => out,
+            Err(err) => return Scan::Unavailable(format!("Could not run svn: {err}")),
+        }
+    } else {
+        super::exec::CommandOutput::default()
     };
     let mut files = unified::parse(&diff.stdout);
     for file in &mut files {
@@ -146,6 +164,12 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_property_change_still_asks_for_the_diff() {
+        assert!(has_property_changes(" M      src/lib\n"));
+        assert!(!has_property_changes("M       src/a.c\n?       new.txt\n"));
+    }
+
+    #[test]
     fn status_columns_are_read_by_position() {
         let output = "\
 M       src/main.c
@@ -218,6 +242,8 @@ I       ignored.o
         let limits = Limits {
             max_file_bytes: 1024 * 1024,
             snapshot_max_files: 1000,
+            nested_max_depth: 3,
+            nested_max_roots: 64,
         };
         let Scan::Changes(set) = scan(&wc, &Runner::host(), limits) else {
             panic!("scan unavailable");

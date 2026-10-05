@@ -269,21 +269,52 @@ fn wsl_session_is_fresh(modified: SystemTime, now: SystemTime) -> bool {
 }
 
 /// Encode a working directory the way Claude Code names its project folders:
-/// separators, colons **and dots** all become dashes.
+/// every character outside `[A-Za-z0-9]` becomes a dash.
 ///
-/// The dot is easy to miss and load-bearing: a home directory like
-/// `/Users/first.last` encodes to `-Users-first-last`, and a reader that keeps
-/// the dot silently resolves nothing for every such user.
-/// `sidebar.rs::encode_claude_project_path` still has that bug — dedupe onto
-/// this function when the concurrent sidebar work lands.
+/// That is Claude's own `replace(/[^a-zA-Z0-9]/g, "-")`, so separators, colons,
+/// dots, underscores, spaces and parentheses all collapse alike. The dot is the
+/// one that bit first: a home like `/Users/first.last` encodes to
+/// `-Users-first-last`, and a reader that keeps the dot resolves nothing for
+/// every such user. The regex runs over UTF-16 code units, so a character
+/// outside the BMP becomes two dashes, not one.
 pub fn encode_project_path(cwd: &Path) -> String {
-    cwd.to_string_lossy()
-        .chars()
-        .map(|ch| match ch {
-            '/' | '\\' | ':' | '.' => '-',
-            _ => ch,
-        })
-        .collect()
+    let mut out = String::new();
+    for ch in cwd.to_string_lossy().chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch);
+        } else {
+            out.extend(std::iter::repeat('-').take(ch.len_utf16()));
+        }
+    }
+    out
+}
+
+/// Longest project folder name Claude writes verbatim; a longer encoding is cut
+/// here and suffixed with a hash of the full path.
+const MAX_PROJECT_DIR_NAME: usize = 200;
+
+/// True when `cwd` is the directory Claude filed the project folder
+/// `dir_name` under.
+///
+/// Claude names the folder after the directory the session was *started* in,
+/// and `claude --resume <id>` only finds a session from that directory: from
+/// anywhere else it answers "This conversation is from a different directory".
+/// So a cwd that fails this test cannot be resumed, whatever the transcript
+/// says.
+///
+/// ASCII case is ignored because a Windows drive letter is recorded as either
+/// `C:` or `c:` depending on how the session was started.
+pub fn project_dir_matches(dir_name: &str, cwd: &Path) -> bool {
+    let encoded = encode_project_path(cwd);
+    if encoded.eq_ignore_ascii_case(dir_name) {
+        return true;
+    }
+    // Truncated + hashed: the hash is not reproducible here without Claude's
+    // hash function, but the 200-character prefix is.
+    encoded.len() > MAX_PROJECT_DIR_NAME
+        && dir_name.len() > MAX_PROJECT_DIR_NAME
+        && dir_name.is_char_boundary(MAX_PROJECT_DIR_NAME)
+        && encoded[..MAX_PROJECT_DIR_NAME].eq_ignore_ascii_case(&dir_name[..MAX_PROJECT_DIR_NAME])
 }
 
 /// Resolve a project's log directory, refusing anything that escapes the
@@ -591,6 +622,43 @@ mod tests {
             encode_project_path(Path::new("/Users/tim.grossinger/.local/lib/TGs-router")),
             "-Users-tim-grossinger--local-lib-TGs-router"
         );
+    }
+
+    #[test]
+    fn every_non_alphanumeric_character_becomes_a_dash() {
+        assert_eq!(
+            encode_project_path(Path::new("/mnt/c/work_space/Service Layer (old)")),
+            "-mnt-c-work-space-Service-Layer--old-"
+        );
+        // One dash per UTF-16 unit, like Claude's JavaScript regex.
+        assert_eq!(encode_project_path(Path::new("/a/ü")), "-a--");
+        assert_eq!(encode_project_path(Path::new("/a/😀")), "-a---");
+    }
+
+    #[test]
+    fn project_dir_match_accepts_only_the_folder_the_session_was_filed_under() {
+        let cwd = Path::new("/mnt/c/ws/ServiceLayerFile");
+        assert!(project_dir_matches("-mnt-c-ws-ServiceLayerFile", cwd));
+        assert!(!project_dir_matches("-mnt-c-ws", cwd));
+        assert!(!project_dir_matches(
+            "-mnt-c-ws-ServiceLayerFile",
+            Path::new("/mnt/c/ws")
+        ));
+        // Drive letter case differs between how sessions were started.
+        assert!(project_dir_matches(
+            "c--src-repo",
+            Path::new("C:\\src\\repo")
+        ));
+    }
+
+    #[test]
+    fn project_dir_match_handles_truncated_long_names() {
+        let long = format!("/{}", "a".repeat(260));
+        let encoded = encode_project_path(Path::new(&long));
+        let dir_name = format!("{}-1a2b3c", &encoded[..MAX_PROJECT_DIR_NAME]);
+        assert!(project_dir_matches(&dir_name, Path::new(&long)));
+        let other = format!("/{}", "b".repeat(260));
+        assert!(!project_dir_matches(&dir_name, Path::new(&other)));
     }
 
     #[test]
@@ -1147,6 +1215,7 @@ impl crate::agent_herd::vendor::SessionSource for ClaudeDetector {
                 let name = session_name(transcript.as_deref(), s.name, s.name_is_derived);
                 crate::agent_herd::vendor::VendorSession {
                     origin: SessionOrigin::Host,
+                    home: None,
                     pane_hint: None,
                     pid: s.pid,
                     interactive: s.interactive,

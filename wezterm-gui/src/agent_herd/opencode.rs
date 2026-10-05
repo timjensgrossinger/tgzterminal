@@ -183,6 +183,7 @@ impl SessionSource for OpenCodeDetector {
                         .unwrap_or(HerdStatus::Unknown);
                     sessions.push(VendorSession {
                         origin: SessionOrigin::Host,
+                        home: None,
                         pane_hint: None,
                         pid,
                         // This store does not distinguish harness-spawned
@@ -370,6 +371,7 @@ fn collect_database_sessions(home: &Path) -> Vec<VendorSession> {
         let activity = opencode_activity(&conn, schema, &session_id);
         Some(VendorSession {
             origin: SessionOrigin::Host,
+            home: None,
             pane_hint: None,
             // OpenCode's current database has no process id. Binding falls back
             // to the unique cwd match, while pane detection still handles live

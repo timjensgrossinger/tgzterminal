@@ -183,6 +183,11 @@ pub struct VendorSession {
     /// read this field -- it is passed the root's origin directly, before a
     /// session is even constructed.
     pub origin: SessionOrigin,
+    /// The home directory the session was found under, in a form this process
+    /// can open (the UNC path for a WSL root). Stamped alongside `origin`; the
+    /// detectors leave it `None`. Needed to find the session's transcript again:
+    /// a WSL session's files are not under this machine's home.
+    pub home: Option<PathBuf>,
     /// The pane this session's process says it runs in, read from its
     /// environment. Only filled for WSL sessions, where the pid lives in the
     /// distro's namespace and cannot be matched against a pane's process tree;
@@ -253,6 +258,7 @@ impl VendorRegistry {
                 for session in &mut sessions {
                     session.vendor = vendor.clone();
                     session.origin = root.origin.clone();
+                    session.home = Some(root.home.clone());
                     if let SessionOrigin::Wsl(_) = root.origin {
                         session.pane_hint =
                             super::wsl_proc::pane_of_process(&root.home, session.pid);

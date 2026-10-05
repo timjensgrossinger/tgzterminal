@@ -1,5 +1,5 @@
 use crate::agent_herd::claude::{self, ProjectDirError as ClaudeLogsPathError};
-use crate::agent_herd::vendor::{AgentVendor, SessionRoot, VendorSession};
+use crate::agent_herd::vendor::{AgentVendor, SessionOrigin, SessionRoot, VendorSession};
 use crate::agent_herd::{
     group_by_project, HerdActivity, HerdAgent, HerdContent, HerdDisplayStatus, HerdEvent,
     HerdEventKind, HerdStatus, HerdView, PaneAgentRow,
@@ -4347,6 +4347,7 @@ fn window_agent_sessions(agents: &[HerdAgent]) -> Vec<(PaneId, SnapshotSession)>
                     session_id,
                     cwd,
                     label: Some(agent.name.clone()),
+                    distro: agent.origin.distro().map(str::to_string),
                 },
             ))
         })
@@ -4493,6 +4494,36 @@ fn spawn_domain_distro(domain: &SpawnTabDomain, config: &config::ConfigHandle) -
         SpawnTabDomain::DomainName(name) => wsl_paths::distro_for_domain(name, config),
         _ => None,
     }
+}
+
+/// Move the start directory of a [`wsl_paths::wsl_exec_argv`] spawn into its
+/// argv as `wsl.exe --cd`, returning the cwd the spawn itself should keep.
+///
+/// That spawn runs on the local domain, whose own cwd cannot carry a Linux
+/// directory: it is not a directory from this process, so the Windows spawn
+/// quietly falls back to the profile directory. The directory goes to `--cd`
+/// in its Windows form (`C:\…`, or the `\\wsl.localhost\` share), the same
+/// form the WSL-domain resume hands `wsl.exe --cd` — a bare Linux path there
+/// was seen to hang it — or as `~` when it has no Windows form. Any other argv
+/// is returned unchanged with its cwd.
+fn wsl_exec_start_dir(argv: &mut Vec<String>, cwd: Option<PathBuf>) -> Option<PathBuf> {
+    let Some(distro) = wsl_paths::wsl_exec_distro(argv).map(str::to_string) else {
+        return cwd;
+    };
+    let dir = cwd
+        .as_ref()
+        .map(|cwd| cwd.to_string_lossy().into_owned())
+        .and_then(|cwd| {
+            if cwd.starts_with('/') {
+                wsl_paths::wsl_to_windows(&cwd, &distro)
+                    .map(|path| path.to_string_lossy().into_owned())
+            } else {
+                Some(cwd)
+            }
+        })
+        .unwrap_or_else(|| wsl_paths::WSL_HOME_CWD.to_string());
+    wsl_paths::set_wsl_exec_cwd(argv, &dir);
+    None
 }
 
 /// The restore row's text, e.g. `"Reopen last session (7 agents, 2 windows)"`.
@@ -6562,9 +6593,34 @@ impl crate::TermWindow {
         if let Some(argv) = resolve_agent_command(command, values) {
             return Some((argv, None));
         }
+        self.resolve_agent_command_in_distro(command, values, None)
+    }
+
+    /// `command` resolved inside a WSL distro that has its program: `distro`
+    /// when given, else whichever distro the probe found it in.
+    fn resolve_agent_command_in_distro(
+        &self,
+        command: Option<&Vec<String>>,
+        values: &AgentActionTemplateValues,
+        distro: Option<&str>,
+    ) -> Option<(Vec<String>, Option<SpawnTabDomain>)> {
         let argv = expand_agent_command(command, values)?;
         let hits = self.wsl_agent_hits();
-        let hit = hits.get(argv.first()?.trim())?;
+        let Some(hit) = hits
+            .get(argv.first()?.trim())
+            .filter(|hit| distro.map_or(true, |distro| hit.distro.eq_ignore_ascii_case(distro)))
+        else {
+            // The probe keeps one distro per program, so a CLI installed in two
+            // distros is only "found" in one of them. A session recorded in the
+            // other is proof enough that its CLI is there too: reach it through
+            // that distro's domain with the login shell the probe would use.
+            let distro = distro?;
+            let domain = self.wsl_domain_name_for_distro(distro)?;
+            return Some((
+                wsl_paths::WslProbeShell::BashInteractive.wrap(argv),
+                Some(SpawnTabDomain::DomainName(domain)),
+            ));
+        };
         let wrapped = hit.shell.wrap(argv);
         Some(match self.wsl_domain_name_for_distro(&hit.distro) {
             Some(domain) => (wrapped, Some(SpawnTabDomain::DomainName(domain))),
@@ -6577,12 +6633,26 @@ impl crate::TermWindow {
         })
     }
 
+    /// The resume command for a session recorded under `origin`.
+    ///
+    /// A session found inside a WSL distro resumes inside that distro even when
+    /// the CLI is also installed on this machine: the host install keeps its
+    /// own session store and has never heard of it. Only when the distro's CLI
+    /// is not (yet) known does it fall back to wherever the CLI is.
     fn resolve_agent_resume_anywhere(
         &self,
         adapter: &AgentAdapterConfig,
         values: &AgentActionTemplateValues,
+        origin: &SessionOrigin,
     ) -> Option<(Vec<String>, Option<SpawnTabDomain>)> {
-        self.resolve_agent_command_anywhere(agent_resume_template(adapter, values), values)
+        let command = agent_resume_template(adapter, values);
+        if let Some(distro) = origin.distro() {
+            if let Some(found) = self.resolve_agent_command_in_distro(command, values, Some(distro))
+            {
+                return Some(found);
+            }
+        }
+        self.resolve_agent_command_anywhere(command, values)
     }
 
     fn resolve_agent_attach_anywhere(
@@ -7020,7 +7090,20 @@ impl crate::TermWindow {
     /// Directory a launched agent should start in, honoring the sticky
     /// project-root toggle and the target domain. `None` means "let the domain
     /// decide".
-    fn agent_launch_cwd(&self, target: &SpawnTabDomain, forced_local: bool) -> Option<PathBuf> {
+    ///
+    /// A launch into a WSL distro starts in the Linux home (`~`, like a new tab
+    /// there) when the source pane's directory says nothing about where the
+    /// user is — see [`wsl_paths::wsl_launch_home`]. `None` would not do that:
+    /// a spawn with an explicit command applies the global `default_cwd`, not
+    /// the WSL domain's `~`, so `wsl.exe` would start in the Windows profile.
+    fn agent_launch_cwd(
+        &self,
+        target: &SpawnTabDomain,
+        forced_local: bool,
+        argv: &[String],
+    ) -> Option<PathBuf> {
+        let target_is_wsl = spawn_domain_distro(target, &self.config).is_some()
+            || wsl_paths::wsl_exec_distro(argv).is_some();
         if forced_local {
             // The active pane's directory names a path on the remote host and
             // means nothing here, so borrow the newest local pane's directory
@@ -7031,6 +7114,12 @@ impl crate::TermWindow {
                 .unwrap_or_else(|| config::HOME_DIR.clone())
                 .to_string_lossy()
                 .into_owned();
+            if target_is_wsl {
+                if let Some(home) = wsl_paths::wsl_launch_home(Some(&raw), false, &config::HOME_DIR)
+                {
+                    return Some(home);
+                }
+            }
             let cwd = if self.agent_launcher_project_root {
                 self.project_root_for(&raw, None)
             } else {
@@ -7039,10 +7128,20 @@ impl crate::TermWindow {
             return Some(cwd);
         }
 
-        let raw = crate::termwindow::composer::active_pane_cwd(self)?;
+        let raw = crate::termwindow::composer::active_pane_cwd(self);
         let source_distro = self
             .active_pane_domain_name()
             .and_then(|name| wsl_paths::distro_for_domain(&name, &self.config));
+        if target_is_wsl {
+            if let Some(home) = wsl_paths::wsl_launch_home(
+                raw.as_deref(),
+                source_distro.is_some(),
+                &config::HOME_DIR,
+            ) {
+                return Some(home);
+            }
+        }
+        let raw = raw?;
 
         let cwd = if self.agent_launcher_project_root {
             // Falls back to the pane directory when the pane is not inside a
@@ -7085,7 +7184,9 @@ impl crate::TermWindow {
         // otherwise inherit the pane directory, ignore project-root mode, and
         // drop the cwd entirely whenever the target domain differs.
         let domain = self.agent_launch_domain(entry, forced_local);
-        let cwd = self.agent_launch_cwd(&domain, forced_local);
+        let cwd = self.agent_launch_cwd(&domain, forced_local, &entry.argv);
+        let mut argv = entry.argv.clone();
+        let cwd = wsl_exec_start_dir(&mut argv, cwd);
         let placement = self.agent_launch_placement(invert_target, override_target);
         // A configured per-adapter title wins over the derived
         // "Claude agent"-style label; both become the pane's spawn title,
@@ -7099,7 +7200,7 @@ impl crate::TermWindow {
         self.spawn_agent(
             SpawnCommand {
                 label: Some(label),
-                args: Some(entry.argv.clone()),
+                args: Some(argv),
                 cwd,
                 domain,
                 ..Default::default()
@@ -7239,10 +7340,9 @@ impl crate::TermWindow {
         let future = promise::spawn::spawn_into_new_thread(move || {
             // Same roots the herd scan uses: on Windows the transcripts are
             // inside the distro, not under the Windows home.
-            let homes: Vec<PathBuf> = agent_session_roots(home, &distros)
-                .into_iter()
-                .map(|root| root.home)
-                .collect();
+            // Roots, not bare homes: each session keeps the origin it was
+            // found under, so a WSL session resumes inside its distro.
+            let roots = agent_session_roots(home, &distros);
             // The scan thread must not touch the mux or any GUI state, so each
             // result is applied back on the GUI thread, which then repaints:
             // paint is on demand, and an open menu would otherwise sit on
@@ -7279,8 +7379,8 @@ impl crate::TermWindow {
                 // WSL share that is seconds. Show the newest page first; the
                 // full pass below re-reads none of it (the details cache).
                 apply(
-                    crate::agent_herd::sessions::collect_recent_sessions_since(
-                        &homes,
+                    crate::agent_herd::sessions::collect_recent_sessions_in(
+                        &roots,
                         SESSION_SCAN_FIRST_PAGE,
                         newer_than,
                     ),
@@ -7288,25 +7388,27 @@ impl crate::TermWindow {
                 );
             }
             let (sessions, stats) =
-                crate::agent_herd::sessions::scan_recent_sessions(&homes, limit, newer_than);
+                crate::agent_herd::sessions::scan_recent_sessions_in(&roots, limit, newer_than);
             // One line per menu open, at info so it reaches the log file: a
             // session missing from the menu is otherwise indistinguishable
             // from one in a home that was never scanned.
             log::info!(
                 "agent session scan: {} listed of {} candidates in {:?} \
-                 (headless {}, no cwd {}, unreadable {}, bad id {}, duplicate {}; {} reads) from {}",
+                 (headless {}, no cwd {}, wrong dir {}, unreadable {}, bad id {}, duplicate {}; \
+                 {} reads) from {}",
                 stats.listed,
                 stats.candidates,
                 started.elapsed(),
                 stats.headless,
                 stats.no_cwd,
+                stats.wrong_dir,
                 stats.unreadable,
                 stats.bad_id,
                 stats.duplicates,
                 stats.reads,
-                homes
+                roots
                     .iter()
-                    .map(|home| home.display().to_string())
+                    .map(|root| root.home.display().to_string())
                     .collect::<Vec<_>>()
                     .join(", ")
             );
@@ -7367,6 +7469,7 @@ impl crate::TermWindow {
             &session.session_id,
             session.cwd.clone(),
             Some(&session.label),
+            &session.origin,
             target,
         );
     }
@@ -7382,6 +7485,7 @@ impl crate::TermWindow {
         session_id: &str,
         session_cwd: PathBuf,
         session_title: Option<&str>,
+        origin: &SessionOrigin,
         target: Option<AgentLaunchTarget>,
     ) {
         let Some(spawn) = self.agent_resume_spawn_command(
@@ -7389,6 +7493,7 @@ impl crate::TermWindow {
             session_id,
             session_cwd,
             session_title,
+            origin,
             false,
         ) else {
             return;
@@ -7489,6 +7594,7 @@ impl crate::TermWindow {
                 &entry.session_id,
                 entry.cwd.clone(),
                 entry.label.as_deref(),
+                &entry.origin(),
                 true,
             ) {
                 Some(spawn) => {
@@ -7559,6 +7665,7 @@ impl crate::TermWindow {
         session_id: &str,
         session_cwd: PathBuf,
         session_title: Option<&str>,
+        origin: &SessionOrigin,
         quiet: bool,
     ) -> Option<SpawnCommand> {
         // Ids reach argv as their own element. The transcript scan gates its own
@@ -7576,7 +7683,9 @@ impl crate::TermWindow {
             home: dirs_next::home_dir(),
             attach_url: None,
         };
-        let Some((argv, wsl_domain)) = self.resolve_agent_resume_anywhere(&adapter, &values) else {
+        let Some((mut argv, wsl_domain)) =
+            self.resolve_agent_resume_anywhere(&adapter, &values, origin)
+        else {
             if !quiet {
                 wezterm_toast_notification::show(wezterm_toast_notification::ToastNotification {
                     title: "Agent resume".to_string(),
@@ -7619,6 +7728,18 @@ impl crate::TermWindow {
                 }
             }
         }
+        // The `wsl.exe` fallback (no registered domain for the distro) gets the
+        // directory as `--cd`; the local domain could not hand it over. The
+        // session's own path is the right one there, before any translation
+        // for the active pane's domain.
+        if wsl_paths::wsl_exec_distro(&argv).is_some() {
+            cwd = wsl_exec_start_dir(&mut argv, Some(values.cwd.clone().unwrap_or_default()));
+        }
+        // A wrong start directory is exactly what Claude answers with "This
+        // conversation is from a different directory", so say where it went.
+        log::info!(
+            "resume {adapter_id} {session_id}: domain {domain:?}, cwd {cwd:?}, origin {origin:?}"
+        );
         Some(SpawnCommand {
             label: Some(resume_tab_title(session_title, session_id, &label)),
             args: Some(argv),
@@ -7729,7 +7850,7 @@ impl crate::TermWindow {
                     .resolve_agent_attach_anywhere(&adapter, &values)
                     .is_some();
                 actions.resume = self
-                    .resolve_agent_resume_anywhere(&adapter, &values)
+                    .resolve_agent_resume_anywhere(&adapter, &values, &SessionOrigin::Host)
                     .is_some();
                 actions.open_logs =
                     resolve_agent_detail_path(adapter_id, &adapter, &values).is_some();
@@ -8736,7 +8857,9 @@ impl crate::TermWindow {
             return;
         }
         let values = AgentActionTemplateValues::from_agent(&agent);
-        let Some((argv, wsl_domain)) = self.resolve_agent_resume_anywhere(&adapter, &values) else {
+        let Some((argv, wsl_domain)) =
+            self.resolve_agent_resume_anywhere(&adapter, &values, &SessionOrigin::Host)
+        else {
             self.set_agent_feedback("Resume unavailable: command cannot be resolved");
             return;
         };
@@ -17183,6 +17306,7 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
     fn vendor_session(pid: u32, session_id: &str, cwd: &str, interactive: bool) -> VendorSession {
         VendorSession {
             origin: crate::agent_herd::vendor::SessionOrigin::Host,
+            home: None,
             pane_hint: None,
             pid,
             interactive,
@@ -17349,11 +17473,50 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
             cost: None,
             can_attach: true,
             can_open_logs: true,
+            origin: crate::agent_herd::vendor::SessionOrigin::Host,
+            home: None,
         }
     }
 
     fn herd_names(agents: &[HerdAgent]) -> Vec<&str> {
         agents.iter().map(|agent| agent.name.as_str()).collect()
+    }
+
+    #[test]
+    fn wsl_exec_spawn_moves_its_directory_into_wsl_cd() {
+        let exec = || wsl_paths::wsl_exec_argv("Ubuntu", vec!["claude".to_string()]);
+        // A session's Linux directory goes to `--cd` in its Windows form.
+        let mut argv = exec();
+        let cwd = wsl_exec_start_dir(&mut argv, Some(PathBuf::from("/mnt/c/ws/Module")));
+        assert_eq!(cwd, None);
+        assert_eq!(
+            argv,
+            [
+                "wsl.exe",
+                "-d",
+                "Ubuntu",
+                "--cd",
+                r"C:\ws\Module",
+                "--exec",
+                "claude"
+            ]
+        );
+        let mut argv = exec();
+        wsl_exec_start_dir(&mut argv, Some(PathBuf::from("/home/me/src")));
+        assert_eq!(argv[4], r"\\wsl.localhost\Ubuntu\home\me\src");
+        // A Windows directory is handed on as it is.
+        let mut argv = exec();
+        wsl_exec_start_dir(&mut argv, Some(PathBuf::from(r"C:\ws\Module")));
+        assert_eq!(argv[4], r"C:\ws\Module");
+        // Nothing known: the Linux home, not the Windows profile.
+        let mut argv = exec();
+        wsl_exec_start_dir(&mut argv, None);
+        assert_eq!(argv[4], "~");
+        // Any other spawn keeps its argv and cwd.
+        let mut argv = vec!["claude".to_string()];
+        let cwd = wsl_exec_start_dir(&mut argv, Some(PathBuf::from("/repo")));
+        assert_eq!(cwd, Some(PathBuf::from("/repo")));
+        assert_eq!(argv, ["claude"]);
     }
 
     fn snapshot(adapter: &str, id: &str, cwd: &str) -> SnapshotSession {
@@ -17362,6 +17525,7 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
             session_id: id.to_string(),
             cwd: PathBuf::from(cwd),
             label: None,
+            distro: None,
         }
     }
 

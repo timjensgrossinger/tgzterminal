@@ -71,6 +71,7 @@ impl SessionSource for GeminiDetector {
                         .unwrap_or(HerdStatus::Unknown);
                     sessions.push(VendorSession {
                         origin: SessionOrigin::Host,
+                        home: None,
                         pane_hint: None,
                         pid,
                         // This store does not distinguish harness-spawned

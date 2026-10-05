@@ -23,6 +23,7 @@ pub fn show_agent_log_overlay(mut term: TermWizTerminal, agent: HerdAgent) -> an
     let provider = agent.provider.clone();
     let session_id = agent.session_id.clone();
     let cwd = agent.cwd.clone();
+    let home = agent.home.clone();
 
     // State carried across refreshes: the rendered header, and the signature of
     // the last event we appended so we only write what is new.
@@ -35,7 +36,12 @@ pub fn show_agent_log_overlay(mut term: TermWizTerminal, agent: HerdAgent) -> an
     loop {
         let now = Instant::now();
         if now.duration_since(last_render) >= refresh_interval {
-            let live = refresh_activity(&provider, session_id.as_deref(), cwd.as_deref());
+            let live = refresh_activity(
+                &provider,
+                session_id.as_deref(),
+                cwd.as_deref(),
+                home.as_deref(),
+            );
             render_log(
                 &mut term,
                 &agent,
@@ -59,7 +65,12 @@ pub fn show_agent_log_overlay(mut term: TermWizTerminal, agent: HerdAgent) -> an
                 key: KeyCode::Char('r'),
                 ..
             })) => {
-                let live = refresh_activity(&provider, session_id.as_deref(), cwd.as_deref());
+                let live = refresh_activity(
+                    &provider,
+                    session_id.as_deref(),
+                    cwd.as_deref(),
+                    home.as_deref(),
+                );
                 render_log(
                     &mut term,
                     &agent,
@@ -79,8 +90,9 @@ fn refresh_activity(
     provider: &str,
     session_id: Option<&str>,
     cwd: Option<&std::path::Path>,
+    home: Option<&std::path::Path>,
 ) -> Option<crate::agent_herd::HerdActivity> {
-    match crate::agent_herd::transcript_source(provider, session_id, cwd) {
+    match crate::agent_herd::transcript_source_for(provider, session_id, cwd, home) {
         crate::agent_herd::TranscriptSource::File(path) => {
             Some(crate::agent_herd::transcript::read_activity(&path, 500))
         }

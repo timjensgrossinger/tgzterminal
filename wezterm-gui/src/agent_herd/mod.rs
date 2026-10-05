@@ -24,6 +24,7 @@ pub mod copilot;
 pub mod gemini;
 pub mod opencode;
 pub mod sessions;
+pub mod touched;
 pub mod transcript;
 pub mod vendor;
 pub mod wsl_proc;
@@ -460,6 +461,11 @@ pub struct HerdAgent {
     /// Whether row actions resolved successfully for its bound pane.
     pub can_attach: bool,
     pub can_open_logs: bool,
+    /// Where the session's files were found; `Host` for a pane-only row.
+    pub origin: vendor::SessionOrigin,
+    /// The home the session was found under (see [`vendor::VendorSession::home`]);
+    /// `None` for a pane-only row, meaning this machine's home.
+    pub home: Option<PathBuf>,
 }
 
 impl HerdAgent {
@@ -828,6 +834,8 @@ pub fn join_sessions_with_panes(
                 .or_else(|| pane.and_then(|p| p.cost.clone())),
             can_attach: pane.is_some_and(|p| p.can_attach),
             can_open_logs: pane.is_some_and(|p| p.can_open_logs),
+            origin: session.origin.clone(),
+            home: session.home.clone(),
         });
     }
 
@@ -874,6 +882,8 @@ pub fn join_sessions_with_panes(
             cost: row.cost,
             can_attach: row.can_attach,
             can_open_logs: row.can_open_logs,
+            origin: vendor::SessionOrigin::Host,
+            home: None,
         });
     }
 
@@ -1081,6 +1091,24 @@ pub fn transcript_source(
     transcript_source_at(&home, provider, session_id, cwd)
 }
 
+/// [`transcript_source`] for a herd agent, looked up under the home its
+/// session was found in.
+///
+/// A WSL session's transcript lives under the distro's home (the UNC path),
+/// not under this machine's: resolving it against `$HOME` found nothing, so
+/// the Log and Transcript actions were dead for every agent running in WSL.
+pub fn transcript_source_for(
+    provider: &str,
+    session_id: Option<&str>,
+    cwd: Option<&Path>,
+    home: Option<&Path>,
+) -> TranscriptSource {
+    match home {
+        Some(home) => transcript_source_at(home, provider, session_id, cwd),
+        None => transcript_source(provider, session_id, cwd),
+    }
+}
+
 /// Same as [`transcript_source`] but with an injectable `home`, so tests
 /// don't depend on the real `$HOME` of whatever machine runs them.
 fn transcript_source_at(
@@ -1173,6 +1201,7 @@ mod tests {
     fn session(pid: u32, name: &str, cwd: &str) -> VendorSession {
         VendorSession {
             origin: crate::agent_herd::vendor::SessionOrigin::Host,
+            home: None,
             pane_hint: None,
             pid,
             interactive: true,
@@ -1218,6 +1247,8 @@ mod tests {
             cost: None,
             can_attach: true,
             can_open_logs: true,
+            origin: vendor::SessionOrigin::Host,
+            home: None,
         }
     }
 

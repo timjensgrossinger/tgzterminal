@@ -66,6 +66,22 @@ pub struct SnapshotSession {
     /// Display name at capture time. Never load-bearing — logs only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// The WSL distro the session's files live in; `None` for this machine.
+    /// A session from a distro resumes in that distro even when the CLI is
+    /// also installed here. Absent in files written before it existed, which
+    /// restore as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub distro: Option<String>,
+}
+
+impl SnapshotSession {
+    /// Where the session was recorded, as the resume path takes it.
+    pub fn origin(&self) -> crate::agent_herd::vendor::SessionOrigin {
+        match &self.distro {
+            Some(distro) => crate::agent_herd::vendor::SessionOrigin::Wsl(distro.clone()),
+            None => crate::agent_herd::vendor::SessionOrigin::Host,
+        }
+    }
 }
 
 /// Which way a split divides its pane. Mirrors `mux::tab::SplitDirection`:
@@ -547,6 +563,7 @@ mod tests {
             session_id: id.to_string(),
             cwd: PathBuf::from(cwd),
             label: Some(format!("{adapter} · {id}")),
+            distro: None,
         }
     }
 
@@ -611,6 +628,7 @@ mod tests {
                 session_id: "abc-123".to_string(),
                 cwd: PathBuf::from("/repo/here"),
                 label: Some("claude · abc".to_string()),
+                distro: None,
             }],
             tabs: vec![LayoutTree::Split {
                 direction: SnapshotSplit::Horizontal,

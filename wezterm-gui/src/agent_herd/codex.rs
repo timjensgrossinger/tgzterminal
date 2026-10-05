@@ -144,6 +144,7 @@ impl SessionSource for CodexDetector {
                         .unwrap_or(HerdStatus::Unknown);
                     sessions.push(VendorSession {
                         origin: SessionOrigin::Host,
+                        home: None,
                         pane_hint: None,
                         pid,
                         // This store does not distinguish harness-spawned
@@ -220,6 +221,7 @@ fn collect_rollout_sessions(home: &Path) -> Vec<VendorSession> {
                 crate::agent_herd::sessions::activity_from_session_files(&path, &root, &session_id);
             sessions.push(VendorSession {
                 origin: SessionOrigin::Host,
+                home: None,
                 pane_hint: None,
                 // Rollout metadata has no process id. Herd binding falls back
                 // to a unique cwd match against the live pane.

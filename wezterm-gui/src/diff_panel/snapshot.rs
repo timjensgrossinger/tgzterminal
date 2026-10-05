@@ -26,7 +26,7 @@ const CONTEXT_LINES: usize = 3;
 /// Baselines not touched for this long are removed by [`prune`].
 pub const BASELINE_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 /// Directories never worth recording, even when no ignore file says so.
-const SKIPPED_DIRS: [&str; 8] = [
+pub(super) const SKIPPED_DIRS: [&str; 8] = [
     ".git",
     ".svn",
     ".hg",
@@ -357,6 +357,8 @@ mod tests {
         Limits {
             max_file_bytes: 1024,
             snapshot_max_files: 100,
+            nested_max_depth: 3,
+            nested_max_roots: 64,
         }
     }
 
@@ -469,6 +471,8 @@ mod tests {
         let tight = Limits {
             max_file_bytes: 1024,
             snapshot_max_files: 3,
+            nested_max_depth: 3,
+            nested_max_roots: 64,
         };
         match scan(&root, &base, tight) {
             Scan::Unavailable(reason) => assert!(reason.contains("More than 3 files")),

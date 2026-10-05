@@ -13,7 +13,7 @@ pub const MAX_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 /// over a slow disk takes seconds.
 pub const TIMEOUT: Duration = Duration::from_secs(20);
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct CommandOutput {
     pub success: bool,
     pub stdout: String,
@@ -101,6 +101,12 @@ impl Runner {
             envs,
             chosen: std::cell::Cell::new(None),
         }
+    }
+
+    /// A runner over the same environments that has not chosen one yet, for
+    /// a scan of another working copy.
+    pub fn fork(&self) -> Self {
+        Self::new(self.envs.clone())
     }
 
     #[cfg(test)]

@@ -140,6 +140,8 @@ mod tests {
         Limits {
             max_file_bytes: 1024 * 1024,
             snapshot_max_files: 1000,
+            nested_max_depth: 3,
+            nested_max_roots: 64,
         }
     }
 

@@ -1261,6 +1261,8 @@ config.diff_panel = {
   refresh_ms = 2000,
   max_file_bytes = 1048576,
   snapshot_max_files = 5000,
+  nested_max_depth = 3,
+  nested_max_roots = 64,
 }
 ```
 
@@ -1289,6 +1291,8 @@ config.keys = {
 | `refresh_ms` | `2000` | How often the visible panel re-reads the directory when nothing tells it to. A tree that is slow to diff is re-read less often than this. A written file does not wait for it: the working copy is watched, and a change is re-read within about a third of a second. Where watching is not possible (a network share, a WSL distro's own filesystem seen from Windows) this poll is the only trigger. |
 | `max_file_bytes` | `1048576` | Files larger than this are listed without a diff. |
 | `snapshot_max_files` | `5000` | Most files a snapshot baseline may record (see "No version control"). |
+| `nested_max_depth` | `3` | How many folder levels below the pane's directory to look for Git and Subversion working copies when the directory itself is in none (see "A folder of working copies"). `0` turns the search off. |
+| `nested_max_roots` | `64` | Most working copies that search collects; the panel says when there are more. |
 
 ### Size and position
 
@@ -1336,11 +1340,49 @@ place is kept when the order changes.
 | --- | --- | --- |
 | Inside a Git repository | `git diff HEAD` plus untracked files | The last commit |
 | Inside a Subversion working copy | `svn status` and `svn diff` | The pristine BASE |
-| Neither | A snapshot taken by the panel | The directory as it was when the panel first opened there |
+| Above Git or Subversion working copies | Each working copy as above, shown together | Each one's own base |
+| None of these | A snapshot taken by the panel | The directory as it was when the panel first opened there |
 
 Git and Subversion are read with their command-line clients, which must be
 installed. Nothing is written to the repository, and Git is run with
 `--no-optional-locks` so it never contends with an agent for the index.
+
+### A folder of working copies
+
+A workspace often has no checkout of its own, only one per module:
+`workspaceTrunk/ServiceLayerFile/.svn`, `workspaceTrunk/CDP4JClient/.svn`, …
+When the pane's directory is in no working copy, the panel looks up to
+`nested_max_depth` folder levels below it for Git and Subversion working
+copies, and shows all their changes in one list. That needs at least two
+working copies, or a folder with no files of its own: a project that merely
+holds one checkout (a vendored clone, say) keeps the snapshot of its own
+files, and the home directory is never searched. Each path is prefixed with
+its module's folder, and the header reads e.g. `SVN ×12`. A working copy's
+own subfolders are not searched further, and hidden folders, `node_modules`,
+`target` and the like are skipped. The search stops after `nested_max_roots`
+working copies or 2000 folders, and its answer is reused for 30 seconds, so a
+module checked out meanwhile shows up within that time. A module whose client
+fails is named in the note under the header; the others are still shown.
+
+### Only this session's files
+
+The panel shows the whole working copy against its base, including other and
+older changes. When the pane runs a Claude Code or Codex session that the
+sidebar's agent section has matched to it, the header offers **Session**: it
+narrows the list to the files that session touched, as its transcript records
+them, and **All** goes back. The note under the header says how many of the
+changed files are left.
+
+A file counts as touched when an edit tool wrote it (`Edit`, `Write`,
+`MultiEdit`, `NotebookEdit`, Codex `apply_patch`), when a command that
+certainly changes it named it (`svn mv`/`rm`/`add`/…, `git mv`/`rm`, `mv`,
+`cp`, `rm`, `sed -i`, `patch <file>`, a `>` redirect), and also when its path
+merely appears in a shell command — a Python script rewriting a file in binary
+mode to keep its line endings, say. That last kind may have been a read, so
+such a file carries the note "named in a shell command by this session".
+Relative paths are resolved against the directory each command ran in,
+following a leading `cd`. A transcript is read incrementally; of one longer
+than 64 MiB only the last 64 MiB count.
 
 ### No version control
 
@@ -1353,8 +1395,8 @@ The baseline honours `.gitignore` and `.ignore` files and skips
 `node_modules`, `target`, `.venv` and similar. It holds a copy of each text
 file up to `max_file_bytes`, kept under `diff-snapshots` in the data directory,
 readable by you alone. Baselines unused for 30 days are removed. A directory
-with more than `snapshot_max_files` files is refused: open the panel in a
-project folder rather than in your home directory.
+with more than `snapshot_max_files` files is refused with "More than 5000
+files here; open the panel in a project folder" (the number is the setting).
 
 ### Limits
 

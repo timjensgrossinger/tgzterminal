@@ -282,6 +282,17 @@ pub struct DiffPanelConfig {
     /// directory is under neither Git nor Subversion.
     #[dynamic(default = "default_diff_panel_snapshot_max_files")]
     pub snapshot_max_files: usize,
+
+    /// How many directory levels below the pane's directory to look for Git
+    /// and Subversion working copies when the directory itself is in none —
+    /// a flat workspace with one checkout per module. `0` turns the search off.
+    #[dynamic(default = "default_diff_panel_nested_max_depth")]
+    pub nested_max_depth: usize,
+
+    /// Most working copies collected by that search; the rest are left out
+    /// and the panel says so.
+    #[dynamic(default = "default_diff_panel_nested_max_roots")]
+    pub nested_max_roots: usize,
 }
 
 impl Default for DiffPanelConfig {
@@ -295,6 +306,8 @@ impl Default for DiffPanelConfig {
             refresh_ms: default_diff_panel_refresh_ms(),
             max_file_bytes: default_diff_panel_max_file_bytes(),
             snapshot_max_files: default_diff_panel_snapshot_max_files(),
+            nested_max_depth: default_diff_panel_nested_max_depth(),
+            nested_max_roots: default_diff_panel_nested_max_roots(),
         }
     }
 }
@@ -3671,6 +3684,14 @@ fn default_diff_panel_snapshot_max_files() -> usize {
     5000
 }
 
+fn default_diff_panel_nested_max_depth() -> usize {
+    3
+}
+
+fn default_diff_panel_nested_max_roots() -> usize {
+    64
+}
+
 fn default_update_interval() -> u64 {
     86400
 }
@@ -4545,6 +4566,8 @@ mod agent_ui_tests {
         assert_eq!(config.diff_panel.position, DiffPanelPosition::Right);
         assert_eq!(config.diff_panel.raised_mode, DiffPanelRaisedMode::Float);
         assert_eq!(config.diff_panel.width_px, 840);
+        assert_eq!(config.diff_panel.nested_max_depth, 3);
+        assert_eq!(config.diff_panel.nested_max_roots, 64);
     }
 
     #[test]

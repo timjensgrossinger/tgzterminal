@@ -63,7 +63,16 @@ const REMOTE_PANE: &str = "Changes are not available for remote panes yet";
 /// What the panel shows for one pane.
 #[derive(Default)]
 pub struct PaneView {
+    /// What is shown: [`Self::raw`], narrowed to the session's files when the
+    /// session filter is on.
     scan: Option<Scan>,
+    /// The scan as it came back, every file of the working copy.
+    raw: Option<Scan>,
+    /// The scan knew the pane's agent session and marked its files, so the
+    /// session filter can be offered.
+    session_linked: bool,
+    /// Show only the files the pane's agent session touched.
+    session_only: bool,
     /// When the scan on show was started.
     scanned_at: Option<Instant>,
     /// How long that scan took.
@@ -78,6 +87,16 @@ pub struct PaneView {
 }
 
 impl PaneView {
+    /// Recompute what is shown from [`Self::raw`] and the session filter.
+    fn apply_session_filter(&mut self) {
+        self.scan = match &self.raw {
+            Some(Scan::Changes(set)) if self.session_only && self.session_linked => {
+                Some(Scan::Changes(diff_panel::session_only(set)))
+            }
+            raw => raw.clone(),
+        };
+    }
+
     fn rebuild(&mut self) {
         match &self.scan {
             Some(Scan::Changes(set)) => {
@@ -110,6 +129,92 @@ enum PaintRow {
         text: String,
     },
     Note(String),
+}
+
+/// The agent session running in a pane, as the scan thread needs it to
+/// find the session's transcript. Captured on the GUI thread from the herd;
+/// the transcript lookup itself touches the filesystem, so it waits for the
+/// scan thread.
+struct PaneSession {
+    provider: String,
+    session_id: String,
+    cwd: Option<PathBuf>,
+    /// The home the session's files were found under; `None` for this
+    /// machine's.
+    home: Option<PathBuf>,
+    /// The WSL distro the session runs in: its paths are that distro's.
+    distro: Option<String>,
+}
+
+/// Resolved transcript paths, by session. Finding a Codex rollout walks
+/// its date-sharded store (and, for WSL, does so over the distro share), so
+/// it is done once per session rather than on every scan.
+static TRANSCRIPT_PATHS: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<(String, String, Option<PathBuf>), PathBuf>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Sessions whose transcript path is remembered before the map is emptied.
+const TRANSCRIPT_PATHS_CAP: usize = 64;
+
+impl PaneSession {
+    /// The session's transcript file, remembered once found; a remembered
+    /// path that has gone is looked up again.
+    fn transcript(&self) -> Option<PathBuf> {
+        let key = (
+            self.provider.clone(),
+            self.session_id.clone(),
+            self.home.clone(),
+        );
+        let cached = TRANSCRIPT_PATHS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&key)
+            .cloned();
+        if let Some(path) = cached.filter(|path| path.is_file()) {
+            return Some(path);
+        }
+        let source = crate::agent_herd::transcript_source_for(
+            &self.provider,
+            Some(&self.session_id),
+            self.cwd.as_deref(),
+            self.home.as_deref(),
+        );
+        let crate::agent_herd::TranscriptSource::File(path) = source else {
+            return None;
+        };
+        let mut paths = TRANSCRIPT_PATHS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if paths.len() >= TRANSCRIPT_PATHS_CAP {
+            paths.clear();
+        }
+        paths.insert(key, path.clone());
+        Some(path)
+    }
+
+    /// Mark the files of `set` this session touched. `false` when its
+    /// transcript cannot be read, so the filter is not offered.
+    fn mark(&self, set: &mut diff_panel::ChangeSet) -> bool {
+        let Some(path) = self.transcript() else {
+            return false;
+        };
+        let touched = match crate::agent_herd::touched::touched_by(&path) {
+            Ok(touched) => touched,
+            Err(err) => {
+                log::debug!("diff panel: cannot read {}: {err}", path.display());
+                return false;
+            }
+        };
+        let root = set.root.to_string_lossy().into_owned();
+        // The session wrote its paths in its own view of the files.
+        let root_view = self
+            .distro
+            .as_deref()
+            .and_then(|distro| crate::termwindow::wsl_paths::windows_to_wsl(&root, distro))
+            .unwrap_or(root);
+        diff_panel::mark_session(set, &root_view, &touched);
+        true
+    }
 }
 
 fn snapshot_base() -> PathBuf {
@@ -556,7 +661,35 @@ impl crate::TermWindow {
             .map(|distro| distro.name.clone())
     }
 
-    fn diff_panel_publish(&mut self, pane_id: PaneId, started: Instant, result: Scan) {
+    /// The agent session bound to `pane_id`, for vendors whose transcript
+    /// records the files they touch.
+    fn diff_panel_session(&self, pane_id: PaneId) -> Option<PaneSession> {
+        // `try_`: this runs from paint, and a herd update holding the state
+        // must cost one refresh without the filter, never a panic.
+        let herd = self.agent_herd_state.try_borrow().ok()?;
+        let agent = herd
+            .agents
+            .iter()
+            .find(|agent| agent.pane_id == Some(pane_id))?;
+        if !matches!(agent.provider.as_str(), "claude" | "codex") {
+            return None;
+        }
+        Some(PaneSession {
+            provider: agent.provider.clone(),
+            session_id: agent.session_id.clone()?,
+            cwd: agent.cwd.clone(),
+            home: agent.home.clone(),
+            distro: agent.origin.distro().map(str::to_string),
+        })
+    }
+
+    fn diff_panel_publish(
+        &mut self,
+        pane_id: PaneId,
+        started: Instant,
+        result: Scan,
+        session_linked: bool,
+    ) {
         if !self.diff_panel.enabled_panes.contains(&pane_id) {
             return;
         }
@@ -564,7 +697,7 @@ impl crate::TermWindow {
         let view = self.diff_panel.views.entry(pane_id).or_default();
         view.scanned_at = Some(started);
         view.scan_cost = started.elapsed();
-        if view.scan.as_ref() == Some(&result) {
+        if view.raw.as_ref() == Some(&result) && view.session_linked == session_linked {
             return;
         }
         // Files reorder as they change. Someone reading further down keeps
@@ -576,7 +709,9 @@ impl crate::TermWindow {
             }
             _ => None,
         };
-        view.scan = Some(result);
+        view.raw = Some(result);
+        view.session_linked = session_linked;
+        view.apply_session_filter();
         view.rebuild();
         if let (Some((path, delta)), Some(Scan::Changes(set))) = (anchor, &view.scan) {
             let row = set
@@ -639,7 +774,7 @@ impl crate::TermWindow {
         let target = match self.diff_panel_target(pane) {
             Ok(target) => target,
             Err(reason) => {
-                self.diff_panel_publish(pane_id, now, Scan::Unavailable(reason));
+                self.diff_panel_publish(pane_id, now, Scan::Unavailable(reason), false);
                 return;
             }
         };
@@ -649,8 +784,11 @@ impl crate::TermWindow {
         let limits = Limits {
             max_file_bytes: self.config.diff_panel.max_file_bytes,
             snapshot_max_files: self.config.diff_panel.snapshot_max_files,
+            nested_max_depth: self.config.diff_panel.nested_max_depth,
+            nested_max_roots: self.config.diff_panel.nested_max_roots,
         };
         let other_distro = Self::default_wsl_distro();
+        let session = self.diff_panel_session(pane_id);
         let watched = self.diff_panel.watch.as_ref().map(|watch| {
             watch.clear();
             watch.root().to_path_buf()
@@ -661,9 +799,13 @@ impl crate::TermWindow {
             .spawn(move || {
                 let settled = settle_scan_target(target, other_distro);
                 let settled_in = now.elapsed();
+                let mut session_linked = false;
                 let result = match settled {
                     Ok((dir, runner)) => {
-                        let result = diff_panel::scan(&dir, &runner, &snapshot_base(), limits);
+                        let mut result = diff_panel::scan(&dir, &runner, &snapshot_base(), limits);
+                        if let (Scan::Changes(set), Some(session)) = (&mut result, &session) {
+                            session_linked = session.mark(set);
+                        }
                         // Like the herd scan: a slow one is worth a line, so
                         // "the panel is slow" can be told apart from "the
                         // client is slow" after the fact.
@@ -703,7 +845,7 @@ impl crate::TermWindow {
                     if watch.is_some() {
                         term_window.diff_panel.watch = watch;
                     }
-                    term_window.diff_panel_publish(pane_id, now, result);
+                    term_window.diff_panel_publish(pane_id, now, result, session_linked);
                 })));
             });
         if let Err(err) = spawned {
@@ -762,6 +904,15 @@ impl crate::TermWindow {
         match target {
             None => {}
             Some(Ok(DiffPanelAction::Close)) => self.toggle_diff_panel_pane(pane_id),
+            Some(Ok(DiffPanelAction::ToggleSessionFilter)) => {
+                if let Some(view) = self.diff_panel.views.get_mut(&pane_id) {
+                    view.session_only = !view.session_only;
+                    view.apply_session_filter();
+                    view.rebuild();
+                    view.scroll = 0;
+                }
+                context.invalidate();
+            }
             Some(Ok(DiffPanelAction::ToggleChips)) => {
                 if let Some(view) = self.diff_panel.views.get_mut(&pane_id) {
                     view.chips_expanded = !view.chips_expanded;
@@ -1111,6 +1262,19 @@ impl crate::TermWindow {
         ];
         if is_snapshot {
             buttons.push(("Reset", DiffPanelAction::ResetBaseline));
+        }
+        // Offered only when the scan found the pane's agent session. The
+        // label names what a click shows next.
+        let session_filter = self
+            .diff_panel
+            .views
+            .get(&pane_id)
+            .filter(|view| view.session_linked)
+            .map(|view| view.session_only);
+        match session_filter {
+            Some(false) => buttons.push(("Session", DiffPanelAction::ToggleSessionFilter)),
+            Some(true) => buttons.push(("All", DiffPanelAction::ToggleSessionFilter)),
+            None => {}
         }
         for (label, action) in buttons {
             let label_w = label.chars().count() as f32 * cell_w;

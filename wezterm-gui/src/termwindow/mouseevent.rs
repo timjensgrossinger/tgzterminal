@@ -2709,10 +2709,11 @@ impl super::TermWindow {
                 }
             }
             AgentRowAction::Transcript => {
-                match crate::agent_herd::transcript_source(
+                match crate::agent_herd::transcript_source_for(
                     &agent.provider,
                     agent.session_id.as_deref(),
                     agent.cwd.as_deref(),
+                    agent.home.as_deref(),
                 ) {
                     // OpenCode keeps every session in one opencode.db with no
                     // per-session file; the Log overlay reads it live instead.
@@ -2763,6 +2764,7 @@ impl super::TermWindow {
                             &session_id,
                             cwd,
                             Some(&agent.name),
+                            &agent.origin,
                             None,
                         );
                         // Force a re-scan so the new pane binds to the agent

@@ -23,7 +23,7 @@
 
 use config::{WslDistro, WslDomain};
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
@@ -585,6 +585,75 @@ pub(crate) fn wsl_exec_argv(distro: &str, command: Vec<String>) -> Vec<String> {
     argv
 }
 
+/// The distro a [`wsl_exec_argv`] command runs in, or `None` for any other
+/// argv.
+pub(crate) fn wsl_exec_distro(argv: &[String]) -> Option<&str> {
+    match argv {
+        [wsl, flag, distro, exec, ..] if wsl == "wsl.exe" && flag == "-d" && exec == "--exec" => {
+            Some(distro.as_str())
+        }
+        _ => None,
+    }
+}
+
+/// Give a [`wsl_exec_argv`] command its start directory: `--cd <dir>` before
+/// `--exec`.
+///
+/// Without one, `wsl.exe` starts in its own Windows working directory
+/// translated — the user's Windows profile, `/mnt/c/Users/<name>` — because
+/// the local domain spawns it with no usable cwd. `dir` is a Linux path or
+/// `~`, which `wsl.exe --cd` documents as the Linux home. The launcher entries
+/// that carry this argv are cached, so the directory is added per spawn, not
+/// when the argv is built. Returns `false`, changing nothing, for any other
+/// argv.
+pub(crate) fn set_wsl_exec_cwd(argv: &mut Vec<String>, dir: &str) -> bool {
+    if wsl_exec_distro(argv).is_none() {
+        return false;
+    }
+    argv.splice(3..3, ["--cd".to_string(), dir.to_string()]);
+    true
+}
+
+/// `~`, the start directory of a new tab in a WSL domain.
+pub(crate) const WSL_HOME_CWD: &str = "~";
+
+/// The directory a launch into a WSL distro should start in when the source
+/// pane's directory says nothing about where the user is.
+///
+/// `Some("~")` — the same place a new tab in that distro opens — when:
+/// - there is no pane directory at all;
+/// - the source pane is itself in WSL but its directory is a Windows drive
+///   path. A stock distro shell sends no OSC 7, so the directory was divined
+///   from the `wsl.exe` host process, whose cwd is the Windows profile; it is
+///   not where the shell is;
+/// - the source is a Windows pane sitting in the Windows home, which is where
+///   every fresh Windows shell starts and so means "nowhere in particular".
+///   Handing it on would land the agent in `/mnt/c/Users/<name>`.
+///
+/// `None` keeps the pane directory: a real project folder on `C:` is still
+/// where the user is working.
+pub(crate) fn wsl_launch_home(
+    raw: Option<&str>,
+    source_is_wsl: bool,
+    host_home: &Path,
+) -> Option<PathBuf> {
+    let home = || Some(PathBuf::from(WSL_HOME_CWD));
+    let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
+        return home();
+    };
+    let bytes = raw.as_bytes();
+    let drive_path = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
+    if source_is_wsl {
+        return if drive_path { home() } else { None };
+    }
+    let trim = |path: &str| path.trim_end_matches(['\\', '/']).to_string();
+    let host_home = host_home.to_string_lossy();
+    if !host_home.is_empty() && trim(raw).eq_ignore_ascii_case(&trim(&host_home)) {
+        return home();
+    }
+    None
+}
+
 /// Distro name for a domain, or `None` when the domain is not a WSL domain.
 ///
 /// Prefers a configured `wsl_domains` entry, whose `distribution` may differ
@@ -842,6 +911,45 @@ fn strip_mnt_drive(path: &str) -> Option<(char, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wsl_exec_gets_its_start_directory_before_exec() {
+        let mut argv = wsl_exec_argv("Ubuntu", vec!["bash".into(), "-lic".into()]);
+        assert_eq!(wsl_exec_distro(&argv), Some("Ubuntu"));
+        assert!(set_wsl_exec_cwd(&mut argv, "~"));
+        assert_eq!(
+            argv,
+            ["wsl.exe", "-d", "Ubuntu", "--cd", "~", "--exec", "bash", "-lic"]
+        );
+        // Not our shape: left alone.
+        let mut other = vec!["claude".to_string(), "--resume".to_string()];
+        assert!(!set_wsl_exec_cwd(&mut other, "~"));
+        assert_eq!(other, ["claude", "--resume"]);
+    }
+
+    #[test]
+    fn wsl_launch_starts_in_the_linux_home_unless_the_pane_says_otherwise() {
+        let home = Path::new(r"C:\Users\stefan.sigmund");
+        let tilde = Some(PathBuf::from("~"));
+        // No directory known.
+        assert_eq!(wsl_launch_home(None, true, home), tilde);
+        assert_eq!(wsl_launch_home(None, false, home), tilde);
+        // A WSL pane whose directory was divined from the wsl.exe host.
+        assert_eq!(
+            wsl_launch_home(Some(r"C:\Users\stefan.sigmund"), true, home),
+            tilde
+        );
+        // A WSL pane that reported a Linux directory keeps it.
+        assert_eq!(wsl_launch_home(Some("/mnt/c/ws/Module"), true, home), None);
+        assert_eq!(wsl_launch_home(Some("/home/stefan/src"), true, home), None);
+        // A Windows pane in the Windows home: nowhere in particular.
+        assert_eq!(
+            wsl_launch_home(Some(r"c:\users\Stefan.Sigmund\"), false, home),
+            tilde
+        );
+        // A Windows pane in a real project folder keeps it.
+        assert_eq!(wsl_launch_home(Some(r"C:\ws\Module"), false, home), None);
+    }
 
     #[test]
     fn a_probe_with_no_answer_keeps_the_last_one() {

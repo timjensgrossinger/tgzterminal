@@ -28,7 +28,10 @@
 //! Even so this touches the filesystem and must never run on the GUI thread —
 //! callers scan on a worker thread and cache the result.
 
-use super::{transcript, HerdActivity, HerdContent, HerdEvent, HerdEventKind, SubagentNode};
+use super::vendor::{SessionOrigin, SessionRoot};
+use super::{
+    claude, transcript, HerdActivity, HerdContent, HerdEvent, HerdEventKind, SubagentNode,
+};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
@@ -72,6 +75,10 @@ pub struct AgentSession {
     pub label: String,
     /// Last write to the transcript; the sort key, newest first.
     pub modified: SystemTime,
+    /// Which home the transcript was found under. A session recorded inside a
+    /// WSL distro resumes inside that distro, wherever else the CLI is also
+    /// installed: the other install has never heard of it.
+    pub origin: SessionOrigin,
 }
 
 impl AgentSession {
@@ -162,6 +169,10 @@ enum Skip {
     Headless,
     /// The store records no directory, and a resume must not guess one.
     NoCwd,
+    /// Every directory the transcript records is one Claude would refuse to
+    /// resume it from: none of them encodes to the project folder the file
+    /// sits in.
+    WrongDirectory,
     /// Nothing in the head parsed, or it lacks the id a resume needs.
     Unreadable,
 }
@@ -178,6 +189,8 @@ pub struct SessionScanStats {
     pub listed: usize,
     pub headless: usize,
     pub no_cwd: usize,
+    /// See [`Skip::WrongDirectory`].
+    pub wrong_dir: usize,
     pub unreadable: usize,
     /// An id [`session_id_is_sane`] refused.
     pub bad_id: usize,
@@ -192,6 +205,7 @@ impl SessionScanStats {
         match skip {
             Skip::Headless => self.headless += 1,
             Skip::NoCwd => self.no_cwd += 1,
+            Skip::WrongDirectory => self.wrong_dir += 1,
             Skip::Unreadable => self.unreadable += 1,
         }
     }
@@ -244,25 +258,53 @@ pub fn scan_recent_sessions(
     limit: usize,
     newer_than: Option<SystemTime>,
 ) -> (Vec<AgentSession>, SessionScanStats) {
+    let roots: Vec<SessionRoot> = homes.iter().cloned().map(SessionRoot::host).collect();
+    scan_recent_sessions_in(&roots, limit, newer_than)
+}
+
+/// Like [`collect_recent_sessions_since`], over roots that know their origin.
+pub fn collect_recent_sessions_in(
+    roots: &[SessionRoot],
+    limit: usize,
+    newer_than: Option<SystemTime>,
+) -> Vec<AgentSession> {
+    scan_recent_sessions_in(roots, limit, newer_than).0
+}
+
+/// [`scan_recent_sessions`] over roots that know their origin; every session
+/// listed carries the origin of the root it was found under.
+pub fn scan_recent_sessions_in(
+    roots: &[SessionRoot],
+    limit: usize,
+    newer_than: Option<SystemTime>,
+) -> (Vec<AgentSession>, SessionScanStats) {
     let mut stats = SessionScanStats::default();
     if limit == 0 {
         return (Vec::new(), stats);
     }
 
     let mut candidates = Vec::new();
-    for home in homes {
-        let home = home.as_path();
+    // Index into `roots` per candidate, so the origin survives the sort.
+    let mut tagged: Vec<(usize, Candidate)> = Vec::new();
+    for (root_index, root) in roots.iter().enumerate() {
+        let home = root.home.as_path();
         collect_claude_candidates(home, &mut candidates);
         collect_codex_candidates(home, &mut candidates);
         collect_opencode_candidates(home, limit, newer_than, &mut candidates);
         collect_copilot_candidates(home, &mut candidates);
+        tagged.extend(
+            candidates
+                .drain(..)
+                .map(|candidate| (root_index, candidate)),
+        );
     }
+    let mut candidates = tagged;
     if let Some(cutoff) = newer_than {
-        candidates.retain(|candidate| candidate.modified() >= cutoff);
+        candidates.retain(|(_, candidate)| candidate.modified() >= cutoff);
     }
     stats.candidates = candidates.len();
 
-    candidates.sort_by(|a, b| {
+    candidates.sort_by(|(_, a), (_, b)| {
         b.modified()
             .cmp(&a.modified())
             .then_with(|| a.sort_key().cmp(&b.sort_key()))
@@ -279,7 +321,7 @@ pub fn scan_recent_sessions(
         if cache.len() > DETAILS_CACHE_CAP {
             let live_paths: HashSet<&Path> = candidates
                 .iter()
-                .filter_map(|candidate| match candidate {
+                .filter_map(|(_, candidate)| match candidate {
                     Candidate::Deferred { path, .. } => Some(path.as_path()),
                     Candidate::Ready(_) => None,
                 })
@@ -287,11 +329,11 @@ pub fn scan_recent_sessions(
             cache.retain(|path, _| live_paths.contains(path.as_path()));
         }
     }
-    for candidate in candidates {
+    for (root_index, candidate) in candidates {
         if sessions.len() >= limit {
             break;
         }
-        let session = match candidate {
+        let mut session = match candidate {
             Candidate::Deferred {
                 ref path, modified, ..
             } => {
@@ -323,6 +365,7 @@ pub fn scan_recent_sessions(
             }
             Candidate::Ready(session) => session,
         };
+        session.origin = roots[root_index].origin.clone();
         if !session_id_is_sane(&session.session_id) {
             stats.bad_id += 1;
             continue;
@@ -358,6 +401,8 @@ fn ready_session(
         git_branch,
         label: label.unwrap_or_else(|| NO_DESCRIPTION.to_string()),
         modified,
+        // Stamped by the scan, which knows which root the session came from.
+        origin: SessionOrigin::Host,
     }
 }
 
@@ -505,7 +550,19 @@ fn collect_claude_candidates(home: &Path, out: &mut Vec<Candidate>) {
 /// background agent or last night's cron job, and on a machine with claude-mem
 /// and a scheduled sweep installed they outnumber the real sessions four to
 /// one.
+///
+/// The directory offered is the one the project folder is named after, not
+/// simply the first `cwd` the transcript records: `claude --resume` only finds
+/// a session from the directory it was filed under (see
+/// [`claude::project_dir_matches`]), and a transcript can open with records
+/// carrying some other directory. When neither the head nor the tail records a
+/// directory that fits, the session is dropped — the resume could only fail
+/// with "This conversation is from a different directory".
 fn read_claude_details(path: &Path) -> Result<SessionDetails, Skip> {
+    let project_dir = path
+        .parent()
+        .and_then(|dir| dir.file_name())
+        .map(|name| name.to_string_lossy().into_owned());
     let head = claude_head_scan(path, true);
     if head.headless {
         return Err(Skip::Headless);
@@ -513,17 +570,71 @@ fn read_claude_details(path: &Path) -> Result<SessionDetails, Skip> {
     if !head.parsed {
         return Err(Skip::Unreadable);
     }
+    let cwd = match project_dir {
+        Some(dir_name) => resumable_claude_cwd(path, &dir_name, &head.cwds)?,
+        None => head.cwds.into_iter().next().ok_or(Skip::NoCwd)?,
+    };
     Ok(SessionDetails {
-        cwd: head.cwd.ok_or(Skip::NoCwd)?,
+        cwd,
         git_branch: head.git_branch,
         label: head.label,
         session_id: None,
     })
 }
 
+/// Pick the directory a Claude session can be resumed from.
+///
+/// The head's directories are tried first, in order. Only when none fits is the
+/// tail read: a transcript whose head was copied from another session keeps its
+/// own directory in the records written after the copy.
+fn resumable_claude_cwd(
+    path: &Path,
+    dir_name: &str,
+    head_cwds: &[PathBuf],
+) -> Result<PathBuf, Skip> {
+    if let Some(cwd) = head_cwds
+        .iter()
+        .find(|cwd| claude::project_dir_matches(dir_name, cwd))
+    {
+        return Ok(cwd.clone());
+    }
+    let tail_cwd = transcript::tail_lines(path, CLAUDE_TAIL_CWD_LINES)
+        .iter()
+        .rev()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter_map(|value| {
+            value
+                .get("cwd")
+                .and_then(|value| value.as_str())
+                .filter(|text| !text.is_empty())
+                .map(PathBuf::from)
+        })
+        .find(|cwd| claude::project_dir_matches(dir_name, cwd));
+    match tail_cwd {
+        Some(cwd) => Ok(cwd),
+        None if head_cwds.is_empty() => Err(Skip::NoCwd),
+        None => {
+            log::debug!(
+                "agent session scan: {} records no directory matching its project folder {dir_name:?} \
+                 (head has {head_cwds:?}); not offered",
+                path.display()
+            );
+            Err(Skip::WrongDirectory)
+        }
+    }
+}
+
+/// Tail records searched for a matching directory when the head has none.
+const CLAUDE_TAIL_CWD_LINES: usize = 50;
+
+/// Distinct directories a head scan keeps; more than a handful means a session
+/// that wandered, and the first few are the candidates that matter.
+const CLAUDE_HEAD_MAX_CWDS: usize = 8;
+
 /// What one head scan of a Claude transcript yields.
 struct ClaudeHead {
-    cwd: Option<PathBuf>,
+    /// Distinct `cwd` values in the order the head records them.
+    cwds: Vec<PathBuf>,
     git_branch: Option<String>,
     label: Option<String>,
     /// The session was started without a human at the keyboard: a headless
@@ -576,11 +687,12 @@ pub fn claude_transcript_label(path: &Path) -> Option<String> {
 /// headless, for callers that drop such sessions anyway: without it, each of
 /// them costs a full head read looking for a title that is never used.
 fn claude_head_scan(path: &Path, stop_at_headless: bool) -> ClaudeHead {
-    let mut cwd = None;
+    let mut cwds: Vec<PathBuf> = Vec::new();
     let mut git_branch = None;
     let mut title = None;
     let mut prompt = None;
     let mut entrypoint_seen = false;
+    let mut sidechain_seen = false;
     let mut headless = false;
     let mut parsed = false;
 
@@ -589,6 +701,16 @@ fn claude_head_scan(path: &Path, stop_at_headless: bool) -> ClaudeHead {
             continue;
         };
         parsed = true;
+        // A transcript that opens on a subagent's own turn is a subagent
+        // transcript filed beside the sessions (older Claude Code wrote them as
+        // top-level `agent-<id>.jsonl`): it shares its parent's directory and
+        // branch, so it reads as a duplicate row, and it cannot be resumed.
+        if !sidechain_seen {
+            if let Some(sidechain) = value.get("isSidechain").and_then(|value| value.as_bool()) {
+                sidechain_seen = true;
+                headless |= sidechain;
+            }
+        }
         if !entrypoint_seen {
             if let Some(entrypoint) = value.get("entrypoint").and_then(|value| value.as_str()) {
                 entrypoint_seen = true;
@@ -608,12 +730,16 @@ fn claude_head_scan(path: &Path, stop_at_headless: bool) -> ClaudeHead {
         if headless && stop_at_headless {
             break;
         }
-        if cwd.is_none() {
-            cwd = value
+        if cwds.len() < CLAUDE_HEAD_MAX_CWDS {
+            if let Some(cwd) = value
                 .get("cwd")
                 .and_then(|value| value.as_str())
                 .filter(|text| !text.is_empty())
-                .map(PathBuf::from);
+            {
+                if !cwds.iter().any(|seen| seen.as_os_str() == cwd) {
+                    cwds.push(PathBuf::from(cwd));
+                }
+            }
         }
         if git_branch.is_none() {
             git_branch = value
@@ -656,13 +782,13 @@ fn claude_head_scan(path: &Path, stop_at_headless: bool) -> ClaudeHead {
         }
         // The title is the best answer available; once both it and the
         // directory are known there is nothing left to look for.
-        if title.is_some() && cwd.is_some() && git_branch.is_some() {
+        if title.is_some() && !cwds.is_empty() && git_branch.is_some() {
             break;
         }
     }
 
     ClaudeHead {
-        cwd,
+        cwds,
         git_branch,
         label: title.or(prompt),
         headless,
@@ -1362,6 +1488,82 @@ mod tests {
     }
 
     #[test]
+    fn resume_directory_is_the_one_the_project_folder_is_named_after() {
+        // The head opens with records from another directory (a copied parent
+        // session, a subfolder): the row must still resume where Claude filed it.
+        let dir = tempfile::tempdir().unwrap();
+        claude_session(
+            dir.path(),
+            "-ws-ServiceLayerFile",
+            "aaaa-5551",
+            &[
+                user_line("/ws", "MATE-684", "first prompt"),
+                user_line("/ws/ServiceLayerFile", "MATE-684", "second prompt"),
+            ],
+            1_000,
+        );
+        let (sessions, _) = scan_recent_sessions(&[dir.path().to_path_buf()], 10, None);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].cwd, PathBuf::from("/ws/ServiceLayerFile"));
+        assert_eq!(sessions[0].project, "ServiceLayerFile");
+    }
+
+    #[test]
+    fn resume_directory_falls_back_to_the_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut lines = vec![user_line("/elsewhere", "main", "copied prompt")];
+        lines.extend((0..400).map(|i| title_line(&format!("filler {i}"))));
+        lines.push(user_line("/repo", "main", "latest prompt"));
+        claude_session(dir.path(), "-repo", "aaaa-5552", &lines, 1_000);
+        let (sessions, _) = scan_recent_sessions(&[dir.path().to_path_buf()], 10, None);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].cwd, PathBuf::from("/repo"));
+    }
+
+    #[test]
+    fn session_recorded_only_under_another_directory_is_not_offered() {
+        // Resuming it anywhere it says would fail with "This conversation is
+        // from a different directory".
+        let dir = tempfile::tempdir().unwrap();
+        claude_session(
+            dir.path(),
+            "-ws-ServiceLayerFile",
+            "aaaa-5553",
+            &[user_line("/ws/Other", "MATE-684", "prompt")],
+            1_000,
+        );
+        let (sessions, stats) = scan_recent_sessions(&[dir.path().to_path_buf()], 10, None);
+        assert!(sessions.is_empty());
+        assert_eq!(stats.wrong_dir, 1);
+    }
+
+    #[test]
+    fn subagent_transcript_beside_the_sessions_is_not_offered() {
+        // Older Claude Code filed subagents as top-level `agent-<id>.jsonl`:
+        // same directory and branch as the parent, so they read as duplicates.
+        let dir = tempfile::tempdir().unwrap();
+        let sidechain = serde_json::json!({
+            "type": "user",
+            "isSidechain": true,
+            "cwd": "/repo",
+            "gitBranch": "MATE-684",
+            "message": { "content": [{ "type": "text", "text": "subagent task" }] },
+        })
+        .to_string();
+        claude_session(dir.path(), "-repo", "agent-5554", &[sidechain], 1_000);
+        claude_session(
+            dir.path(),
+            "-repo",
+            "aaaa-5555",
+            &[user_line("/repo", "MATE-684", "the real session")],
+            900,
+        );
+        let (sessions, _) = scan_recent_sessions(&[dir.path().to_path_buf()], 10, None);
+        let ids: Vec<&str> = sessions.iter().map(|s| s.session_id.as_str()).collect();
+        assert_eq!(ids, ["aaaa-5555"]);
+    }
+
+    #[test]
     fn ai_title_wins_over_the_first_prompt() {
         let dir = tempfile::tempdir().unwrap();
         claude_session(
@@ -1989,6 +2191,7 @@ mod tests {
                 listed: 1,
                 headless: 1,
                 no_cwd: 1,
+                wrong_dir: 0,
                 unreadable: 1,
                 bad_id: 1,
                 duplicates: 0,

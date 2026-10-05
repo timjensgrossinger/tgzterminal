@@ -121,6 +121,7 @@ impl SessionSource for AntigravityDetector {
                     .flatten();
                 Some(VendorSession {
                     origin: SessionOrigin::Host,
+                    home: None,
                     pane_hint: None,
                     // agy history has no process id. Herd binding falls back to
                     // a unique cwd match against the live pane.

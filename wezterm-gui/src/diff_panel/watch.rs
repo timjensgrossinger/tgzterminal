@@ -76,24 +76,27 @@ pub fn is_relevant(root: &Path, path: &Path) -> bool {
     let Ok(relative) = path.strip_prefix(root) else {
         return true;
     };
-    let mut names = relative
+    let names: Vec<&str> = relative
         .components()
         .filter_map(|component| match component {
             Component::Normal(name) => name.to_str(),
             _ => None,
-        });
-    let Some(first) = names.next() else {
+        })
+        .collect();
+    if names.is_empty() {
         return true;
-    };
+    }
     let leaf = relative.file_name().and_then(|name| name.to_str());
-    if first == ".git" {
+    // At any depth: a panel over a folder of clones watches every module's
+    // `.git`, and each `git status` it runs rewrites that module's objects.
+    if let Some(at) = names.iter().position(|name| *name == ".git") {
         return !leaf.is_some_and(|leaf| leaf.ends_with(".lock"))
             && matches!(
-                names.next(),
+                names.get(at + 1).copied(),
                 Some("index" | "HEAD" | "refs" | "packed-refs")
             );
     }
-    if first == ".svn" || names.any(|name| name == ".svn") {
+    if names.contains(&".svn") {
         return leaf == Some("wc.db");
     }
     true
@@ -123,6 +126,11 @@ mod tests {
         assert!(!relevant("vendor/lib/.svn/tmp/x"));
         // A file merely named like the directory is an ordinary file.
         assert!(relevant("docs/.gitignore"));
+        // A module's own repository, below the watched folder.
+        assert!(relevant("tool/.git/index"));
+        assert!(!relevant("tool/.git/objects/ab/cdef"));
+        assert!(!relevant("tool/.git/index.lock"));
+        assert!(relevant("mod/.svn/wc.db"));
     }
 
     #[test]

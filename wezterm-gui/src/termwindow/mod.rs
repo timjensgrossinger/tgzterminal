@@ -411,6 +411,8 @@ pub enum DiffPanelAction {
     ResetBaseline,
     /// Show every file's chip in the index, or go back to the first rows.
     ToggleChips,
+    /// Show only the files the pane's agent session touched, or all of them.
+    ToggleSessionFilter,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
