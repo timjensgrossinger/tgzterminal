@@ -42,6 +42,9 @@ jobs:
       - name: Install system dependencies
         run: |
           chmod +x get-deps ci/build-tgz-deb.sh
+          # The runner image ships a package index from the day it was
+          # built; a package superseded since then is a 404 on the mirror.
+          sudo apt-get update
           CI=yes ./get-deps
 
       - name: Build release binaries
