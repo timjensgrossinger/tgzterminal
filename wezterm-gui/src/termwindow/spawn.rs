@@ -17,6 +17,24 @@ impl super::TermWindow {
         spawn_where: SpawnWhere,
         title_policy: SpawnTitlePolicy,
     ) {
+        // A new tab or split from a WSL agent pane inherits the agent's
+        // directory, not the Windows home of the `wsl.exe` hosting it.
+        let inherited;
+        let spawn = match spawn.cwd {
+            None if spawn_where != SpawnWhere::NewWindow => {
+                match self.wsl_inherited_cwd(&spawn.domain) {
+                    Some(cwd) => {
+                        inherited = SpawnCommand {
+                            cwd: Some(cwd),
+                            ..spawn.clone()
+                        };
+                        &inherited
+                    }
+                    None => spawn,
+                }
+            }
+            _ => spawn,
+        };
         let size = if spawn_where == SpawnWhere::NewWindow {
             self.config.initial_size(
                 self.dimensions.dpi as u32,

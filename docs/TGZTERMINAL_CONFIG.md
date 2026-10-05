@@ -885,6 +885,23 @@ agent_ui = {
 }
 ```
 
+An agent found inside a distro is started — launched or resumed — the way a
+terminal would start it: through a login, interactive `bash` (`bash -lic`),
+so `~/.profile` *and* `~/.bashrc` run first, even past Ubuntu's "not
+interactive, return" guard at the top of `.bashrc`. Functions defined there
+(a `mvn` wrapper around Windows Maven, say) are then available to the agent
+and its shell commands, just as when you run `claude --resume <id>` by hand.
+A distro without `bash` falls back to `sh -l`.
+
+Where it starts: a WSL pane only knows its directory when its shell reports it
+with OSC 7; otherwise the only guess is the directory of the `wsl.exe` process
+hosting it, which is always the Windows home. An agent pane started or resumed
+from the sidebar never ran a shell prompt, so for such a pane the directory
+recorded in the agent's own session file is used instead: the Claude button, a
+new tab and a split taken from it all start where the agent runs. A WSL pane
+with no usable directory and no agent starts them in `~`, like a new tab of
+that distro, not in `/mnt/c/Users/<name>`.
+
 Agents installed natively on Windows (in PowerShell or cmd, not in WSL) need
 no WSL at all: turn `prefer_wsl` off so launches stay in the Windows domain.
 Their sessions are read from the Windows home (`%USERPROFILE%\.claude` and

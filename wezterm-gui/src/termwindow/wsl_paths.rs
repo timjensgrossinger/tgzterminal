@@ -217,6 +217,10 @@ impl WslProbeShell {
 
     /// `command` run through this shell, so its rc-file `PATH` applies.
     /// Arguments travel as positional parameters, never re-parsed as shell.
+    ///
+    /// Probing only: a found program is *started* with [`launch_wrap`],
+    /// whichever shell found it.
+    #[cfg(test)]
     pub fn wrap(self, command: Vec<String>) -> Vec<String> {
         let [shell, flags] = self.shell();
         let mut argv = vec![
@@ -227,6 +231,33 @@ impl WslProbeShell {
         argv.extend(command);
         argv
     }
+}
+
+/// Script that starts `"$0" "$@"` the way a terminal the user opened would:
+/// through a login, interactive bash, which reads `~/.profile` *and*
+/// `~/.bashrc`. Run under `sh -lc`, so a distro without bash still starts the
+/// program (with `~/.profile`'s `PATH`).
+///
+/// Which shell *found* a program says nothing about how to start it. A CLI
+/// under `~/.local/bin` is found by the cheap `sh -lc` probe, but started that
+/// way it never sees `~/.bashrc`: Ubuntu's returns at once for a
+/// non-interactive shell, so functions defined or `export -f`'d there (a `mvn`
+/// wrapper, say) were missing from the agent and from the shell snapshot
+/// Claude Code takes at startup, while the same session resumed by hand from a
+/// terminal had them.
+const LOGIN_BASH_SCRIPT: &str = r#"command -v bash >/dev/null 2>&1 && exec bash -lic "exec \"\$0\" \"\$@\"" "$0" "$@"; exec "$0" "$@""#;
+
+/// `command` started inside a distro as an interactive login shell would start
+/// it; see [`LOGIN_BASH_SCRIPT`]. Arguments travel as positional parameters,
+/// never re-parsed as shell.
+pub fn launch_wrap(command: Vec<String>) -> Vec<String> {
+    let mut argv = vec![
+        "sh".to_string(),
+        "-lc".to_string(),
+        LOGIN_BASH_SCRIPT.to_string(),
+    ];
+    argv.extend(command);
+    argv
 }
 
 /// An agent CLI found inside a WSL distro.
@@ -614,6 +645,13 @@ pub(crate) fn set_wsl_exec_cwd(argv: &mut Vec<String>, dir: &str) -> bool {
     true
 }
 
+/// `C:\…` or `C:/…`: a Windows drive path, which inside a distro pane means
+/// the directory was divined from the `wsl.exe` host, not reported.
+pub(crate) fn is_windows_drive_path(path: &str) -> bool {
+    let bytes = path.trim().as_bytes();
+    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+}
+
 /// `~`, the start directory of a new tab in a WSL domain.
 pub(crate) const WSL_HOME_CWD: &str = "~";
 
@@ -641,8 +679,7 @@ pub(crate) fn wsl_launch_home(
     let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
         return home();
     };
-    let bytes = raw.as_bytes();
-    let drive_path = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
+    let drive_path = is_windows_drive_path(raw);
     if source_is_wsl {
         return if drive_path { home() } else { None };
     }
@@ -911,6 +948,57 @@ fn strip_mnt_drive(path: &str) -> Option<(char, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn launch_wrap_runs_the_program_with_its_arguments_intact() {
+        // A throwaway home: the login shells read its (empty) rc files, not
+        // whoever runs the tests.
+        let home = tempfile::tempdir().unwrap();
+        let argv = launch_wrap(vec![
+            "printf".into(),
+            "%s|".into(),
+            "a b".into(),
+            "$HOME".into(),
+            "c'd\"e".into(),
+        ]);
+        let out = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .env("HOME", home.path())
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "a b|$HOME|c'd\"e|");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn launch_wrap_reads_bashrc_functions() {
+        if std::process::Command::new("bash")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("bash not installed; skipping");
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        // Ubuntu's .bashrc shape: bail out unless interactive, then define.
+        std::fs::write(
+            home.path().join(".bashrc"),
+            "case $- in *i*) ;; *) return;; esac\nmvn() { echo wrapped; }\nexport -f mvn\n",
+        )
+        .unwrap();
+        std::fs::write(home.path().join(".bash_profile"), ". ~/.bashrc\n").unwrap();
+        let argv = launch_wrap(vec!["bash".into(), "-c".into(), "mvn".into()]);
+        let out = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .env("HOME", home.path())
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "wrapped");
+    }
 
     #[test]
     fn wsl_exec_gets_its_start_directory_before_exec() {

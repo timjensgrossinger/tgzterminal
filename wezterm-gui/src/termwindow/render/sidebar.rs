@@ -6385,7 +6385,7 @@ impl crate::TermWindow {
                     };
                     argv
                 } else if let Some(hit) = wsl_hits.get(program.trim()) {
-                    let wrapped = hit.shell.wrap(argv.clone());
+                    let wrapped = wsl_paths::launch_wrap(argv.clone());
                     match self.wsl_domain_name_for_distro(&hit.distro) {
                         Some(domain) => {
                             launch_domain.get_or_insert(domain);
@@ -6613,15 +6613,15 @@ impl crate::TermWindow {
             // The probe keeps one distro per program, so a CLI installed in two
             // distros is only "found" in one of them. A session recorded in the
             // other is proof enough that its CLI is there too: reach it through
-            // that distro's domain with the login shell the probe would use.
+            // that distro's domain, started as from a login shell.
             let distro = distro?;
             let domain = self.wsl_domain_name_for_distro(distro)?;
             return Some((
-                wsl_paths::WslProbeShell::BashInteractive.wrap(argv),
+                wsl_paths::launch_wrap(argv),
                 Some(SpawnTabDomain::DomainName(domain)),
             ));
         };
-        let wrapped = hit.shell.wrap(argv);
+        let wrapped = wsl_paths::launch_wrap(argv);
         Some(match self.wsl_domain_name_for_distro(&hit.distro) {
             Some(domain) => (wrapped, Some(SpawnTabDomain::DomainName(domain))),
             // See `agent_launcher_entries`: no domain opens that distro, so
@@ -6928,6 +6928,64 @@ impl crate::TermWindow {
             .map(|domain| domain.domain_name().to_string())
     }
 
+    /// The directory of the agent session running in the active pane, when
+    /// that pane is in a WSL distro and cannot report its own directory.
+    ///
+    /// A distro pane's directory comes from OSC 7 or, failing that, from the
+    /// Windows process hosting it — `wsl.exe`, which always sits in the Windows
+    /// home. A shell can be taught to send OSC 7; an agent pane started or
+    /// resumed by the launcher never ran a shell prompt, so it has nothing but
+    /// that guess. Its session file, though, records where it runs (the herd
+    /// reads it), in the distro's own Linux form.
+    pub(crate) fn wsl_active_pane_session_cwd(&self) -> Option<PathBuf> {
+        let pane = self.get_active_pane_or_overlay()?;
+        let domain = self.active_pane_domain_name()?;
+        wsl_paths::distro_for_domain(&domain, &self.config)?;
+        let raw = crate::termwindow::composer::active_pane_cwd(self);
+        if raw
+            .as_deref()
+            .is_some_and(|raw| !wsl_paths::is_windows_drive_path(raw))
+        {
+            // A Linux directory from OSC 7: the pane knows where it is.
+            return None;
+        }
+        let herd = self.agent_herd_state.try_borrow().ok()?;
+        herd.agents
+            .iter()
+            .find(|agent| agent.pane_id == Some(pane.pane_id()) && agent.origin.distro().is_some())?
+            .cwd
+            .clone()
+    }
+
+    /// The directory a new tab or split taken from the active pane should
+    /// inherit, when the mux would otherwise inherit the wrong one.
+    ///
+    /// Only for a WSL pane spawning into its own domain without a directory
+    /// of its own: the mux would hand on the `wsl.exe` host's Windows home
+    /// (see [`Self::wsl_active_pane_session_cwd`]). The agent session's
+    /// directory wins; with none, `~`, where a new tab of that distro starts.
+    /// `None` leaves the mux's own inheritance alone.
+    pub(crate) fn wsl_inherited_cwd(&self, target: &SpawnTabDomain) -> Option<PathBuf> {
+        let source = self.active_pane_domain_name()?;
+        let same_domain = match target {
+            SpawnTabDomain::CurrentPaneDomain => true,
+            SpawnTabDomain::DomainName(name) => *name == source,
+            _ => false,
+        };
+        if !same_domain {
+            return None;
+        }
+        wsl_paths::distro_for_domain(&source, &self.config)?;
+        if let Some(cwd) = self.wsl_active_pane_session_cwd() {
+            return Some(cwd);
+        }
+        let raw = crate::termwindow::composer::active_pane_cwd(self);
+        match raw {
+            Some(raw) if !wsl_paths::is_windows_drive_path(&raw) => None,
+            _ => Some(PathBuf::from(wsl_paths::WSL_HOME_CWD)),
+        }
+    }
+
     fn domain_is_registered(&self, name: &str) -> bool {
         Mux::get().get_domain_by_name(name).is_some()
     }
@@ -7128,7 +7186,11 @@ impl crate::TermWindow {
             return Some(cwd);
         }
 
-        let raw = crate::termwindow::composer::active_pane_cwd(self);
+        // An agent pane in a distro knows its directory only from its session.
+        let raw = self
+            .wsl_active_pane_session_cwd()
+            .map(|cwd| cwd.to_string_lossy().into_owned())
+            .or_else(|| crate::termwindow::composer::active_pane_cwd(self));
         let source_distro = self
             .active_pane_domain_name()
             .and_then(|name| wsl_paths::distro_for_domain(&name, &self.config));
