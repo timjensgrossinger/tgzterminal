@@ -77,6 +77,10 @@ const CLOSE_ZONE_W: f32 = 34.;
 /// the Windows and Debian builds this fork also releases, and a tofu box in
 /// place of a control is worse than an unusual codepoint.
 const SIDEBAR_COPY_GLYPH: &str = "\u{f0c5}";
+/// `nf-fa-wrench`, for the sidebar button that shows or hides the agent
+/// toolbelt. From the bundled Symbols Nerd Font for the same reason as
+/// [`SIDEBAR_COPY_GLYPH`].
+const SIDEBAR_TOOLBELT_GLYPH: &str = "\u{f0ad}";
 
 /// Gap between the close button's right edge and the right edge of its zone.
 /// Both the hover button and the `×` inside it derive from this, and so does the
@@ -4693,6 +4697,102 @@ pub(crate) fn pane_copy_menu_items(kind: &PaneToolbeltKind) -> Vec<(&'static str
     }
 }
 
+/// Where the user dragged the agent toolbelt to: the distance of the strip's
+/// top-right corner from the pane's top-right corner, in DPI-independent
+/// pixels. One position for every agent pane, so it is relative to the corner
+/// the strip lives in by default rather than to any one pane's size.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PaneToolbeltOffset {
+    pub right: f32,
+    pub top: f32,
+}
+
+/// The rects one toolbelt paint used, in window pixels. Kept from the last
+/// paint so a drag can start from where the strip actually was.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PaneToolbeltGeometry {
+    /// The whole pane, not the part a floating Changes panel leaves clear: a
+    /// dragged strip may go anywhere on its pane.
+    pub pane: RectF,
+    pub strip: RectF,
+    pub dpi_scale: f32,
+}
+
+/// `value` clamped into `lo..=hi`, or `lo` when the span is empty (a strip
+/// wider than its pane keeps its left edge on the pane).
+fn clamp_span(value: f32, lo: f32, hi: f32) -> f32 {
+    if hi < lo {
+        lo
+    } else {
+        value.clamp(lo, hi)
+    }
+}
+
+/// Top-left corner of the toolbelt strip.
+///
+/// With no `offset` this is the configured spot: `clear_w` from the pane's
+/// left edge (the part a floating Changes panel leaves uncovered), inset from
+/// the right, at the top or bottom. A dragged strip keeps its distance from
+/// the pane's top-right corner, clamped so all of it stays on the pane.
+fn pane_toolbelt_origin(
+    pane: RectF,
+    clear_w: f32,
+    tool_size: (f32, f32),
+    position: PaneToolbeltPosition,
+    offset: Option<PaneToolbeltOffset>,
+    dpi_scale: f32,
+) -> (f32, f32) {
+    let (tool_w, strip_h) = tool_size;
+    let Some(offset) = offset else {
+        let x = pane.min_x() + clear_w - tool_w - PANE_TOOLBELT_RIGHT_INSET;
+        let y = match position {
+            PaneToolbeltPosition::Top => pane.min_y() + FLOAT_GAP,
+            PaneToolbeltPosition::Bottom => pane.max_y() - strip_h - FLOAT_GAP,
+        };
+        return (x, y);
+    };
+    let x = pane.max_x() - offset.right * dpi_scale - tool_w;
+    let y = pane.min_y() + offset.top * dpi_scale;
+    (
+        clamp_span(
+            x,
+            pane.min_x() + FLOAT_GAP,
+            pane.max_x() - tool_w - FLOAT_GAP,
+        ),
+        clamp_span(
+            y,
+            pane.min_y() + FLOAT_GAP,
+            pane.max_y() - strip_h - FLOAT_GAP,
+        ),
+    )
+}
+
+/// The offset that puts the strip `delta` pixels away from where `start` had
+/// it, clamped to the pane exactly as [`pane_toolbelt_origin`] would, so a
+/// strip dragged past an edge comes back the moment the pointer does.
+pub(crate) fn pane_toolbelt_dragged_offset(
+    start: &PaneToolbeltGeometry,
+    delta: (f32, f32),
+) -> PaneToolbeltOffset {
+    let pane = start.pane;
+    let strip = start.strip;
+    let x = clamp_span(
+        strip.min_x() + delta.0,
+        pane.min_x() + FLOAT_GAP,
+        pane.max_x() - strip.width() - FLOAT_GAP,
+    );
+    let y = clamp_span(
+        strip.min_y() + delta.1,
+        pane.min_y() + FLOAT_GAP,
+        pane.max_y() - strip.height() - FLOAT_GAP,
+    );
+    let scale = start.dpi_scale.max(f32::EPSILON);
+    PaneToolbeltOffset {
+        right: (pane.max_x() - (x + strip.width())) / scale,
+        top: (y - pane.min_y()) / scale,
+    }
+}
+
 /// Per-kind strip content and width floor, resolved before any drawing.
 ///
 /// Exists so a one-button shell strip is not padded out to the agent strip's
@@ -7553,6 +7653,27 @@ impl crate::TermWindow {
         );
     }
 
+    /// Whether the sidebar offers the toolbelt button: only when there is a
+    /// toolbelt to hide, i.e. agent awareness and the strip are both on.
+    pub(crate) fn sidebar_toolbelt_toggle_shown(&self) -> bool {
+        self.config.agent_ui.enabled && self.config.agent_ui.show_pane_toolbelt
+    }
+
+    /// The sidebar's toolbelt button: show or hide the agent pane toolbelt in
+    /// this window, and remember it for windows opened later and restarts.
+    pub fn toggle_pane_toolbelt_hidden(&mut self) {
+        self.pane_toolbelt_hidden = !self.pane_toolbelt_hidden;
+        crate::termwindow::tgz_ui_state::save_pane_toolbelt_hidden(self.pane_toolbelt_hidden);
+        if self.pane_toolbelt_hidden {
+            self.pane_toolbelt_painted = None;
+            self.pane_toolbelt_drag_start = None;
+        }
+        self.quad_generation += 1;
+        if let Some(window) = self.window.as_ref() {
+            window.invalidate();
+        }
+    }
+
     pub fn agent_launcher_project_root_enabled(&self) -> bool {
         self.agent_launcher_project_root
     }
@@ -8948,7 +9069,8 @@ impl crate::TermWindow {
     ///
     /// Expanded: "+ New Tab" plus the shared Worktree/agent row. Collapsed:
     /// the "+" rail icon plus the agent launcher slot when an agent is
-    /// installed and the Changes slot when the panel is enabled. Kept in one place so the paint pass, the wheel-scroll
+    /// installed, the Changes slot when the panel is enabled and the toolbelt
+    /// slot when there is a toolbelt. Kept in one place so the paint pass, the wheel-scroll
     /// clamp and the scrollbar cannot disagree.
     fn sidebar_bottom_button_rows(&self) -> f32 {
         let collapsed = self.config.sidebar_auto_hide && !self.sidebar_auto_hide_open;
@@ -8959,6 +9081,9 @@ impl crate::TermWindow {
                 rows += 1.;
             }
             if self.config.diff_panel.enabled {
+                rows += 1.;
+            }
+            if self.sidebar_toolbelt_toggle_shown() {
                 rows += 1.;
             }
             if ssh_present {
@@ -9924,6 +10049,13 @@ impl crate::TermWindow {
         pos: &PositionedPane,
     ) -> anyhow::Result<()> {
         self.prune_agent_detection_cache();
+        self.pane_toolbelt_painted = None;
+        // Switched off from the sidebar. Gated here rather than in
+        // `pane_toolbelt_kind`, which also decides what the sidebar's Copy
+        // icon opens: hiding the strip must not take that away.
+        if self.pane_toolbelt_hidden {
+            return Ok(());
+        }
         // Agent panes only. A plain pane's Copy control lives on the sidebar tab
         // row, where it covers no output at all.
         let Some(kind @ PaneToolbeltKind::Agent(_)) = self.pane_toolbelt_kind(&pos.pane) else {
@@ -9965,9 +10097,23 @@ impl crate::TermWindow {
         let pane_x = border.left.get() as f32 + padding_left + pos.left as f32 * cell_w_f;
         let pane_y =
             border.top.get() as f32 + top_bar_height + padding_top + pos.top as f32 * cell_h_f;
+        let pane_rect = euclid::rect(
+            pane_x,
+            pane_y,
+            pos.pixel_width as f32,
+            pos.pixel_height as f32,
+        );
+        let offset = self.pane_toolbelt_offset;
         // A floating Changes panel covers this pane's top corner: keep the
-        // strip, which carries the panel's own toggle, clear of it.
-        let pane_w = self.diff_panel_clear_width(pane_x, pos.pixel_width as f32);
+        // strip, which carries the panel's own toggle, clear of it. A strip
+        // the user dragged goes wherever they put it, so it gets the whole
+        // pane to size itself against.
+        let clear_w = self.diff_panel_clear_width(pane_x, pos.pixel_width as f32);
+        let pane_w = if offset.is_some() {
+            pos.pixel_width as f32
+        } else {
+            clear_w
+        };
         let pane_h = pos.pixel_height as f32;
         if pane_w < 140. || pane_h < strip_h + FLOAT_GAP * 2. {
             return Ok(());
@@ -9998,9 +10144,12 @@ impl crate::TermWindow {
         let label_fallbacks = &layout.label_fallbacks;
         let label = label_fallbacks.first().cloned().unwrap_or_default();
 
-        let max_tool_w = (pane_w - PANE_TOOLBELT_RIGHT_INSET - FLOAT_GAP)
-            .max(1.)
-            .min(PANE_TOOLBELT_MAX_W);
+        let side_room = if offset.is_some() {
+            FLOAT_GAP * 2.
+        } else {
+            PANE_TOOLBELT_RIGHT_INSET + FLOAT_GAP
+        };
+        let max_tool_w = (pane_w - side_room).max(1.).min(PANE_TOOLBELT_MAX_W);
         // A shell strip has no dot, so it must not reserve the dot's gap either.
         let fixed_controls_w = pad_x * 2. + dot_size + if dot_size > 0. { FLOAT_GAP } else { 0. };
         let max_button_area = (max_tool_w - fixed_controls_w).max(0.);
@@ -10024,11 +10173,19 @@ impl crate::TermWindow {
         let tool_w = desired_w
             .min(max_tool_w)
             .max(fixed_controls_w + button_area);
-        let tool_x = pane_x + pane_w - tool_w - PANE_TOOLBELT_RIGHT_INSET;
-        let tool_y = match self.config.agent_ui.toolbelt_position {
-            PaneToolbeltPosition::Top => pane_y + FLOAT_GAP,
-            PaneToolbeltPosition::Bottom => pane_y + pane_h - strip_h - FLOAT_GAP,
-        };
+        let (tool_x, tool_y) = pane_toolbelt_origin(
+            pane_rect,
+            clear_w,
+            (tool_w, strip_h),
+            self.config.agent_ui.toolbelt_position,
+            offset,
+            dpi_scale,
+        );
+        self.pane_toolbelt_painted = Some(PaneToolbeltGeometry {
+            pane: pane_rect,
+            strip: euclid::rect(tool_x, tool_y, tool_w, strip_h),
+            dpi_scale,
+        });
 
         let sb = self.sidebar_palette();
         let fg = sb.text_active;
@@ -10176,6 +10333,22 @@ impl crate::TermWindow {
                 bg,
                 false,
             )?;
+        }
+
+        // The dot and label are the grip: buttons fire on release, and a
+        // release that ends a drag is swallowed, so a drag cannot start on
+        // one of them.
+        let handle_w = (button_start_x - FLOAT_GAP * 0.5 - tool_x).max(0.);
+        if handle_w >= 1. {
+            self.ui_items.push(UIItem {
+                x: tool_x as usize,
+                y: tool_y as usize,
+                width: handle_w.ceil() as usize,
+                height: strip_h.ceil() as usize,
+                item_type: UIItemType::PaneToolbeltHandle {
+                    pane_id: pos.pane.pane_id(),
+                },
+            });
         }
 
         let hovered_item = self
@@ -11664,17 +11837,18 @@ impl crate::TermWindow {
         // any width and the collapsed rail -- so the panel is always one click
         // away; only the box it is given differs. `hit` is the clickable
         // `(x, width)`: the rail lets a click anywhere across it count.
-        let paint_changes_button = |this: &mut Self,
-                                    layers: &mut TripleLayerQuadAllocator,
-                                    (x, y, w, h): (f32, f32, f32, f32),
-                                    radius: f32,
-                                    hit: (f32, f32)|
+        // The square toggles at the bottom of the sidebar: Changes (`±`) and
+        // the agent toolbelt. `on` paints the button lit.
+        let paint_square_toggle = |this: &mut Self,
+                                   layers: &mut TripleLayerQuadAllocator,
+                                   (item_type, glyph, on): (UIItemType, &str, bool),
+                                   (x, y, w, h): (f32, f32, f32, f32),
+                                   radius: f32,
+                                   hit: (f32, f32)|
          -> anyhow::Result<()> {
-            let changes_type = UIItemType::SidebarDiffPanelButton;
-            let hovered = hovered_item.as_ref() == Some(&changes_type);
+            let hovered = hovered_item.as_ref() == Some(&item_type);
             let pressed =
-                hovered && left_pressed && this.pressed_ui_item.as_ref() == Some(&changes_type);
-            let on = this.diff_panel_shown();
+                hovered && left_pressed && this.pressed_ui_item.as_ref() == Some(&item_type);
             let bg = if pressed {
                 pressed_fill
             } else if hovered {
@@ -11697,7 +11871,7 @@ impl crate::TermWindow {
             render_text(
                 this,
                 layers,
-                "\u{00b1}",
+                glyph,
                 &CellAttributes::default(),
                 x + (w - cell_width as f32) * 0.5,
                 y + offset + (h - cell_height as f32) * 0.5,
@@ -11714,9 +11888,45 @@ impl crate::TermWindow {
                 y: y as usize,
                 width: hit.1 as usize,
                 height: h as usize,
-                item_type: changes_type,
+                item_type,
             });
             Ok(())
+        };
+        let paint_changes_button = |this: &mut Self,
+                                    layers: &mut TripleLayerQuadAllocator,
+                                    rect: (f32, f32, f32, f32),
+                                    radius: f32,
+                                    hit: (f32, f32)|
+         -> anyhow::Result<()> {
+            let on = this.diff_panel_shown();
+            paint_square_toggle(
+                this,
+                layers,
+                (UIItemType::SidebarDiffPanelButton, "\u{00b1}", on),
+                rect,
+                radius,
+                hit,
+            )
+        };
+        let paint_toolbelt_toggle = |this: &mut Self,
+                                     layers: &mut TripleLayerQuadAllocator,
+                                     rect: (f32, f32, f32, f32),
+                                     radius: f32,
+                                     hit: (f32, f32)|
+         -> anyhow::Result<()> {
+            let on = !this.pane_toolbelt_hidden;
+            paint_square_toggle(
+                this,
+                layers,
+                (
+                    UIItemType::SidebarToolbeltToggle,
+                    SIDEBAR_TOOLBELT_GLYPH,
+                    on,
+                ),
+                rect,
+                radius,
+                hit,
+            )
         };
 
         if self.config.sidebar_auto_hide && !self.sidebar_auto_hide_open {
@@ -11778,13 +11988,22 @@ impl crate::TermWindow {
             let rail_launch_y = rail_launcher_entry
                 .as_ref()
                 .map(|_| ssh_rail_y.unwrap_or(new_tab_y) - row_stride);
-            // The Changes toggle tops the stack of bottom buttons.
+            // The Changes toggle tops the stack of bottom buttons, with the
+            // toolbelt toggle above it.
             let changes_rail_y = self
                 .config
                 .diff_panel
                 .enabled
                 .then(|| rail_launch_y.or(ssh_rail_y).unwrap_or(new_tab_y) - row_stride);
-            let list_bottom = changes_rail_y
+            let toolbelt_rail_y = self.sidebar_toolbelt_toggle_shown().then(|| {
+                changes_rail_y
+                    .or(rail_launch_y)
+                    .or(ssh_rail_y)
+                    .unwrap_or(new_tab_y)
+                    - row_stride
+            });
+            let list_bottom = toolbelt_rail_y
+                .or(changes_rail_y)
                 .or(rail_launch_y)
                 .or(ssh_rail_y)
                 .unwrap_or(new_tab_y);
@@ -11991,6 +12210,15 @@ impl crate::TermWindow {
                     self,
                     layers,
                     (rail_x, changes_y, rail_side, rail_side),
+                    rail_radius,
+                    (left, width as f32),
+                )?;
+            }
+            if let Some(toolbelt_y) = toolbelt_rail_y {
+                paint_toolbelt_toggle(
+                    self,
+                    layers,
+                    (rail_x, toolbelt_y, rail_side, rail_side),
                     rail_radius,
                     (left, width as f32),
                 )?;
@@ -13253,14 +13481,23 @@ impl crate::TermWindow {
             // right end, so the row keeps its height and the launcher its half.
             // On a narrow sidebar it shrinks to half the pill rather than go:
             // the Worktree label gives way first.
-            let changes_side =
-                (row_height as f32).min(((bottom_row.worktree_fill_w - GAP) * 0.5).max(1.));
-            let changes_x = self.config.diff_panel.enabled.then(|| {
+            // The toolbelt toggle joins it on the far right, and the two
+            // split what the Worktree pill can give up.
+            let show_changes = self.config.diff_panel.enabled;
+            let show_toolbelt = self.sidebar_toolbelt_toggle_shown();
+            let squares = show_changes as usize + show_toolbelt as usize;
+            let changes_side = (row_height as f32).min(
+                ((bottom_row.worktree_fill_w - GAP * squares as f32) / (squares + 1) as f32)
+                    .max(1.),
+            );
+            let mut carve_square = || {
                 bottom_row.worktree_fill_w -= changes_side + GAP;
                 bottom_row.worktree_text_w =
                     (bottom_row.worktree_text_w - changes_side - GAP).max(0.);
                 bottom_row.worktree_fill_x + bottom_row.worktree_fill_w + GAP
-            });
+            };
+            let toolbelt_x = show_toolbelt.then(&mut carve_square);
+            let changes_x = show_changes.then(&mut carve_square);
 
             let worktree_type = UIItemType::SidebarWorktreeButton;
             let worktree_hovered = hovered_item.as_ref() == Some(&worktree_type);
@@ -13351,6 +13588,15 @@ impl crate::TermWindow {
                     (changes_x, worktree_y, changes_side, row_height as f32),
                     RADIUS * dpi_scale,
                     (changes_x, changes_side),
+                )?;
+            }
+            if let Some(toolbelt_x) = toolbelt_x {
+                paint_toolbelt_toggle(
+                    self,
+                    layers,
+                    (toolbelt_x, worktree_y, changes_side, row_height as f32),
+                    RADIUS * dpi_scale,
+                    (toolbelt_x, changes_side),
                 )?;
             }
 
@@ -13457,11 +13703,35 @@ impl crate::TermWindow {
         } else {
             0.
         };
-        let split_w = if narrow_changes_w > 0. {
-            item_w - narrow_changes_w - GAP
+        // The toolbelt toggle follows it there, but only while "+" keeps at
+        // least a square of its own: at the 140px drag floor it does not, and
+        // the rail and the wide row still offer it.
+        let narrow_toolbelt_w = if width <= 180 && self.sidebar_toolbelt_toggle_shown() {
+            let side = (row_height as f32).min(((item_w - chevron_w - GAP) * 0.5).max(1.));
+            let used = if narrow_changes_w > 0. {
+                narrow_changes_w + GAP
+            } else {
+                0.
+            };
+            if item_w - chevron_w - used - side - GAP >= side {
+                side
+            } else {
+                0.
+            }
         } else {
-            item_w
+            0.
         };
+        let split_w = item_w
+            - if narrow_changes_w > 0. {
+                narrow_changes_w + GAP
+            } else {
+                0.
+            }
+            - if narrow_toolbelt_w > 0. {
+                narrow_toolbelt_w + GAP
+            } else {
+                0.
+            };
         let new_tab_fill_w = (split_w - chevron_w).max(1.);
         let chevron_x = item_x + new_tab_fill_w;
         // Both hit regions key off the drawn geometry. Deriving them from the
@@ -13576,6 +13846,16 @@ impl crate::TermWindow {
                 (changes_x, new_tab_y, narrow_changes_w, row_height as f32),
                 RADIUS * dpi_scale,
                 (changes_x, narrow_changes_w),
+            )?;
+        }
+        if narrow_toolbelt_w > 0. {
+            let toolbelt_x = item_x + item_w - narrow_toolbelt_w;
+            paint_toolbelt_toggle(
+                self,
+                layers,
+                (toolbelt_x, new_tab_y, narrow_toolbelt_w, row_height as f32),
+                RADIUS * dpi_scale,
+                (toolbelt_x, narrow_toolbelt_w),
             )?;
         }
 
@@ -15625,6 +15905,119 @@ mod tests {
     ///
     /// The dot means *agent status*; on a shell it would mean nothing, and the
     /// 360px agent floor would leave it stranded in empty space.
+    fn toolbelt_pane() -> RectF {
+        euclid::rect(100., 50., 1000., 600.)
+    }
+
+    #[test]
+    fn toolbelt_without_an_offset_keeps_the_configured_spot() {
+        let pane = toolbelt_pane();
+        let (x, y) = pane_toolbelt_origin(
+            pane,
+            1000.,
+            (400., 30.),
+            PaneToolbeltPosition::Top,
+            None,
+            2.,
+        );
+        assert_eq!(x, 100. + 1000. - 400. - PANE_TOOLBELT_RIGHT_INSET);
+        assert_eq!(y, 50. + FLOAT_GAP);
+        let (_, y) = pane_toolbelt_origin(
+            pane,
+            1000.,
+            (400., 30.),
+            PaneToolbeltPosition::Bottom,
+            None,
+            2.,
+        );
+        assert_eq!(y, 650. - 30. - FLOAT_GAP);
+        // A floating Changes panel narrows only the default spot.
+        let (x, _) =
+            pane_toolbelt_origin(pane, 600., (400., 30.), PaneToolbeltPosition::Top, None, 2.);
+        assert_eq!(x, 100. + 600. - 400. - PANE_TOOLBELT_RIGHT_INSET);
+    }
+
+    #[test]
+    fn a_dragged_toolbelt_keeps_its_distance_from_the_top_right_corner() {
+        let offset = PaneToolbeltOffset {
+            right: 50.,
+            top: 100.,
+        };
+        // The offset is DPI-independent: 2x doubles it in pixels. The clear
+        // width and the configured position no longer matter.
+        let (x, y) = pane_toolbelt_origin(
+            toolbelt_pane(),
+            300.,
+            (400., 30.),
+            PaneToolbeltPosition::Bottom,
+            Some(offset),
+            2.,
+        );
+        assert_eq!((x, y), (1100. - 100. - 400., 50. + 200.));
+    }
+
+    #[test]
+    fn a_dragged_toolbelt_stays_on_its_pane() {
+        let pane = toolbelt_pane();
+        let place = |right, top| {
+            pane_toolbelt_origin(
+                pane,
+                1000.,
+                (400., 30.),
+                PaneToolbeltPosition::Top,
+                Some(PaneToolbeltOffset { right, top }),
+                1.,
+            )
+        };
+        assert_eq!(
+            place(-500., -500.),
+            (1100. - 400. - FLOAT_GAP, 50. + FLOAT_GAP)
+        );
+        assert_eq!(
+            place(5000., 5000.),
+            (100. + FLOAT_GAP, 650. - 30. - FLOAT_GAP)
+        );
+        // A strip wider than its pane keeps its left edge on the pane.
+        let (x, _) = pane_toolbelt_origin(
+            euclid::rect(100., 50., 200., 600.),
+            200.,
+            (400., 30.),
+            PaneToolbeltPosition::Top,
+            Some(PaneToolbeltOffset { right: 0., top: 0. }),
+            1.,
+        );
+        assert_eq!(x, 100. + FLOAT_GAP);
+    }
+
+    #[test]
+    fn dragging_the_toolbelt_round_trips_through_its_offset() {
+        let start = PaneToolbeltGeometry {
+            pane: toolbelt_pane(),
+            strip: euclid::rect(650., 56., 400., 30.),
+            dpi_scale: 2.,
+        };
+        let offset = pane_toolbelt_dragged_offset(&start, (-200., 300.));
+        assert_eq!(
+            offset,
+            PaneToolbeltOffset {
+                right: (1100. - 850.) / 2.,
+                top: (356. - 50.) / 2.,
+            }
+        );
+        let (x, y) = pane_toolbelt_origin(
+            start.pane,
+            1000.,
+            (400., 30.),
+            PaneToolbeltPosition::Top,
+            Some(offset),
+            2.,
+        );
+        assert_eq!((x, y), (450., 356.));
+        // Past an edge the offset is clamped, so coming back moves it at once.
+        let pinned = pane_toolbelt_dragged_offset(&start, (0., -10_000.));
+        assert_eq!(pinned.top, FLOAT_GAP / 2.);
+    }
+
     #[test]
     fn pane_toolbelt_layout_drops_the_dot_and_the_width_floor_on_a_plain_pane() {
         let shell = pane_toolbelt_layout(&PaneToolbeltKind::Shell, 1.);

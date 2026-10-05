@@ -329,13 +329,13 @@ vendor-neutral agent.
 |---|---|---|---|
 | `enabled` | bool | `true` | Master switch for detection and every agent surface. |
 | `show_sidebar_badges` | bool | `true` | |
-| `show_pane_toolbelt` | bool | `true` | |
+| `show_pane_toolbelt` | bool | `true` | Whether the strip exists at all. The sidebar's wrench button (see [Moving and hiding the agent toolbelt](#moving-and-hiding-the-agent-toolbelt)) only shows while this is on. |
 | `enable_control_actions` | bool | `false` | Opt-in half of the control-action gate; see below. |
 | `show_stop` | bool | `true` | Show Stop in expanded herd rows when agent can be interrupted. |
 | `detect_processes` | bool | `true` | When off, only user vars identify an agent — no process, title or visible-text detection, and therefore no inferred status. |
 | `copy_scrollback_lines` | int | `20000` | Maximum **physical** rows a copy action reads, counted from the bottom of the pane buffer. Wrapped output costs several rows per logical line, which is why the previous `500` truncated real sessions. Clamped to 100000 rows per action. Lower it to capture less. |
 | `waiting_notification` | bool | `false` | Off by default: short tasks end waiting for input after nearly every turn. |
-| `toolbelt_position` | enum | `"Top"` | `"Top"`, `"Bottom"` |
+| `toolbelt_position` | enum | `"Top"` | `"Top"`, `"Bottom"`. Where the strip sits until you drag it somewhere else. |
 | `visible_identity_signals` | int | `2` | Distinct adapter-exclusive patterns that must agree before visible text names an agent. Clamped by how many the adapter declares. |
 | `trust_visible_evidence` | bool | `true` | Whether multi-signal visible-text evidence counts as trusted for control actions. |
 | `pulse_working_dot` | bool | `true` | Pulse the status dot while an agent is Running/Streaming/WaitingForInput. Historically also the single kill switch for every sidebar animation; see [Sidebar animations](#sidebar-animations) for exactly when it still is. |
@@ -1111,6 +1111,29 @@ about how much output a copy may reach, not about agents.
 
 `agent_ui.toolbelt_position` no longer has anything to say here: it places the
 agent strip, and the plain-pane control is not placed over a pane at all.
+
+## Moving and hiding the agent toolbelt
+
+The floating strip on an agent pane (`• Claude agent sonnet  Stop  Input …`) can be
+moved and switched off at runtime:
+
+- **Drag** its dot or label to move it. The buttons stay buttons: a drag has to
+  start on the part of the strip that is not one. The strip stays entirely on its
+  pane, and is drawn above the Changes panel, so it can be parked anywhere.
+- **Double-click** the dot or label to put it back where `toolbelt_position`
+  places it (which also keeps clear of a floating Changes panel again).
+- The **wrench button** beside the Changes (`±`) button in the sidebar shows or
+  hides the strip. It sits on the Worktree row, in the collapsed rail, and on the
+  narrow new-tab row when that row has room for it (at the 140px drag floor it
+  does not; the rail and the wide row still offer it). Hiding the strip does not
+  touch the sidebar's Copy icon.
+
+There is one position for every agent pane, kept as the distance from the pane's
+top-right corner, so it carries across panes of different sizes. Both the
+position and the hidden state are remembered across restarts in the UI state
+file (`tgz-ui-state.json` in the data directory), not in your Lua config, because
+`agent_ui` is a nested table and a runtime override of one key in it would replace
+the whole table.
 
 ## Rich Input Composer
 

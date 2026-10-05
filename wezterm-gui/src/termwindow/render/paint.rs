@@ -272,11 +272,6 @@ impl crate::TermWindow {
             self.paint_pane(&pos, &mut layers).context("paint_pane")?;
         }
 
-        if let Some(pos) = active_agent_pane.as_ref() {
-            self.paint_pane_toolbelt(&mut layers, pos)
-                .context("paint_pane_toolbelt")?;
-        }
-
         self.paint_scrollbar_edge_overlay(&mut layers)
             .context("paint_scrollbar_edge_overlay")?;
 
@@ -298,6 +293,14 @@ impl crate::TermWindow {
         // the sidebar so a floating panel wins clicks over what it covers.
         self.paint_diff_panel(&mut layers)
             .context("paint_diff_panel")?;
+
+        // After the Changes panel: by default the strip keeps clear of it,
+        // and one the user dragged onto it is meant to be on top of it, both
+        // drawn and for clicks.
+        if let Some(pos) = active_agent_pane.as_ref() {
+            self.paint_pane_toolbelt(&mut layers, pos)
+                .context("paint_pane_toolbelt")?;
+        }
 
         // After the sidebar: the launch menu floats above it, and hit testing
         // walks ui_items in reverse, so its rows must be pushed last to win

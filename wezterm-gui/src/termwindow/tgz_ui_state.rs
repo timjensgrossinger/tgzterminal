@@ -50,6 +50,16 @@ struct TgzUiState {
     /// snapped to the bottom. `None` when the user has never dragged it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     diff_panel_height: Option<usize>,
+
+    /// Dragged position of the agent pane toolbelt as `[right, top]`: the
+    /// distance of the strip's top-right corner from the pane's top-right
+    /// corner, in DPI-independent pixels. `None` keeps the configured spot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pane_toolbelt_offset: Option<[f32; 2]>,
+
+    /// Whether the agent pane toolbelt is hidden from the sidebar toggle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pane_toolbelt_hidden: Option<bool>,
 }
 
 fn state_path() -> PathBuf {
@@ -168,6 +178,33 @@ pub fn save_diff_panel_size(width: Option<usize>, height: Option<usize>) {
     let mut state = read_state();
     state.diff_panel_width = width;
     state.diff_panel_height = height;
+    write_state(&state);
+}
+
+/// Persisted toolbelt position as `[right, top]`, or `None` when the user has
+/// never dragged it (or reset it). Non-finite values are dropped.
+pub fn load_pane_toolbelt_offset() -> Option<[f32; 2]> {
+    read_state()
+        .pane_toolbelt_offset
+        .filter(|[right, top]| right.is_finite() && top.is_finite())
+}
+
+/// Persist the toolbelt position; `None` clears it. Best-effort.
+pub fn save_pane_toolbelt_offset(offset: Option<[f32; 2]>) {
+    let mut state = read_state();
+    state.pane_toolbelt_offset = offset;
+    write_state(&state);
+}
+
+/// Persisted toolbelt hidden flag, or `None` when unset.
+pub fn load_pane_toolbelt_hidden() -> Option<bool> {
+    read_state().pane_toolbelt_hidden
+}
+
+/// Persist the toolbelt hidden flag. Best-effort.
+pub fn save_pane_toolbelt_hidden(value: bool) {
+    let mut state = read_state();
+    state.pane_toolbelt_hidden = Some(value);
     write_state(&state);
 }
 
@@ -309,6 +346,13 @@ mod tests {
     }
 
     #[test]
+    fn a_file_without_toolbelt_keys_loads_with_the_toolbelt_at_its_default() {
+        let parsed: TgzUiState = serde_json::from_str(r#"{"sidebar_auto_hide":true}"#).unwrap();
+        assert_eq!(parsed.pane_toolbelt_offset, None);
+        assert_eq!(parsed.pane_toolbelt_hidden, None);
+    }
+
+    #[test]
     fn default_state_has_no_persisted_toggles() {
         assert_eq!(TgzUiState::default().sidebar_auto_hide, None);
     }
@@ -348,12 +392,16 @@ mod tests {
             wsl_session_distros: Some(vec!["Ubuntu".into()]),
             diff_panel_width: Some(640),
             diff_panel_height: Some(0),
+            pane_toolbelt_offset: Some([120.0, 300.0]),
+            pane_toolbelt_hidden: Some(true),
         };
         let json = serde_json::to_string_pretty(&state).unwrap();
         let parsed: TgzUiState = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.sidebar_auto_hide, Some(false));
         assert_eq!(parsed.diff_panel_width, Some(640));
         assert_eq!(parsed.diff_panel_height, Some(0));
+        assert_eq!(parsed.pane_toolbelt_offset, Some([120.0, 300.0]));
+        assert_eq!(parsed.pane_toolbelt_hidden, Some(true));
         assert_eq!(parsed.agent_launcher_project_root, Some(true));
         assert_eq!(parsed.sidebar_expanded_tabs, Some(vec![0, 2]));
         assert_eq!(parsed.wsl_session_distros, Some(vec!["Ubuntu".into()]));
@@ -408,6 +456,9 @@ mod tests {
             wsl_session_distros: Some(vec!["Ubuntu".into()]),
             diff_panel_width: Some(640),
             diff_panel_height: None,
+            // Toolbelt state is window state, not config: never an override.
+            pane_toolbelt_offset: Some([10.0, 20.0]),
+            pane_toolbelt_hidden: Some(true),
         });
         assert_eq!(overrides, Value::Null);
     }

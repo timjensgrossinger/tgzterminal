@@ -523,6 +523,8 @@ pub enum UIItemType {
     /// Square button beside Worktree: shows or hides the Changes panel for
     /// the active pane.
     SidebarDiffPanelButton,
+    /// Square button beside Changes: shows or hides the agent pane toolbelt.
+    SidebarToolbeltToggle,
     /// Sidebar button that starts a fresh agent session.
     SidebarAgentLaunchButton,
     /// A single agent row in the launch dropdown.
@@ -583,6 +585,11 @@ pub enum UIItemType {
     PaneToolbeltButton {
         pane_id: PaneId,
         action: PaneToolbeltAction,
+    },
+    /// The toolbelt's dot and label: drag to move the strip, double-click to
+    /// put it back where the config places it.
+    PaneToolbeltHandle {
+        pane_id: PaneId,
     },
     PaneCopyMenuItem {
         pane_id: PaneId,
@@ -1126,6 +1133,19 @@ pub struct TermWindow {
     /// `agent_ui.launcher.cwd` and then owned by the user's dropdown toggle,
     /// persisted via `tgz_ui_state`.
     agent_launcher_project_root: bool,
+    /// The agent toolbelt switched off from the sidebar. Not
+    /// `agent_ui.show_pane_toolbelt`: that is nested in `agent_ui`, and a
+    /// runtime override of it would replace the user's whole table.
+    /// Persisted via `tgz_ui_state`.
+    pane_toolbelt_hidden: bool,
+    /// Where the user dragged the toolbelt to; `None` keeps the configured
+    /// spot. Persisted via `tgz_ui_state`.
+    pane_toolbelt_offset: Option<render::sidebar::PaneToolbeltOffset>,
+    /// The strip's rects from the last paint, `None` when none was drawn.
+    pane_toolbelt_painted: Option<render::sidebar::PaneToolbeltGeometry>,
+    /// [`Self::pane_toolbelt_painted`] as it was when a drag began, and
+    /// whether the pointer has since moved far enough to count as a drag.
+    pane_toolbelt_drag_start: Option<(render::sidebar::PaneToolbeltGeometry, bool)>,
     agent_detection_cache: RefCell<HashMap<PaneId, AgentDetectionCacheEntry>>,
     /// Panes that are agent insight views. Membership is the identity check —
     /// these panes must never be badged as agents, split into, or picked as a
@@ -1605,6 +1625,11 @@ impl TermWindow {
             new_tab_menu_cache: RefCell::new(None),
             agent_launcher_project_root: tgz_ui_state::load_agent_launcher_project_root()
                 .unwrap_or(config.agent_ui.launcher.cwd == config::AgentLauncherCwd::ProjectRoot),
+            pane_toolbelt_hidden: tgz_ui_state::load_pane_toolbelt_hidden().unwrap_or(false),
+            pane_toolbelt_offset: tgz_ui_state::load_pane_toolbelt_offset()
+                .map(|[right, top]| render::sidebar::PaneToolbeltOffset { right, top }),
+            pane_toolbelt_painted: None,
+            pane_toolbelt_drag_start: None,
             agent_detection_cache: RefCell::new(HashMap::new()),
             agent_herd_state: RefCell::new(AgentHerdState {
                 collapsed: tgz_ui_state::load_agent_section_collapsed().unwrap_or(false),

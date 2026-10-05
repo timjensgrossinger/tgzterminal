@@ -1,9 +1,11 @@
 use crate::agent_herd::AgentKey;
 use crate::tabbar::TabBarItem;
+use crate::termwindow::render::sidebar::pane_toolbelt_dragged_offset;
 use crate::termwindow::{
-    AgentLaunchMenuState, AgentRowAction, CloseTabMenuAction, CloseTabMenuState, CloseTabSource,
-    ExpandedMenuRow, GuiWin, MouseCapture, PaneCopyAction, PaneCopyMenuState, PaneToolbeltAction,
-    PositionedSplit, SshLaunchMenuState, TermWindowNotif, UIItem, UIItemType, TMB,
+    tgz_ui_state, AgentLaunchMenuState, AgentRowAction, CloseTabMenuAction, CloseTabMenuState,
+    CloseTabSource, ExpandedMenuRow, GuiWin, MouseCapture, PaneCopyAction, PaneCopyMenuState,
+    PaneToolbeltAction, PositionedSplit, SshLaunchMenuState, TermWindowNotif, UIItem, UIItemType,
+    TMB,
 };
 use ::window::{
     CursorIcon, MouseButtons as WMB, MouseEvent, MouseEventKind as WMEK, MousePress,
@@ -66,6 +68,7 @@ impl super::TermWindow {
             | UIItemType::SidebarAutoHideToggle
             | UIItemType::SidebarWorktreeButton
             | UIItemType::SidebarDiffPanelButton
+            | UIItemType::SidebarToolbeltToggle
             | UIItemType::SidebarAgentLaunchButton
             | UIItemType::SidebarSessionsButton
             | UIItemType::SidebarAgentMenuItem { .. }
@@ -87,6 +90,7 @@ impl super::TermWindow {
             | UIItemType::SidebarSshLaunchButton
             | UIItemType::SidebarSshMenuItem { .. }
             | UIItemType::PaneToolbeltButton { .. }
+            | UIItemType::PaneToolbeltHandle { .. }
             | UIItemType::PaneCopyMenuItem { .. }
             | UIItemType::SidebarWaitingCounter
             | UIItemType::AboveScrollThumb
@@ -120,6 +124,7 @@ impl super::TermWindow {
             | UIItemType::SidebarAutoHideToggle
             | UIItemType::SidebarWorktreeButton
             | UIItemType::SidebarDiffPanelButton
+            | UIItemType::SidebarToolbeltToggle
             | UIItemType::SidebarAgentLaunchButton
             | UIItemType::SidebarSessionsButton
             | UIItemType::SidebarAgentMenuItem { .. }
@@ -141,6 +146,7 @@ impl super::TermWindow {
             | UIItemType::SidebarSshLaunchButton
             | UIItemType::SidebarSshMenuItem { .. }
             | UIItemType::PaneToolbeltButton { .. }
+            | UIItemType::PaneToolbeltHandle { .. }
             | UIItemType::PaneCopyMenuItem { .. }
             | UIItemType::SidebarWaitingCounter
             | UIItemType::AboveScrollThumb
@@ -238,6 +244,9 @@ impl super::TermWindow {
                         }
                         if matches!(item.item_type, UIItemType::DiffPanelResize { .. }) {
                             self.finish_diff_panel_resize();
+                        }
+                        if matches!(item.item_type, UIItemType::PaneToolbeltHandle { .. }) {
+                            self.finish_pane_toolbelt_drag(context);
                         }
                         if let Some(tab_idx) = dropped_tab {
                             self.sidebar_drop_flash = Some((tab_idx, Instant::now()));
@@ -615,6 +624,9 @@ impl super::TermWindow {
             UIItemType::SidebarTab { tab_idx, .. } => {
                 self.drag_sidebar_tab(item, tab_idx, start_event, event, context);
             }
+            UIItemType::PaneToolbeltHandle { .. } => {
+                self.drag_pane_toolbelt(item, start_event, event, context);
+            }
             _ => {
                 log::error!("drag not implemented for {:?}", item);
             }
@@ -754,6 +766,15 @@ impl super::TermWindow {
                 }
                 context.invalidate();
             }
+            UIItemType::SidebarToolbeltToggle => {
+                if event.kind == WMEK::Release(MousePress::Left)
+                    && self.pressed_ui_item.as_ref() == Some(&UIItemType::SidebarToolbeltToggle)
+                {
+                    self.pressed_ui_item = None;
+                    self.toggle_pane_toolbelt_hidden();
+                }
+                context.invalidate();
+            }
             UIItemType::SidebarAgentLaunchButton => {
                 self.mouse_event_sidebar_agent_launch_button(item, event, context);
             }
@@ -832,6 +853,9 @@ impl super::TermWindow {
             }
             UIItemType::PaneToolbeltButton { pane_id, action } => {
                 self.mouse_event_pane_toolbelt_button(pane_id, action, event, context);
+            }
+            UIItemType::PaneToolbeltHandle { .. } => {
+                self.mouse_event_pane_toolbelt_handle(item, event, context);
             }
             UIItemType::PaneCopyMenuItem { pane_id, action } => {
                 self.mouse_event_pane_copy_menu_item(pane_id, action, event, context);
@@ -1579,6 +1603,79 @@ impl super::TermWindow {
             _ => {}
         }
         context.set_cursor(Some(CursorIcon::Default));
+    }
+
+    fn mouse_event_pane_toolbelt_handle(
+        &mut self,
+        item: UIItem,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        if event.kind == WMEK::Press(MousePress::Left) {
+            let streak = self
+                .last_mouse_click
+                .as_ref()
+                .map(|click| click.streak)
+                .unwrap_or(1);
+            if streak >= 2 {
+                // Double-click: back to where the config puts it.
+                self.pressed_ui_item = None;
+                self.pane_toolbelt_drag_start = None;
+                if self.pane_toolbelt_offset.take().is_some() {
+                    tgz_ui_state::save_pane_toolbelt_offset(None);
+                }
+                context.invalidate();
+            } else if let Some(start) = self.pane_toolbelt_painted {
+                self.pane_toolbelt_drag_start = Some((start, false));
+                self.dragging.replace((item, event));
+                context.set_cursor(Some(CursorIcon::Grabbing));
+                return;
+            }
+        }
+        context.set_cursor(Some(CursorIcon::Grab));
+    }
+
+    fn drag_pane_toolbelt(
+        &mut self,
+        item: UIItem,
+        start_event: MouseEvent,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        let Some((start, moved)) = self.pane_toolbelt_drag_start else {
+            return;
+        };
+        let dx = event.coords.x.saturating_sub(start_event.coords.x);
+        let dy = event.coords.y.saturating_sub(start_event.coords.y);
+        // A click that wobbles a pixel is still a click, not a move. Once the
+        // strip has moved it follows the pointer exactly, back to the start
+        // included.
+        if !moved && dx.abs() < 4 && dy.abs() < 4 {
+            self.dragging.replace((item, start_event));
+            return;
+        }
+        self.pane_toolbelt_drag_start = Some((start, true));
+        let offset = pane_toolbelt_dragged_offset(&start, (dx as f32, dy as f32));
+        context.set_cursor(Some(CursorIcon::Grabbing));
+        if self.pane_toolbelt_offset != Some(offset) {
+            self.pane_toolbelt_offset = Some(offset);
+            context.invalidate();
+        }
+        self.dragging.replace((item, start_event));
+    }
+
+    fn finish_pane_toolbelt_drag(&mut self, context: &dyn WindowOps) {
+        let Some((_, moved)) = self.pane_toolbelt_drag_start.take() else {
+            return;
+        };
+        if !moved {
+            return;
+        }
+        if let Some(offset) = self.pane_toolbelt_offset {
+            tgz_ui_state::save_pane_toolbelt_offset(Some([offset.right, offset.top]));
+        }
+        context.set_cursor(Some(CursorIcon::Grab));
+        context.invalidate();
     }
 
     fn mouse_event_pane_toolbelt_button(
