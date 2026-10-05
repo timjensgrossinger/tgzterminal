@@ -11,14 +11,17 @@
 //! avoid.
 
 use crate::spawn::{command_builder_for, SpawnWhere};
+use crate::termwindow::tgz_last_session::{clamp_split_percent, LayoutTree, SnapshotSplit};
 use anyhow::{anyhow, Context};
 use config::keyassignment::SpawnCommand;
 use config::{AgentLaunchTarget, AgentTilePolicy, TermConfig};
 use mux::domain::SplitSource;
-use mux::pane::{PaneId, SpawnTitlePolicy};
-use mux::tab::{SplitDirection, SplitRequest, SplitSize as MuxSplitSize};
+use mux::pane::{Pane, PaneId, SpawnTitlePolicy};
+use mux::tab::{SplitDirection, SplitRequest, SplitSize as MuxSplitSize, Tab};
+use mux::window::WindowId as MuxWindowId;
 use mux::Mux;
 use std::sync::Arc;
+use wezterm_term::TerminalSize;
 
 /// Where a launched agent ends up, fully resolved: either a plain new tab,
 /// or a split against a specific pane, optionally zoomed afterward.
@@ -196,20 +199,20 @@ pub(crate) fn agent_placement(
     }
 }
 
-/// Split `pane_id`, run `spawn` in the new pane, and optionally zoom it.
+/// Split `pane_id` and run `spawn` in the new pane, which is returned with
+/// the tab that holds it.
 ///
 /// Drives `Mux::split_pane` directly with an explicit target `PaneId`
 /// instead of going through `spawn_command`/`SpawnWhere::SplitPane`, which
 /// resolves its target as the tab's active pane inside the future — fine
 /// for a single launch, but nondeterministic once several splits are
 /// in flight.
-async fn split_and_maybe_zoom(
+async fn split_spawn(
     spawn: SpawnCommand,
     pane_id: PaneId,
     request: SplitRequest,
-    zoom: bool,
     term_config: Arc<TermConfig>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<(Arc<Tab>, Arc<dyn Pane>)> {
     let mux = Mux::get();
     let _activity = mux::activity::Activity::new();
 
@@ -249,6 +252,19 @@ async fn split_and_maybe_zoom(
         pane.set_spawn_title(label, SpawnTitlePolicy::WhileForeground);
     }
 
+    Ok((tab, pane))
+}
+
+/// Split `pane_id`, run `spawn` in the new pane, and optionally zoom it.
+async fn split_and_maybe_zoom(
+    spawn: SpawnCommand,
+    pane_id: PaneId,
+    request: SplitRequest,
+    zoom: bool,
+    term_config: Arc<TermConfig>,
+) -> anyhow::Result<()> {
+    let (tab, pane) = split_spawn(spawn, pane_id, request, term_config).await?;
+
     if zoom {
         // `Tab::toggle_zoom` zooms whichever pane is active; it cannot be
         // told a pane directly, so the new pane must be made active first.
@@ -257,6 +273,119 @@ async fn split_and_maybe_zoom(
     }
 
     Ok(())
+}
+
+/// Spawn `spawn` into a new tab of `window_id` and return its pane.
+///
+/// The `NewTab` branch of `spawn::spawn_command_internal_with_title`, which
+/// returns no pane id; the restore needs one to split the tab it just made.
+async fn spawn_agent_tab(
+    spawn: SpawnCommand,
+    size: TerminalSize,
+    window_id: MuxWindowId,
+    term_config: Arc<TermConfig>,
+) -> anyhow::Result<PaneId> {
+    let mux = Mux::get();
+    let _activity = mux::activity::Activity::new();
+
+    let current_pane_id = mux
+        .get_active_tab_for_window(window_id)
+        .and_then(|tab| tab.get_active_pane())
+        .map(|pane| pane.pane_id());
+    let (command, command_dir) = command_builder_for(&spawn)?;
+    let workspace = mux.active_workspace().clone();
+
+    let (_tab, pane, _window_id) = mux
+        .spawn_tab_or_window(
+            Some(window_id),
+            spawn.domain.clone(),
+            command,
+            command_dir,
+            size,
+            current_pane_id,
+            workspace,
+            spawn.position.clone(),
+        )
+        .await
+        .context("spawn_tab_or_window")?;
+
+    if let Some(label) = spawn.label.as_deref() {
+        pane.set_spawn_title(label, SpawnTitlePolicy::WhileForeground);
+    }
+    pane.set_config(term_config);
+    Ok(pane.pane_id())
+}
+
+/// Rebuild one restored tab: its first agent in a new tab, then every split.
+///
+/// Splits are applied outer first, the way the mux built the tree: a `Split`
+/// node's pane is split once, the new pane taking the second subtree's share,
+/// and each side is then refined on its own pane. Returns (spawned, failed)
+/// counted in agents; a split that fails costs only its own subtree.
+async fn spawn_agent_layout(
+    tab: LayoutTree<SpawnCommand>,
+    size: TerminalSize,
+    window_id: MuxWindowId,
+    term_config: Arc<TermConfig>,
+) -> (usize, usize) {
+    let root = match spawn_agent_tab(
+        tab.first_leaf().clone(),
+        size,
+        window_id,
+        term_config.clone(),
+    )
+    .await
+    {
+        Ok(pane_id) => pane_id,
+        Err(err) => {
+            log::error!("agent session restore failed: {err:#}");
+            return (0, tab.leaf_count());
+        }
+    };
+
+    let mut spawned = 1;
+    let mut failed = 0;
+    // Each entry is a subtree whose first leaf already runs in `pane_id`.
+    let mut pending = vec![(tab, root)];
+    while let Some((node, pane_id)) = pending.pop() {
+        let LayoutTree::Split {
+            direction,
+            first_percent,
+            first,
+            second,
+        } = node
+        else {
+            continue;
+        };
+        let request = SplitRequest {
+            direction: match direction {
+                SnapshotSplit::Horizontal => SplitDirection::Horizontal,
+                SnapshotSplit::Vertical => SplitDirection::Vertical,
+            },
+            target_is_second: true,
+            size: MuxSplitSize::Percent(100 - clamp_split_percent(first_percent)),
+            top_level: false,
+        };
+        match split_spawn(
+            second.first_leaf().clone(),
+            pane_id,
+            request,
+            term_config.clone(),
+        )
+        .await
+        {
+            Ok((_tab, pane)) => {
+                spawned += 1;
+                pending.push((*second, pane.pane_id()));
+            }
+            Err(err) => {
+                log::error!("agent session restore failed: {err:#}");
+                failed += second.leaf_count();
+            }
+        }
+        pending.push((*first, pane_id));
+    }
+    (spawned, failed)
 }
 
 impl super::TermWindow {
@@ -292,19 +421,19 @@ impl super::TermWindow {
         }
     }
 
-    /// Spawn several agents into new tabs of this window, one after another.
+    /// Rebuild several restored tabs in this window, one after another, each
+    /// with its splits.
     ///
     /// Both halves matter. A batch must not go through `agent_launch_placement`
     /// per item — every in-flight `NewTab` spawn would resolve its target against
     /// the pre-restore layout — and awaiting each spawn is what keeps the
-    /// restored tabs in the order they were captured. Goes straight to
-    /// `spawn_command_internal` rather than `spawn_command`, which is
-    /// fire-and-forget and would give up both properties.
+    /// restored tabs in the order they were captured, and lets a split target
+    /// the pane it was just given rather than whichever pane is active.
     ///
     /// `skipped` is reported in the summary so a partial restore is visible
     /// rather than looking like everything worked.
-    pub(crate) fn spawn_agents_in_new_tabs(&self, spawns: Vec<SpawnCommand>, skipped: usize) {
-        if spawns.is_empty() {
+    pub(crate) fn spawn_agent_layouts(&self, tabs: Vec<LayoutTree<SpawnCommand>>, skipped: usize) {
+        if tabs.is_empty() {
             notify_restore_outcome(0, skipped);
             return;
         }
@@ -314,23 +443,11 @@ impl super::TermWindow {
         promise::spawn::spawn(async move {
             let mut restored = 0usize;
             let mut failed = 0usize;
-            for spawn in spawns {
-                match crate::spawn::spawn_command_internal_with_title(
-                    spawn,
-                    SpawnWhere::NewTab,
-                    size,
-                    Some(window_id),
-                    term_config.clone(),
-                    SpawnTitlePolicy::WhileForeground,
-                )
-                .await
-                {
-                    Ok(()) => restored += 1,
-                    Err(err) => {
-                        failed += 1;
-                        log::error!("agent session restore failed: {err:#}");
-                    }
-                }
+            for tab in tabs {
+                let (spawned, lost) =
+                    spawn_agent_layout(tab, size, window_id, term_config.clone()).await;
+                restored += spawned;
+                failed += lost;
             }
             notify_restore_outcome(restored, skipped + failed);
         })

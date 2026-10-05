@@ -773,6 +773,13 @@ restore row still appears at the bottom of the launcher dropdown, and the
 command palette as *Reopen last session's agents*) does the same thing without
 the mouse.
 
+The restore rebuilds each tab as it was: agents that shared a tab come back in
+one tab, split the same way (direction and roughly the same ratio). Panes that
+held no agent — a shell beside one — are left out and their split closes up
+around the agents. A session that cannot be reopened (still running, adapter
+disabled, directory gone) is dropped from its tab the same way. Snapshots
+written by older builds carry no layout, and restore one tab per session.
+
 Nothing opens that dropdown for you. An earlier version offered it once per
 process on the first painted frame; a menu that appears over the terminal
 before you have asked for anything is an interruption, and the offer keeps for

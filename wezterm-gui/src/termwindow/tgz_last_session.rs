@@ -68,6 +68,121 @@ pub struct SnapshotSession {
     pub label: Option<String>,
 }
 
+/// Which way a split divides its pane. Mirrors `mux::tab::SplitDirection`:
+/// `Horizontal` puts the two halves side by side, `Vertical` stacks them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SnapshotSplit {
+    Horizontal,
+    Vertical,
+}
+
+/// One tab's pane tree, reduced to the panes that held a restorable agent.
+///
+/// Generic over the leaf so the same shape serves every stage: pane ids while
+/// capturing, indices into [`WindowSnapshot::sessions`] on disk, sessions once
+/// loaded, spawn commands while restoring. Leaves are always visited first
+/// subtree before second, which is the order the restore spawns them in.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LayoutTree<L> {
+    Leaf(L),
+    Split {
+        direction: SnapshotSplit,
+        /// Share of the split taken by `first`, in percent (5..=95).
+        first_percent: u8,
+        first: Box<LayoutTree<L>>,
+        second: Box<LayoutTree<L>>,
+    },
+}
+
+/// A tab layout as stored: leaves index into the window's `sessions`.
+pub type SnapshotLayout = LayoutTree<usize>;
+
+/// A tab layout as offered for restore: leaves are the sessions themselves.
+pub type RestoreTab = LayoutTree<SnapshotSession>;
+
+/// Clamp a split share so neither side of a restored split is a sliver.
+pub fn clamp_split_percent(percent: u8) -> u8 {
+    percent.clamp(5, 95)
+}
+
+impl<L> LayoutTree<L> {
+    /// Leaves in spawn order.
+    pub fn leaves(&self) -> Vec<&L> {
+        let mut out = Vec::new();
+        self.collect_leaves(&mut out);
+        out
+    }
+
+    fn collect_leaves<'a>(&'a self, out: &mut Vec<&'a L>) {
+        match self {
+            LayoutTree::Leaf(leaf) => out.push(leaf),
+            LayoutTree::Split { first, second, .. } => {
+                first.collect_leaves(out);
+                second.collect_leaves(out);
+            }
+        }
+    }
+
+    pub fn leaf_count(&self) -> usize {
+        match self {
+            LayoutTree::Leaf(_) => 1,
+            LayoutTree::Split { first, second, .. } => first.leaf_count() + second.leaf_count(),
+        }
+    }
+
+    /// The leaf that occupies a split's pane before it is split: the first
+    /// leaf of the first subtree, all the way down.
+    pub fn first_leaf(&self) -> &L {
+        match self {
+            LayoutTree::Leaf(leaf) => leaf,
+            LayoutTree::Split { first, .. } => first.first_leaf(),
+        }
+    }
+
+    /// Map every leaf, dropping those `f` rejects. A split that loses one side
+    /// collapses into the other; one that loses both disappears. Leaves are
+    /// visited in spawn order, so `f` may carry order-dependent state.
+    pub fn filter_map<M>(self, f: &mut impl FnMut(L) -> Option<M>) -> Option<LayoutTree<M>> {
+        match self {
+            LayoutTree::Leaf(leaf) => f(leaf).map(LayoutTree::Leaf),
+            LayoutTree::Split {
+                direction,
+                first_percent,
+                first,
+                second,
+            } => {
+                let first = first.filter_map(f);
+                let second = second.filter_map(f);
+                match (first, second) {
+                    (Some(first), Some(second)) => Some(LayoutTree::Split {
+                        direction,
+                        first_percent: clamp_split_percent(first_percent),
+                        first: Box::new(first),
+                        second: Box::new(second),
+                    }),
+                    (Some(only), None) | (None, Some(only)) => Some(only),
+                    (None, None) => None,
+                }
+            }
+        }
+    }
+}
+
+/// What a window persists: its sessions, and how they sat in its tabs.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WindowAgents {
+    pub sessions: Vec<SnapshotSession>,
+    /// One entry per tab that held an agent, in tab order. Every index into
+    /// `sessions` appears in exactly one tab.
+    pub tabs: Vec<SnapshotLayout>,
+}
+
+impl WindowAgents {
+    pub fn is_empty(&self) -> bool {
+        self.sessions.is_empty()
+    }
+}
+
 /// The agent sessions one window had open.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WindowSnapshot {
@@ -87,6 +202,11 @@ pub struct WindowSnapshot {
     pub closed_cleanly: bool,
     /// In capture order, i.e. tab order, so restored tabs come back in place.
     pub sessions: Vec<SnapshotSession>,
+    /// How `sessions` were laid out in tabs and splits. Additive, so it does not
+    /// bump [`SNAPSHOT_VERSION`]: a file written before it has none, and then
+    /// every session is restored into a tab of its own, as before.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tabs: Vec<SnapshotLayout>,
 }
 
 /// On-disk shape.
@@ -184,16 +304,82 @@ fn write_file_at(path: &Path, file: &LastSessionFile) {
 /// Applied on both write and read: on write so the file stays bounded, on read
 /// because the file is untrusted input like anything else under `$HOME`.
 fn sanitize_sessions(sessions: Vec<SnapshotSession>) -> Vec<SnapshotSession> {
+    sanitize_window_agents(WindowAgents {
+        sessions,
+        tabs: Vec::new(),
+    })
+    .sessions
+}
+
+/// [`sanitize_sessions`], plus keeping the tab layouts consistent with what
+/// survived: leaves of dropped sessions are pruned (their splits collapse),
+/// out-of-range or repeated indices are dropped, and any session no layout
+/// places gets a tab of its own. Afterwards every session sits in exactly one
+/// tab, which is what the restore relies on.
+fn sanitize_window_agents(agents: WindowAgents) -> WindowAgents {
     let mut seen = std::collections::HashSet::new();
-    sessions
-        .into_iter()
-        .filter(|session| {
-            !session.adapter_id.is_empty()
-                && crate::agent_herd::sessions::session_id_is_sane(&session.session_id)
-        })
-        .filter(|session| seen.insert((session.adapter_id.clone(), session.session_id.clone())))
-        .take(MAX_SNAPSHOT_SESSIONS)
-        .collect()
+    let mut remap: Vec<Option<usize>> = Vec::with_capacity(agents.sessions.len());
+    let mut sessions = Vec::new();
+    for session in agents.sessions {
+        let keep = sessions.len() < MAX_SNAPSHOT_SESSIONS
+            && !session.adapter_id.is_empty()
+            && crate::agent_herd::sessions::session_id_is_sane(&session.session_id)
+            && seen.insert((session.adapter_id.clone(), session.session_id.clone()));
+        if keep {
+            remap.push(Some(sessions.len()));
+            sessions.push(session);
+        } else {
+            remap.push(None);
+        }
+    }
+
+    let mut placed = vec![false; sessions.len()];
+    let mut tabs = Vec::new();
+    for layout in agents.tabs {
+        let pruned = layout.filter_map(&mut |old: usize| {
+            let new = remap.get(old).copied().flatten()?;
+            let already = std::mem::replace(&mut placed[new], true);
+            (!already).then_some(new)
+        });
+        tabs.extend(pruned);
+    }
+    for (index, was_placed) in placed.iter().enumerate() {
+        if !was_placed {
+            tabs.push(LayoutTree::Leaf(index));
+        }
+    }
+    WindowAgents { sessions, tabs }
+}
+
+/// The tabs one restore reopens, across every window of the set, in window
+/// then tab order.
+///
+/// A window written before layouts were recorded has no `tabs`; sanitizing
+/// gives each of its sessions a tab of its own. A session already placed by an
+/// earlier window is pruned from later ones, and the whole set is capped at
+/// [`MAX_SNAPSHOT_SESSIONS`] in spawn order.
+fn restore_tabs(windows: &[&WindowSnapshot]) -> Vec<RestoreTab> {
+    let mut seen = std::collections::HashSet::new();
+    let mut tabs = Vec::new();
+    for window in windows {
+        let WindowAgents {
+            sessions,
+            tabs: layouts,
+        } = sanitize_window_agents(WindowAgents {
+            sessions: window.sessions.clone(),
+            tabs: window.tabs.clone(),
+        });
+        for layout in layouts {
+            let tab = layout.filter_map(&mut |index: usize| {
+                let session = sessions.get(index)?;
+                let fresh = seen.len() < MAX_SNAPSHOT_SESSIONS
+                    && seen.insert((session.adapter_id.clone(), session.session_id.clone()));
+                fresh.then(|| session.clone())
+            });
+            tabs.extend(tab);
+        }
+    }
+    tabs
 }
 
 /// Insert or replace one window's entry, leaving other windows alone, and prune
@@ -290,8 +476,8 @@ fn pick_last_window_set<'a>(
 
 /// Record one window's agent sessions. Best-effort; safe to call from a worker
 /// thread.
-pub fn record_window_sessions(key: String, sessions: Vec<SnapshotSession>, closed_cleanly: bool) {
-    let sessions = sanitize_sessions(sessions);
+pub fn record_window_sessions(key: String, agents: WindowAgents, closed_cleanly: bool) {
+    let WindowAgents { sessions, tabs } = sanitize_window_agents(agents);
     let path = state_path();
     let _guard = write_lock().lock();
     let mut file = read_file_at(&path);
@@ -303,6 +489,7 @@ pub fn record_window_sessions(key: String, sessions: Vec<SnapshotSession>, close
             updated_at_ms: epoch_millis_now(),
             closed_cleanly,
             sessions,
+            tabs,
         },
     );
     write_file_at(&path, &file);
@@ -323,14 +510,14 @@ pub fn load_last_window() -> Option<LastWindowSet> {
     let window_count = windows.len();
     // Dedupe across windows too: the same session can only be resumed once, and
     // two windows may each have had a row for it.
-    let sessions = sanitize_sessions(
-        windows
-            .into_iter()
-            .flat_map(|w| w.sessions.iter().cloned())
-            .collect(),
-    );
+    let tabs = restore_tabs(&windows);
+    let sessions: Vec<SnapshotSession> = tabs
+        .iter()
+        .flat_map(|tab| tab.leaves().into_iter().cloned())
+        .collect();
     (!sessions.is_empty()).then(|| LastWindowSet {
         sessions,
+        tabs,
         window_count,
     })
 }
@@ -338,11 +525,14 @@ pub fn load_last_window() -> Option<LastWindowSet> {
 /// The restore offer: what to reopen, and how many windows it came from.
 ///
 /// The count is for the label only ("7 agents · 2 windows"); the restore itself
-/// reopens sessions, not window geometry.
+/// reopens every window's tabs into the current window, splits included, but
+/// not window geometry.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LastWindowSet {
-    /// Sessions to reopen, deduped, in capture order.
+    /// Sessions to reopen, deduped, in spawn order: the leaves of `tabs`.
     pub sessions: Vec<SnapshotSession>,
+    /// The tabs to rebuild, each session in exactly one of them.
+    pub tabs: Vec<RestoreTab>,
     /// How many windows contributed. Always at least 1.
     pub window_count: usize,
 }
@@ -369,6 +559,7 @@ mod tests {
             sessions: (0..count)
                 .map(|i| session("claude", &format!("session-{i}"), "/repo"))
                 .collect(),
+            tabs: Vec::new(),
         }
     }
 
@@ -384,6 +575,7 @@ mod tests {
                 .iter()
                 .map(|id| session("claude", id, "/repo"))
                 .collect(),
+            tabs: Vec::new(),
         }
     }
 
@@ -419,6 +611,12 @@ mod tests {
                 session_id: "abc-123".to_string(),
                 cwd: PathBuf::from("/repo/here"),
                 label: Some("claude · abc".to_string()),
+            }],
+            tabs: vec![LayoutTree::Split {
+                direction: SnapshotSplit::Horizontal,
+                first_percent: 40,
+                first: Box::new(LayoutTree::Leaf(0)),
+                second: Box::new(LayoutTree::Leaf(0)),
             }],
         };
         let json = serde_json::to_string(&file_with(vec![snapshot.clone()])).unwrap();
@@ -686,5 +884,138 @@ mod tests {
         )]);
         file.version = SNAPSHOT_VERSION + 1;
         assert!(pick_last_window_set(&file, "current", NOW_MS).is_empty());
+    }
+
+    fn split<L>(first_percent: u8, first: LayoutTree<L>, second: LayoutTree<L>) -> LayoutTree<L> {
+        LayoutTree::Split {
+            direction: SnapshotSplit::Horizontal,
+            first_percent,
+            first: Box::new(first),
+            second: Box::new(second),
+        }
+    }
+
+    fn leaf_ids(tab: &RestoreTab) -> Vec<&str> {
+        tab.leaves()
+            .into_iter()
+            .map(|s| s.session_id.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn filter_map_collapses_a_split_that_loses_a_side() {
+        let tree = split(
+            30,
+            LayoutTree::Leaf(1),
+            split(50, LayoutTree::Leaf(2), LayoutTree::Leaf(3)),
+        );
+        let pruned = tree
+            .filter_map(&mut |n: usize| (n != 2).then_some(n))
+            .unwrap();
+        assert_eq!(pruned, split(30, LayoutTree::Leaf(1), LayoutTree::Leaf(3)));
+    }
+
+    #[test]
+    fn filter_map_visits_leaves_in_spawn_order() {
+        let tree = split(
+            50,
+            split(50, LayoutTree::Leaf("a"), LayoutTree::Leaf("b")),
+            LayoutTree::Leaf("c"),
+        );
+        let mut order = Vec::new();
+        tree.filter_map(&mut |l| {
+            order.push(l);
+            Some(l)
+        });
+        assert_eq!(order, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn sanitize_remaps_layout_indices_past_a_dropped_session() {
+        let agents = sanitize_window_agents(WindowAgents {
+            sessions: vec![
+                session("claude", "--evil", "/repo"),
+                session("claude", "left", "/repo"),
+                session("claude", "right", "/repo"),
+            ],
+            tabs: vec![
+                split(60, LayoutTree::Leaf(1), LayoutTree::Leaf(2)),
+                LayoutTree::Leaf(0),
+            ],
+        });
+        assert_eq!(agents.sessions.len(), 2);
+        assert_eq!(
+            agents.tabs,
+            vec![split(60, LayoutTree::Leaf(0), LayoutTree::Leaf(1))]
+        );
+    }
+
+    #[test]
+    fn sanitize_drops_bad_indices_and_gives_unplaced_sessions_a_tab() {
+        // The file is untrusted: an index past the end, the same index twice,
+        // and a session no layout mentions.
+        let agents = sanitize_window_agents(WindowAgents {
+            sessions: vec![
+                session("claude", "a", "/repo"),
+                session("claude", "b", "/repo"),
+            ],
+            tabs: vec![
+                split(50, LayoutTree::Leaf(0), LayoutTree::Leaf(7)),
+                LayoutTree::Leaf(0),
+            ],
+        });
+        assert_eq!(agents.tabs, vec![LayoutTree::Leaf(0), LayoutTree::Leaf(1)]);
+    }
+
+    #[test]
+    fn a_legacy_window_restores_one_tab_per_session() {
+        let legacy = window_ids("run-a:0", "run-a", NOW_MS, &["a0", "a1"]);
+        let tabs = restore_tabs(&[&legacy]);
+        assert_eq!(tabs.len(), 2);
+        assert_eq!(leaf_ids(&tabs[0]), vec!["a0"]);
+        assert_eq!(leaf_ids(&tabs[1]), vec!["a1"]);
+    }
+
+    #[test]
+    fn a_legacy_file_without_tabs_still_parses() {
+        let parsed: WindowSnapshot =
+            serde_json::from_str(r#"{"key":"k","run_id":"r","updated_at_ms":1,"sessions":[]}"#)
+                .unwrap();
+        assert!(parsed.tabs.is_empty());
+    }
+
+    #[test]
+    fn a_split_tab_restores_as_one_tab() {
+        let mut win = window_ids("run-a:0", "run-a", NOW_MS, &["left", "right", "solo"]);
+        win.tabs = vec![
+            split(55, LayoutTree::Leaf(0), LayoutTree::Leaf(1)),
+            LayoutTree::Leaf(2),
+        ];
+        let tabs = restore_tabs(&[&win]);
+        assert_eq!(tabs.len(), 2);
+        assert_eq!(leaf_ids(&tabs[0]), vec!["left", "right"]);
+        assert!(matches!(
+            tabs[0],
+            LayoutTree::Split {
+                first_percent: 55,
+                ..
+            }
+        ));
+        assert_eq!(leaf_ids(&tabs[1]), vec!["solo"]);
+    }
+
+    #[test]
+    fn a_session_in_two_windows_is_restored_once() {
+        let first = window_ids("run-a:0", "run-a", NOW_MS, &["shared"]);
+        let mut second = window_ids("run-a:1", "run-a", NOW_MS, &["shared", "other"]);
+        second.tabs = vec![split(50, LayoutTree::Leaf(0), LayoutTree::Leaf(1))];
+        let tabs = restore_tabs(&[&first, &second]);
+        assert_eq!(tabs.len(), 2);
+        assert_eq!(leaf_ids(&tabs[0]), vec!["shared"]);
+        // The split lost its left side and collapsed to the survivor.
+        assert_eq!(
+            tabs[1],
+            LayoutTree::Leaf(session("claude", "other", "/repo"))
+        );
     }
 }

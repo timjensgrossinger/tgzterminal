@@ -529,6 +529,10 @@ fn parse_assistant_line(value: &serde_json::Value) -> Vec<HerdEvent> {
     events
 }
 
+/// Longest tool output kept per event, in bytes. Truncation rounds down to a
+/// char boundary, so a kept output can be a few bytes shorter.
+const MAX_TOOL_RESULT_BYTES: usize = 4096;
+
 /// Parse a user JSONL line for tool_result blocks.
 fn parse_user_line(value: &serde_json::Value) -> Vec<HerdEvent> {
     let at = value
@@ -555,13 +559,13 @@ fn parse_user_line(value: &serde_json::Value) -> Vec<HerdEvent> {
             .and_then(|v| v.as_str())
             .map(str::to_string);
 
-        let output = extract_tool_result_content(block.get("content"));
-        let truncated = output.len() > 4096;
-        let output = if truncated {
-            output[..4096].to_string()
-        } else {
-            output
-        };
+        let mut output = extract_tool_result_content(block.get("content"));
+        let truncated = output.len() > MAX_TOOL_RESULT_BYTES;
+        if truncated {
+            // Never a raw byte slice: tool output is arbitrary UTF-8, and a cut
+            // inside a multibyte char panics the herd scan thread.
+            output.truncate(output.floor_char_boundary(MAX_TOOL_RESULT_BYTES));
+        }
 
         events.push(HerdEvent {
             at,
@@ -843,6 +847,32 @@ mod tests {
         assert_eq!(activity.recent[0].kind, HerdEventKind::Assistant);
         assert_eq!(activity.recent[1].kind, HerdEventKind::ToolResult);
         assert_eq!(activity.recent[1].tool_use_id.as_deref(), Some("tu1"));
+    }
+
+    #[test]
+    fn long_tool_result_is_truncated_on_a_char_boundary() {
+        // Byte 4096 lands inside the two-byte `ü`. Slicing there used to panic
+        // the herd scan thread, which froze every disk-derived status and kept
+        // agents started afterwards out of the "Reopen last window" snapshot.
+        let content = format!("{}ütail", "a".repeat(MAX_TOOL_RESULT_BYTES - 1));
+        let line = serde_json::json!({
+            "type": "user",
+            "timestamp": "2026-07-30T10:00:01.000Z",
+            "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "tu1", "content": content}
+            ]}
+        });
+
+        let events = parse_user_line(&line);
+        assert_eq!(events.len(), 1);
+        match &events[0].content {
+            HerdContent::ToolResult { output, truncated } => {
+                assert!(*truncated);
+                assert_eq!(output.len(), MAX_TOOL_RESULT_BYTES - 1);
+                assert!(output.chars().all(|c| c == 'a'));
+            }
+            other => panic!("expected a tool result, got {:?}", other),
+        }
     }
 
     #[test]

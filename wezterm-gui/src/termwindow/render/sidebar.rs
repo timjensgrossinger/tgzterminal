@@ -14,7 +14,9 @@ use crate::termwindow::render::corners::{
 };
 use crate::termwindow::render::RenderScreenLineParams;
 use crate::termwindow::shell_copy::{shell_copy_toast_message, ShellCopyAction};
-use crate::termwindow::tgz_last_session::{self, SnapshotSession};
+use crate::termwindow::tgz_last_session::{
+    self, LayoutTree, RestoreTab, SnapshotSession, SnapshotSplit, WindowAgents,
+};
 use crate::termwindow::{
     agent_launch, wsl_paths, AgentCopyAction, AgentLauncherEntry, AgentRowAction,
     CloseTabMenuAction, CloseTabSource, ExpandedMenuRow, NewTabMenuEntry, NewTabTarget,
@@ -4326,23 +4328,137 @@ fn wsl_agent_homes(home_base: Option<&Path>, root_home: Option<&Path>) -> Vec<Pa
 /// pane's project. Only pane-bound agents count — a pane-bound agent is by
 /// construction a pane of this window, whereas a detached row came from the
 /// machine-wide disk scan and may belong to anyone.
-fn window_agent_sessions(agents: &[HerdAgent]) -> Vec<SnapshotSession> {
+fn window_agent_sessions(agents: &[HerdAgent]) -> Vec<(PaneId, SnapshotSession)> {
     let mut seen = HashSet::new();
     agents
         .iter()
-        .filter(|agent| agent.pane_id.is_some())
         .filter_map(|agent| {
+            let pane_id = agent.pane_id?;
             let session_id = agent.session_id.clone()?;
             let cwd = agent.cwd.clone()?;
-            Some(SnapshotSession {
-                adapter_id: agent.provider.clone(),
-                session_id,
-                cwd,
-                label: Some(agent.name.clone()),
-            })
+            Some((
+                pane_id,
+                SnapshotSession {
+                    adapter_id: agent.provider.clone(),
+                    session_id,
+                    cwd,
+                    label: Some(agent.name.clone()),
+                },
+            ))
         })
-        .filter(|session| seen.insert((session.adapter_id.clone(), session.session_id.clone())))
+        .filter(|(_, session)| {
+            seen.insert((session.adapter_id.clone(), session.session_id.clone()))
+        })
         .collect()
+}
+
+/// Share of a split taken by its first side, as `SplitSize::Percent` reads it:
+/// a percentage of the whole pane, divider included.
+fn split_first_percent(first_cells: usize, second_cells: usize) -> u8 {
+    let total = first_cells + second_cells + 1;
+    let percent = (first_cells * 100 + total / 2) / total;
+    tgz_last_session::clamp_split_percent(percent.min(100) as u8)
+}
+
+/// A tab's mux pane tree as a [`LayoutTree`] of pane ids.
+fn pane_layout_tree(node: &mux::tab::PaneNode) -> Option<LayoutTree<PaneId>> {
+    use mux::tab::PaneNode;
+    match node {
+        PaneNode::Empty => None,
+        PaneNode::Leaf(entry) => Some(LayoutTree::Leaf(entry.pane_id)),
+        PaneNode::Split { left, right, node } => {
+            let (direction, first, second) = match node.direction {
+                SplitDirection::Horizontal => {
+                    (SnapshotSplit::Horizontal, node.first.cols, node.second.cols)
+                }
+                SplitDirection::Vertical => {
+                    (SnapshotSplit::Vertical, node.first.rows, node.second.rows)
+                }
+            };
+            match (pane_layout_tree(left), pane_layout_tree(right)) {
+                (Some(first_tree), Some(second_tree)) => Some(LayoutTree::Split {
+                    direction,
+                    first_percent: split_first_percent(first, second),
+                    first: Box::new(first_tree),
+                    second: Box::new(second_tree),
+                }),
+                (Some(only), None) | (None, Some(only)) => Some(only),
+                (None, None) => None,
+            }
+        }
+    }
+}
+
+/// What this window persists for "Reopen last window": its restorable agent
+/// sessions, grouped by tab, with each tab's splits.
+///
+/// `tab_panes` lists every tab's panes in tab order. `tree_for(tab_idx)` is
+/// asked only for a tab holding two or more recorded agents, so the common
+/// one-agent-per-tab window costs no pane-tree walk on the paint path. Panes
+/// that hold no recorded agent -- a shell beside an agent -- are pruned from
+/// the tree and their splits collapse. Sessions come out in spawn order: tab
+/// by tab, and within a tab in tree order.
+fn window_agent_layout(
+    recorded: Vec<(PaneId, SnapshotSession)>,
+    tab_panes: &[Vec<PaneId>],
+    mut tree_for: impl FnMut(usize) -> Option<LayoutTree<PaneId>>,
+) -> WindowAgents {
+    fn place(
+        by_pane: &mut HashMap<PaneId, SnapshotSession>,
+        agents: &mut WindowAgents,
+        pane: PaneId,
+    ) -> Option<usize> {
+        let session = by_pane.remove(&pane)?;
+        agents.sessions.push(session);
+        Some(agents.sessions.len() - 1)
+    }
+
+    // First claim on a pane wins, matching the session dedupe above it.
+    let mut by_pane: HashMap<PaneId, SnapshotSession> = HashMap::new();
+    for (pane, session) in recorded {
+        by_pane.entry(pane).or_insert(session);
+    }
+    let mut agents = WindowAgents::default();
+
+    for (tab_idx, panes) in tab_panes.iter().enumerate() {
+        let bound: Vec<PaneId> = panes
+            .iter()
+            .copied()
+            .filter(|pane| by_pane.contains_key(pane))
+            .collect();
+        let tree = match bound.as_slice() {
+            [] => continue,
+            [only] => Some(LayoutTree::Leaf(*only)),
+            _ => tree_for(tab_idx),
+        };
+        match tree {
+            Some(tree) => {
+                if let Some(layout) =
+                    tree.filter_map(&mut |pane| place(&mut by_pane, &mut agents, pane))
+                {
+                    agents.tabs.push(layout);
+                }
+            }
+            // No tree to be had: still record every agent, a tab each.
+            None => {
+                for pane in bound {
+                    if let Some(index) = place(&mut by_pane, &mut agents, pane) {
+                        agents.tabs.push(LayoutTree::Leaf(index));
+                    }
+                }
+            }
+        }
+    }
+
+    // Bound to a pane no tab listed: keep it rather than lose the session.
+    let mut leftover: Vec<PaneId> = by_pane.keys().copied().collect();
+    leftover.sort_unstable();
+    for pane in leftover {
+        if let Some(index) = place(&mut by_pane, &mut agents, pane) {
+            agents.tabs.push(LayoutTree::Leaf(index));
+        }
+    }
+    agents
 }
 
 /// The title a resumed session's tab starts with: the session's own title when
@@ -4429,6 +4545,25 @@ fn plan_session_restore(
         plan.spawn.push(entry.clone());
     }
     plan
+}
+
+/// The tabs a restore spawns: each offered tab with every session swapped for
+/// its spawn command, and sessions that got none pruned out.
+///
+/// A spawn is taken at most once, so a session the offer somehow lists twice
+/// still opens one pane.
+fn restore_tab_plans<T>(
+    tabs: &[RestoreTab],
+    mut spawns: HashMap<(String, String), T>,
+) -> Vec<LayoutTree<T>> {
+    tabs.iter()
+        .cloned()
+        .filter_map(|tab| {
+            tab.filter_map(&mut |session: SnapshotSession| {
+                spawns.remove(&(session.adapter_id, session.session_id))
+            })
+        })
+        .collect()
 }
 
 /// Buttons offered by an expanded herd row, in display order.
@@ -7246,7 +7381,8 @@ impl crate::TermWindow {
             self.agent_restore_limit(),
         );
         let mut skipped = plan.skipped;
-        let mut spawns = Vec::with_capacity(plan.spawn.len());
+        let mut spawns: HashMap<(String, String), SpawnCommand> =
+            HashMap::with_capacity(plan.spawn.len());
         for entry in plan.spawn {
             match self.agent_resume_spawn_command(
                 &entry.adapter_id,
@@ -7282,7 +7418,7 @@ impl crate::TermWindow {
                         entry.session_id,
                         spawn.domain
                     );
-                    spawns.push(spawn);
+                    spawns.insert((entry.adapter_id.clone(), entry.session_id.clone()), spawn);
                 }
                 None => {
                     log::info!(
@@ -7295,13 +7431,17 @@ impl crate::TermWindow {
             }
         }
 
+        // Put each spawn back where its session sat: dropped sessions leave
+        // their tab's split tree, which collapses around them.
+        let tabs = restore_tab_plans(&entries.tabs, spawns);
+
         // Only now is the offer spent. A double-click cannot restore twice
         // because the second click finds the row gone; a restore that produced
         // nothing leaves it in place.
-        if !spawns.is_empty() {
+        if !tabs.is_empty() {
             self.last_window_sessions = None;
         }
-        self.spawn_agents_in_new_tabs(spawns, skipped);
+        self.spawn_agent_layouts(tabs, skipped);
     }
 
     /// Build the spawn for a resume, or `None` when this session cannot be
@@ -13479,11 +13619,18 @@ impl crate::TermWindow {
         let mut panes: Vec<PaneAgentRow> = Vec::new();
 
         let tab_count = window.count_tabs();
-        let window_panes: HashSet<PaneId> = window
+        // Every tab's panes, in tab order: what the restore snapshot groups
+        // agents by.
+        let tab_panes: Vec<Vec<PaneId>> = window
             .iter_tabs()
-            .flat_map(|tab| tab.iter_panes_ignoring_zoom())
-            .map(|pos| pos.pane.pane_id())
+            .map(|tab| {
+                tab.iter_panes_ignoring_zoom()
+                    .into_iter()
+                    .map(|pos| pos.pane.pane_id())
+                    .collect()
+            })
             .collect();
+        let window_panes: HashSet<PaneId> = tab_panes.iter().flatten().copied().collect();
         // The mux borrow has to go before `detect_agent_pane`, which reaches
         // back into the mux for each pane.
         drop(window);
@@ -13600,7 +13747,7 @@ impl crate::TermWindow {
         self.apply_resume_binds(&mut agents);
         // Before project scoping: the snapshot is about this window, not about
         // whatever project the active pane happens to sit in.
-        self.record_agent_window_sessions(&agents);
+        self.record_agent_window_sessions(&agents, &tab_panes);
 
         let view = self.agent_herd_state.borrow().view;
         let current_project = self.current_project_root();
@@ -13705,13 +13852,17 @@ impl crate::TermWindow {
         }
     }
 
-    /// Note which agent sessions this window is running, and persist the list
-    /// when it changes.
+    /// Note which agent sessions this window is running, and how they sit in
+    /// its tabs, and persist that when it changes.
     ///
     /// Runs on the paint path, so the per-frame cost is a filter plus one
     /// comparison against the last thing written; identity excludes status, so a
-    /// working→idle flip writes nothing. The write itself is a worker-thread job.
-    fn record_agent_window_sessions(&mut self, agents: &[HerdAgent]) {
+    /// working->idle flip writes nothing. The pane-tree walk that recovers a
+    /// tab's splits only runs for tabs with two or more agents, and only when
+    /// the session set changed or [`SNAPSHOT_WRITE_INTERVAL`] has passed since
+    /// the last walk -- so a resize is picked up within seconds, not per frame.
+    /// The write itself is a worker-thread job.
+    fn record_agent_window_sessions(&mut self, agents: &[HerdAgent], tab_panes: &[Vec<PaneId>]) {
         if self.config.agent_ui.launcher.restore_last_window_sessions == 0 {
             return;
         }
@@ -13721,7 +13872,9 @@ impl crate::TermWindow {
             return;
         }
 
-        let sessions = window_agent_sessions(agents);
+        self.log_unrecorded_agent_panes(agents);
+
+        let recorded = window_agent_sessions(agents);
 
         // An empty set is never persisted, whether or not this window has written
         // before. The snapshot is a restore point, not a live mirror: a window
@@ -13735,13 +13888,41 @@ impl crate::TermWindow {
         // last non-empty set. Clearing it here meant the close-time write --
         // the one that marks the entry `closed_cleanly` and catches changes the
         // write throttle deferred -- found nothing to write.
-        if sessions.is_empty() {
+        if recorded.is_empty() {
             return;
         }
-        self.agent_window_sessions = sessions.clone();
+
+        let same_sessions = {
+            let mut now: Vec<&SnapshotSession> = recorded.iter().map(|(_, s)| s).collect();
+            let mut before: Vec<&SnapshotSession> =
+                self.agent_window_sessions.sessions.iter().collect();
+            now.sort_by(|a, b| (&a.adapter_id, &a.session_id).cmp(&(&b.adapter_id, &b.session_id)));
+            before.sort_by(|a, b| {
+                (&a.adapter_id, &a.session_id).cmp(&(&b.adapter_id, &b.session_id))
+            });
+            now == before
+        };
+        let layout_is_fresh = self
+            .agent_layout_checked_at
+            .is_some_and(|at| at.elapsed() < SNAPSHOT_WRITE_INTERVAL);
+        if !(same_sessions && layout_is_fresh) {
+            let window_id = self.mux_window_id;
+            let snapshot = window_agent_layout(recorded, tab_panes, |tab_idx| {
+                // Clone the tab out so the window guard is gone before
+                // `codec_pane_tree`, which looks the window up itself.
+                let tab = Mux::get()
+                    .get_window(window_id)?
+                    .get_tab_at_idx(tab_idx)
+                    .cloned()?;
+                pane_layout_tree(&tab.codec_pane_tree())
+            });
+            self.agent_layout_checked_at = Some(Instant::now());
+            self.agent_window_sessions = snapshot;
+        }
+        let snapshot = self.agent_window_sessions.clone();
 
         if let Some((_, previous)) = &self.agent_snapshot_written {
-            if *previous == sessions {
+            if *previous == snapshot {
                 return;
             }
         }
@@ -13755,20 +13936,77 @@ impl crate::TermWindow {
             }
         }
 
-        self.agent_snapshot_written = Some((Instant::now(), sessions.clone()));
+        self.agent_snapshot_written = Some((Instant::now(), snapshot.clone()));
 
         let key = tgz_last_session::window_key(self.mux_window_id as usize);
         promise::spawn::spawn_into_new_thread(move || {
-            tgz_last_session::record_window_sessions(key, sessions, false);
+            tgz_last_session::record_window_sessions(key, snapshot, false);
             Ok::<(), anyhow::Error>(())
         })
         .detach();
     }
 
+    /// Say, once per change, which agent panes the snapshot cannot record.
+    ///
+    /// A pane the herd recognises as an agent but that carries no session id
+    /// (or no cwd) is silently missing from "Reopen last window". Logged when
+    /// that set changes, never per frame, so the next "it only restored one of
+    /// them" explains itself.
+    fn log_unrecorded_agent_panes(&mut self, agents: &[HerdAgent]) {
+        let unrecorded: Vec<&HerdAgent> = agents
+            .iter()
+            .filter(|agent| {
+                agent.pane_id.is_some() && (agent.session_id.is_none() || agent.cwd.is_none())
+            })
+            .collect();
+        let mut ids: Vec<PaneId> = unrecorded.iter().filter_map(|a| a.pane_id).collect();
+        ids.sort_unstable();
+        if ids == self.agent_unrecorded_panes {
+            return;
+        }
+        self.agent_unrecorded_panes = ids;
+
+        let (cache_age, cached) = match &self.agent_herd_session_cache {
+            Some((at, sessions)) => (Some(at.elapsed()), Some(sessions.clone())),
+            None => (None, None),
+        };
+        for agent in unrecorded {
+            let reason = if agent.session_id.is_some() {
+                "no cwd".to_string()
+            } else {
+                let same_cwd = cached
+                    .as_ref()
+                    .map(|sessions| {
+                        sessions
+                            .iter()
+                            .filter(|s| {
+                                s.vendor.adapter_id() == agent.provider
+                                    && agent.cwd.as_deref() == Some(s.cwd.as_path())
+                            })
+                            .count()
+                    })
+                    .unwrap_or(0);
+                if same_cwd > 1 {
+                    format!("{same_cwd} sessions share its cwd and none matched its pid")
+                } else {
+                    "no session in the herd cache".to_string()
+                }
+            };
+            log::info!(
+                "restore snapshot: pane {} ({}, cwd {:?}) not recordable: {} (herd cache age {:?})",
+                agent.pane_id.unwrap_or_default(),
+                agent.provider,
+                agent.cwd,
+                reason,
+                cache_age
+            );
+        }
+    }
+
     /// Persist this window's agent sessions as it closes.
     ///
     /// Synchronous on purpose: the process may exit moments from now and a worker
-    /// thread would be killed with it. Reuses the list the paint path already
+    /// thread would be killed with it. Reuses what the paint path already
     /// computed, so there is no mux walk here either.
     pub(crate) fn persist_agent_window_sessions_on_close(&self) {
         if self.config.agent_ui.launcher.restore_last_window_sessions == 0 {
@@ -16837,8 +17075,9 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
 
         let recorded = window_agent_sessions(&[bound, detached, idless, cwdless]);
         assert_eq!(recorded.len(), 1);
-        assert_eq!(recorded[0].session_id, "session-a");
-        assert_eq!(recorded[0].cwd, PathBuf::from("/repos/mine/src"));
+        assert_eq!(recorded[0].0, 4);
+        assert_eq!(recorded[0].1.session_id, "session-a");
+        assert_eq!(recorded[0].1.cwd, PathBuf::from("/repos/mine/src"));
     }
 
     #[test]
@@ -16859,9 +17098,126 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
         assert_eq!(
             recorded
                 .iter()
-                .map(|s| s.session_id.as_str())
+                .map(|(_, s)| s.session_id.as_str())
                 .collect::<Vec<_>>(),
             vec!["one", "two"]
+        );
+    }
+
+    fn recorded_on(panes: &[(PaneId, &str)]) -> Vec<(PaneId, SnapshotSession)> {
+        panes
+            .iter()
+            .map(|(pane, id)| (*pane, snapshot("claude", id, "/repo")))
+            .collect()
+    }
+
+    fn hsplit<L>(first_percent: u8, first: LayoutTree<L>, second: LayoutTree<L>) -> LayoutTree<L> {
+        LayoutTree::Split {
+            direction: SnapshotSplit::Horizontal,
+            first_percent,
+            first: Box::new(first),
+            second: Box::new(second),
+        }
+    }
+
+    #[test]
+    fn window_agent_layout_keeps_a_split_pair_in_one_tab() {
+        // Tab 0: agents left and right. Tab 1: one agent.
+        let tabs = vec![vec![10, 11], vec![20]];
+        let mut asked = Vec::new();
+        let agents = window_agent_layout(
+            recorded_on(&[(20, "solo"), (11, "right"), (10, "left")]),
+            &tabs,
+            |tab_idx| {
+                asked.push(tab_idx);
+                Some(hsplit(40, LayoutTree::Leaf(10), LayoutTree::Leaf(11)))
+            },
+        );
+        // Only the multi-agent tab costs a tree walk.
+        assert_eq!(asked, vec![0]);
+        let ids: Vec<&str> = agents
+            .sessions
+            .iter()
+            .map(|s| s.session_id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["left", "right", "solo"]);
+        assert_eq!(
+            agents.tabs,
+            vec![
+                hsplit(40, LayoutTree::Leaf(0), LayoutTree::Leaf(1)),
+                LayoutTree::Leaf(2)
+            ]
+        );
+    }
+
+    #[test]
+    fn window_agent_layout_prunes_a_shell_pane_from_the_split() {
+        // Agent | (shell / agent): the shell goes, the inner split collapses.
+        let tabs = vec![vec![1, 2, 3]];
+        let agents = window_agent_layout(recorded_on(&[(1, "a"), (3, "b")]), &tabs, |_| {
+            Some(hsplit(
+                50,
+                LayoutTree::Leaf(1),
+                LayoutTree::Split {
+                    direction: SnapshotSplit::Vertical,
+                    first_percent: 50,
+                    first: Box::new(LayoutTree::Leaf(2)),
+                    second: Box::new(LayoutTree::Leaf(3)),
+                },
+            ))
+        });
+        assert_eq!(
+            agents.tabs,
+            vec![hsplit(50, LayoutTree::Leaf(0), LayoutTree::Leaf(1))]
+        );
+    }
+
+    #[test]
+    fn window_agent_layout_without_a_tree_still_records_every_agent() {
+        let tabs = vec![vec![1, 2]];
+        let agents = window_agent_layout(recorded_on(&[(1, "a"), (2, "b")]), &tabs, |_| None);
+        assert_eq!(agents.sessions.len(), 2);
+        assert_eq!(agents.tabs, vec![LayoutTree::Leaf(0), LayoutTree::Leaf(1)]);
+    }
+
+    #[test]
+    fn window_agent_layout_keeps_an_agent_no_tab_lists() {
+        let agents = window_agent_layout(recorded_on(&[(9, "orphan")]), &[vec![1]], |_| None);
+        assert_eq!(agents.sessions[0].session_id, "orphan");
+        assert_eq!(agents.tabs, vec![LayoutTree::Leaf(0)]);
+    }
+
+    #[test]
+    fn split_first_percent_matches_how_the_mux_sizes_a_split() {
+        // 40 | divider | 39 columns: the first side holds half of 80.
+        assert_eq!(split_first_percent(40, 39), 50);
+        assert_eq!(split_first_percent(24, 55), 30);
+        // Never a sliver, whatever the file or the window says.
+        assert_eq!(split_first_percent(0, 100), 5);
+        assert_eq!(split_first_percent(100, 0), 95);
+    }
+
+    #[test]
+    fn restore_tab_plans_prunes_sessions_that_got_no_spawn() {
+        let tabs = vec![
+            hsplit(
+                60,
+                LayoutTree::Leaf(snapshot("claude", "left", "/repo")),
+                LayoutTree::Leaf(snapshot("claude", "right", "/repo")),
+            ),
+            LayoutTree::Leaf(snapshot("claude", "gone", "/repo")),
+        ];
+        let mut spawns = HashMap::new();
+        spawns.insert(("claude".to_string(), "left".to_string()), "spawn-left");
+        spawns.insert(("claude".to_string(), "right".to_string()), "spawn-right");
+        let plans = restore_tab_plans(&tabs, spawns);
+        assert_eq!(
+            plans,
+            vec![hsplit(
+                60,
+                LayoutTree::Leaf("spawn-left"),
+                LayoutTree::Leaf("spawn-right")
+            )]
         );
     }
 

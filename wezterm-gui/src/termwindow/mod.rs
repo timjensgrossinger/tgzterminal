@@ -1185,11 +1185,16 @@ pub struct TermWindow {
     /// Recomputed from the herd join every paint, which is why it must stay a
     /// plain filter with no filesystem work. Also what the close handler
     /// persists, so it must be current rather than recomputed on the way out.
-    agent_window_sessions: Vec<tgz_last_session::SnapshotSession>,
-    /// What was last persisted for this window, and when. The list is the change
-    /// detector (so an unchanged set writes nothing) and the instant is the rate
-    /// limiter.
-    agent_snapshot_written: Option<(Instant, Vec<tgz_last_session::SnapshotSession>)>,
+    agent_window_sessions: tgz_last_session::WindowAgents,
+    /// When the tab layouts in `agent_window_sessions` were last re-read from
+    /// the mux. Bounds the pane-tree walk to once per write interval.
+    agent_layout_checked_at: Option<Instant>,
+    /// Agent panes the snapshot could not record, as last logged.
+    agent_unrecorded_panes: Vec<PaneId>,
+    /// What was last persisted for this window, and when. The value is the
+    /// change detector (so an unchanged set writes nothing) and the instant is
+    /// the rate limiter.
+    agent_snapshot_written: Option<(Instant, tgz_last_session::WindowAgents)>,
     /// Agent sessions from the windows that were open when the previous run
     /// ended, loaded once at window creation. `None` means there is nothing to
     /// offer, so the restore row stays hidden.
@@ -1617,7 +1622,9 @@ impl TermWindow {
             ssh_launcher_cache: RefCell::new(None),
             agent_session_cache: None,
             agent_session_scan_started_at: None,
-            agent_window_sessions: Vec::new(),
+            agent_window_sessions: tgz_last_session::WindowAgents::default(),
+            agent_layout_checked_at: None,
+            agent_unrecorded_panes: Vec::new(),
             agent_snapshot_written: None,
             // Read once here, never from paint: the launcher's restore row only
             // ever consults this copy.

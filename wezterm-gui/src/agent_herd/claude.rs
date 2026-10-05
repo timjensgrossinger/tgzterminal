@@ -1178,14 +1178,30 @@ impl crate::agent_herd::vendor::SessionSource for ClaudeDetector {
 fn activity_for_session(home: &Path, session: &ClaudeSession) -> Option<super::HerdActivity> {
     let transcript = session_transcript_path(home, &session.cwd, &session.session_id)?;
     let project_dir = transcript.parent()?.to_path_buf();
-    let mut activity = super::transcript::read_activity(&transcript, 8);
-    super::sessions::populate_subagent_tree(
-        &mut activity,
-        &project_dir,
-        &session.session_id,
-        &session.subagents,
-    );
-    Some(activity)
+    // A transcript is someone else's file. A parser bug on one of them must
+    // cost that row its activity line, not the whole scan: a scan that panics
+    // leaves the session cache frozen, so every later agent stays unbound and
+    // never reaches the "Reopen last window" snapshot.
+    let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut activity = super::transcript::read_activity(&transcript, 8);
+        super::sessions::populate_subagent_tree(
+            &mut activity,
+            &project_dir,
+            &session.session_id,
+            &session.subagents,
+        );
+        activity
+    }));
+    match read {
+        Ok(activity) => Some(activity),
+        Err(_) => {
+            log::warn!(
+                "agent herd: reading activity of claude session {} panicked; skipped",
+                session.session_id
+            );
+            None
+        }
+    }
 }
 
 #[cfg(test)]
