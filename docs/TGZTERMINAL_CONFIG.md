@@ -1256,7 +1256,7 @@ config.keys = {
 | `raised_mode` | `"Float"` | What a panel shorter than the pane does to the terminal; see below. |
 | `width_px` | `840` | Initial width, calibrated for a 2x display like `sidebar_width_px`. A drag overrides it. |
 | `snap_px` | `56` | How close (at 2x) the dragged bottom edge must come to the bottom, or to the docked input strip, to snap onto it. |
-| `refresh_ms` | `2000` | How often the visible panel re-reads the directory. A tree that is slow to diff is re-read less often than this. |
+| `refresh_ms` | `2000` | How often the visible panel re-reads the directory when nothing tells it to. A tree that is slow to diff is re-read less often than this. A written file does not wait for it: the working copy is watched, and a change is re-read within about a third of a second. Where watching is not possible (a network share, a WSL distro's own filesystem seen from Windows) this poll is the only trigger. |
 | `max_file_bytes` | `1048576` | Files larger than this are listed without a diff. |
 | `snapshot_max_files` | `5000` | Most files a snapshot baseline may record (see "No version control"). |
 

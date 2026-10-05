@@ -4,6 +4,7 @@
 //! The geometry itself is the pure [`crate::diff_panel::geometry`]; this file
 //! only gathers its inputs from the window and acts on its answer.
 
+use crate::diff_panel::exec::{Env, Runner};
 use crate::diff_panel::geometry::{
     panel_geometry, PanelArea, PanelGeometry, PanelRequest, PanelSnap,
 };
@@ -47,6 +48,11 @@ const SCAN_WATCHDOG: Duration = Duration::from_secs(60);
 /// A scan may use at most this share of the time between scans: a tree that
 /// takes a second to diff is re-read every few seconds, not every two.
 const SCAN_DUTY_DIVISOR: u32 = 4;
+/// How long after a watched change the working copy is re-read: writes come
+/// in bursts (a save, a build, a checkout), and one read should see them all.
+const WATCH_SETTLE: Duration = Duration::from_millis(300);
+/// A tree that keeps changing is re-read at most this share of the time.
+const WATCH_DUTY_DIVISOR: u32 = 2;
 /// Most files given a chip in the index, and most rows the chips may wrap
 /// onto; the rest are counted in a "+N more" marker.
 const MAX_CHIPS: usize = 40;
@@ -110,6 +116,109 @@ fn snapshot_base() -> PathBuf {
     config::DATA_DIR.join("diff-snapshots")
 }
 
+/// Where a pane's changes are to be looked for. Decided on the GUI thread
+/// from what the pane says about itself, and settled into a directory and a
+/// [`Runner`] on the scan thread, which may have to ask a WSL distro.
+enum ScanTarget {
+    /// A directory this process can open.
+    Dir(PathBuf),
+    /// A pane whose program runs inside a WSL distro, where only the distro
+    /// knows the directory it is in.
+    WslPane {
+        /// `(distro, user)` to ask, likeliest first. One for a pane of a WSL
+        /// domain; every running distro for a `wsl.exe` typed into an
+        /// ordinary pane, which does not say where it went.
+        distros: Vec<(String, Option<String>)>,
+        pane_id: PaneId,
+        /// The directory the shell reported through OSC 7, as a Linux path.
+        reported: Option<String>,
+        /// The directory to settle for when the distro has no answer.
+        fallback: Option<PathBuf>,
+    },
+}
+
+/// The directory to scan and the environments its client may live in, the
+/// likeliest first.
+///
+/// The client follows the files, not the pane: a working copy on a Windows
+/// drive is read by the Windows client even from a WSL pane, and one inside a
+/// distro by that distro's. The other side is the fallback for a client that
+/// is installed on one side only. `other_distro` is the default WSL distro,
+/// which stands in when the pane itself is not in one.
+fn settle_scan_target(
+    target: ScanTarget,
+    other_distro: Option<String>,
+) -> Result<(PathBuf, Runner), String> {
+    use crate::termwindow::wsl_paths;
+    // The pane's own distro, when it is in one.
+    let mut pane_env = None;
+    let dir = match target {
+        ScanTarget::Dir(dir) => dir,
+        ScanTarget::WslPane {
+            distros,
+            pane_id,
+            reported,
+            fallback,
+        } => {
+            let found = distros.iter().find_map(|(distro, user)| {
+                let linux = wsl_paths::pane_cwd_in_distro(distro, user.as_deref(), pane_id)?;
+                Some((distro, user, linux))
+            });
+            // A reported directory is only as good as the guess at the distro
+            // it is in, so it counts when there is a single candidate.
+            let found = found.or_else(|| match (distros.as_slice(), reported) {
+                ([(distro, user)], Some(linux)) => Some((distro, user, linux)),
+                _ => None,
+            });
+            let settled = found.and_then(|(distro, user, linux)| {
+                let dir = wsl_paths::wsl_to_windows(&linux, distro)?;
+                Some((dir, distro.clone(), user.clone()))
+            });
+            match (settled, fallback) {
+                (Some((dir, distro, user)), _) => {
+                    pane_env = Some((distro, user));
+                    dir
+                }
+                (None, Some(dir)) => dir,
+                (None, None) => {
+                    return Err("WSL did not say which directory this pane is in".to_string())
+                }
+            }
+        }
+    };
+    let envs = match wsl_paths::distro_of_unc(&dir.to_string_lossy()) {
+        // Inside a distro's own filesystem, whoever is looking at it.
+        Some(distro) => {
+            let user = pane_env
+                .filter(|(pane_distro, _)| pane_distro.eq_ignore_ascii_case(&distro))
+                .and_then(|(_, user)| user);
+            vec![Env::Wsl { distro, user }, Env::Host]
+        }
+        None => std::iter::once(Env::Host)
+            .chain(
+                pane_env
+                    .or(other_distro.map(|distro| (distro, None)))
+                    .map(|(distro, user)| Env::Wsl { distro, user }),
+            )
+            .collect(),
+    };
+    Ok((dir, Runner::new(envs)))
+}
+
+/// True when a Windows process image is one of the shims a WSL session runs
+/// behind; the Linux program itself is invisible from this side.
+fn is_wsl_shim(executable: &str) -> bool {
+    let name = executable
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(executable)
+        .to_ascii_lowercase();
+    matches!(
+        name.trim_end_matches(".exe"),
+        "wsl" | "wslhost" | "wslrelay"
+    )
+}
+
 /// How tall the user wants the panel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PanelHeight {
@@ -134,6 +243,10 @@ pub struct DiffPanelState {
     relayout_queued: Cell<bool>,
     views: HashMap<PaneId, PaneView>,
     scan_started_at: Cell<Option<Instant>>,
+    /// Watches the working copy on show, so a written file is re-read at
+    /// once instead of at the next poll. `None` where watching is not
+    /// possible; the poll still runs either way.
+    watch: Option<diff_panel::watch::Watch>,
     /// Body rows that fit, as of the last paint; the wheel scrolls within it.
     visible_rows: Cell<usize>,
 }
@@ -153,6 +266,7 @@ impl DiffPanelState {
             relayout_queued: Cell::new(false),
             views: HashMap::new(),
             scan_started_at: Cell::new(None),
+            watch: None,
             visible_rows: Cell::new(0),
         }
     }
@@ -337,6 +451,10 @@ impl crate::TermWindow {
         }
         if self.diff_panel.enabled_panes.remove(&pane_id) {
             self.diff_panel.views.remove(&pane_id);
+            if self.diff_panel.enabled_panes.is_empty() {
+                // Nothing on show to keep current.
+                self.diff_panel.watch = None;
+            }
         } else {
             self.diff_panel.enabled_panes.insert(pane_id);
             // Housekeeping rides on the first use rather than on startup.
@@ -350,20 +468,92 @@ impl crate::TermWindow {
         self.relayout_for_diff_panel();
     }
 
-    /// The local directory whose changes `pane` should show.
-    fn diff_panel_dir(&self, pane: &Arc<dyn Pane>) -> Result<PathBuf, String> {
-        let local = Mux::get()
+    /// Where the changes `pane` should show are to be looked for.
+    fn diff_panel_target(&self, pane: &Arc<dyn Pane>) -> Result<ScanTarget, String> {
+        let domain = Mux::get()
             .get_domain(pane.domain_id())
-            .is_some_and(|domain| domain.downcast_ref::<mux::domain::LocalDomain>().is_some());
-        if !local {
-            return Err(REMOTE_PANE.to_string());
-        }
-        let url = pane
+            .filter(|domain| domain.downcast_ref::<mux::domain::LocalDomain>().is_some())
+            .ok_or_else(|| REMOTE_PANE.to_string())?;
+        let cwd = pane
             .get_current_working_dir(CachePolicy::AllowStale)
-            .ok_or_else(|| "This pane has not reported its directory".to_string())?;
+            .map(|url| url.to_file_path());
+
+        if cfg!(windows) {
+            use crate::termwindow::wsl_paths;
+            let domain_name = domain.domain_name();
+            // What OSC 7 from inside a distro resolves to: a UNC naming this
+            // machine. Anything else is `wsl.exe`'s own directory, which says
+            // nothing about where the shell inside it is.
+            let reported = cwd
+                .as_ref()
+                .and_then(|cwd| cwd.as_ref().ok())
+                .and_then(|cwd| wsl_paths::unc_host_path_to_linux(&cwd.to_string_lossy()));
+            if let Some(distro) = wsl_paths::distro_for_domain(domain_name, &self.config) {
+                let user = wsl_paths::wsl_domains(&self.config)
+                    .into_iter()
+                    .find(|wsl| wsl.name == domain_name)
+                    .and_then(|wsl| wsl.username);
+                return Ok(ScanTarget::WslPane {
+                    distros: vec![(distro, user)],
+                    pane_id: pane.pane_id(),
+                    reported,
+                    fallback: None,
+                });
+            }
+            // `wsl.exe` run by hand in an ordinary pane. Which distro it
+            // entered is not visible from here, so each running one is asked;
+            // a distro the pane is not in simply has no such pane.
+            let shim = pane
+                .get_foreground_process_name(CachePolicy::AllowStale)
+                .is_some_and(|name| is_wsl_shim(&name));
+            let distros = if shim {
+                Self::running_wsl_distros()
+            } else {
+                vec![]
+            };
+            if !distros.is_empty() {
+                return Ok(ScanTarget::WslPane {
+                    distros: distros.into_iter().map(|distro| (distro, None)).collect(),
+                    pane_id: pane.pane_id(),
+                    reported,
+                    fallback: cwd.and_then(|cwd| cwd.ok()),
+                });
+            }
+        }
+
         // A shell on another host reports a `file://host/...` this machine
         // cannot open.
-        url.to_file_path().map_err(|_| REMOTE_PANE.to_string())
+        cwd.ok_or_else(|| "This pane has not reported its directory".to_string())?
+            .map(ScanTarget::Dir)
+            .map_err(|_| REMOTE_PANE.to_string())
+    }
+
+    /// Running distros, the default first; just the default while it is not
+    /// yet known which are running. Asking a stopped one would boot it.
+    fn running_wsl_distros() -> Vec<String> {
+        if !cfg!(windows) {
+            return vec![];
+        }
+        let distros = crate::termwindow::wsl_paths::cached_distros();
+        let running: Vec<String> = distros
+            .iter()
+            .filter(|distro| distro.state == config::WSL_STATE_RUNNING)
+            .map(|distro| distro.name.clone())
+            .collect();
+        if running.is_empty() && distros.iter().all(|distro| distro.state.is_empty()) {
+            return Self::default_wsl_distro().into_iter().collect();
+        }
+        running
+    }
+
+    fn default_wsl_distro() -> Option<String> {
+        if !cfg!(windows) {
+            return None;
+        }
+        crate::termwindow::wsl_paths::cached_distros()
+            .iter()
+            .find(|distro| distro.is_default)
+            .map(|distro| distro.name.clone())
     }
 
     fn diff_panel_publish(&mut self, pane_id: PaneId, started: Instant, result: Scan) {
@@ -415,8 +605,26 @@ impl crate::TermWindow {
             .get(&pane_id)
             .map(|view| (view.scanned_at, view.scan_cost))
             .unwrap_or_default();
-        let ttl = Duration::from_millis(self.config.diff_panel.refresh_ms.max(250))
-            .max(cost * SCAN_DUTY_DIVISOR);
+        // A change the watch saw is read as soon as the burst it belongs to
+        // has had a moment to finish; with nothing seen, the poll decides.
+        let changed = self
+            .diff_panel
+            .watch
+            .as_ref()
+            .filter(|watch| watch.is_dirty())
+            .is_some_and(|watch| {
+                let view = self.diff_panel.views.get(&pane_id);
+                matches!(
+                    view.and_then(|view| view.scan.as_ref()),
+                    Some(Scan::Changes(set)) if set.root == watch.root()
+                )
+            });
+        let ttl = if changed {
+            WATCH_SETTLE.max(cost * WATCH_DUTY_DIVISOR)
+        } else {
+            Duration::from_millis(self.config.diff_panel.refresh_ms.max(250))
+                .max(cost * SCAN_DUTY_DIVISOR)
+        };
         // Come back when the next scan is due even if nothing else repaints.
         self.update_next_frame_time(Some(now + ttl));
         if !herd_scan_is_due(
@@ -428,8 +636,8 @@ impl crate::TermWindow {
         ) {
             return;
         }
-        let dir = match self.diff_panel_dir(pane) {
-            Ok(dir) => dir,
+        let target = match self.diff_panel_target(pane) {
+            Ok(target) => target,
             Err(reason) => {
                 self.diff_panel_publish(pane_id, now, Scan::Unavailable(reason));
                 return;
@@ -442,13 +650,59 @@ impl crate::TermWindow {
             max_file_bytes: self.config.diff_panel.max_file_bytes,
             snapshot_max_files: self.config.diff_panel.snapshot_max_files,
         };
+        let other_distro = Self::default_wsl_distro();
+        let watched = self.diff_panel.watch.as_ref().map(|watch| {
+            watch.clear();
+            watch.root().to_path_buf()
+        });
         self.diff_panel.scan_started_at.set(Some(now));
         let spawned = std::thread::Builder::new()
             .name("diff-panel-scan".into())
             .spawn(move || {
-                let result = diff_panel::scan(&dir, &snapshot_base(), limits);
+                let settled = settle_scan_target(target, other_distro);
+                let settled_in = now.elapsed();
+                let result = match settled {
+                    Ok((dir, runner)) => {
+                        let result = diff_panel::scan(&dir, &runner, &snapshot_base(), limits);
+                        // Like the herd scan: a slow one is worth a line, so
+                        // "the panel is slow" can be told apart from "the
+                        // client is slow" after the fact.
+                        if now.elapsed() > Duration::from_secs(2) {
+                            log::info!(
+                                "diff panel scan of {} took {:?} ({:?} finding the directory)",
+                                dir.display(),
+                                now.elapsed(),
+                                settled_in
+                            );
+                        }
+                        result
+                    }
+                    Err(reason) => Scan::Unavailable(reason),
+                };
+                // Follow the working copy on show. Started here because
+                // registering a large tree takes a while on some platforms.
+                let watch = match &result {
+                    Scan::Changes(set) if watched.as_deref() != Some(set.root.as_path()) => {
+                        let window = window.clone();
+                        diff_panel::watch::Watch::start(&set.root, move || {
+                            window.notify(TermWindowNotif::Apply(Box::new(|term_window| {
+                                if let Some(window) = term_window.window.as_ref() {
+                                    window.invalidate();
+                                }
+                            })));
+                        })
+                        .map_err(|err| {
+                            log::debug!("diff panel: cannot watch {}: {err:#}", set.root.display())
+                        })
+                        .ok()
+                    }
+                    _ => None,
+                };
                 window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
                     term_window.diff_panel.scan_started_at.set(None);
+                    if watch.is_some() {
+                        term_window.diff_panel.watch = watch;
+                    }
                     term_window.diff_panel_publish(pane_id, now, result);
                 })));
             });

@@ -704,6 +704,61 @@ pub fn windows_to_wsl(win_path: &str, distro: &str) -> Option<String> {
     None
 }
 
+/// The distro a `\\wsl.localhost\<distro>\...` path (or its `\\wsl$\` form)
+/// lives in: a Windows program can sit in such a directory too, and the
+/// working copy there belongs to that distro's tools.
+pub fn distro_of_unc(win_path: &str) -> Option<String> {
+    let path = win_path.trim();
+    let rest = UNC_PREFIXES
+        .iter()
+        .find_map(|prefix| strip_prefix_ignore_ascii_case(path, prefix))?;
+    let distro = rest.split(['\\', '/']).next()?;
+    (!distro.is_empty()).then(|| distro.to_string())
+}
+
+/// Prints the directory of the program in the foreground of pane `$1` of the
+/// GUI whose socket is `$2`: the leader of the terminal's foreground process
+/// group, or failing that the pane's oldest process (its shell).
+const PANE_CWD_SCRIPT: &str = r#"pane=$1; sock=$2; best=; fg=
+for f in $(grep -lzxF "WEZTERM_PANE=$pane" /proc/[0-9]*/environ 2>/dev/null); do
+  grep -qzxF "WEZTERM_UNIX_SOCKET=$sock" "$f" 2>/dev/null || continue
+  d=${f%/environ}; pid=${d#/proc/}
+  s=$(cat "$d/stat" 2>/dev/null) || continue
+  set -- ${s##*) }
+  if [ -z "$best" ] || [ "$pid" -lt "$best" ]; then best=$pid; fi
+  if [ "$pid" = "$6" ]; then fg=$pid; break; fi
+done
+p=${fg:-$best}
+[ -n "$p" ] && readlink "/proc/$p/cwd""#;
+
+/// Where the program running in pane `pane_id` is, as `distro` sees it.
+///
+/// The Windows side cannot answer this: a WSL pane's process tree ends at
+/// `wsl.exe`, whose own directory is wherever it was started from, while the
+/// shell inside moves around freely. The distro's `/proc` knows, and the
+/// processes of a pane are recognisable by the `WEZTERM_PANE` and
+/// `WEZTERM_UNIX_SOCKET` they inherit through `WSLENV`.
+///
+/// Spawns `wsl.exe`; never call it on the GUI thread.
+pub(crate) fn pane_cwd_in_distro(
+    distro: &str,
+    user: Option<&str>,
+    pane_id: usize,
+) -> Option<String> {
+    let socket = std::env::var("WEZTERM_UNIX_SOCKET").ok()?;
+    let pane = pane_id.to_string();
+    let mut args = vec!["--distribution", distro];
+    if let Some(user) = user {
+        args.extend(["--user", user]);
+    }
+    args.extend(["--exec", "sh", "-c", PANE_CWD_SCRIPT, "sh", &pane, &socket]);
+    let output = run_wsl_hidden(&args, config::WSL_COMMAND_TIMEOUT)
+        .map_err(|err| log::debug!("no directory for pane {pane_id} from {distro}: {err:?}"))
+        .ok()?;
+    let cwd = output.lines().next()?.trim();
+    cwd.starts_with('/').then(|| cwd.to_string())
+}
+
 /// Split `/mnt/<drive>[/tail]` into the drive letter and the remaining path.
 /// Only single-letter mounts count: `/mnt/data` is an ordinary directory.
 /// Recover the Linux path from a UNC whose host is *not* a WSL share.
@@ -964,6 +1019,18 @@ mod tests {
             windows_to_wsl(r"\\WSL.LOCALHOST\ubuntu\home", "Ubuntu"),
             Some("/home".to_string())
         );
+    }
+
+    #[test]
+    fn a_wsl_share_path_names_its_distro() {
+        assert_eq!(
+            distro_of_unc(r"\\wsl.localhost\Ubuntu\home\tim\proj").as_deref(),
+            Some("Ubuntu")
+        );
+        assert_eq!(distro_of_unc(r"\\WSL$\Debian").as_deref(), Some("Debian"));
+        assert_eq!(distro_of_unc(r"C:\Users\tim"), None);
+        assert_eq!(distro_of_unc(r"\\server\share\dir"), None);
+        assert_eq!(distro_of_unc(r"\\wsl.localhost\"), None);
     }
 
     #[test]

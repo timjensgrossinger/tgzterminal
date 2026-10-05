@@ -3,7 +3,7 @@
 //! Uses the command-line client rather than libgit2 so the user's own
 //! configuration (ignore rules, attributes, filters) decides what a change is.
 
-use super::exec::{self, CommandOutput};
+use super::exec::{CommandOutput, Runner};
 use super::{
     read_text_file, unified, ChangeSet, ChangeSource, FileChange, FileStatus, Limits, Scan,
     MAX_UNTRACKED_FILES,
@@ -14,7 +14,7 @@ use std::path::Path;
 /// is compared against before the first commit exists.
 const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
-fn git(root: &Path, args: &[&str]) -> std::io::Result<CommandOutput> {
+fn git(runner: &Runner, root: &Path, args: &[&str]) -> std::io::Result<CommandOutput> {
     let mut full = vec![
         "--no-optional-locks",
         // Paths as they are, not octal-escaped.
@@ -22,11 +22,12 @@ fn git(root: &Path, args: &[&str]) -> std::io::Result<CommandOutput> {
         "core.quotepath=off",
     ];
     full.extend_from_slice(args);
-    exec::run("git", &full, root)
+    runner.run("git", &full, root)
 }
 
-fn diff_against(root: &Path, base: &str) -> std::io::Result<CommandOutput> {
+fn diff_against(runner: &Runner, root: &Path, base: &str) -> std::io::Result<CommandOutput> {
     git(
+        runner,
         root,
         &[
             "diff",
@@ -61,8 +62,8 @@ fn untracked_file(root: &Path, path: &str, limits: Limits, read_content: bool) -
     }
 }
 
-pub fn scan(root: &Path, limits: Limits) -> Scan {
-    let branch = match git(root, &["symbolic-ref", "--short", "-q", "HEAD"]) {
+pub fn scan(root: &Path, runner: &Runner, limits: Limits) -> Scan {
+    let branch = match git(runner, root, &["symbolic-ref", "--short", "-q", "HEAD"]) {
         Ok(out) if out.success => Some(out.stdout.trim().to_string()).filter(|b| !b.is_empty()),
         // Detached HEAD: a repository, just not on a branch.
         Ok(_) => None,
@@ -72,13 +73,13 @@ pub fn scan(root: &Path, limits: Limits) -> Scan {
         Err(err) => return Scan::Unavailable(format!("Could not run git: {err}")),
     };
 
-    let mut diff = match diff_against(root, "HEAD") {
+    let mut diff = match diff_against(runner, root, "HEAD") {
         Ok(out) => out,
         Err(err) => return Scan::Unavailable(format!("Could not run git: {err}")),
     };
     if !diff.success && !diff.truncated {
         // No commit yet, so no HEAD to compare with.
-        match diff_against(root, EMPTY_TREE) {
+        match diff_against(runner, root, EMPTY_TREE) {
             Ok(out) if out.success || out.truncated => diff = out,
             _ => {
                 let reason = diff.stderr.lines().next().unwrap_or("git diff failed");
@@ -88,11 +89,21 @@ pub fn scan(root: &Path, limits: Limits) -> Scan {
     }
 
     let mut files = unified::parse(&diff.stdout);
-    let mut note = diff
-        .truncated
-        .then(|| "The diff is too large to show in full".to_string());
+    if files.is_empty() {
+        if let Some(reason) = diff.timeout_reason("git") {
+            return Scan::Unavailable(reason);
+        }
+    }
+    let mut note = diff.timeout_reason("git").or_else(|| {
+        diff.truncated
+            .then(|| "The diff is too large to show in full".to_string())
+    });
 
-    if let Ok(out) = git(root, &["ls-files", "--others", "--exclude-standard", "-z"]) {
+    if let Ok(out) = git(
+        runner,
+        root,
+        &["ls-files", "--others", "--exclude-standard", "-z"],
+    ) {
         if out.success {
             let untracked = parse_path_list(&out.stdout);
             for (idx, path) in untracked.iter().enumerate() {
@@ -116,7 +127,7 @@ pub fn scan(root: &Path, limits: Limits) -> Scan {
         source: ChangeSource::Git { branch },
         root: root.to_path_buf(),
         files,
-        note,
+        note: note.or_else(|| runner.fallback_note("git")),
     })
 }
 
@@ -153,7 +164,7 @@ mod tests {
     }
 
     fn changes(root: &Path) -> ChangeSet {
-        match scan(root, limits()) {
+        match scan(root, &Runner::host(), limits()) {
             Scan::Changes(set) => set,
             Scan::Unavailable(reason) => panic!("scan unavailable: {}", reason),
         }

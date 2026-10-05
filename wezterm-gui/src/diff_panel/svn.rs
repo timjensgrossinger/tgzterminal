@@ -1,6 +1,6 @@
 //! Subversion provider: the working copy against its pristine BASE.
 
-use super::exec;
+use super::exec::Runner;
 use super::{
     read_text_file, unified, ChangeSet, ChangeSource, FileChange, FileStatus, Limits, Scan,
     MAX_UNTRACKED_FILES,
@@ -42,8 +42,8 @@ fn parse_status(output: &str) -> Vec<(String, SvnState)> {
         .collect()
 }
 
-pub fn scan(root: &Path, limits: Limits) -> Scan {
-    let status = match exec::run("svn", &["status"], root) {
+pub fn scan(root: &Path, runner: &Runner, limits: Limits) -> Scan {
+    let status = match runner.run("svn", &["status"], root) {
         Ok(out) => out,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             return Scan::Unavailable(
@@ -52,6 +52,9 @@ pub fn scan(root: &Path, limits: Limits) -> Scan {
         }
         Err(err) => return Scan::Unavailable(format!("Could not run svn: {err}")),
     };
+    if let Some(reason) = status.timeout_reason("svn") {
+        return Scan::Unavailable(reason);
+    }
     if !status.success && !status.truncated {
         let reason = status.stderr.lines().next().unwrap_or("svn status failed");
         return Scan::Unavailable(reason.trim().to_string());
@@ -59,7 +62,7 @@ pub fn scan(root: &Path, limits: Limits) -> Scan {
     let states = parse_status(&status.stdout);
 
     // `--internal-diff`: never hand off to a diff tool the user configured.
-    let diff = match exec::run("svn", &["diff", "--internal-diff"], root) {
+    let diff = match runner.run("svn", &["diff", "--internal-diff"], root) {
         Ok(out) => out,
         Err(err) => return Scan::Unavailable(format!("Could not run svn: {err}")),
     };
@@ -67,8 +70,10 @@ pub fn scan(root: &Path, limits: Limits) -> Scan {
     for file in &mut files {
         file.path = file.path.replace('\\', "/");
     }
-    let mut note = (diff.truncated || status.truncated)
-        .then(|| "The diff is too large to show in full".to_string());
+    let mut note = diff.timeout_reason("svn").or_else(|| {
+        (diff.truncated || status.truncated)
+            .then(|| "The diff is too large to show in full".to_string())
+    });
 
     // `svn status` knows things the diff does not say outright: conflicts,
     // and changed files the diff skipped.
@@ -132,7 +137,7 @@ pub fn scan(root: &Path, limits: Limits) -> Scan {
         source: ChangeSource::Svn,
         root: root.to_path_buf(),
         files,
-        note,
+        note: note.or_else(|| runner.fallback_note("svn")),
     })
 }
 
@@ -214,7 +219,7 @@ I       ignored.o
             max_file_bytes: 1024 * 1024,
             snapshot_max_files: 1000,
         };
-        let Scan::Changes(set) = scan(&wc, limits) else {
+        let Scan::Changes(set) = scan(&wc, &Runner::host(), limits) else {
             panic!("scan unavailable");
         };
         assert_eq!(set.source, ChangeSource::Svn);

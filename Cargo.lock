@@ -7154,6 +7154,7 @@ dependencies = [
  "mlua",
  "mux",
  "mux-lua",
+ "notify",
  "nucleo-matcher",
  "objc",
  "ordered-float 4.6.0",

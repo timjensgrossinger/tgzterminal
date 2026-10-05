@@ -16,6 +16,7 @@ pub mod snapshot;
 pub mod svn;
 pub mod unified;
 pub mod view;
+pub mod watch;
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -272,15 +273,18 @@ pub fn looks_binary(bytes: &[u8]) -> bool {
 
 /// The working-copy changes for `dir`, from whichever provider applies.
 ///
+/// `dir` is a path this process can open; `runner` says where the directory's
+/// version-control client lives, which need not be this machine.
+///
 /// Blocking: runs child processes and walks the filesystem. Never call it on
 /// the GUI thread.
-pub fn scan(dir: &Path, snapshot_store: &Path, limits: Limits) -> Scan {
+pub fn scan(dir: &Path, runner: &exec::Runner, snapshot_store: &Path, limits: Limits) -> Scan {
     if !dir.is_dir() {
         return Scan::Unavailable("This pane's directory is not available".to_string());
     }
     let mut scan = match detect_vcs(dir) {
-        Some((Vcs::Git, root)) => git::scan(&root, limits),
-        Some((Vcs::Svn, root)) => svn::scan(&root, limits),
+        Some((Vcs::Git, root)) => git::scan(&root, runner, limits),
+        Some((Vcs::Svn, root)) => svn::scan(&root, runner, limits),
         None => snapshot::scan(dir, snapshot_store, limits),
     };
     if let Scan::Changes(set) = &mut scan {

@@ -8808,7 +8808,7 @@ impl crate::TermWindow {
     ///
     /// Expanded: "+ New Tab" plus the shared Worktree/agent row. Collapsed:
     /// the "+" rail icon plus the agent launcher slot when an agent is
-    /// installed. Kept in one place so the paint pass, the wheel-scroll
+    /// installed and the Changes slot when the panel is enabled. Kept in one place so the paint pass, the wheel-scroll
     /// clamp and the scrollbar cannot disagree.
     fn sidebar_bottom_button_rows(&self) -> f32 {
         let collapsed = self.config.sidebar_auto_hide && !self.sidebar_auto_hide_open;
@@ -8816,6 +8816,9 @@ impl crate::TermWindow {
         if collapsed {
             let mut rows = 1.;
             if self.agent_launcher_default().is_some() {
+                rows += 1.;
+            }
+            if self.config.diff_panel.enabled {
                 rows += 1.;
             }
             if ssh_present {
@@ -11517,6 +11520,65 @@ impl crate::TermWindow {
             Ok(())
         };
 
+        // The Changes toggle. Every layout draws it -- the expanded sidebar at
+        // any width and the collapsed rail -- so the panel is always one click
+        // away; only the box it is given differs. `hit` is the clickable
+        // `(x, width)`: the rail lets a click anywhere across it count.
+        let paint_changes_button = |this: &mut Self,
+                                    layers: &mut TripleLayerQuadAllocator,
+                                    (x, y, w, h): (f32, f32, f32, f32),
+                                    radius: f32,
+                                    hit: (f32, f32)|
+         -> anyhow::Result<()> {
+            let changes_type = UIItemType::SidebarDiffPanelButton;
+            let hovered = hovered_item.as_ref() == Some(&changes_type);
+            let pressed =
+                hovered && left_pressed && this.pressed_ui_item.as_ref() == Some(&changes_type);
+            let on = this.diff_panel_shown();
+            let bg = if pressed {
+                pressed_fill
+            } else if hovered {
+                hover_fill
+            } else if on {
+                sb.active_fill
+            } else {
+                search_fill
+            };
+            let offset = if pressed { 1. } else { 0. };
+            this.sidebar_bordered_fill(
+                layers,
+                1,
+                euclid::rect(x, y + offset, w, h),
+                radius.min(w * 0.5),
+                dpi_scale.max(1.),
+                bg,
+                sb.row_border,
+            )?;
+            render_text(
+                this,
+                layers,
+                "\u{00b1}",
+                &CellAttributes::default(),
+                x + (w - cell_width as f32) * 0.5,
+                y + offset + (h - cell_height as f32) * 0.5,
+                cell_width as f32,
+                if hovered || on {
+                    hover_fg
+                } else {
+                    inactive_fg.mul_alpha(0.86)
+                },
+                bg,
+            )?;
+            this.ui_items.push(UIItem {
+                x: hit.0 as usize,
+                y: y as usize,
+                width: hit.1 as usize,
+                height: h as usize,
+                item_type: changes_type,
+            });
+            Ok(())
+        };
+
         if self.config.sidebar_auto_hide && !self.sidebar_auto_hide_open {
             let tabs: Vec<_> = self
                 .tab_bar
@@ -11576,7 +11638,16 @@ impl crate::TermWindow {
             let rail_launch_y = rail_launcher_entry
                 .as_ref()
                 .map(|_| ssh_rail_y.unwrap_or(new_tab_y) - row_stride);
-            let list_bottom = rail_launch_y.or(ssh_rail_y).unwrap_or(new_tab_y);
+            // The Changes toggle tops the stack of bottom buttons.
+            let changes_rail_y = self
+                .config
+                .diff_panel
+                .enabled
+                .then(|| rail_launch_y.or(ssh_rail_y).unwrap_or(new_tab_y) - row_stride);
+            let list_bottom = changes_rail_y
+                .or(rail_launch_y)
+                .or(ssh_rail_y)
+                .unwrap_or(new_tab_y);
             let list_height = (list_bottom - GAP - list_top).max(0.);
             let visible_rows = ((list_height + GAP) / row_stride).floor().max(0.) as usize;
             let max_offset = tabs.len().saturating_sub(visible_rows);
@@ -11773,6 +11844,16 @@ impl crate::TermWindow {
                     item_type: tab_type,
                 });
                 rail_y += row_stride;
+            }
+
+            if let Some(changes_y) = changes_rail_y {
+                paint_changes_button(
+                    self,
+                    layers,
+                    (rail_x, changes_y, rail_side, rail_side),
+                    rail_radius,
+                    (left, width as f32),
+                )?;
             }
 
             // SSH quick-launch rail slot, directly above "+". A flat glyph
@@ -13030,15 +13111,16 @@ impl crate::TermWindow {
                 sidebar_bottom_row_layout(item_x, item_w, content_x, content_w, dot_size, true);
             // The Changes toggle is a square carved off the Worktree pill's
             // right end, so the row keeps its height and the launcher its half.
-            let changes_side = row_height as f32;
-            let changes_x = (self.config.diff_panel.enabled
-                && bottom_row.worktree_fill_w > changes_side * 2. + GAP)
-                .then(|| {
-                    bottom_row.worktree_fill_w -= changes_side + GAP;
-                    bottom_row.worktree_text_w =
-                        (bottom_row.worktree_text_w - changes_side - GAP).max(0.);
-                    bottom_row.worktree_fill_x + bottom_row.worktree_fill_w + GAP
-                });
+            // On a narrow sidebar it shrinks to half the pill rather than go:
+            // the Worktree label gives way first.
+            let changes_side =
+                (row_height as f32).min(((bottom_row.worktree_fill_w - GAP) * 0.5).max(1.));
+            let changes_x = self.config.diff_panel.enabled.then(|| {
+                bottom_row.worktree_fill_w -= changes_side + GAP;
+                bottom_row.worktree_text_w =
+                    (bottom_row.worktree_text_w - changes_side - GAP).max(0.);
+                bottom_row.worktree_fill_x + bottom_row.worktree_fill_w + GAP
+            });
 
             let worktree_type = UIItemType::SidebarWorktreeButton;
             let worktree_hovered = hovered_item.as_ref() == Some(&worktree_type);
@@ -13123,58 +13205,13 @@ impl crate::TermWindow {
             });
 
             if let Some(changes_x) = changes_x {
-                let changes_type = UIItemType::SidebarDiffPanelButton;
-                let changes_hovered = hovered_item.as_ref() == Some(&changes_type);
-                let changes_pressed = changes_hovered
-                    && left_pressed
-                    && self.pressed_ui_item.as_ref() == Some(&changes_type);
-                let changes_on = self.diff_panel_shown();
-                let changes_bg = if changes_pressed {
-                    pressed_fill
-                } else if changes_hovered {
-                    hover_fill
-                } else if changes_on {
-                    sb.active_fill
-                } else {
-                    search_fill
-                };
-                let changes_offset = if changes_pressed { 1. } else { 0. };
-                self.sidebar_bordered_fill(
-                    layers,
-                    1,
-                    euclid::rect(
-                        changes_x,
-                        worktree_y + changes_offset,
-                        changes_side,
-                        row_height as f32,
-                    ),
-                    RADIUS * dpi_scale,
-                    dpi_scale.max(1.),
-                    changes_bg,
-                    sb.row_border,
-                )?;
-                render_text(
+                paint_changes_button(
                     self,
                     layers,
-                    "\u{00b1}",
-                    &CellAttributes::default(),
-                    changes_x + (changes_side - cell_width as f32) * 0.5,
-                    worktree_y + changes_offset + (row_height as f32 - cell_height as f32) * 0.5,
-                    cell_width as f32,
-                    if changes_hovered || changes_on {
-                        hover_fg
-                    } else {
-                        inactive_fg.mul_alpha(0.86)
-                    },
-                    changes_bg,
+                    (changes_x, worktree_y, changes_side, row_height as f32),
+                    RADIUS * dpi_scale,
+                    (changes_x, changes_side),
                 )?;
-                self.ui_items.push(UIItem {
-                    x: changes_x as usize,
-                    y: worktree_y as usize,
-                    width: changes_side as usize,
-                    height: row_height,
-                    item_type: changes_type,
-                });
             }
 
             {
@@ -13273,7 +13310,19 @@ impl crate::TermWindow {
         } else {
             0.
         };
-        let new_tab_fill_w = (item_w - chevron_w).max(1.);
+        // Too narrow for the Worktree row, which is where the Changes toggle
+        // lives: it takes the right end of this row instead.
+        let narrow_changes_w = if width <= 180 && self.config.diff_panel.enabled {
+            (row_height as f32).min(((item_w - chevron_w - GAP) * 0.5).max(1.))
+        } else {
+            0.
+        };
+        let split_w = if narrow_changes_w > 0. {
+            item_w - narrow_changes_w - GAP
+        } else {
+            item_w
+        };
+        let new_tab_fill_w = (split_w - chevron_w).max(1.);
         let chevron_x = item_x + new_tab_fill_w;
         // Both hit regions key off the drawn geometry. Deriving them from the
         // content column instead put the chevron's hit box a full button width
@@ -13377,6 +13426,17 @@ impl crate::TermWindow {
                 height: row_height,
                 item_type: chevron_type,
             });
+        }
+
+        if narrow_changes_w > 0. {
+            let changes_x = item_x + split_w + GAP;
+            paint_changes_button(
+                self,
+                layers,
+                (changes_x, new_tab_y, narrow_changes_w, row_height as f32),
+                RADIUS * dpi_scale,
+                (changes_x, narrow_changes_w),
+            )?;
         }
 
         self.ui_items.push(UIItem {
