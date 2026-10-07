@@ -1703,7 +1703,14 @@ impl super::TermWindow {
                     tgz_ui_state::save_pane_toolbelt_offset(None);
                 }
                 context.invalidate();
-            } else if let Some(start) = self.pane_toolbelt_painted {
+            } else if let Some(start) = match &item.item_type {
+                // The strip being grabbed, which need not be the focused
+                // pane's.
+                UIItemType::PaneToolbeltHandle { pane_id } => {
+                    self.pane_toolbelt_painted.get(pane_id).copied()
+                }
+                _ => None,
+            } {
                 self.pane_toolbelt_drag_start = Some((start, false));
                 self.dragging.replace((item, event));
                 context.set_cursor(Some(CursorIcon::Grabbing));

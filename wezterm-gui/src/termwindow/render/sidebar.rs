@@ -7897,7 +7897,7 @@ impl crate::TermWindow {
         self.pane_toolbelt_hidden = !self.pane_toolbelt_hidden;
         crate::termwindow::tgz_ui_state::save_pane_toolbelt_hidden(self.pane_toolbelt_hidden);
         if self.pane_toolbelt_hidden {
-            self.pane_toolbelt_painted = None;
+            self.pane_toolbelt_painted.clear();
             self.pane_toolbelt_drag_start = None;
         }
         self.quad_generation += 1;
@@ -10328,13 +10328,21 @@ impl crate::TermWindow {
         items
     }
 
+    /// Forget the strips of the last paint and tidy the detection cache.
+    /// Once per frame, before the strips are painted.
+    pub fn begin_pane_toolbelts(&mut self) {
+        self.prune_agent_detection_cache();
+        self.pane_toolbelt_painted.clear();
+    }
+
+    /// The toolbelt of one pane, if it is an agent pane. Called for every
+    /// visible pane, focused or not: an agent in the other half of a split
+    /// is still running and still needs its Stop button.
     pub fn paint_pane_toolbelt(
         &mut self,
         layers: &mut TripleLayerQuadAllocator,
         pos: &PositionedPane,
     ) -> anyhow::Result<()> {
-        self.prune_agent_detection_cache();
-        self.pane_toolbelt_painted = None;
         // Switched off from the sidebar. Gated here rather than in
         // `pane_toolbelt_kind`, which also decides what the sidebar's Copy
         // icon opens: hiding the strip must not take that away.
@@ -10466,11 +10474,14 @@ impl crate::TermWindow {
             offset,
             dpi_scale,
         );
-        self.pane_toolbelt_painted = Some(PaneToolbeltGeometry {
-            pane: pane_rect,
-            strip: euclid::rect(tool_x, tool_y, tool_w, strip_h),
-            dpi_scale,
-        });
+        self.pane_toolbelt_painted.insert(
+            pos.pane.pane_id(),
+            PaneToolbeltGeometry {
+                pane: pane_rect,
+                strip: euclid::rect(tool_x, tool_y, tool_w, strip_h),
+                dpi_scale,
+            },
+        );
 
         let sb = self.sidebar_palette();
         let fg = sb.text_active;

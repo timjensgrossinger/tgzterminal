@@ -259,7 +259,7 @@ impl crate::TermWindow {
             .context("filled_rectangle for window background")?;
         }
 
-        let mut active_agent_pane = None;
+        let mut toolbelt_panes = Vec::with_capacity(panes.len());
         for pos in panes {
             if pos.is_active {
                 self.update_text_cursor(&pos);
@@ -267,9 +267,9 @@ impl crate::TermWindow {
                     pos.pane.advise_focus();
                     mux::Mux::get().record_focus_for_current_identity(pos.pane.pane_id());
                 }
-                active_agent_pane = Some(pos.clone());
             }
             self.paint_pane(&pos, &mut layers).context("paint_pane")?;
+            toolbelt_panes.push(pos);
         }
 
         self.paint_scrollbar_edge_overlay(&mut layers)
@@ -297,7 +297,10 @@ impl crate::TermWindow {
         // After the Changes panel: by default the strip keeps clear of it,
         // and one the user dragged onto it is meant to be on top of it, both
         // drawn and for clicks.
-        if let Some(pos) = active_agent_pane.as_ref() {
+        // Every pane, not only the focused one: the strip used to vanish from
+        // an agent the moment focus moved to the pane beside it.
+        self.begin_pane_toolbelts();
+        for pos in &toolbelt_panes {
             self.paint_pane_toolbelt(&mut layers, pos)
                 .context("paint_pane_toolbelt")?;
         }

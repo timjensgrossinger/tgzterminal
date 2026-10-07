@@ -1174,8 +1174,9 @@ pub struct TermWindow {
     /// Where the user dragged the toolbelt to; `None` keeps the configured
     /// spot. Persisted via `tgz_ui_state`.
     pane_toolbelt_offset: Option<render::sidebar::PaneToolbeltOffset>,
-    /// The strip's rects from the last paint, `None` when none was drawn.
-    pane_toolbelt_painted: Option<render::sidebar::PaneToolbeltGeometry>,
+    /// Each strip's rects from the last paint, by the pane it sits on. A
+    /// split tab can show several agents, and each has its own strip.
+    pane_toolbelt_painted: HashMap<PaneId, render::sidebar::PaneToolbeltGeometry>,
     /// [`Self::pane_toolbelt_painted`] as it was when a drag began, and
     /// whether the pointer has since moved far enough to count as a drag.
     pane_toolbelt_drag_start: Option<(render::sidebar::PaneToolbeltGeometry, bool)>,
@@ -1669,7 +1670,7 @@ impl TermWindow {
             pane_toolbelt_hidden: tgz_ui_state::load_pane_toolbelt_hidden().unwrap_or(false),
             pane_toolbelt_offset: tgz_ui_state::load_pane_toolbelt_offset()
                 .map(|[right, top]| render::sidebar::PaneToolbeltOffset { right, top }),
-            pane_toolbelt_painted: None,
+            pane_toolbelt_painted: HashMap::new(),
             pane_toolbelt_drag_start: None,
             agent_detection_cache: RefCell::new(HashMap::new()),
             agent_herd_state: RefCell::new(AgentHerdState {
