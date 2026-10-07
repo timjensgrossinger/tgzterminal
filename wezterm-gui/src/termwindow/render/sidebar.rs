@@ -10425,13 +10425,16 @@ impl crate::TermWindow {
             self.config.rich_input.enabled,
             self.config.rich_input.docked,
         );
-        if buttons.is_empty() {
-            return Ok(());
-        }
         // Appended here rather than in `pane_toolbelt_buttons`: it is not an
-        // agent capability, so it rides on whatever strip the agent earned.
+        // agent capability. It is added before the emptiness check, not
+        // after: with the default config an idle agent offers no button of
+        // its own (Stop only exists while it runs), and a strip that came and
+        // went with every turn read as the toolbelt breaking at random.
         if self.config.diff_panel.enabled {
             buttons.push(("Changes", PaneToolbeltAction::Diff));
+        }
+        if buttons.is_empty() {
+            return Ok(());
         }
 
         let label_fallbacks = &layout.label_fallbacks;
