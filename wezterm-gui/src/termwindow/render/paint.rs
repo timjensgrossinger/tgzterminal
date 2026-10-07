@@ -317,6 +317,8 @@ impl crate::TermWindow {
             .context("paint_close_tab_menu")?;
         self.paint_ssh_launch_menu(&mut layers)
             .context("paint_ssh_launch_menu")?;
+        self.paint_usage_menu(&mut layers)
+            .context("paint_usage_menu")?;
 
         self.paint_window_borders(&mut layers)
             .context("paint_window_borders")?;

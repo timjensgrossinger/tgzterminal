@@ -22,7 +22,6 @@
 //! Pure apart from the file read; no GUI, mux or terminal types.
 
 use std::collections::HashMap;
-use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 
@@ -30,8 +29,6 @@ use std::sync::{LazyLock, Mutex};
 /// its newest records are the ones that matter, so a longer one is read from
 /// this far before its end, and later reads only append.
 const MAX_TRANSCRIPT_BYTES: u64 = 64 * 1024 * 1024;
-/// Read size per chunk of an incremental read.
-const CHUNK_BYTES: usize = 1024 * 1024;
 /// Transcripts whose read state is kept; one per panel-visible agent is the
 /// realistic need.
 const CACHE_CAP: usize = 32;
@@ -574,24 +571,6 @@ struct CacheEntry {
 
 static CACHE: LazyLock<Mutex<HashMap<PathBuf, CacheEntry>>> = LazyLock::new(Default::default);
 
-/// Fold the complete lines in `bytes` into `state`; returns how many bytes
-/// that consumed. A trailing line without its newline is left for the next
-/// read: the agent may still be writing it.
-fn scan_bytes(bytes: &[u8], state: &mut ScanState) -> usize {
-    let Some(last_newline) = bytes.iter().rposition(|byte| *byte == b'\n') else {
-        return 0;
-    };
-    for line in bytes[..last_newline].split(|byte| *byte == b'\n') {
-        if line.is_empty() {
-            continue;
-        }
-        if let Ok(line) = std::str::from_utf8(line) {
-            scan_record(line, state);
-        }
-    }
-    last_newline + 1
-}
-
 /// Every file the session behind `transcript` touched so far.
 ///
 /// Incremental: a later call reads only what was appended since. A file that
@@ -612,46 +591,20 @@ pub fn touched_by(transcript: &Path) -> std::io::Result<TouchedPaths> {
         entry = CacheEntry::default();
     }
     // Past the cap, keep the newest records: what the agent is doing now is
-    // what the filter is for. Jumping forward lands mid-line, so the partial
-    // line up to the next newline is dropped.
-    let mut skip_partial = false;
-    if len - entry.offset > MAX_TRANSCRIPT_BYTES {
-        entry.offset = len - MAX_TRANSCRIPT_BYTES;
-        skip_partial = true;
+    // what the filter is for.
+    let state = &mut entry.state;
+    let skipped = super::incremental::read_appended(
+        transcript,
+        len,
+        &mut entry.offset,
+        MAX_TRANSCRIPT_BYTES,
+        &mut |line| scan_record(line, state),
+    )?;
+    if skipped {
         log::debug!(
             "touched files: {} is {len} bytes; reading its last {MAX_TRANSCRIPT_BYTES}",
             transcript.display()
         );
-    }
-    let end = len;
-    if entry.offset < end {
-        let mut file = std::fs::File::open(transcript)?;
-        file.seek(SeekFrom::Start(entry.offset))?;
-        let mut pending: Vec<u8> = Vec::new();
-        let mut chunk = vec![0u8; CHUNK_BYTES];
-        let mut remaining = end - entry.offset;
-        while remaining > 0 {
-            let want = (remaining as usize).min(CHUNK_BYTES);
-            let read = file.read(&mut chunk[..want])?;
-            if read == 0 {
-                break;
-            }
-            remaining -= read as u64;
-            pending.extend_from_slice(&chunk[..read]);
-            if skip_partial {
-                let Some(newline) = pending.iter().position(|byte| *byte == b'\n') else {
-                    entry.offset += pending.len() as u64;
-                    pending.clear();
-                    continue;
-                };
-                entry.offset += newline as u64 + 1;
-                pending.drain(..=newline);
-                skip_partial = false;
-            }
-            let consumed = scan_bytes(&pending, &mut entry.state);
-            entry.offset += consumed as u64;
-            pending.drain(..consumed);
-        }
     }
     let touched = entry.state.touched.clone();
     let mut cache = CACHE

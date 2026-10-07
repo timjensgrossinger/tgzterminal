@@ -918,6 +918,8 @@ fn run_gui_forever(gui: std::rc::Rc<crate::frontend::GuiFrontEnd>) -> anyhow::Re
     // asks for it; the sidebar never spawns `wsl.exe` itself.
     #[cfg(windows)]
     crate::termwindow::wsl_paths::warm_distro_cache();
+    crate::termwindow::tgz_ssh_hosts::warm_ssh_host_cache();
+    crate::termwindow::tgz_usage_menu::note_launch();
 
     gui.run_forever()
 }

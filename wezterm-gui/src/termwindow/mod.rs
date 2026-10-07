@@ -129,7 +129,10 @@ mod selection;
 pub mod shell_copy;
 pub mod spawn;
 pub mod tgz_last_session;
+pub mod tgz_secret_mask;
+pub mod tgz_ssh_hosts;
 pub mod tgz_ui_state;
+pub mod tgz_usage_menu;
 pub mod webgpu;
 pub mod wsl_paths;
 use crate::spawn::SpawnWhere;
@@ -452,6 +455,12 @@ pub enum AgentCopyAction {
 pub enum PaneCopyAction {
     Agent(AgentCopyAction),
     Shell(shell_copy::ShellCopyAction),
+    /// The same agent copy with recognised secrets replaced by `[REDACTED]`,
+    /// whether or not `secret_masking` is switched on.
+    AgentRedacted(AgentCopyAction),
+    /// The same shell copy with recognised secrets replaced by `[REDACTED]`,
+    /// whether or not `secret_masking` is switched on.
+    ShellRedacted(shell_copy::ShellCopyAction),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -580,6 +589,13 @@ pub enum UIItemType {
     },
     /// Sidebar button that opens the SSH quick-launch dropdown.
     SidebarSshLaunchButton,
+    /// The `Σ` button in the Agents section header: opens the usage popup.
+    SidebarUsageButton,
+    /// A line of the usage popup. Only the graph line does anything when
+    /// clicked: it steps the number of days the graph covers.
+    SidebarUsageMenuRow {
+        cycles_graph: bool,
+    },
     /// A row in the SSH quick-launch dropdown.
     SidebarSshMenuItem {
         domain_name: String,
@@ -769,6 +785,10 @@ pub struct AgentLaunchMenuState {
 pub struct SshLaunchMenuState {
     pub x: usize,
     pub y: usize,
+    /// Typed while the menu is open; rows that do not match are hidden.
+    pub query: String,
+    /// First row painted once the list is taller than the dropdown cap.
+    pub scroll_offset: usize,
 }
 
 /// What a new-tab dropdown row spawns.
@@ -828,6 +848,13 @@ pub struct SshQuickLaunchEntry {
     /// Resolved argv for `Mosh`/`Et` (absolute program path first); empty for
     /// `WezTerm`/`Ssh`, which spawn through the mux domain instead.
     pub argv: Vec<String>,
+    /// The transport tag as shown: `ssh`, `mux`, `mosh`, `et` or `custom`.
+    pub badge: &'static str,
+    /// `user@hostname:port via jump` from the ssh config, when it says more
+    /// than the label does.
+    pub detail: Option<String>,
+    /// Recently connected to; these rows lead the dropdown.
+    pub recent: bool,
 }
 
 /// State for the agent section embedded in the sidebar.
@@ -1127,6 +1154,10 @@ pub struct TermWindow {
     close_tab_menu: Option<CloseTabMenuState>,
     /// Sidebar SSH quick-launch dropdown anchor. `None` when closed.
     ssh_launch_menu: Option<SshLaunchMenuState>,
+    /// The token usage popup, when open.
+    usage_menu: Option<tgz_usage_menu::UsageMenuState>,
+    /// Days covered by the usage popup's graph.
+    usage_graph_days: usize,
     /// Shells/domains offered by the new-tab dropdown. Probing for shells
     /// touches the filesystem, so this is rebuilt only when the config
     /// generation changes.
@@ -1188,7 +1219,10 @@ pub struct TermWindow {
     /// SSH quick-launch entries, rebuilt only when the config generation
     /// changes. Building probes `$PATH` for `mosh`/`et`, so this must never
     /// be recomputed per frame.
-    ssh_launcher_cache: RefCell<Option<(usize, Arc<Vec<SshQuickLaunchEntry>>)>>,
+    ssh_launcher_cache: RefCell<Option<(usize, u64, Arc<Vec<SshQuickLaunchEntry>>)>>,
+    /// Domain names of recently used SSH quick-launch hosts, most recent
+    /// first. Persisted in the UI state file.
+    ssh_recent_hosts: Vec<String>,
     /// Past sessions offered by the session menus, and the scan they came from.
     ///
     /// Finding these means statting every transcript on disk and reading the
@@ -1258,6 +1292,9 @@ pub struct TermWindow {
 
     /// The URL over which we are currently hovering
     current_highlight: Option<Arc<Hyperlink>>,
+
+    /// Secret masking: rules, per-pane mask table and the hovered secret.
+    secret_mask: tgz_secret_mask::SecretMaskState,
 
     quad_generation: usize,
     shape_generation: usize,
@@ -1624,6 +1661,8 @@ impl TermWindow {
             new_tab_menu: None,
             close_tab_menu: None,
             ssh_launch_menu: None,
+            usage_menu: None,
+            usage_graph_days: 7,
             new_tab_menu_cache: RefCell::new(None),
             agent_launcher_project_root: tgz_ui_state::load_agent_launcher_project_root()
                 .unwrap_or(config.agent_ui.launcher.cwd == config::AgentLauncherCwd::ProjectRoot),
@@ -1647,6 +1686,7 @@ impl TermWindow {
             wsl_agent_probe: RefCell::new(None),
             wsl_agent_probe_started_at: Cell::new(None),
             ssh_launcher_cache: RefCell::new(None),
+            ssh_recent_hosts: tgz_ui_state::load_ssh_recent_hosts(),
             agent_session_cache: None,
             agent_session_scan_started_at: None,
             agent_window_sessions: tgz_last_session::WindowAgents::default(),
@@ -1681,6 +1721,7 @@ impl TermWindow {
             current_mouse_capture: None,
             last_mouse_click: None,
             current_highlight: None,
+            secret_mask: Default::default(),
             quad_generation: 0,
             shape_generation: 0,
             shape_cache: RefCell::new(LfuCache::new(
@@ -5205,6 +5246,15 @@ done
             }
             CopyTextTo { text, destination } => {
                 self.copy_to_clipboard(*destination, text.clone());
+            }
+            CopyRedactedTo(dest) => {
+                self.copy_selection_redacted(pane, *dest);
+            }
+            ToggleSecretMasking => {
+                self.toggle_secret_masking();
+            }
+            ShowSshHostMenu => {
+                self.show_ssh_host_menu();
             }
             PasteFrom(source) => {
                 self.paste_from_clipboard(pane, *source);

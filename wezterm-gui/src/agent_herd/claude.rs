@@ -1213,6 +1213,12 @@ impl crate::agent_herd::vendor::SessionSource for ClaudeDetector {
                     .map(turn_state_from_transcript)
                     .unwrap_or_default();
                 let name = session_name(transcript.as_deref(), s.name, s.name_is_derived);
+                let usage = transcript
+                    .as_deref()
+                    .and_then(|path| {
+                        super::usage::totals_for(path, super::usage::UsageFormat::Claude)
+                    })
+                    .unwrap_or_default();
                 crate::agent_herd::vendor::VendorSession {
                     origin: SessionOrigin::Host,
                     home: None,
@@ -1224,7 +1230,7 @@ impl crate::agent_herd::vendor::SessionSource for ClaudeDetector {
                     cwd: s.cwd,
                     project_root: s.project_root,
                     name,
-                    model: None,
+                    model: usage.model,
                     status: s.status,
                     // `sessions/<pid>.json` is the agent's own self-report and
                     // carries no way to tell a stale `busy` from a live one, so
@@ -1235,8 +1241,8 @@ impl crate::agent_herd::vendor::SessionSource for ClaudeDetector {
                     status_changed_at: s.status_changed_at,
                     subagents: s.subagents,
                     activity,
-                    input_tokens: None,
-                    output_tokens: None,
+                    input_tokens: usage.input_tokens,
+                    output_tokens: usage.output_tokens,
                     cost: None,
                 }
             })

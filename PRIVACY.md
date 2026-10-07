@@ -100,9 +100,13 @@ application. It does not collect, store, or transmit personal data to the
 project or to any server. There are **no analytics, no telemetry uploads, no
 advertising, no cookies, no tracking identifiers, no profiling, and no automated
 decision-making**. The `agent_telemetry` setting only controls what is *displayed
-locally* in the app's own UI surfaces; it does not send anything anywhere.
+locally* in the app's own UI surfaces; it does not send anything anywhere. The
+token counts and model names shown for agent sessions are read from the agents'
+own session files on your device, for display only; they are not stored by
+TGZTerminal and not sent anywhere.
 
-**Data that stays on your device.** Terminal scrollback, recent searches, and
+**Data that stays on your device.** Terminal scrollback, recent searches, the
+names of recently used SSH quick-launch hosts, and
 similar convenience state may contain personal data, but it remains local (see
 _Data Maintained by TGZTerminal_) and under your sole control. You are the
 controller of that local content. Delete it at any time by clearing the relevant

@@ -219,6 +219,11 @@ fn collect_rollout_sessions(home: &Path) -> Vec<VendorSession> {
             };
             let activity =
                 crate::agent_herd::sessions::activity_from_session_files(&path, &root, &session_id);
+            let usage = crate::agent_herd::usage::totals_for(
+                &path,
+                crate::agent_herd::usage::UsageFormat::Codex,
+            )
+            .unwrap_or_default();
             sessions.push(VendorSession {
                 origin: SessionOrigin::Host,
                 home: None,
@@ -233,19 +238,19 @@ fn collect_rollout_sessions(home: &Path) -> Vec<VendorSession> {
                 cwd,
                 project_root: None,
                 name,
-                model: None,
+                model: usage.model,
                 status: if age <= CODEX_WORKING_WINDOW {
                     HerdStatus::Working
                 } else {
                     HerdStatus::Idle
                 },
                 blocked_reason: None,
-                started_at: None,
+                started_at: usage.started_at,
                 status_changed_at: Some(modified),
                 subagents: Vec::new(),
                 activity,
-                input_tokens: None,
-                output_tokens: None,
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
                 cost: None,
             });
         }

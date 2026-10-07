@@ -724,6 +724,12 @@ impl super::TermWindow {
                     }
                 }
 
+                if self.ssh_launch_menu.is_some() && window_key.key_is_down {
+                    if self.ssh_menu_key_input(key, modifiers, context) {
+                        return;
+                    }
+                }
+
                 // When the docked input strip owns focus, route editing keys
                 // into its buffer instead of the pane.
                 if self.docked_input_focused() && window_key.key_is_down {

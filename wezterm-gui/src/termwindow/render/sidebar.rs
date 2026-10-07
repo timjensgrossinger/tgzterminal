@@ -112,6 +112,14 @@ const PANE_TOOLBELT_RIGHT_INSET: f32 = 44.;
 const PANE_COPY_MENU_W: f32 = 360.;
 /// Narrower than the copy menu: rows are short agent names, not sentences.
 const AGENT_LAUNCH_MENU_W: f32 = 200.;
+/// Widest the SSH quick-launch dropdown grows to fit its longest row.
+const SSH_MENU_MAX_W: f32 = 520.;
+/// Columns the SSH dropdown keeps free past its longest row, so the filter
+/// being typed has room before it starts to scroll.
+const SSH_MENU_SPARE_COLS: usize = 5;
+/// Horizontal space a dropdown row spends around its text: the inset on
+/// both sides plus room for the scroll thumb.
+const SSH_MENU_TEXT_MARGIN: f32 = 40.;
 /// Minimum width of the close-tab context submenu. The labels here
 /// ("Close Tabs to the Right", "Close All Other Tabs") are sentences, not
 /// one-word commands, so the agent-launch width clips the trailing word.
@@ -2077,6 +2085,41 @@ fn herd_row_columns(content_cols: usize, project_cols_wanted: usize) -> (usize, 
         return (content_cols, 0);
     }
     (name, project)
+}
+
+/// Tokens a herd agent has used so far (input + output), when either side is
+/// known.
+fn herd_agent_tokens(agent: &crate::agent_herd::HerdAgent) -> Option<u64> {
+    match (agent.input_tokens, agent.output_tokens) {
+        (None, None) => None,
+        (input, output) => Some(input.unwrap_or(0) + output.unwrap_or(0)),
+    }
+}
+
+/// The right-hand label of a collapsed herd row, within the third of the row
+/// that label may use (see `herd_row_columns`): the project and a compact
+/// token count when both fit, the count alone when only it does, and
+/// otherwise the project as before.
+fn herd_row_trailing_label(project: &str, tokens: Option<u64>, content_cols: usize) -> String {
+    let Some(tokens) = tokens else {
+        return project.to_string();
+    };
+    let budget = content_cols / 3;
+    let count = compact_count(tokens);
+    let with_count = if project.is_empty() {
+        count.clone()
+    } else {
+        format!("{project} · {count}")
+    };
+    if unicode_column_width(&with_count, None) <= budget {
+        with_count
+    } else if unicode_column_width(&count, None) <= budget {
+        // A narrow sidebar: the count is the short half, and the section
+        // already lists one project's agents unless switched to "all".
+        count
+    } else {
+        project.to_string()
+    }
 }
 
 /// Diameter of an agent status dot. Single source of truth: the sidebar tab
@@ -4687,6 +4730,45 @@ pub(crate) struct PaneCopyResult {
     pub title: &'static str,
 }
 
+/// The copy menu for this kind of pane, including the "(no secrets)" rows.
+///
+/// Those rows copy the whole pane and its last message (agent) or last output
+/// (shell) with recognised secrets redacted. They are left out when
+/// `secret_masking` already redacts every copy action, where they would only
+/// repeat the rows above them.
+pub(crate) fn pane_copy_menu_items_with_redacted(
+    kind: &PaneToolbeltKind,
+    copies_already_redact: bool,
+) -> Vec<(&'static str, PaneCopyAction)> {
+    let mut items = pane_copy_menu_items(kind);
+    if copies_already_redact {
+        return items;
+    }
+    match kind {
+        PaneToolbeltKind::Agent(_) => {
+            items.push((
+                "Copy conversation (no secrets)",
+                PaneCopyAction::AgentRedacted(AgentCopyAction::Conversation),
+            ));
+            items.push((
+                "Copy last message (no secrets)",
+                PaneCopyAction::AgentRedacted(AgentCopyAction::LastAgentMessage),
+            ));
+        }
+        PaneToolbeltKind::Shell => {
+            items.push((
+                "Copy pane (no secrets)",
+                PaneCopyAction::ShellRedacted(ShellCopyAction::WholePane),
+            ));
+            items.push((
+                "Copy last output (no secrets)",
+                PaneCopyAction::ShellRedacted(ShellCopyAction::LastCommandOutput),
+            ));
+        }
+    }
+    items
+}
+
 /// Rows the copy menu offers on this kind of pane.
 ///
 /// Pure and per-kind so the two lists can be tested without a window. Wording
@@ -6666,101 +6748,37 @@ impl crate::TermWindow {
     /// Pre-registered SSH connections offered by the sidebar SSH quick-launch
     /// dropdown.
     ///
-    /// `WezTerm`/`Ssh` transports spawn through `SpawnTabDomain::DomainName`,
-    /// so their `argv` stays empty. `Mosh`/`Et` bypass the mux and run as a
-    /// plain shell command; their `argv` is the fully resolved program path
-    /// plus `user@host` (plus port for Et) plus the domain's `extra_args`.
-    /// Entries whose declared `Mosh`/`Et` sidecar binary is not on `PATH` (and
-    /// the fallback dirs below) are dropped, so the dropdown never offers a
-    /// row that would fail to spawn.
+    /// The rows themselves are built by `tgz_ssh_hosts::build_entries`, which
+    /// documents what each transport's row carries and which rows are
+    /// dropped.
     ///
-    /// Building this probes `$PATH`, so the result is cached per config
-    /// generation and must never be rebuilt per frame — same pattern as
-    /// `agent_launcher_entries`.
+    /// Building this probes `$PATH`, so the result is cached and must never
+    /// be rebuilt per frame — same pattern as `agent_launcher_entries`. The
+    /// cache key is the config generation plus the host list's epoch: the
+    /// ssh config is parsed on a worker thread (`tgz_ssh_hosts::ssh_hosts`),
+    /// never here.
     pub fn ssh_quick_launch_entries(&self) -> Arc<Vec<SshQuickLaunchEntry>> {
+        use crate::termwindow::tgz_ssh_hosts;
         let gen = self.config.generation();
+        // The ssh config is parsed off this thread; the epoch says when a
+        // refresh changed the host list under an unchanged config.
+        let epoch = tgz_ssh_hosts::ssh_hosts_epoch(&self.config);
         {
             let cached = self.ssh_launcher_cache.borrow();
-            if let Some((cached_gen, ref entries)) = *cached {
-                if cached_gen == gen {
+            if let Some((cached_gen, cached_epoch, ref entries)) = *cached {
+                if cached_gen == gen && cached_epoch == epoch {
                     return Arc::clone(entries);
                 }
             }
         }
 
-        let mut entries = Vec::new();
-        for domain in self.config.ssh_domains() {
-            let transport = domain.transport;
-            let argv = match transport {
-                config::SshTransport::WezTerm | config::SshTransport::Ssh => Vec::new(),
-                config::SshTransport::Mosh | config::SshTransport::Et => {
-                    let Some(binary) = transport.binary_name() else {
-                        continue;
-                    };
-                    let Some(resolved) = resolve_command_path(binary) else {
-                        continue;
-                    };
-                    let mut argv = Vec::with_capacity(2 + domain.extra_args.len());
-                    argv.push(resolved.to_string_lossy().into_owned());
-                    if let Some(user) = domain.username.as_deref() {
-                        argv.push(format!("{user}@{}", domain.remote_address));
-                    } else {
-                        argv.push(domain.remote_address.clone());
-                    }
-                    argv.extend(domain.extra_args.iter().cloned());
-                    argv
-                }
-                config::SshTransport::Custom => {
-                    // The user-supplied argv is the source of truth: no
-                    // host/user synthesis, no port flag. An empty command is
-                    // a config error; skip it quietly rather than spawn an
-                    // empty shell.
-                    if domain.custom_command.is_empty() {
-                        continue;
-                    }
-                    let Some(resolved) = resolve_command_path(&domain.custom_command[0]) else {
-                        continue;
-                    };
-                    let mut argv =
-                        Vec::with_capacity(domain.custom_command.len() + domain.extra_args.len());
-                    argv.push(resolved.to_string_lossy().into_owned());
-                    argv.extend(domain.custom_command.iter().skip(1).cloned());
-                    argv.extend(domain.extra_args.iter().cloned());
-                    argv
-                }
-            };
-
-            // Display label: the bare user@host for mosh/et (the dropdown badge
-            // already says which transport), otherwise the domain name with
-            // the conventional SSH:/SSHMUX: prefix stripped. Custom keeps the
-            // domain name verbatim — there is no host synthesis to lean on.
-            let label = match transport {
-                config::SshTransport::WezTerm | config::SshTransport::Ssh => domain
-                    .name
-                    .strip_prefix("SSH:")
-                    .or_else(|| domain.name.strip_prefix("SSHMUX:"))
-                    .unwrap_or(&domain.name)
-                    .to_string(),
-                config::SshTransport::Mosh | config::SshTransport::Et => {
-                    if let Some(user) = domain.username.as_deref() {
-                        format!("{user}@{}", domain.remote_address)
-                    } else {
-                        domain.remote_address.clone()
-                    }
-                }
-                config::SshTransport::Custom => domain.name.clone(),
-            };
-
-            entries.push(SshQuickLaunchEntry {
-                domain_name: domain.name.clone(),
-                label,
-                transport,
-                argv,
-            });
-        }
-
-        let result = Arc::new(entries);
-        *self.ssh_launcher_cache.borrow_mut() = Some((gen, Arc::clone(&result)));
+        let hosts = tgz_ssh_hosts::ssh_hosts(&self.config);
+        let result = Arc::new(tgz_ssh_hosts::build_entries(
+            &hosts,
+            &resolve_command_path,
+            &self.ssh_recent_hosts,
+        ));
+        *self.ssh_launcher_cache.borrow_mut() = Some((gen, epoch, Arc::clone(&result)));
         result
     }
 
@@ -6877,6 +6895,13 @@ impl crate::TermWindow {
         else {
             return;
         };
+        self.ssh_recent_hosts = crate::termwindow::tgz_ssh_hosts::record_recent(
+            &self.ssh_recent_hosts,
+            &entry.domain_name,
+        );
+        crate::termwindow::tgz_ui_state::save_ssh_recent_hosts(&self.ssh_recent_hosts);
+        // The row order depends on the recents.
+        *self.ssh_launcher_cache.borrow_mut() = None;
         let (domain, args, cwd) = match entry.transport {
             config::SshTransport::WezTerm | config::SshTransport::Ssh => {
                 let domain = SpawnTabDomain::DomainName(entry.domain_name.clone());
@@ -8705,13 +8730,30 @@ impl crate::TermWindow {
     /// Total agent tokens (input + output) observed across this window's panes,
     /// for the collapsed-rail footer summary. `cost` is a free-form string and
     /// is intentionally not summed here.
+    ///
+    /// Two views of the same panes: what each pane reports through its user
+    /// vars, and the herd's agents bound to a pane, whose counts also come
+    /// from the vendor's transcript. The herd view carries the pane's own
+    /// numbers wherever the transcript has none, so the larger sum is the
+    /// more complete one; taking it also keeps the total from dropping to the
+    /// pane-only figure while the herd list is still empty.
     pub(crate) fn agent_token_total(&self) -> u64 {
-        self.agent_detection_cache
+        let from_panes: u64 = self
+            .agent_detection_cache
             .borrow()
             .values()
             .filter_map(|entry| entry.state.as_ref())
             .map(|state| state.input_tokens.unwrap_or(0) + state.output_tokens.unwrap_or(0))
-            .sum()
+            .sum();
+        let from_herd: u64 = self
+            .agent_herd_state
+            .borrow()
+            .agents
+            .iter()
+            .filter(|agent| agent.pane_id.is_some())
+            .filter_map(herd_agent_tokens)
+            .sum();
+        from_panes.max(from_herd)
     }
 
     fn prune_agent_detection_cache(&self) {
@@ -8848,12 +8890,39 @@ impl crate::TermWindow {
     /// Built per pane kind so the single copy sink stays kind-agnostic and the
     /// message stays a pure function of the payload.
     pub(crate) fn pane_copy_result(
+        &mut self,
+        pane: &Arc<dyn Pane>,
+        action: &PaneCopyAction,
+    ) -> PaneCopyResult {
+        use crate::termwindow::tgz_secret_mask::{forced_redaction_note, redaction_note};
+        // A "(no secrets)" row is the plain copy plus a redaction that does
+        // not wait for `secret_masking.enabled`.
+        let (plain, forced) = match action {
+            PaneCopyAction::AgentRedacted(action) => (PaneCopyAction::Agent(action.clone()), true),
+            PaneCopyAction::ShellRedacted(action) => (PaneCopyAction::Shell(*action), true),
+            PaneCopyAction::Agent(_) | PaneCopyAction::Shell(_) => (action.clone(), false),
+        };
+        let mut result = self.pane_copy_payload_result(pane, &plain);
+        let text = std::mem::take(&mut result.text);
+        let (text, note) = if forced {
+            let (text, redacted) = self.redact_always(&text);
+            (text, forced_redaction_note(redacted))
+        } else {
+            let (text, redacted) = self.redact_for_copy_action(text);
+            (text, redaction_note(redacted))
+        };
+        result.text = text;
+        result.message.push_str(&note);
+        result
+    }
+
+    fn pane_copy_payload_result(
         &self,
         pane: &Arc<dyn Pane>,
         action: &PaneCopyAction,
     ) -> PaneCopyResult {
         match action {
-            PaneCopyAction::Agent(action) => {
+            PaneCopyAction::Agent(action) | PaneCopyAction::AgentRedacted(action) => {
                 let payload = self.agent_pane_copy_payload(pane, action);
                 PaneCopyResult {
                     message: agent_copy_toast_message(action, &payload),
@@ -8862,7 +8931,7 @@ impl crate::TermWindow {
                     title: "Agent copy",
                 }
             }
-            PaneCopyAction::Shell(action) => {
+            PaneCopyAction::Shell(action) | PaneCopyAction::ShellRedacted(action) => {
                 let payload = self.shell_pane_copy_payload(pane, *action);
                 PaneCopyResult {
                     message: shell_copy_toast_message(*action, &payload),
@@ -9317,20 +9386,25 @@ impl crate::TermWindow {
 
     /// Set the open session dropdown's scroll offset; true when it moved.
     ///
-    /// The sessions menu and the launcher are mutually exclusive, so at most
-    /// one of them is open and `sidebar_dropdown_scroll` describes it.
+    /// The sessions menu, the launcher and the SSH menu are mutually
+    /// exclusive, so at most one of them is open and
+    /// `sidebar_dropdown_scroll` describes it.
     fn set_sidebar_dropdown_offset(&mut self, next: usize) -> bool {
-        let Some(menu) = self
+        let offset = if let Some(menu) = self
             .sessions_menu
             .as_mut()
             .or(self.agent_launch_menu.as_mut())
-        else {
+        {
+            &mut menu.scroll_offset
+        } else if let Some(menu) = self.ssh_launch_menu.as_mut() {
+            &mut menu.scroll_offset
+        } else {
             return false;
         };
-        if menu.scroll_offset == next {
+        if *offset == next {
             false
         } else {
-            menu.scroll_offset = next;
+            *offset = next;
             true
         }
     }
@@ -9346,7 +9420,9 @@ impl crate::TermWindow {
             .sessions_menu
             .as_ref()
             .or(self.agent_launch_menu.as_ref())
-            .map(|menu| menu.scroll_offset.min(max_offset))
+            .map(|menu| menu.scroll_offset)
+            .or(self.ssh_launch_menu.as_ref().map(|menu| menu.scroll_offset))
+            .map(|offset| offset.min(max_offset))
         else {
             return false;
         };
@@ -11255,6 +11331,62 @@ impl crate::TermWindow {
 
     /// Sidebar SSH quick-launch dropdown. One row per pre-registered
     /// `SshDomain` whose transport is usable (installed binary for mosh/et).
+    /// The token usage popup: live sessions, today, the last week, and a bar
+    /// per day. Rows come from `tgz_usage_menu::usage_rows`; the per-day
+    /// history is scanned off this thread and the popup says so until it
+    /// arrives.
+    pub fn paint_usage_menu(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+    ) -> anyhow::Result<()> {
+        use crate::termwindow::tgz_usage_menu;
+        let Some(menu) = self.usage_menu.clone() else {
+            return Ok(());
+        };
+        let history = tgz_usage_menu::history_for_menu();
+        let sessions: Vec<(String, u64)> = self
+            .agent_herd_state
+            .borrow()
+            .agents
+            .iter()
+            .filter_map(|agent| Some((agent.name.clone(), herd_agent_tokens(agent)?)))
+            .collect();
+        let rows: Vec<SidebarDropdownRow> = tgz_usage_menu::usage_rows(
+            &sessions,
+            history.as_deref(),
+            chrono::Local::now().date_naive(),
+            self.usage_graph_days,
+            tgz_usage_menu::USAGE_MENU_COLS,
+        )
+        .into_iter()
+        .map(|row| SidebarDropdownRow {
+            label: row.label,
+            dot_color: None,
+            checkbox: None,
+            divider_above: row.divider_above,
+            indent: false,
+            trailing_chevron: false,
+            item_type: UIItemType::SidebarUsageMenuRow {
+                cycles_graph: row.cycles_graph,
+            },
+        })
+        .collect();
+
+        // In pre-DPI logical pixels, like `paint_sidebar_dropdown`'s `width`.
+        let dpi_scale = (self.dimensions.dpi as f32 / 96.).clamp(1., 2.5);
+        let cell_w_logical = self.render_metrics.cell_size.width as f32 / dpi_scale;
+        let menu_w = tgz_usage_menu::USAGE_MENU_COLS as f32 * cell_w_logical + SSH_MENU_TEXT_MARGIN;
+        self.paint_sidebar_dropdown(
+            layers,
+            menu.x as f32,
+            menu.y as f32,
+            menu_w,
+            false,
+            &rows,
+            None,
+        )
+    }
+
     /// Clicking a row spawns the connection into a new tab — `WezTerm`/`Ssh`
     /// through the mux domain, `Mosh`/`Et` as a plain shell command. There is
     /// no expandable submenu: every row is a single click, mirroring the
@@ -11272,30 +11404,52 @@ impl crate::TermWindow {
             return Ok(());
         }
 
-        let rows: Vec<SidebarDropdownRow> = entries
-            .iter()
-            .map(|entry| {
-                let badge = match entry.transport {
-                    config::SshTransport::Mosh => "mosh",
-                    config::SshTransport::Et => "et",
-                    config::SshTransport::Custom => "custom",
-                    config::SshTransport::WezTerm => "mux",
-                    config::SshTransport::Ssh => "ssh",
-                };
-                let label = format!("{}  · {}", entry.label, badge);
-                SidebarDropdownRow {
-                    label,
-                    dot_color: None,
-                    checkbox: None,
-                    divider_above: false,
-                    indent: false,
-                    trailing_chevron: false,
-                    item_type: UIItemType::SidebarSshMenuItem {
-                        domain_name: entry.domain_name.clone(),
-                    },
-                }
-            })
-            .collect();
+        use crate::termwindow::tgz_ssh_hosts;
+        let matching = tgz_ssh_hosts::filter_entries(&entries, &menu.query);
+
+        // Wide enough for the longest host row, from the whole list rather
+        // than the filtered one so the panel does not resize while typing.
+        // In pre-DPI logical pixels, like `paint_sidebar_dropdown`'s `width`.
+        let dpi_scale = (self.dimensions.dpi as f32 / 96.).clamp(1., 2.5);
+        let cell_w_logical = self.render_metrics.cell_size.width as f32 / dpi_scale;
+        let menu_w = ((tgz_ssh_hosts::widest_row_cols(&entries) + SSH_MENU_SPARE_COLS) as f32
+            * cell_w_logical
+            + SSH_MENU_TEXT_MARGIN)
+            .clamp(AGENT_LAUNCH_MENU_W, SSH_MENU_MAX_W);
+        let text_cols = ((menu_w - SSH_MENU_TEXT_MARGIN) / cell_w_logical).floor() as usize;
+        let ssh_row = |label: String, domain_name: &str, divider_above: bool| SidebarDropdownRow {
+            label,
+            dot_color: None,
+            checkbox: None,
+            divider_above,
+            indent: false,
+            trailing_chevron: false,
+            item_type: UIItemType::SidebarSshMenuItem {
+                domain_name: domain_name.to_string(),
+            },
+        };
+
+        let mut rows: Vec<SidebarDropdownRow> = Vec::with_capacity(matching.len() + 1);
+        // The filter row is not a host: its empty domain name makes a click
+        // on it a no-op (see `mouse_event_sidebar_ssh_menu_item`).
+        if let Some(label) = tgz_ssh_hosts::filter_row_label(&menu.query, entries.len(), text_cols)
+        {
+            rows.push(ssh_row(label, "", false));
+        }
+        if matching.is_empty() {
+            rows.push(ssh_row(tgz_ssh_hosts::NO_MATCH_ROW.to_string(), "", false));
+        }
+        let mut previous_recent = None;
+        for entry in matching {
+            // One divider where the recent hosts end and the rest begin.
+            let divider_above = previous_recent == Some(true) && !entry.recent;
+            previous_recent = Some(entry.recent);
+            rows.push(ssh_row(
+                tgz_ssh_hosts::entry_row_label(entry),
+                &entry.domain_name,
+                divider_above,
+            ));
+        }
 
         // The button anchors at the bottom of the sidebar, so the dropdown
         // grows upward — same as the agent launch menu.
@@ -11303,10 +11457,10 @@ impl crate::TermWindow {
             layers,
             menu.x as f32,
             menu.y as f32,
-            AGENT_LAUNCH_MENU_W,
+            menu_w,
             false,
             &rows,
-            None,
+            Some(menu.scroll_offset),
         )
     }
 
@@ -14077,6 +14231,9 @@ impl crate::TermWindow {
     /// `HerdAgent` model so the agent section renders with live data.
     fn update_agent_herd_state(&mut self) {
         self.kick_agent_herd_scan();
+        if self.config.agent_ui.section.show_tokens {
+            crate::termwindow::tgz_usage_menu::keep_history_warm();
+        }
         let mux = Mux::get();
         let Some(window) = mux.get_window(self.mux_window_id) else {
             return;
@@ -14885,7 +15042,14 @@ impl crate::TermWindow {
         let sessions_x = sessions.x;
         let sessions_fits = sessions_x > section_x + pad + cell_h;
         let label_x = section_x + pad + cell_h + 4.0 * dpi;
-        let label_right = if sessions_fits {
+        // Usage button, left of the sessions button and the same size. It is
+        // the first to go when the header is narrow: the label needs room.
+        let usage_type = UIItemType::SidebarUsageButton;
+        let usage_x = sessions_x - 4.0 * dpi - sessions_w;
+        let usage_fits = sessions_fits && usage_x > label_x + 10.0 * cell_w;
+        let label_right = if usage_fits {
+            usage_x - 4.0 * dpi
+        } else if sessions_fits {
             sessions_x - 4.0 * dpi
         } else {
             section_x + section_w - pad
@@ -14977,6 +15141,64 @@ impl crate::TermWindow {
                 width: sessions_w as usize,
                 height: header_h as usize,
                 item_type: sessions_type,
+            });
+        }
+
+        if usage_fits {
+            // The same pill as the sessions button beside it.
+            let usage_hovered = self
+                .last_ui_item
+                .as_ref()
+                .map(|item| item.item_type == usage_type)
+                .unwrap_or(false);
+            let open = self.usage_menu.is_some();
+            let usage_pressed = usage_hovered
+                && self.current_mouse_buttons.contains(&MousePress::Left)
+                && self.pressed_ui_item.as_ref() == Some(&usage_type);
+            let usage_fg = if usage_hovered || open {
+                fg
+            } else {
+                lerp_rgba(bg, fg, 0.62)
+            };
+            let usage_fill = if usage_pressed {
+                sb.pressed_fill
+            } else if usage_hovered || open {
+                sb.hover_fill
+            } else {
+                sb.search_fill
+            };
+            let usage_offset = if usage_pressed { 1. } else { 0. };
+            let usage_h = header_h - 4.0 * dpi;
+            self.sidebar_bordered_fill(
+                layers,
+                1,
+                euclid::rect(
+                    usage_x,
+                    header_y + 2.0 * dpi + usage_offset,
+                    sessions_w,
+                    usage_h,
+                ),
+                (RADIUS * dpi).min(usage_h * 0.5),
+                dpi.max(1.),
+                usage_fill,
+                sb.row_border,
+            )?;
+            self.paint_text(
+                layers,
+                "Σ",
+                usage_x + (sessions_w - cell_w) * 0.5,
+                header_y + (header_h - cell_h) * 0.5 + usage_offset,
+                cell_w,
+                usage_fg,
+                bg,
+                false,
+            )?;
+            self.ui_items.push(UIItem {
+                x: usage_x as usize,
+                y: header_y as usize,
+                width: sessions_w as usize,
+                height: header_h as usize,
+                item_type: usage_type,
             });
         }
 
@@ -15099,7 +15321,12 @@ impl crate::TermWindow {
             let name_x = dot_x + 10.0 * dpi;
             let content_right = section_x + section_w - pad;
             let content_cols = sidebar_text_cols((content_right - name_x).max(0.), cell_w_cols);
-            let project = agent.project_label();
+            let tokens = if self.config.agent_ui.section.show_tokens {
+                herd_agent_tokens(agent)
+            } else {
+                None
+            };
+            let project = herd_row_trailing_label(&agent.project_label(), tokens, content_cols);
             let (name_cols, project_cols) =
                 herd_row_columns(content_cols, unicode_column_width(&project, None));
 
@@ -16057,6 +16284,32 @@ mod tests {
         assert_eq!(
             pane_toolbelt_buttons(&on, &PaneToolbeltKind::Shell, None, true, true),
             vec![("Copy", PaneToolbeltAction::CopyMenu)]
+        );
+    }
+
+    /// Each pane kind gains its whole-pane and last-item copies in a redacted
+    /// form, after the plain rows, unless every copy already redacts.
+    #[test]
+    fn pane_copy_menu_adds_no_secrets_rows_unless_copies_already_redact() {
+        let shell = pane_copy_menu_items_with_redacted(&PaneToolbeltKind::Shell, false);
+        let plain = pane_copy_menu_items(&PaneToolbeltKind::Shell);
+        assert_eq!(shell[..plain.len()], plain[..]);
+        assert_eq!(
+            shell[plain.len()..],
+            [
+                (
+                    "Copy pane (no secrets)",
+                    PaneCopyAction::ShellRedacted(ShellCopyAction::WholePane)
+                ),
+                (
+                    "Copy last output (no secrets)",
+                    PaneCopyAction::ShellRedacted(ShellCopyAction::LastCommandOutput)
+                ),
+            ]
+        );
+        assert_eq!(
+            pane_copy_menu_items_with_redacted(&PaneToolbeltKind::Shell, true),
+            plain
         );
     }
 
@@ -18573,6 +18826,29 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
         // Too narrow to show both: the name keeps the whole row.
         assert_eq!(herd_row_columns(9, 11), (9, 0));
         assert_eq!(herd_row_columns(0, 5), (0, 0));
+    }
+
+    /// The trailing label steps down as the row narrows: project and count,
+    /// then the count alone, then the project as it always was.
+    #[test]
+    fn herd_row_trailing_label_adds_tokens_only_when_they_fit() {
+        // 36 columns: the trailing label may use 12.
+        assert_eq!(
+            herd_row_trailing_label("api", Some(1_250_000), 36),
+            "api · 1.2m"
+        );
+        // Too long together: the count is what a narrow sidebar keeps.
+        assert_eq!(
+            herd_row_trailing_label("tgzterminal", Some(1_250_000), 36),
+            "1.2m"
+        );
+        // Not even the count fits: unchanged from a row without tokens.
+        assert_eq!(
+            herd_row_trailing_label("tgzterminal", Some(1_250_000), 9),
+            "tgzterminal"
+        );
+        assert_eq!(herd_row_trailing_label("api", None, 36), "api");
+        assert_eq!(herd_row_trailing_label("", Some(900), 36), "900");
     }
 
     #[test]

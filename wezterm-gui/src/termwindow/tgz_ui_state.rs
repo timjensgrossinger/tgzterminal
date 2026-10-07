@@ -20,6 +20,11 @@ struct TgzUiState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     agent_launcher_project_root: Option<bool>,
 
+    /// Domain names of recently used SSH quick-launch hosts, most recent
+    /// first. Names only: no addresses, users or keys.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ssh_recent_hosts: Option<Vec<String>>,
+
     /// Tab indices whose pane children are expanded in the sidebar. Stored as
     /// a plain list because a tab index is the only identity the sidebar row
     /// model has; indices shift when tabs are reordered or closed, so on
@@ -111,6 +116,18 @@ pub fn save_sidebar_expanded_tabs(tabs: &HashSet<usize>) {
     let mut tabs: Vec<usize> = tabs.iter().copied().collect();
     tabs.sort_unstable();
     state.sidebar_expanded_tabs = Some(tabs);
+    write_state(&state);
+}
+
+/// Recently used SSH quick-launch hosts, most recent first; empty when unset.
+pub fn load_ssh_recent_hosts() -> Vec<String> {
+    read_state().ssh_recent_hosts.unwrap_or_default()
+}
+
+/// Persist the recently used SSH quick-launch hosts. Best-effort.
+pub fn save_ssh_recent_hosts(hosts: &[String]) {
+    let mut state = read_state();
+    state.ssh_recent_hosts = Some(hosts.to_vec());
     write_state(&state);
 }
 
@@ -372,6 +389,7 @@ mod tests {
     fn json_round_trip_preserves_agent_launcher_project_root() {
         let state = TgzUiState {
             agent_launcher_project_root: Some(true),
+            ssh_recent_hosts: None,
             ..TgzUiState::default()
         };
         let json = serde_json::to_string_pretty(&state).unwrap();
@@ -386,6 +404,7 @@ mod tests {
         let state = TgzUiState {
             sidebar_auto_hide: Some(false),
             agent_launcher_project_root: Some(true),
+            ssh_recent_hosts: None,
             sidebar_expanded_tabs: Some(vec![0, 2]),
             agent_section_collapsed: None,
             agent_section_view: None,
@@ -450,6 +469,7 @@ mod tests {
         let overrides = overrides_from_state(&TgzUiState {
             sidebar_auto_hide: None,
             agent_launcher_project_root: Some(true),
+            ssh_recent_hosts: None,
             sidebar_expanded_tabs: Some(vec![0]),
             agent_section_collapsed: None,
             agent_section_view: None,

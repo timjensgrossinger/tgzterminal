@@ -72,6 +72,12 @@ jobs:
       - name: Test last-session snapshot
         run: cargo test -p wezterm-gui termwindow::tgz_last_session
 
+      - name: Test secret masking
+        run: cargo test -p wezterm-gui termwindow::tgz_secret_mask
+
+      - name: Test SSH host list
+        run: cargo test -p wezterm-gui termwindow::tgz_ssh_hosts
+
       - name: Test updater asset matching
         run: cargo test -p wezterm-gui update::tests
 

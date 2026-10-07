@@ -297,6 +297,7 @@ impl crate::TermWindow {
 
             pos.pane
                 .apply_hyperlinks(stable_range.clone(), &self.config.hyperlink_rules);
+            self.refresh_secret_masks(&pos.pane, stable_range.clone());
 
             struct LineRender<'a, 'b> {
                 term_window: &'a mut crate::TermWindow,
@@ -362,6 +363,10 @@ impl crate::TermWindow {
                     line: &&mut Line,
                 ) -> anyhow::Result<()> {
                     let stable_row = stable_top + line_idx as StableRowIndex;
+                    let masked =
+                        self.term_window
+                            .secret_masked_line(self.pane_id, stable_row, line);
+                    let line: &Line = masked.as_ref().unwrap_or(line);
                     let selrange = self
                         .selrange
                         .map_or(0..0, |sel| sel.cols_for_row(stable_row, self.rectangular));

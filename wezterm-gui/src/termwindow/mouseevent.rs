@@ -71,6 +71,8 @@ impl super::TermWindow {
             | UIItemType::SidebarToolbeltToggle
             | UIItemType::SidebarAgentLaunchButton
             | UIItemType::SidebarSessionsButton
+            | UIItemType::SidebarUsageButton
+            | UIItemType::SidebarUsageMenuRow { .. }
             | UIItemType::SidebarAgentMenuItem { .. }
             | UIItemType::SidebarAgentMenuProjectRootToggle
             | UIItemType::SidebarAgentMenuHerd
@@ -127,6 +129,8 @@ impl super::TermWindow {
             | UIItemType::SidebarToolbeltToggle
             | UIItemType::SidebarAgentLaunchButton
             | UIItemType::SidebarSessionsButton
+            | UIItemType::SidebarUsageButton
+            | UIItemType::SidebarUsageMenuRow { .. }
             | UIItemType::SidebarAgentMenuItem { .. }
             | UIItemType::SidebarAgentMenuProjectRootToggle
             | UIItemType::SidebarAgentMenuHerd
@@ -475,6 +479,21 @@ impl super::TermWindow {
             }
         }
 
+        if matches!(&event.kind, WMEK::Press(_)) && self.usage_menu.is_some() {
+            let on_usage_menu = matches!(
+                &ui_item,
+                Some(item)
+                    if matches!(
+                        item.item_type,
+                        UIItemType::SidebarUsageButton | UIItemType::SidebarUsageMenuRow { .. }
+                    )
+            );
+            if !on_usage_menu {
+                self.usage_menu = None;
+                context.invalidate();
+            }
+        }
+
         if matches!(&event.kind, WMEK::Press(_)) && self.ssh_launch_menu.is_some() {
             let on_ssh_menu = matches!(
                 &ui_item,
@@ -531,6 +550,7 @@ impl super::TermWindow {
         {
             context.invalidate();
         }
+        self.clear_secret_reveal();
         self.update_title();
         context.set_cursor(Some(CursorIcon::Default));
         context.invalidate();
@@ -845,6 +865,12 @@ impl super::TermWindow {
             UIItemType::SidebarSshLaunchButton => {
                 self.mouse_event_sidebar_ssh_launch_button(item, event, context);
             }
+            UIItemType::SidebarUsageButton => {
+                self.mouse_event_sidebar_usage_button(item, event, context);
+            }
+            UIItemType::SidebarUsageMenuRow { cycles_graph } => {
+                self.mouse_event_sidebar_usage_menu_row(cycles_graph, event, context);
+            }
             UIItemType::SidebarSshMenuItem { domain_name } => {
                 self.mouse_event_sidebar_ssh_menu_item(domain_name, event, context);
             }
@@ -987,7 +1013,11 @@ impl super::TermWindow {
             self.pressed_ui_item = None;
             if let Some(pane) = self.sidebar_primary_pane_for_tab_idx(tab_idx) {
                 if let Some(kind) = self.sidebar_copy_kind(&pane) {
-                    let items = crate::termwindow::render::sidebar::pane_copy_menu_items(&kind);
+                    let items =
+                        crate::termwindow::render::sidebar::pane_copy_menu_items_with_redacted(
+                            &kind,
+                            self.copy_actions_redact(),
+                        );
                     self.pane_copy_menu = Some(PaneCopyMenuState {
                         pane_id: pane.pane_id(),
                         // Below the row and hard against the icon, so the menu
@@ -1164,8 +1194,52 @@ impl super::TermWindow {
                     None => Some(SshLaunchMenuState {
                         x: item.x,
                         y: item.y,
+                        query: String::new(),
+                        scroll_offset: 0,
                     }),
                 };
+            }
+        }
+        context.invalidate();
+    }
+
+    /// The `Σ` button in the Agents header: toggles the usage popup.
+    fn mouse_event_sidebar_usage_button(
+        &mut self,
+        item: UIItem,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        if event.kind == WMEK::Release(MousePress::Left) {
+            self.pressed_ui_item = None;
+            // One dropdown at a time: the sessions menu opens from the button
+            // next to this one.
+            self.sessions_menu = None;
+            self.agent_launch_menu = None;
+            self.usage_menu = match self.usage_menu.take() {
+                Some(_) => None,
+                None => Some(crate::termwindow::tgz_usage_menu::UsageMenuState {
+                    x: item.x,
+                    y: item.y,
+                }),
+            };
+        }
+        context.invalidate();
+    }
+
+    /// A line of the usage popup. The popup is for reading, so a click leaves
+    /// it open; on the graph line it also steps the graph's span.
+    fn mouse_event_sidebar_usage_menu_row(
+        &mut self,
+        cycles_graph: bool,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        if event.kind == WMEK::Release(MousePress::Left) {
+            self.pressed_ui_item = None;
+            if cycles_graph {
+                self.usage_graph_days =
+                    crate::termwindow::tgz_usage_menu::next_graph_span(self.usage_graph_days);
             }
         }
         context.invalidate();
@@ -1178,9 +1252,13 @@ impl super::TermWindow {
         context: &dyn WindowOps,
     ) {
         if event.kind == WMEK::Release(MousePress::Left) {
-            self.ssh_launch_menu = None;
             self.pressed_ui_item = None;
-            self.spawn_ssh_quick_launch_entry(&domain_name);
+            // The filter row carries no domain: clicking it leaves the menu
+            // open for more typing.
+            if !domain_name.is_empty() {
+                self.ssh_launch_menu = None;
+                self.spawn_ssh_quick_launch_entry(&domain_name);
+            }
         }
         context.invalidate();
     }
@@ -1722,8 +1800,9 @@ impl super::TermWindow {
                                     .get_pane(pane_id)
                                     .and_then(|pane| self.pane_toolbelt_kind(&pane))
                                     .map(|kind| {
-                                        crate::termwindow::render::sidebar::pane_copy_menu_items(
+                                        crate::termwindow::render::sidebar::pane_copy_menu_items_with_redacted(
                                             &kind,
+                                            self.copy_actions_redact(),
                                         )
                                     })
                                     .unwrap_or_default();
@@ -2310,6 +2389,10 @@ impl super::TermWindow {
                 context.invalidate();
             }
         };
+
+        if self.update_secret_reveal(pane.pane_id(), stable_row, column) {
+            context.invalidate();
+        }
 
         let outside_window = event.coords.x < 0
             || event.coords.x as usize > self.dimensions.pixel_width

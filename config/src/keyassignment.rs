@@ -673,6 +673,16 @@ pub enum KeyAssignment {
     /// Copy the active pane's scrollback, capped by
     /// `agent_ui.copy_scrollback_lines`.
     CopyPaneScrollback,
+    /// Copy the selection with recognised secrets replaced by `[REDACTED]`.
+    /// Works whether or not `secret_masking.enabled` is set.
+    CopyRedactedTo(ClipboardCopyDestination),
+    /// Switch secret masking on or off for this window, overriding
+    /// `secret_masking.enabled` until the window closes.
+    ToggleSecretMasking,
+    /// Open the sidebar's SSH quick-launch dropdown, ready to filter by
+    /// typing. Falls back to the launcher's domain list when the sidebar
+    /// button is not on screen.
+    ShowSshHostMenu,
 }
 impl_lua_conversion_dynamic!(KeyAssignment);
 

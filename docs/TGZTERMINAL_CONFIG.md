@@ -391,7 +391,8 @@ outside that window, the copied text starts with
 `[… earlier scrollback not included …]`. If transcript cleanup ends up with
 nothing, the raw pane text (or, failing that, the agent details) is copied
 instead and the notification says which one it used. Copied text may include
-terminal output or secrets printed in that range.
+terminal output or secrets printed in that range; turn on
+[Secret Masking](#secret-masking) to have recognised ones redacted.
 
 `enable_control_actions` is `false` by default. Resume, Attach and log-opening
 controls require **both** an explicit opt-in — `agent_ui.enable_control_actions
@@ -971,7 +972,7 @@ agent_ui = {
     refresh_ms = 500,     -- how often the disk-scanned source re-reads, clamped 100..=10000
     show_non_interactive = false, -- also list SDK/headless/hook agent processes
     show_activity = true, -- transcript headline, attention, branch, subagent summary + tree
-    show_tokens = true, -- pane-reported token/cost telemetry
+    show_tokens = true, -- token counts (transcript or pane-reported) and vendor-reported cost
     sort_attention_first = true, -- surface blocked/waiting agents at the top of the list
   },
 }
@@ -982,6 +983,57 @@ need attention). Scroll the list with the mouse wheel when it is taller than
 the section. **Left-click** the header collapses it; **right-click** toggles
 between the current-project view and `· all` (every project's agents). Click a
 row to focus its pane, or the chevron to expand it.
+
+**Usage popup.** The `Σ` button in the section header (left of the sessions
+button; dropped first when the header is narrow) opens a panel with:
+
+- every open session and its tokens, largest first, with a total;
+- **Today** and **Last 7 days**, across all Claude Code and Codex sessions on
+  this machine, open or not;
+- a bar per day. Click that row to step the graph through 7, 14 and 30 days.
+
+The per-day figures are worked out from the timestamps in the agents' own
+transcripts. Nothing is recorded for it, so there is no history file to manage.
+
+- **Indexed in the background.** Twenty seconds after launch the transcripts
+  written to in the last 30 days are read once on a background thread, shared
+  by every window. After that a refresh (every 5 minutes, or every 20 seconds
+  while the popup is open) only checks each file's size and reads what was
+  appended. The cost follows how much the agents wrote since the last refresh,
+  not how many are open. `show_tokens = false` switches it off.
+- **How far back.** As far as the transcripts go, 30 days at most. Claude Code
+  deletes its own transcripts after 30 days unless `cleanupPeriodDays` in
+  `~/.claude/settings.json` says otherwise.
+- **Counted once.** A message repeated across a transcript's records, or
+  copied into a resumed session's file, is counted a single time. A resumed
+  Codex session does not recount the total it inherited.
+- OpenCode sessions count in the open sessions list but not in the per-day
+  figures.
+
+**Where the token counts come from.** With `show_tokens` on, an expanded row
+shows `tokens: in X · out Y`, and a collapsed row adds a compact total after
+the project name (`api · 1.2m`). When the sidebar is too narrow for both, the
+total alone is shown (`1.2m`). The numbers are read locally
+from the agent's own session files: Claude Code and Codex transcripts, and the
+OpenCode database. An agent can also report them itself through the
+`agent.input_tokens` / `agent.output_tokens` user vars. Other agents show no
+count.
+
+- `in` is what the session sent that was **not** served from the prompt cache
+  (for Claude: fresh input plus cache writes, which in practice means cache
+  writes, since its transcripts record fresh input as a placeholder of a few
+  tokens; for Codex: input minus cached input). Cache reads are left out on purpose — a long session re-reads its
+  whole cached context every turn, and that would bury the figure.
+- `out` is the model's output tokens as the transcript records them. Claude
+  Code's transcripts are reported to leave thinking tokens out of this
+  figure, so treat it as a floor.
+- These are the transcripts' own figures, good for comparing sessions and
+  days. They are not a bill.
+- A **cost** is shown only where the agent reports one (OpenCode, or the
+  `agent.cost` user var). TGZTerminal ships no price list and does not turn
+  tokens into money.
+- The model name and elapsed time on the status line come from the same files,
+  so they now appear for Codex as well as Claude.
 
 Expanded rows show status, project root, the latest activity headline, a flat
 indented **subagent tree**, and action buttons. Available actions: `Focus`,
@@ -1099,7 +1151,8 @@ described above. When older rows exist but fall outside that window, the copied
 text starts with `[… earlier scrollback not included …]`.
 
 As with any copy action, **copied text may include terminal output or secrets
-printed in that range.**
+printed in that range.** With [Secret Masking](#secret-masking) enabled, secrets
+it recognises are replaced by `[REDACTED]` and the notification says how many.
 
 ### Keybindings
 
@@ -1151,6 +1204,121 @@ position and the hidden state are remembered across restarts in the UI state
 file (`tgz-ui-state.json` in the data directory), not in your Lua config, because
 `agent_ui` is a nested table and a runtime override of one key in it would replace
 the whole table.
+
+## Secret Masking
+
+Hides token-shaped strings — API keys, access tokens, passwords in URLs — in
+terminal panes and in the pane Copy actions. Off by default: terminal output is
+never altered unless you ask.
+
+```lua
+config.secret_masking = {
+  enabled = false,
+  mask_on_screen = true,
+  redact_copy_actions = true,
+  reveal_on_hover = true,
+  builtin_patterns = true,
+  patterns = {},
+}
+```
+
+| Key | Default | Meaning |
+|---|---|---|
+| `enabled` | `false` | Master switch. `ToggleSecretMasking` overrides it for one window until that window closes. |
+| `mask_on_screen` | `true` | Paint recognised secrets as `•`. Only the painting changes: the pane's real text is untouched, so selection, search and a plain copy still see it. |
+| `redact_copy_actions` | `true` | Replace recognised secrets with `[REDACTED]` in the pane Copy actions (the agent copy menu, `CopyLastCommandOutput`, `CopyLastCommandWithOutput`, `CopyPaneScrollback`). The notification reports how many were redacted. |
+| `reveal_on_hover` | `true` | Show a masked secret while the pointer is over it. A secret wrapped across rows is revealed as a whole. Set to `false` when screen sharing. |
+| `builtin_patterns` | `true` | Use the built-in rules listed below. |
+| `patterns` | `{}` | Extra regular expressions ([Rust `regex` syntax](https://docs.rs/regex/latest/regex/#syntax)). If a pattern has a capture group, group 1 is the part that is hidden; otherwise the whole match is. A pattern that does not compile is logged and skipped. |
+
+The built-in rules recognise two kinds of thing.
+
+**Strings with a shape of their own:** AWS access key ids, GitHub and GitLab
+tokens, Slack tokens, Stripe live keys, `sk-…` API keys, Google API keys, JSON
+web tokens, `Bearer <token>`, the password in `scheme://user:password@host`,
+and the body of a PEM private key.
+
+**Values given a telling name**, in English or German, matched without regard
+to case:
+
+| The name contains | Value is hidden |
+|---|---|
+| `password`, `passwd`, `passphrase`, `passwort`, `kennwort`, `secret`, `geheimnis`, `geheim`, `zugangscode` | at any length |
+| `token`, `api_key`, `access_key`, `private_key`, `credential(s)`, `schlüssel`, `schluessel`, `zugangsdaten` | from 8 characters up |
+
+The second row has a minimum because those words are also everyday labels
+(`tokens: 5000`). The name may be part of a longer one (`DB_PASSWORT`,
+`client_secret`, `Geheimschlüssel`), and the value is recognised in these
+forms:
+
+| Form | Example |
+|---|---|
+| `NAME=value`, no spaces | `DB_PASSWORT=abc`, `--token=abcdef123456` |
+| quoted value | `passwort = "abc"`, `api_key: 'abcd1234efgh'` |
+| `name: value` at the end of a line | `Kennwort: abc` |
+| a flag and its argument | `--password abc`, `--passwort abc` |
+
+Not matched, so that source code is not blanked out: an unquoted value after
+` = ` with spaces (`let password = input;`), a value followed by `)`
+(`connect(password=password)`), and a password with no name next to it.
+
+```lua
+-- Also hide internal ticket ids, and only the value of `corp_id=...`
+config.secret_masking = {
+  enabled = true,
+  patterns = { [[\bTKT-\d{6}\b]], [[corp_id=(\w+)]] },
+}
+```
+
+### Copy menu: "(no secrets)" rows
+
+The pane copy menu (the toolbelt Copy button and the sidebar tab-row Copy icon)
+ends with two rows that redact recognised secrets **even when `enabled` is
+`false`**:
+
+| Pane | Rows |
+|---|---|
+| Agent | `Copy conversation (no secrets)`, `Copy last message (no secrets)` |
+| Shell / ssh | `Copy pane (no secrets)`, `Copy last output (no secrets)` |
+
+They copy exactly what the row of the same name copies, then replace each
+recognised secret with `[REDACTED]`. The notification says how many were
+redacted, or `no secrets found`. They use the same rules as everything else
+here (`builtin_patterns` and `patterns`).
+
+With `enabled = true` and `redact_copy_actions = true` every row in the menu
+already redacts, so these two are hidden.
+
+### What a plain copy does
+
+**A plain selection copy is never redacted** — `CopyTo`, copy on mouse release,
+QuickSelect and copy mode all copy exactly what the pane holds, masked on screen
+or not. To copy a selection without its secrets, use `CopyRedactedTo`, which
+works whether or not `enabled` is set:
+
+```lua
+config.keys = {
+  { key = 'c', mods = 'SUPER|SHIFT', action = wezterm.action.CopyRedactedTo 'Clipboard' },
+  { key = 'm', mods = 'SUPER|SHIFT', action = wezterm.action.ToggleSecretMasking },
+}
+```
+
+Both actions are in the command palette and the Edit / View menus; neither has
+a default key.
+
+### Limits
+
+Masking is pattern based and best effort. It hides the shapes it knows; a secret
+in any other shape is shown and copied as-is, so do not treat it as a guarantee.
+In particular:
+
+- A password you type at a prompt is not echoed by the program asking for it, so
+  there is nothing on screen to mask.
+- A private key's body is recognised by its `BEGIN … PRIVATE KEY` line. Once that
+  line is more than 48 rows above the top of the view, the rest of the body is no
+  longer masked on screen (copied text is not affected by this).
+- Text an application puts on the clipboard itself (OSC 52) is not redacted.
+- Nothing matched is ever written to the log.
 
 ## Rich Input Composer
 
@@ -1431,7 +1599,7 @@ upstream WezTerm uses — plus two new per-domain fields:
 
 | Key (on `SshDomain`) | Type | Default | Meaning |
 |---|---|---|---|
-| `transport` | enum | `"WezTerm"` | `"WezTerm"` (native mux, default for `SSHMUX:`), `"Ssh"` (plain ssh, default for `SSH:`), `"Mosh"` (requires `mosh` on `PATH`), `"Et"` (requires `et` on `PATH`), or `"Custom"` (run an arbitrary argv you supply — see `custom_command`). |
+| `transport` | enum | `"WezTerm"` | `"WezTerm"` (wezterm's own SSH; whether it also runs the mux on the remote is the domain's `multiplexing`), `"Ssh"` (same connection path, shown with an `ssh` badge), `"Mosh"` (requires `mosh` on `PATH`), `"Et"` (requires `et` on `PATH`), or `"Custom"` (run an arbitrary argv you supply — see `custom_command`). |
 | `extra_args` | list of string | unset | Appended to the spawn argv for `Mosh`/`Et`/`Custom` only. Ignored for `WezTerm`/`Ssh` (use `ssh_option` for those). |
 | `custom_command` | list of string | unset | Literal argv run when `transport = "Custom"`. Use a wrapper script, an autossh invocation, a Secretive-mediated `ssh user@secretive_alias`, or anything the built-in transports cannot name. First element is probed on `PATH`; missing binary hides the row. |
 
@@ -1480,7 +1648,9 @@ Discovery and behavior:
   auto-generated domain pick it up).
 - `Mosh` rows spawn `mosh <user@host>` as a plain shell command in the
   **local** domain — mosh owns its own reconnect and bypasses the wezterm
-  mux entirely. The row is hidden when `mosh` is not on `PATH`.
+  mux entirely. A port in `remote_address` (`host:2222`) is handed to the
+  ssh that mosh bootstraps through: `mosh --ssh="ssh -p 2222" <user@host>`.
+  The row is hidden when `mosh` is not on `PATH`.
 - `Et` rows similarly spawn `et <user@host[:port]>`. Hidden when `et` is
   not on `PATH`.
 - `Custom` rows run `custom_command` verbatim (plus `extra_args`) as a
@@ -1492,6 +1662,18 @@ Discovery and behavior:
 - Auto-generated entries from `wezterm.default_ssh_domains()` always use
   `transport = "WezTerm"`, matching previous behavior; only your own
   `ssh_domains` entries opt into mosh/et/custom.
+- **One row per `~/.ssh/config` host.** With no `ssh_domains` in your Lua
+  config, every `Host` in the ssh config is registered twice by upstream, as
+  `SSH:<host>` (plain) and `SSHMUX:<host>` (remote mux). The dropdown lists
+  the plain one only; the mux variant stays available from the new-tab
+  dropdown's domain list. Domains you declare yourself are listed exactly as
+  declared, with an `ssh` or `mux` badge according to their `multiplexing`.
+- Rows from the ssh config also show where the alias points when that adds
+  something: `web  · ssh · deploy@10.0.0.5:2222 via bastion`. The default
+  port, your own username and a hostname equal to the alias are left out.
+- The ssh config files (including every `Include`) are read on a background
+  thread and re-read every 60 seconds, so a host you add shows up within a
+  minute without a config reload.
 - Binary lookup uses `PATH` and then `fallback_command_dirs`
   (`~/.local/bin`, `~/bin`, `/opt/homebrew/bin`, …) for the same
   Finder/Dock launchd-PATH reason as the agent launcher. The resolved
@@ -1501,6 +1683,25 @@ Discovery and behavior:
 
 The dropdown is hidden entirely when no row is usable (no `ssh_domains`
 and no sidecar binaries installed).
+
+### Filtering, recents and the keyboard
+
+- **Type to filter.** While the dropdown is open, typing narrows it to the
+  rows containing every word you typed (in the host, its details or its
+  badge, case-insensitively). `Backspace` edits, `Enter` connects to the
+  first match, `Esc` closes. A list longer than 14 rows scrolls.
+- **Recent hosts first.** The last 8 hosts you connected to from the dropdown
+  lead the list, above a divider. Their domain names (nothing else) are kept
+  in the UI state file, `tgz-ui-state.json` in the data directory.
+- **`ShowSshHostMenu`** opens the dropdown from the keyboard. When the
+  sidebar button is not on screen it opens the launcher's fuzzy domain list
+  instead. It is in the command palette and has no default key:
+
+```lua
+config.keys = {
+  { key = 'h', mods = 'SUPER|SHIFT', action = wezterm.action.ShowSshHostMenu },
+}
+```
 
 ## Update Checking
 
@@ -1646,6 +1847,7 @@ you are not left hunting for one.
 | Per-toolbelt-button visibility | Toolbelt visibility is derived. Herd-row `Stop` is governed by `agent_ui.show_stop`; it appears when the agent can be interrupted. `Attach` / `Resume` / `Details` need their action templates *and* the control-action gate; `Input` / `Compose` follow `rich_input.enabled` and `rich_input.docked`. If a button is missing, it is a detection or a gate question — see *How an agent is identified*. |
 | Tab-row Copy icon size and threshold | Hardcoded. It matches the close button's size but is centred in its own slot. It stays at every width its box fits, shrinking its slot at the 140px drag floor; the title is shortened instead. |
 | Sidebar spacing, radii and row geometry | Compile-time constants. |
+| Secret mask character, `[REDACTED]` text and the built-in rule list | Hardcoded. `secret_masking.builtin_patterns = false` drops the built-in rules as a whole; individual ones cannot be switched off. |
 | Individual sidebar colors | No per-element keys. The whole palette is derived — see `sidebar_theme` for which source it derives from. The attention colour (waiting-queue dot, pip, selection bar, attention line) comes from the palette too, so it follows the theme rather than being separately settable. |
 | Worktree picker behavior | `config.file_browser` — `shell` picks where the picker runs (`"Auto"` / `"Wsl"` / `"GitBash"`), `wsl_distro` names the distro when the target pane is not a WSL pane, `editor_command` opens selections, and `split_size_percent` sizes the split. The picker's internal script, its cache location and the fzf fallback prompt are not configurable. |
 

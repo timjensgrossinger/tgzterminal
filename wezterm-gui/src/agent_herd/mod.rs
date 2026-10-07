@@ -22,10 +22,13 @@ pub mod claude;
 pub mod codex;
 pub mod copilot;
 pub mod gemini;
+pub mod incremental;
 pub mod opencode;
 pub mod sessions;
 pub mod touched;
 pub mod transcript;
+pub mod usage;
+pub mod usage_history;
 pub mod vendor;
 pub mod wsl_proc;
 

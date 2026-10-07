@@ -208,6 +208,48 @@ impl Default for PaneToolbeltConfig {
     }
 }
 
+/// Hide token-shaped strings (API keys, passwords in URLs, ...) on screen and
+/// in the pane Copy actions.
+///
+/// Pattern based and best effort: it recognises the shapes it knows and
+/// nothing else. Off by default so terminal output is never altered unasked.
+#[derive(Debug, Clone, FromDynamic, ToDynamic)]
+pub struct SecretMaskingConfig {
+    /// Master switch.
+    #[dynamic(default)]
+    pub enabled: bool,
+    /// Paint matched secrets as bullets in terminal panes.
+    #[dynamic(default = "default_true")]
+    pub mask_on_screen: bool,
+    /// Redact matched secrets in the pane Copy actions (agent and shell copy).
+    /// A plain selection copy is never altered.
+    #[dynamic(default = "default_true")]
+    pub redact_copy_actions: bool,
+    /// Show a masked secret while the pointer is over it.
+    #[dynamic(default = "default_true")]
+    pub reveal_on_hover: bool,
+    /// Use the built-in rules for well-known token shapes.
+    #[dynamic(default = "default_true")]
+    pub builtin_patterns: bool,
+    /// Extra regular expressions. If a pattern has a capture group, group 1
+    /// is the part that is masked; otherwise the whole match is.
+    #[dynamic(default)]
+    pub patterns: Vec<String>,
+}
+
+impl Default for SecretMaskingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mask_on_screen: true,
+            redact_copy_actions: true,
+            reveal_on_hover: true,
+            builtin_patterns: true,
+            patterns: vec![],
+        }
+    }
+}
+
 /// Which window edge the diff panel docks to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, FromDynamic, ToDynamic)]
 pub enum DiffPanelPosition {
@@ -2126,6 +2168,10 @@ pub struct Config {
     #[dynamic(default)]
     pub pane_toolbelt: PaneToolbeltConfig,
 
+    /// Masking of token-shaped strings on screen and in pane Copy actions.
+    #[dynamic(default)]
+    pub secret_masking: SecretMaskingConfig,
+
     /// Shells and domains offered by the sidebar new-tab dropdown.
     #[dynamic(default)]
     pub new_tab_menu: NewTabMenuConfig,
@@ -3817,6 +3863,20 @@ mod agent_ui_tests {
         assert!(config.agent_ui.enabled);
         assert!(config.agent_ui.show_pane_toolbelt);
         assert_eq!(config.agent_ui.copy_scrollback_lines, 20_000);
+    }
+
+    /// Masking alters what the terminal shows, so it must be opt-in; the
+    /// sub-switches default on so that `enabled = true` alone is useful.
+    #[test]
+    fn secret_masking_defaults_to_off_with_sub_switches_on() {
+        let config = Config::default_config();
+
+        assert!(!config.secret_masking.enabled);
+        assert!(config.secret_masking.mask_on_screen);
+        assert!(config.secret_masking.redact_copy_actions);
+        assert!(config.secret_masking.reveal_on_hover);
+        assert!(config.secret_masking.builtin_patterns);
+        assert!(config.secret_masking.patterns.is_empty());
     }
 
     #[test]

@@ -2104,6 +2104,36 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             menubar: &["Edit"],
             icon: None,
         },
+        CopyRedactedTo(_) => CommandDef {
+            brief: "Copy selection without secrets".into(),
+            doc: "Copies the selection with recognised secrets (API keys, \
+                  tokens, passwords in URLs) replaced by [REDACTED]"
+                .into(),
+            keys: vec![],
+            args: &[ArgType::ActivePane],
+            menubar: &["Edit"],
+            icon: Some("md_content_copy"),
+        },
+        ToggleSecretMasking => CommandDef {
+            brief: "Toggle Secret Masking".into(),
+            doc: "Shows or hides recognised secrets in this window's panes, \
+                  overriding secret_masking.enabled"
+                .into(),
+            keys: vec![],
+            args: &[ArgType::ActiveWindow],
+            menubar: &["View"],
+            icon: None,
+        },
+        ShowSshHostMenu => CommandDef {
+            brief: "Connect to SSH host".into(),
+            doc: "Opens the sidebar's SSH quick-launch list; type to filter, \
+                  Enter connects to the first match"
+                .into(),
+            keys: vec![],
+            args: &[ArgType::ActiveWindow],
+            menubar: &["Shell"],
+            icon: Some("md_lan_connect"),
+        },
         ToggleDiffPanel => CommandDef {
             brief: "Toggle Changes Panel".into(),
             doc: "Shows or hides the Changes panel, which lists the working-copy \
@@ -2143,6 +2173,7 @@ fn compute_default_actions() -> Vec<KeyAssignment> {
         CloseCurrentTab { confirm: true },
         CloseCurrentPane { confirm: true },
         DetachDomain(SpawnTabDomain::CurrentPaneDomain),
+        ShowSshHostMenu,
         ResetTerminal,
         // ----------------- Edit
         #[cfg(not(target_os = "macos"))]
@@ -2153,6 +2184,7 @@ fn compute_default_actions() -> Vec<KeyAssignment> {
         CopyLastCommandOutput,
         CopyLastCommandWithOutput,
         CopyPaneScrollback,
+        CopyRedactedTo(ClipboardCopyDestination::Clipboard),
         PasteFrom(ClipboardPasteSource::Clipboard),
         ClearScrollback(ScrollbackEraseMode::ScrollbackOnly),
         ClearScrollback(ScrollbackEraseMode::ScrollbackAndViewport),
@@ -2165,6 +2197,7 @@ fn compute_default_actions() -> Vec<KeyAssignment> {
         ToggleDockedInput,
         // ----------------- View
         ToggleDiffPanel,
+        ToggleSecretMasking,
         DecreaseFontSize,
         IncreaseFontSize,
         ResetFontSize,
