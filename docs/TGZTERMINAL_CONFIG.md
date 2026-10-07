@@ -1066,8 +1066,8 @@ The button opens a three-row menu:
 
 | Row | Copies |
 | --- | --- |
-| Copy last command output | The most recent command's output, without the command line. |
-| Copy last command + output | The command line together with its output. |
+| Copy last output | The most recent command's output, without the command line. |
+| Copy last command and output | The command line together with its output. |
 | Copy pane | The pane's scrollback, capped as below. |
 
 ### Exact vs guessed
