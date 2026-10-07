@@ -4795,11 +4795,11 @@ pub(crate) fn pane_copy_menu_items(kind: &PaneToolbeltKind) -> Vec<(&'static str
         ],
         PaneToolbeltKind::Shell => vec![
             (
-                "Copy last command output",
+                "Copy last output",
                 PaneCopyAction::Shell(ShellCopyAction::LastCommandOutput),
             ),
             (
-                "Copy last command + output",
+                "Copy last command and output",
                 PaneCopyAction::Shell(ShellCopyAction::LastCommandWithOutput),
             ),
             (
@@ -4808,6 +4808,30 @@ pub(crate) fn pane_copy_menu_items(kind: &PaneToolbeltKind) -> Vec<(&'static str
             ),
         ],
     }
+}
+
+/// Width of the copy menu in physical pixels.
+///
+/// `PANE_COPY_MENU_W` is the floor, scaled for DPI like the rest of the menu's
+/// geometry. The text cell is DPI-sized too, so an unscaled floor fit only ~17
+/// columns at 2x and clipped two shell rows to the same "Copy last command".
+/// Widened to the longest label, then capped at what the window allows.
+pub(crate) fn pane_copy_menu_width<'a>(
+    labels: impl IntoIterator<Item = &'a str>,
+    cell_width: f32,
+    text_inset: f32,
+    dpi_scale: f32,
+    window_w: f32,
+) -> f32 {
+    let label_cols = labels
+        .into_iter()
+        .map(|label| unicode_column_width(label, None))
+        .max()
+        .unwrap_or(0);
+    // One spare cell absorbs the floor in `sidebar_text_cols`.
+    let label_w = (label_cols + 1) as f32 * cell_width + 2. * text_inset;
+    let max_w = (window_w - 2. * FLOAT_GAP).max(0.);
+    (PANE_COPY_MENU_W * dpi_scale).max(label_w).min(max_w)
 }
 
 /// Where the user dragged the agent toolbelt to: the distance of the strip's
@@ -10703,7 +10727,13 @@ impl crate::TermWindow {
         let row_radius = (7. * dpi_scale).min(row_h * 0.5);
         let row_inset = 4. * dpi_scale;
         let row_text_inset = 12. * dpi_scale;
-        let menu_w = PANE_COPY_MENU_W;
+        let menu_w = pane_copy_menu_width(
+            items.iter().map(|(label, _)| *label),
+            cell_width as f32,
+            row_text_inset,
+            dpi_scale,
+            self.dimensions.pixel_width as f32,
+        );
         let menu_h = items.len() as f32 * row_h + menu_pad;
         let max_x = (self.dimensions.pixel_width as f32 - menu_w - FLOAT_GAP).max(FLOAT_GAP);
         let max_y = (self.dimensions.pixel_height as f32 - menu_h - FLOAT_GAP).max(FLOAT_GAP);
@@ -16321,11 +16351,11 @@ mod tests {
             shell,
             vec![
                 (
-                    "Copy last command output",
+                    "Copy last output",
                     PaneCopyAction::Shell(ShellCopyAction::LastCommandOutput)
                 ),
                 (
-                    "Copy last command + output",
+                    "Copy last command and output",
                     PaneCopyAction::Shell(ShellCopyAction::LastCommandWithOutput)
                 ),
                 (
@@ -16337,6 +16367,55 @@ mod tests {
         assert!(shell
             .iter()
             .all(|(_, action)| matches!(action, PaneCopyAction::Shell(_))));
+    }
+
+    /// Every copy-menu label fits untruncated, at 1x and at Retina 2x where
+    /// the unscaled 360px used to clip both "last command" rows to one string.
+    #[test]
+    fn pane_copy_menu_width_fits_every_label() {
+        let shell: Vec<&str> = pane_copy_menu_items(&PaneToolbeltKind::Shell)
+            .into_iter()
+            .map(|(label, _)| label)
+            .collect();
+        // The agent list ignores the pane state, so its labels are listed
+        // rather than building an `AgentPaneState` fixture.
+        let agent = vec![
+            "Copy conversation",
+            "Copy as Markdown",
+            "Copy last message",
+            "Copy agent details",
+        ];
+        for labels in [shell, agent] {
+            for (cell_w, dpi_scale) in [(9_usize, 1.0_f32), (19, 2.0)] {
+                let inset = 12. * dpi_scale;
+                let menu_w = pane_copy_menu_width(
+                    labels.iter().copied(),
+                    cell_w as f32,
+                    inset,
+                    dpi_scale,
+                    4000.,
+                );
+                let cols = sidebar_text_cols(menu_w - 2. * inset, cell_w);
+                for label in &labels {
+                    assert_eq!(
+                        truncate_to_cols(label, cols),
+                        *label,
+                        "clipped to {cols} cols at {dpi_scale}x"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pane_copy_menu_width_keeps_floor_and_window_cap() {
+        assert_eq!(pane_copy_menu_width(["Copy"], 9., 12., 1., 4000.), 360.);
+        assert_eq!(pane_copy_menu_width(["Copy"], 18., 24., 2., 4000.), 720.);
+        assert_eq!(
+            pane_copy_menu_width(["Copy"], 9., 12., 1., 200.),
+            200. - 2. * FLOAT_GAP
+        );
+        assert_eq!(pane_copy_menu_width(["Copy"], 9., 12., 1., 0.), 0.);
     }
 
     /// A one-button strip is exactly its button wide, with no status dot.
