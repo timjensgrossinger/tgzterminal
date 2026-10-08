@@ -218,11 +218,11 @@ impl Default for PaneToolbeltConfig {
 /// in the pane Copy actions.
 ///
 /// Pattern based and best effort: it recognises the shapes it knows and
-/// nothing else. Off by default so terminal output is never altered unasked.
+/// nothing else. On by default; `enabled = false` turns it off.
 #[derive(Debug, Clone, FromDynamic, ToDynamic)]
 pub struct SecretMaskingConfig {
     /// Master switch.
-    #[dynamic(default)]
+    #[dynamic(default = "default_true")]
     pub enabled: bool,
     /// Paint matched secrets as bullets in terminal panes.
     #[dynamic(default = "default_true")]
@@ -246,7 +246,7 @@ pub struct SecretMaskingConfig {
 impl Default for SecretMaskingConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             mask_on_screen: true,
             redact_copy_actions: true,
             reveal_on_hover: true,
@@ -3893,13 +3893,13 @@ mod agent_ui_tests {
         assert_eq!(config.agent_ui.copy_scrollback_lines, 20_000);
     }
 
-    /// Masking alters what the terminal shows, so it must be opt-in; the
-    /// sub-switches default on so that `enabled = true` alone is useful.
+    /// Masking is on out of the box: a token on screen is the leak it exists
+    /// to prevent. `enabled = false` opts out.
     #[test]
-    fn secret_masking_defaults_to_off_with_sub_switches_on() {
+    fn secret_masking_defaults_to_on() {
         let config = Config::default_config();
 
-        assert!(!config.secret_masking.enabled);
+        assert!(config.secret_masking.enabled);
         assert!(config.secret_masking.mask_on_screen);
         assert!(config.secret_masking.redact_copy_actions);
         assert!(config.secret_masking.reveal_on_hover);

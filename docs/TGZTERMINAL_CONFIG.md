@@ -392,8 +392,8 @@ outside that window, the copied text starts with
 `[… earlier scrollback not included …]`. If transcript cleanup ends up with
 nothing, the raw pane text (or, failing that, the agent details) is copied
 instead and the notification says which one it used. Copied text may include
-terminal output or secrets printed in that range; turn on
-[Secret Masking](#secret-masking) to have recognised ones redacted.
+terminal output or secrets printed in that range; [Secret
+Masking](#secret-masking) (on by default) redacts the ones it recognises.
 
 `enable_control_actions` is `false` by default. Resume, Attach and log-opening
 controls require **both** an explicit opt-in — `agent_ui.enable_control_actions
@@ -1152,7 +1152,7 @@ described above. When older rows exist but fall outside that window, the copied
 text starts with `[… earlier scrollback not included …]`.
 
 As with any copy action, **copied text may include terminal output or secrets
-printed in that range.** With [Secret Masking](#secret-masking) enabled, secrets
+printed in that range.** With [Secret Masking](#secret-masking) on (the default), secrets
 it recognises are replaced by `[REDACTED]` and the notification says how many.
 
 ### Keybindings
@@ -1209,12 +1209,17 @@ the whole table.
 ## Secret Masking
 
 Hides token-shaped strings — API keys, access tokens, passwords in URLs — in
-terminal panes and in the pane Copy actions. Off by default: terminal output is
-never altered unless you ask.
+terminal panes and in the pane Copy actions. On by default; to turn it off:
+
+```lua
+config.secret_masking = { enabled = false }
+```
+
+All keys:
 
 ```lua
 config.secret_masking = {
-  enabled = false,
+  enabled = true,
   mask_on_screen = true,
   redact_copy_actions = true,
   reveal_on_hover = true,
@@ -1225,7 +1230,7 @@ config.secret_masking = {
 
 | Key | Default | Meaning |
 |---|---|---|
-| `enabled` | `false` | Master switch. `ToggleSecretMasking` overrides it for one window until that window closes. |
+| `enabled` | `true` | Master switch. `ToggleSecretMasking` overrides it for one window until that window closes. |
 | `mask_on_screen` | `true` | Paint recognised secrets as `•`. Only the painting changes: the pane's real text is untouched, so selection, search and a plain copy still see it. |
 | `redact_copy_actions` | `true` | Replace recognised secrets with `[REDACTED]` in the pane Copy actions (the agent copy menu, `CopyLastCommandOutput`, `CopyLastCommandWithOutput`, `CopyPaneScrollback`). The notification reports how many were redacted. |
 | `reveal_on_hover` | `true` | Show a masked secret while the pointer is over it. A secret wrapped across rows is revealed as a whole. Set to `false` when screen sharing. |
