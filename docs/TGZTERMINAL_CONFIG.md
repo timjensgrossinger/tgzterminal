@@ -132,6 +132,7 @@ config.file_browser = {
 | Key | Type | Default | Notes |
 |---|---|---|---|
 | `editor_command` | list of string | unset | Receives the selected file path as its final argument. |
+| `editor_is_gui` | bool | `false` | `editor_command` opens its own window (VS Code, Notepad++): start it directly instead of in a split pane. Without `editor_command` the platform opener (`explorer.exe`, `start`) is always treated this way. |
 | `list_command` | list of string | `{ "find", ".", "-maxdepth", "3", "-type", "f" }` | Accepted by the schema but **not currently read by any code**. |
 | `split_size_percent` | int | `30` | Clamped to `5..=95`. |
 | `reuse_editor_pane` | bool | `true` | Accepted by the schema but **not currently read by any code**. |

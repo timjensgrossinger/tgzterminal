@@ -6988,9 +6988,19 @@ impl crate::TermWindow {
     /// reads it), in the distro's own Linux form.
     pub(crate) fn wsl_active_pane_session_cwd(&self) -> Option<PathBuf> {
         let pane = self.get_active_pane_or_overlay()?;
-        let domain = self.active_pane_domain_name()?;
+        self.wsl_pane_session_cwd(&pane)
+    }
+
+    /// [`Self::wsl_active_pane_session_cwd`] for any pane: the Worktree picker
+    /// acts on its target pane, which need not be the active one, and would
+    /// otherwise open in the `wsl.exe` host's Windows home.
+    pub(crate) fn wsl_pane_session_cwd(&self, pane: &Arc<dyn Pane>) -> Option<PathBuf> {
+        let domain = Mux::get()
+            .get_domain(pane.domain_id())?
+            .domain_name()
+            .to_string();
         wsl_paths::distro_for_domain(&domain, &self.config)?;
-        let raw = crate::termwindow::composer::active_pane_cwd(self);
+        let raw = crate::termwindow::composer::pane_cwd(pane);
         if raw
             .as_deref()
             .is_some_and(|raw| !wsl_paths::is_windows_drive_path(raw))

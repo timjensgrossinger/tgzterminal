@@ -218,9 +218,18 @@ pub fn run_cli(opts: &crate::Opt, cli: CliCommand) -> anyhow::Result<()> {
     }
 }
 
+/// Makes a relative `--cwd` absolute against the CLI's own directory.
+///
+/// A POSIX-absolute path is passed on unchanged on Windows: it is meant for a
+/// WSL (or remote) domain, and joining it would prefix the CLI's drive
+/// (`/mnt/j/x` -> `J:/mnt/j/x`), which `wsl.exe --cd` rejects, so the new pane
+/// exits at once. A WSL-side caller (the worktree picker) sends exactly those.
 pub fn resolve_relative_cwd(cwd: Option<OsString>) -> anyhow::Result<Option<String>> {
     match cwd {
         None => Ok(None),
+        Some(cwd) if cfg!(windows) && cwd.to_str().is_some_and(|cwd| cwd.starts_with('/')) => {
+            Ok(cwd.into_string().ok())
+        }
         Some(cwd) => Ok(Some(
             std::env::current_dir()?
                 .join(cwd)

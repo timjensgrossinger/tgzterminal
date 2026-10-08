@@ -563,6 +563,12 @@ fn push_history(history: &RefCell<Vec<String>>, limit: usize, text: &str) {
 /// that a new tab would inherit.
 pub fn active_pane_cwd(term_window: &TermWindow) -> Option<String> {
     let pane = term_window.get_active_pane_or_overlay()?;
+    pane_cwd(&pane)
+}
+
+/// [`active_pane_cwd`] for any pane, for callers that act on a pane other
+/// than the active one (the Worktree picker's target pane).
+pub fn pane_cwd(pane: &Arc<dyn Pane>) -> Option<String> {
     let url = pane.get_current_working_dir(CachePolicy::AllowStale)?;
     let path = percent_decode_str(url.path())
         .decode_utf8()
