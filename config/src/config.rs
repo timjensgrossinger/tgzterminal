@@ -290,17 +290,38 @@ impl Default for DiffPanelRaisedMode {
     }
 }
 
+/// What the Changes panel opens on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromDynamic, ToDynamic)]
+pub enum DiffPanelMode {
+    /// Only what the agent sessions in the tab changed, each file compared
+    /// with its state before an agent touched it. Needs an agent whose
+    /// transcript can be read (Claude, Codex); otherwise the panel shows All.
+    Session,
+    /// Every change in the active pane's working copy.
+    All,
+}
+
+impl Default for DiffPanelMode {
+    fn default() -> Self {
+        Self::Session
+    }
+}
+
 /// The "Changes" panel: working-copy changes for the active pane's directory.
 #[derive(Debug, Clone, FromDynamic, ToDynamic)]
 pub struct DiffPanelConfig {
     /// Offer the panel at all (toolbelt button, `ToggleDiffPanel`). The panel
-    /// itself stays hidden until toggled for a pane.
+    /// itself stays hidden until toggled for a tab.
     #[dynamic(default = "default_true")]
     pub enabled: bool,
 
     /// Which side of the terminal area the panel docks to.
     #[dynamic(default)]
     pub position: DiffPanelPosition,
+
+    /// The mode a newly opened panel starts in; its header button switches.
+    #[dynamic(default)]
+    pub default_mode: DiffPanelMode,
 
     /// Initial panel width in pixels, calibrated for a 2x (Retina) display;
     /// scales with display density like `sidebar_width_px`. A drag-resize
@@ -348,6 +369,7 @@ impl Default for DiffPanelConfig {
         Self {
             enabled: true,
             position: DiffPanelPosition::default(),
+            default_mode: DiffPanelMode::default(),
             width_px: default_diff_panel_width_px(),
             raised_mode: DiffPanelRaisedMode::default(),
             snap_px: default_diff_panel_snap_px(),

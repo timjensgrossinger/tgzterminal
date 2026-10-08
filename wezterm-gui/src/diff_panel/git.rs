@@ -3,7 +3,7 @@
 //! Uses the command-line client rather than libgit2 so the user's own
 //! configuration (ignore rules, attributes, filters) decides what a change is.
 
-use super::exec::{CommandOutput, Runner};
+use super::exec::{run_chunked, CommandOutput, Runner};
 use super::{
     read_text_file, unified, ChangeSet, ChangeSource, FileChange, FileStatus, Limits, Scan,
     MAX_UNTRACKED_FILES,
@@ -25,22 +25,33 @@ fn git(runner: &Runner, root: &Path, args: &[&str]) -> std::io::Result<CommandOu
     runner.run("git", &full, root)
 }
 
-fn diff_against(runner: &Runner, root: &Path, base: &str) -> std::io::Result<CommandOutput> {
-    git(
-        runner,
-        root,
-        &[
-            "diff",
-            "--no-color",
-            "--no-ext-diff",
-            // The parser strips these; a user's `diff.noprefix` must not
-            // take them away.
-            "--src-prefix=a/",
-            "--dst-prefix=b/",
-            base,
-            "--",
-        ],
-    )
+/// `paths` as literal pathspecs: `[`, `*` and `?` in a file name are not globs.
+fn literal_pathspecs(paths: &[&str]) -> Vec<String> {
+    paths
+        .iter()
+        .map(|path| format!(":(literal){path}"))
+        .collect()
+}
+
+fn diff_against(
+    runner: &Runner,
+    root: &Path,
+    base: &str,
+    pathspecs: &[String],
+) -> std::io::Result<CommandOutput> {
+    let mut args = vec![
+        "diff",
+        "--no-color",
+        "--no-ext-diff",
+        // The parser strips these; a user's `diff.noprefix` must not
+        // take them away.
+        "--src-prefix=a/",
+        "--dst-prefix=b/",
+        base,
+        "--",
+    ];
+    args.extend(pathspecs.iter().map(String::as_str));
+    git(runner, root, &args)
 }
 
 /// NUL-separated paths, as `ls-files -z` prints them.
@@ -63,6 +74,12 @@ fn untracked_file(root: &Path, path: &str, limits: Limits, read_content: bool) -
 }
 
 pub fn scan(root: &Path, runner: &Runner, limits: Limits) -> Scan {
+    scan_paths(root, runner, &[], limits)
+}
+
+/// [`scan`] narrowed to `paths` (relative to `root`, `/`-separated); every
+/// change when `paths` is empty.
+pub fn scan_paths(root: &Path, runner: &Runner, paths: &[&str], limits: Limits) -> Scan {
     let branch = match git(runner, root, &["symbolic-ref", "--short", "-q", "HEAD"]) {
         Ok(out) if out.success => Some(out.stdout.trim().to_string()).filter(|b| !b.is_empty()),
         // Detached HEAD: a repository, just not on a branch.
@@ -73,13 +90,17 @@ pub fn scan(root: &Path, runner: &Runner, limits: Limits) -> Scan {
         Err(err) => return Scan::Unavailable(format!("Could not run git: {err}")),
     };
 
-    let mut diff = match diff_against(runner, root, "HEAD") {
+    let mut diff = match run_chunked(&literal_pathspecs(paths), |specs| {
+        diff_against(runner, root, "HEAD", specs)
+    }) {
         Ok(out) => out,
         Err(err) => return Scan::Unavailable(format!("Could not run git: {err}")),
     };
     if !diff.success && !diff.truncated {
         // No commit yet, so no HEAD to compare with.
-        match diff_against(runner, root, EMPTY_TREE) {
+        match run_chunked(&literal_pathspecs(paths), |specs| {
+            diff_against(runner, root, EMPTY_TREE, specs)
+        }) {
             Ok(out) if out.success || out.truncated => diff = out,
             _ => {
                 let reason = diff.stderr.lines().next().unwrap_or("git diff failed");
@@ -99,11 +120,12 @@ pub fn scan(root: &Path, runner: &Runner, limits: Limits) -> Scan {
             .then(|| "The diff is too large to show in full".to_string())
     });
 
-    if let Ok(out) = git(
-        runner,
-        root,
-        &["ls-files", "--others", "--exclude-standard", "-z"],
-    ) {
+    let untracked = run_chunked(&literal_pathspecs(paths), |specs| {
+        let mut args = vec!["ls-files", "--others", "--exclude-standard", "-z", "--"];
+        args.extend(specs.iter().map(String::as_str));
+        git(runner, root, &args)
+    });
+    if let Ok(out) = untracked {
         if out.success {
             let untracked = parse_path_list(&out.stdout);
             for (idx, path) in untracked.iter().enumerate() {
@@ -170,6 +192,36 @@ mod tests {
             Scan::Changes(set) => set,
             Scan::Unavailable(reason) => panic!("scan unavailable: {}", reason),
         }
+    }
+
+    #[test]
+    fn a_scan_narrowed_to_paths_reads_only_those() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        if sh(root, &["init", "-q", "-b", "main"]).is_none() {
+            eprintln!("git not installed; skipping");
+            return;
+        }
+        for name in ["a.txt", "b.txt", "[x].txt"] {
+            std::fs::write(root.join(name), "one\n").unwrap();
+        }
+        sh(root, &["add", "."]).unwrap();
+        sh(root, &["commit", "-q", "-m", "first"]).unwrap();
+        for name in ["a.txt", "b.txt", "[x].txt", "x.txt"] {
+            std::fs::write(root.join(name), "two\n").unwrap();
+        }
+        std::fs::write(root.join("new.txt"), "fresh\n").unwrap();
+        std::fs::write(root.join("other.txt"), "fresh\n").unwrap();
+
+        // `[x].txt` is a name, not a glob that would match `x.txt`.
+        let paths = ["a.txt", "[x].txt", "new.txt", "missing.txt"];
+        let set = match scan_paths(root, &Runner::host(), &paths, limits()) {
+            Scan::Changes(set) => set,
+            Scan::Unavailable(reason) => panic!("scan unavailable: {}", reason),
+        };
+        let mut shown: Vec<&str> = set.files.iter().map(|f| f.path.as_str()).collect();
+        shown.sort();
+        assert_eq!(shown, vec!["[x].txt", "a.txt", "new.txt"]);
     }
 
     #[test]

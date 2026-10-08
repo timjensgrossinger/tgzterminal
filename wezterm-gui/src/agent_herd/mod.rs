@@ -21,6 +21,7 @@ pub mod antigravity;
 pub mod claude;
 pub mod codex;
 pub mod copilot;
+pub mod file_history;
 pub mod gemini;
 pub mod incremental;
 pub mod opencode;

@@ -761,7 +761,7 @@ impl super::TermWindow {
             UIItemType::DiffPanelChip { index } => {
                 if event.kind == WMEK::Release(MousePress::Left) {
                     self.pressed_ui_item = None;
-                    self.diff_panel_jump_to_file(pane.pane_id(), index);
+                    self.diff_panel_jump_to_file(index);
                     context.invalidate();
                 } else {
                     self.mouse_event_diff_panel(None, pane, event, context);

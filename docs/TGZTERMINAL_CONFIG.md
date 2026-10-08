@@ -1441,6 +1441,7 @@ the strip is focused; use the overlay composer if you need paste-into-buffer.
 config.diff_panel = {
   enabled = true,
   position = "Right",      -- or "Left"
+  default_mode = "Session", -- or "All"
   raised_mode = "Float",   -- or "Auto", "Reserve"
   width_px = 840,
   snap_px = 56,
@@ -1452,14 +1453,23 @@ config.diff_panel = {
 }
 ```
 
-The Changes panel lists the working-copy changes for the active pane's
-directory: one folding section per file, with added and removed lines and both
-line numbers. It reads the directory, not the agent, so it works with any agent
-and with a plain shell.
+The Changes panel shows changes one folding section per file, with added and
+removed lines and both line numbers. It has two modes, switched with the
+**Session** / **All** button in its header:
 
-It is hidden until switched on for a pane, with the **Changes** button on an
-agent pane's toolbelt or the `ToggleDiffPanel` action (also in the command
-palette as "Toggle Changes Panel"). There is no default key binding:
+- **Session** (default): only what the agent sessions in the tab changed. See
+  "Session mode" below.
+- **All**: every working-copy change in the active pane's directory. It reads
+  the directory, not the agent, so it works with any agent and with a plain
+  shell.
+
+A tab with no Claude or Codex session whose transcript can be read always
+shows All.
+
+There is one panel per **tab**: split panes share it. It is hidden until
+switched on, with the **Changes** button on an agent pane's toolbelt, the `±`
+sidebar button or the `ToggleDiffPanel` action (also in the command palette as
+"Toggle Changes Panel"). There is no default key binding:
 
 ```lua
 config.keys = {
@@ -1471,14 +1481,45 @@ config.keys = {
 | --- | --- | --- |
 | `enabled` | `true` | Offer the panel at all. `false` removes the toolbelt button and makes `ToggleDiffPanel` do nothing. |
 | `position` | `"Right"` | Which side of the terminal area the panel docks to. With the sidebar on the same side, the panel sits inside it. |
+| `default_mode` | `"Session"` | The mode a newly opened panel starts in: `"Session"` or `"All"`. |
 | `raised_mode` | `"Float"` | What a panel shorter than the pane does to the terminal; see below. |
 | `width_px` | `840` | Initial width, calibrated for a 2x display like `sidebar_width_px`. A drag overrides it. |
 | `snap_px` | `56` | How close (at 2x) the dragged bottom edge must come to the bottom, or to the docked input strip, to snap onto it. |
 | `refresh_ms` | `2000` | How often the visible panel re-reads the directory when nothing tells it to. A tree that is slow to diff is re-read less often than this. A written file does not wait for it: the working copy is watched, and a change is re-read within about a third of a second. Where watching is not possible (a network share, a WSL distro's own filesystem seen from Windows) this poll is the only trigger. |
 | `max_file_bytes` | `1048576` | Files larger than this are listed without a diff. |
-| `snapshot_max_files` | `5000` | Most files a snapshot baseline may record (see "No version control"). |
+| `snapshot_max_files` | `5000` | Most files a snapshot baseline may record (see "No version control"). All mode only: Session mode never takes a snapshot. |
 | `nested_max_depth` | `3` | How many folder levels below the pane's directory to look for Git and Subversion working copies when the directory itself is in none (see "A folder of working copies"). `0` turns the search off. |
 | `nested_max_roots` | `64` | Most working copies that search collects; the panel says when there are more. |
+
+### Session mode
+
+Session mode starts from the agents, not the directory. For every Claude and
+Codex agent in the tab's panes it reads the session transcript for the files
+the agent edited (its edit tools, and shell commands that write: `sed -i`, a
+`>` redirect, `git mv`, `apply_patch`, …), and diffs only those. Nothing else
+in the tree is read, so the size of the directory does not matter, and the
+"More than 5000 files" limit of a snapshot never applies.
+
+Each file is compared with its state **before an agent touched it**:
+
+- A **Claude** session keeps a backup of every file before its first edit
+  (`~/.claude/file-history/<session>/`). That backup is the baseline, so only
+  the agent's lines show, even in a file that already had uncommitted changes
+  of yours, and even in a directory under no version control. When two agents
+  edited the same file, the older backup wins.
+- Anything without such a backup (Codex, a file changed only through the
+  shell, Claude with checkpointing turned off) is diffed against the working
+  copy's base by Git or Subversion, narrowed to those files. With no version
+  control either, the file is listed with "no earlier copy to compare with".
+
+Left out: a file that is back to its baseline, one an agent created and
+removed again, one only *read* in a shell command (`cat`), and files outside
+the agent's project (its plan and memory files). The panel says how many of
+those it skipped. With more than one agent in the tab, each file names the
+agents that touched it.
+
+Session mode follows the agents' transcripts through `refresh_ms`; it does not
+watch the tree.
 
 ### Size and position
 

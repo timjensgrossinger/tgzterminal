@@ -7,12 +7,15 @@
 //!
 //! Three providers produce the same [`ChangeSet`]: Git and Subversion by
 //! running their command-line clients and parsing the unified diff, and a
-//! snapshot fallback for directories under neither.
+//! snapshot fallback for directories under neither. [`session`] builds one
+//! from what a tab's agent sessions touched instead, without reading the
+//! rest of the tree.
 
 pub mod exec;
 pub mod geometry;
 pub mod git;
 pub mod nested;
+pub mod session;
 pub mod snapshot;
 pub mod svn;
 pub mod unified;
@@ -45,6 +48,10 @@ pub enum ChangeSource {
         git: usize,
         svn: usize,
     },
+    /// What the agent sessions of a tab changed; see [`session`].
+    Session {
+        agents: usize,
+    },
 }
 
 impl ChangeSource {
@@ -66,6 +73,8 @@ impl ChangeSource {
                 }
                 parts.join(" \u{00b7} ")
             }
+            Self::Session { agents: 1 } => "Session".to_string(),
+            Self::Session { agents } => format!("Session \u{00b7} {agents} agents"),
         }
     }
 }
@@ -133,6 +142,8 @@ pub struct FileChange {
     /// How the pane's agent session touched this file, when the panel was
     /// told which session that is; see [`mark_session`].
     pub touched: Option<Touch>,
+    /// The agents that touched it, by label; empty when none is known.
+    pub agents: Vec<String>,
 }
 
 impl FileChange {
@@ -148,6 +159,7 @@ impl FileChange {
             modified: None,
             fresh: false,
             touched: None,
+            agents: Vec::new(),
         }
     }
 
@@ -237,14 +249,19 @@ pub fn order_by_recency(set: &mut ChangeSet, now: SystemTime) {
     });
 }
 
-/// Mark every file in `set` that the session's transcript says it touched;
-/// returns how many there are.
+/// Mark every file in `set` that the session's transcript says it touched,
+/// adding `label` to its agents; returns how many there are.
 ///
 /// `root_view` is `set.root` as the *session* saw it: for an agent inside a
 /// WSL distro that is the Linux path (`/mnt/c/...`, `/home/...`), not the
 /// path this process opened. A renamed file counts when either name was
 /// touched.
-pub fn mark_session(set: &mut ChangeSet, root_view: &str, touched: &TouchedPaths) -> usize {
+pub fn mark_session(
+    set: &mut ChangeSet,
+    root_view: &str,
+    touched: &TouchedPaths,
+    label: &str,
+) -> usize {
     let root = root_view.trim_end_matches(['/', '\\']);
     let sep = if root.contains('\\') && !root.contains('/') {
         '\\'
@@ -257,42 +274,16 @@ pub fn mark_session(set: &mut ChangeSet, root_view: &str, touched: &TouchedPaths
     };
     let mut count = 0;
     for file in &mut set.files {
-        file.touched = touch(&file.path).max(file.old_path.as_deref().and_then(touch));
-        count += usize::from(file.touched.is_some());
-    }
-    count
-}
-
-/// `set` narrowed to the files the session touched (see [`mark_session`]).
-///
-/// A file only *named* in a shell command says so in its note: it may have
-/// been read rather than written, and should not look like a certain edit.
-pub fn session_only(set: &ChangeSet) -> ChangeSet {
-    let mut files: Vec<FileChange> = set
-        .files
-        .iter()
-        .filter(|file| file.touched.is_some())
-        .cloned()
-        .collect();
-    for file in &mut files {
-        if file.touched == Some(Touch::Mentioned) && file.note.is_none() {
-            file.note = Some("named in a shell command by this session".to_string());
+        let this = touch(&file.path).max(file.old_path.as_deref().and_then(touch));
+        if this.is_some() {
+            file.touched = file.touched.max(this);
+            if !file.agents.iter().any(|agent| agent == label) {
+                file.agents.push(label.to_string());
+            }
+            count += 1;
         }
     }
-    let summary = format!(
-        "{} of {} changed files are from this session",
-        files.len(),
-        set.files.len()
-    );
-    ChangeSet {
-        source: set.source.clone(),
-        root: set.root.clone(),
-        files,
-        note: Some(match &set.note {
-            Some(note) => format!("{summary}; {note}"),
-            None => summary,
-        }),
-    }
+    count
 }
 
 /// What a scan found.
@@ -314,7 +305,7 @@ pub struct Limits {
     pub nested_max_roots: usize,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Vcs {
     Git,
     Svn,
@@ -458,7 +449,7 @@ mod tests {
     }
 
     #[test]
-    fn the_session_filter_keeps_only_what_the_session_touched() {
+    fn marking_tags_the_files_a_session_touched() {
         let line = |name: &str, input: serde_json::Value| {
             serde_json::json!({
                 "type": "assistant",
@@ -497,29 +488,20 @@ mod tests {
             ],
             note: None,
         };
-        assert_eq!(mark_session(&mut set, "/mnt/c/ws", &touched), 3);
-        let only = session_only(&set);
-        let shown: Vec<(&str, Option<Touch>)> = only
+        assert_eq!(mark_session(&mut set, "/mnt/c/ws", &touched, "Claude"), 3);
+        let shown: Vec<(&str, Option<Touch>, usize)> = set
             .files
             .iter()
-            .map(|file| (file.path.as_str(), file.touched))
+            .map(|file| (file.path.as_str(), file.touched, file.agents.len()))
             .collect();
         assert_eq!(
             shown,
             vec![
-                ("CDP4JClient/src/A.java", Some(Touch::Edited)),
-                ("CDP4JClient/src/New.java", Some(Touch::Edited)),
-                ("CDP4JClient/texts.properties", Some(Touch::Mentioned)),
+                ("CDP4JClient/src/A.java", Some(Touch::Edited), 1),
+                ("CDP4JClient/src/New.java", Some(Touch::Edited), 1),
+                ("CDP4JClient/texts.properties", Some(Touch::Mentioned), 1),
+                ("Other/B.java", None, 0),
             ]
-        );
-        assert!(only.files[2]
-            .note
-            .as_deref()
-            .unwrap()
-            .contains("shell command"));
-        assert_eq!(
-            only.note.as_deref(),
-            Some("3 of 4 changed files are from this session")
         );
     }
 

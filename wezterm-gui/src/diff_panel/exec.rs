@@ -8,6 +8,9 @@ use std::time::{Duration, Instant};
 
 /// Most a client may print before it is cut off. A diff larger than this is
 /// not something a side panel can usefully show.
+/// Paths per client run: a long list is split so a command line stays well
+/// inside Windows' 32K limit.
+pub const PATHS_PER_RUN: usize = 200;
 pub const MAX_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 /// Longest a client may run. Generous: a cold `git status` on a large tree
 /// over a slow disk takes seconds.
@@ -278,6 +281,33 @@ fn collect(mut command: Command) -> std::io::Result<(CommandOutput, Option<i32>)
         },
         code,
     ))
+}
+
+/// Run `run` once with no paths (`paths` empty) or once per chunk of
+/// `paths`, and join what comes back as if it were one run.
+pub fn run_chunked(
+    paths: &[String],
+    mut run: impl FnMut(&[String]) -> std::io::Result<CommandOutput>,
+) -> std::io::Result<CommandOutput> {
+    if paths.is_empty() {
+        return run(&[]);
+    }
+    let mut joined: Option<CommandOutput> = None;
+    for chunk in paths.chunks(PATHS_PER_RUN) {
+        let out = run(chunk)?;
+        joined = Some(match joined {
+            None => out,
+            Some(mut acc) => {
+                acc.stdout.push_str(&out.stdout);
+                acc.stderr.push_str(&out.stderr);
+                acc.success &= out.success;
+                acc.truncated |= out.truncated;
+                acc.timed_out |= out.timed_out;
+                acc
+            }
+        });
+    }
+    Ok(joined.unwrap_or_default())
 }
 
 #[cfg(test)]

@@ -1,6 +1,6 @@
 //! Subversion provider: the working copy against its pristine BASE.
 
-use super::exec::Runner;
+use super::exec::{run_chunked, Runner};
 use super::{
     read_text_file, unified, ChangeSet, ChangeSource, FileChange, FileStatus, Limits, Scan,
     MAX_UNTRACKED_FILES,
@@ -51,7 +51,28 @@ fn has_property_changes(output: &str) -> bool {
 }
 
 pub fn scan(root: &Path, runner: &Runner, limits: Limits) -> Scan {
-    let status = match runner.run("svn", &["status"], root) {
+    scan_paths(root, runner, &[], limits)
+}
+
+/// `path` as an svn target: one with an `@` would otherwise be read as a
+/// peg revision, which a trailing `@` turns off.
+fn svn_target(path: &str) -> String {
+    if path.contains('@') {
+        format!("{path}@")
+    } else {
+        path.to_string()
+    }
+}
+
+/// [`scan`] narrowed to `paths` (relative to `root`, `/`-separated); every
+/// change when `paths` is empty.
+pub fn scan_paths(root: &Path, runner: &Runner, paths: &[&str], limits: Limits) -> Scan {
+    let targets: Vec<String> = paths.iter().map(|path| svn_target(path)).collect();
+    let status = match run_chunked(&targets, |chunk| {
+        let mut args = vec!["status"];
+        args.extend(chunk.iter().map(String::as_str));
+        runner.run("svn", &args, root)
+    }) {
         Ok(out) => out,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             return Scan::Unavailable(
@@ -63,7 +84,9 @@ pub fn scan(root: &Path, runner: &Runner, limits: Limits) -> Scan {
     if let Some(reason) = status.timeout_reason("svn") {
         return Scan::Unavailable(reason);
     }
-    if !status.success && !status.truncated {
+    // Named paths: one that is gone and was never versioned fails the run
+    // with a warning, while the others are still reported.
+    if !status.success && !status.truncated && (paths.is_empty() || status.stdout.is_empty()) {
         let reason = status.stderr.lines().next().unwrap_or("svn status failed");
         return Scan::Unavailable(reason.trim().to_string());
     }
@@ -77,7 +100,12 @@ pub fn scan(root: &Path, runner: &Runner, limits: Limits) -> Scan {
         || has_property_changes(&status.stdout);
     // `--internal-diff`: never hand off to a diff tool the user configured.
     let diff = if tracked_changes {
-        match runner.run("svn", &["diff", "--internal-diff"], root) {
+        let diff = run_chunked(&targets, |chunk| {
+            let mut args = vec!["diff", "--internal-diff"];
+            args.extend(chunk.iter().map(String::as_str));
+            runner.run("svn", &args, root)
+        });
+        match diff {
             Ok(out) => out,
             Err(err) => return Scan::Unavailable(format!("Could not run svn: {err}")),
         }

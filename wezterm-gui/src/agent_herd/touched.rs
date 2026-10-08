@@ -46,6 +46,10 @@ pub enum Touch {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TouchedPaths {
     paths: HashMap<String, Touch>,
+    /// Each path as the session first spelled it. The key is folded (case,
+    /// separators) for matching; a vendor's own records, such as Claude's
+    /// file-history backups, are named after the spelling.
+    spelled: HashMap<String, String>,
 }
 
 impl TouchedPaths {
@@ -54,8 +58,27 @@ impl TouchedPaths {
         if key.is_empty() {
             return;
         }
+        // An edit tool's spelling is the one its backups are named after,
+        // so it replaces a spelling seen first in a shell command.
+        let edited_first_time = touch == Touch::Edited
+            && self
+                .paths
+                .get(&key)
+                .map_or(true, |seen| *seen < Touch::Edited);
+        if edited_first_time || !self.spelled.contains_key(&key) {
+            self.spelled.insert(key.clone(), path.trim().to_string());
+        }
         let entry = self.paths.entry(key).or_insert(touch);
         *entry = (*entry).max(touch);
+    }
+
+    /// Every touched path: `(key, spelling, touch)`.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str, Touch)> {
+        let spellings = &self.spelled;
+        self.paths.iter().map(move |(key, touch)| {
+            let spelled = spellings.get(key).map_or(key.as_str(), String::as_str);
+            (key.as_str(), spelled, *touch)
+        })
     }
 
     /// How `path` (absolute, in the session's own filesystem view) was
