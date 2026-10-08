@@ -152,6 +152,11 @@ pub struct FileBrowserConfig {
     #[dynamic(default)]
     pub editor_command: Option<Vec<String>>,
 
+    /// `editor_command` opens a window of its own (VS Code, Notepad++):
+    /// launch it directly instead of in a split that would only wait for it.
+    #[dynamic(default)]
+    pub editor_is_gui: bool,
+
     /// Command used to list selectable files.
     #[dynamic(default = "default_file_browser_list_command")]
     pub list_command: Vec<String>,
@@ -179,6 +184,7 @@ impl Default for FileBrowserConfig {
     fn default() -> Self {
         Self {
             editor_command: None,
+            editor_is_gui: false,
             list_command: default_file_browser_list_command(),
             split_size_percent: default_file_browser_split_size_percent(),
             reuse_editor_pane: true,

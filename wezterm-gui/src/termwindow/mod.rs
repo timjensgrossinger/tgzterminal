@@ -240,6 +240,8 @@ fn file_browser_wsl_env_argv(
     for key in [
         "TGZTERMINAL_TARGET_PANE",
         "TGZTERMINAL_EDITOR_COMMAND",
+        "TGZTERMINAL_EDITOR_IS_GUI",
+        "TGZTERMINAL_TARGET_IS_AGENT",
         "TGZTERMINAL_REMOTE_DEST",
         "TGZTERMINAL_REMOTE_CWD",
         "TGZTERMINAL_REMOTE_PORT",
@@ -4652,6 +4654,12 @@ send_folder() {
   selection="$1"
   [ -n "$target_pane" ] || return 0
   path_is_dir "$selection" || return 0
+  if [ -n "${TGZTERMINAL_TARGET_IS_AGENT:-}" ] && ! is_remote; then
+    # An agent would take the `cd` as a prompt: give the folder a shell of
+    # its own beside it instead.
+    "$wezterm_bin" cli split-pane --pane-id "$target_pane" --right --percent 50 --cwd "$selection" >/dev/null 2>&1 || true
+    return 0
+  fi
   quoted=$(quote_path "$selection")
   printf '\025cd -- %s\nclear\n' "$quoted" \
     | "$wezterm_bin" cli send-text --pane-id "$target_pane" --no-paste >/dev/null 2>&1 || return 0
@@ -4696,6 +4704,18 @@ open_file() {
   else
     dir=$(dirname "$selection")
     cmdline=$(local_editor_invocation "$quoted" "$selection")
+    # A GUI opener (configured via `editor_is_gui`, or the explorer.exe /
+    # `start` fallback) hands the file to a window of its own and exits at
+    # once (explorer.exe even with status 1 on success), so a split pane would
+    # only flash "Failed to launch editor" and close again.
+    gui=${TGZTERMINAL_EDITOR_IS_GUI:-}
+    case "$cmdline" in
+      explorer.exe*|'cmd.exe /c start'*) gui=1 ;;
+    esac
+    if [ -n "$gui" ]; then
+      (cd "$dir" && sh -c "$cmdline") >/dev/null 2>&1 &
+      return 0
+    fi
     "$wezterm_bin" cli split-pane --pane-id "$target_pane" --right --percent 50 --cwd "$dir" -- \
       sh -lc "printf '\033]0;Editor\007'; $cmdline || { printf '\\nFailed to launch editor\\n'; sleep 4; }" >/dev/null 2>&1 || return 0
   fi
@@ -4978,6 +4998,21 @@ done
         {
             set_environment_variables
                 .insert("TGZTERMINAL_EDITOR_COMMAND".to_string(), editor_command);
+        }
+        if self.config.file_browser.editor_is_gui {
+            set_environment_variables
+                .insert("TGZTERMINAL_EDITOR_IS_GUI".to_string(), "1".to_string());
+        }
+        // A folder pick types `cd` into the target pane, which is only right
+        // for a shell; an agent there would get it as a prompt.
+        let target_is_agent = self.agent_herd_state.try_borrow().is_ok_and(|herd| {
+            herd.agents
+                .iter()
+                .any(|agent| agent.pane_id == Some(target_pane.pane_id()))
+        });
+        if target_is_agent {
+            set_environment_variables
+                .insert("TGZTERMINAL_TARGET_IS_AGENT".to_string(), "1".to_string());
         }
         if let Some(remote) = remote_context.as_ref() {
             set_environment_variables.insert(
