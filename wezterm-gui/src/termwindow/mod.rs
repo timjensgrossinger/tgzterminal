@@ -3786,6 +3786,11 @@ impl TermWindow {
     }
 
     fn file_browser_cwd(&self, pane: &Arc<dyn Pane>) -> Option<PathBuf> {
+        // A WSL agent pane reports no directory of its own, only the
+        // `wsl.exe` host's Windows home; its session file knows where it runs.
+        if let Some(cwd) = self.wsl_pane_session_cwd(pane) {
+            return Some(cwd);
+        }
         pane.get_current_working_dir(CachePolicy::AllowStale)
             .and_then(|url| url.to_file_path().ok())
     }
