@@ -787,13 +787,54 @@ fn claude_head_scan(path: &Path, stop_at_headless: bool) -> ClaudeHead {
         }
     }
 
+    // A `/rename` and every later `ai-title` are appended as the session goes
+    // on, usually far past the head; the tail holds the name Claude Code's own
+    // `/resume` shows. Headless sessions are dropped anyway, so skip the read.
+    let tail_title = (!headless).then(|| claude_tail_title(path)).flatten();
+
     ClaudeHead {
         cwds,
         git_branch,
-        label: title.or(prompt),
+        label: tail_title.or(title).or(prompt),
         headless,
         parsed,
     }
+}
+
+/// Tail records searched for the session's current name. Claude Code repeats
+/// its `custom-title` and `ai-title` records on every turn, so the last few
+/// dozen lines hold them.
+const CLAUDE_TAIL_TITLE_LINES: usize = 50;
+
+/// The current name of a Claude session, read from the end of its transcript:
+/// the user's own `/rename` (`custom-title`) wins, else the latest `ai-title`.
+fn claude_tail_title(path: &Path) -> Option<String> {
+    let mut latest_ai_title = None;
+    for line in transcript::tail_lines(path, CLAUDE_TAIL_TITLE_LINES)
+        .iter()
+        .rev()
+    {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let (key, is_custom) = match value.get("type").and_then(|value| value.as_str()) {
+            Some("custom-title") => ("customTitle", true),
+            Some("ai-title") if latest_ai_title.is_none() => ("aiTitle", false),
+            _ => continue,
+        };
+        let text = value
+            .get(key)
+            .and_then(|value| value.as_str())
+            .map(|text| transcript::trim_to_words(text, 10))
+            .filter(|text| !text.is_empty());
+        if is_custom && text.is_some() {
+            return text;
+        }
+        if !is_custom {
+            latest_ai_title = text;
+        }
+    }
+    latest_ai_title
 }
 
 /// Flatten a Claude `message.content` into plain text.
@@ -1582,6 +1623,43 @@ mod tests {
         assert_eq!(sessions[0].label, "Add resume menu to sidebar");
         assert_eq!(sessions[0].cwd, PathBuf::from("/repo"));
         assert_eq!(sessions[0].project, "repo");
+    }
+
+    #[test]
+    fn a_rename_past_the_head_wins_over_the_first_ai_title() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut lines = vec![
+            user_line("/repo", "main", "please do the thing with the stuff"),
+            title_line("Schreib ok"),
+        ];
+        lines.extend((0..400).map(|i| user_line("/repo", "main", &format!("turn {i}"))));
+        lines.push(
+            serde_json::json!({ "type": "custom-title", "customTitle": "auto-time" }).to_string(),
+        );
+        lines.push(title_line("Schreib ok"));
+        claude_session(dir.path(), "-repo", "aaaa-4444", &lines, 1_000);
+
+        let sessions = collect_recent_sessions(dir.path(), 10);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].label, "auto-time");
+        let path = dir.path().join(".claude/projects/-repo/aaaa-4444.jsonl");
+        assert_eq!(claude_transcript_label(&path).as_deref(), Some("auto-time"));
+    }
+
+    #[test]
+    fn the_latest_ai_title_wins_over_the_first_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut lines = vec![
+            user_line("/repo", "main", "please do the thing with the stuff"),
+            title_line("First guess"),
+        ];
+        lines.extend((0..400).map(|i| user_line("/repo", "main", &format!("turn {i}"))));
+        lines.push(title_line("Where the session ended up"));
+        claude_session(dir.path(), "-repo", "aaaa-3333", &lines, 1_000);
+
+        let sessions = collect_recent_sessions(dir.path(), 10);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].label, "Where the session ended up");
     }
 
     #[test]
