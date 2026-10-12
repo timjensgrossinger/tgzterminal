@@ -392,8 +392,9 @@ outside that window, the copied text starts with
 `[… earlier scrollback not included …]`. If transcript cleanup ends up with
 nothing, the raw pane text (or, failing that, the agent details) is copied
 instead and the notification says which one it used. Copied text may include
-terminal output or secrets printed in that range; [Secret
-Masking](#secret-masking) (on by default) redacts the ones it recognises.
+terminal output or secrets printed in that range; the copy menu's
+"(no secrets)" rows redact the ones [Secret Masking](#secret-masking)
+recognises.
 
 `enable_control_actions` is `false` by default. Resume, Attach and log-opening
 controls require **both** an explicit opt-in — `agent_ui.enable_control_actions
@@ -1152,8 +1153,10 @@ described above. When older rows exist but fall outside that window, the copied
 text starts with `[… earlier scrollback not included …]`.
 
 As with any copy action, **copied text may include terminal output or secrets
-printed in that range.** With [Secret Masking](#secret-masking) on (the default), secrets
-it recognises are replaced by `[REDACTED]` and the notification says how many.
+printed in that range.** The copy menu's "(no secrets)" rows replace the secrets
+[Secret Masking](#secret-masking) recognises with `[REDACTED]` and the
+notification says how many; `secret_masking.redact_copy_actions = true` makes
+every copy action do that.
 
 ### Keybindings
 
@@ -1209,7 +1212,8 @@ the whole table.
 ## Secret Masking
 
 Hides token-shaped strings — API keys, access tokens, passwords in URLs — in
-terminal panes and in the pane Copy actions. On by default; to turn it off:
+terminal panes, and strips them from the copy menu's "(no secrets)" rows. On by
+default; to turn it off:
 
 ```lua
 config.secret_masking = { enabled = false }
@@ -1221,7 +1225,7 @@ All keys:
 config.secret_masking = {
   enabled = true,
   mask_on_screen = true,
-  redact_copy_actions = true,
+  redact_copy_actions = false,
   reveal_on_hover = true,
   builtin_patterns = true,
   patterns = {},
@@ -1232,7 +1236,7 @@ config.secret_masking = {
 |---|---|---|
 | `enabled` | `true` | Master switch. `ToggleSecretMasking` overrides it for one window until that window closes. |
 | `mask_on_screen` | `true` | Paint recognised secrets as `•`. Only the painting changes: the pane's real text is untouched, so selection, search and a plain copy still see it. |
-| `redact_copy_actions` | `true` | Replace recognised secrets with `[REDACTED]` in the pane Copy actions (the agent copy menu, `CopyLastCommandOutput`, `CopyLastCommandWithOutput`, `CopyPaneScrollback`). The notification reports how many were redacted. |
+| `redact_copy_actions` | `false` | Also replace recognised secrets with `[REDACTED]` in the plain pane Copy actions (the agent copy menu, `CopyLastCommandOutput`, `CopyLastCommandWithOutput`, `CopyPaneScrollback`). The notification reports how many were redacted. |
 | `reveal_on_hover` | `true` | Show a masked secret while the pointer is over it. A secret wrapped across rows is revealed as a whole. Set to `false` when screen sharing. |
 | `builtin_patterns` | `true` | Use the built-in rules listed below. |
 | `patterns` | `{}` | Extra regular expressions ([Rust `regex` syntax](https://docs.rs/regex/latest/regex/#syntax)). If a pattern has a capture group, group 1 is the part that is hidden; otherwise the whole match is. A pattern that does not compile is logged and skipped. |
@@ -1292,8 +1296,9 @@ recognised secret with `[REDACTED]`. The notification says how many were
 redacted, or `no secrets found`. They use the same rules as everything else
 here (`builtin_patterns` and `patterns`).
 
-With `enabled = true` and `redact_copy_actions = true` every row in the menu
-already redacts, so these two are hidden.
+They are shown by default. Only with `enabled = true` and
+`redact_copy_actions = true` does every row in the menu already redact, and
+then these two are hidden.
 
 ### What a plain copy does
 

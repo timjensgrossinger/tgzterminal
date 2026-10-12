@@ -227,9 +227,11 @@ pub struct SecretMaskingConfig {
     /// Paint matched secrets as bullets in terminal panes.
     #[dynamic(default = "default_true")]
     pub mask_on_screen: bool,
-    /// Redact matched secrets in the pane Copy actions (agent and shell copy).
-    /// A plain selection copy is never altered.
-    #[dynamic(default = "default_true")]
+    /// Redact matched secrets in the plain pane Copy actions too (agent and
+    /// shell copy). Off by default: the copy menu offers separate
+    /// "(no secrets)" rows, so a plain row copies what its label says. A plain
+    /// selection copy is never altered.
+    #[dynamic(default)]
     pub redact_copy_actions: bool,
     /// Show a masked secret while the pointer is over it.
     #[dynamic(default = "default_true")]
@@ -248,7 +250,7 @@ impl Default for SecretMaskingConfig {
         Self {
             enabled: true,
             mask_on_screen: true,
-            redact_copy_actions: true,
+            redact_copy_actions: false,
             reveal_on_hover: true,
             builtin_patterns: true,
             patterns: vec![],
@@ -3894,14 +3896,15 @@ mod agent_ui_tests {
     }
 
     /// Masking is on out of the box: a token on screen is the leak it exists
-    /// to prevent. `enabled = false` opts out.
+    /// to prevent. `enabled = false` opts out. The plain Copy actions stay
+    /// unredacted so the copy menu can offer its "(no secrets)" rows.
     #[test]
     fn secret_masking_defaults_to_on() {
         let config = Config::default_config();
 
         assert!(config.secret_masking.enabled);
         assert!(config.secret_masking.mask_on_screen);
-        assert!(config.secret_masking.redact_copy_actions);
+        assert!(!config.secret_masking.redact_copy_actions);
         assert!(config.secret_masking.reveal_on_hover);
         assert!(config.secret_masking.builtin_patterns);
         assert!(config.secret_masking.patterns.is_empty());

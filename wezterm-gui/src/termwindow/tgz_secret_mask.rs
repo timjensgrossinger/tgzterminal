@@ -506,7 +506,7 @@ impl TermWindow {
     /// Whether the pane Copy actions redact on their own, which makes the
     /// copy menu's "(no secrets)" rows redundant.
     pub(crate) fn copy_actions_redact(&self) -> bool {
-        self.secret_masking_enabled() && self.config.secret_masking.redact_copy_actions
+        copy_actions_redact(&self.config.secret_masking, self.secret_masking_enabled())
     }
 
     /// Redact `text` regardless of `secret_masking.enabled`: the caller was
@@ -548,10 +548,59 @@ impl TermWindow {
     }
 }
 
+/// Whether the plain pane Copy actions redact on their own. `enabled` is
+/// `secret_masking.enabled` after the window's `ToggleSecretMasking` override.
+pub(crate) fn copy_actions_redact(config: &SecretMaskingConfig, enabled: bool) -> bool {
+    enabled && config.redact_copy_actions
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::termwindow::render::sidebar::{
+        pane_copy_menu_items_with_redacted, PaneToolbeltKind,
+    };
+    use crate::termwindow::shell_copy::ShellCopyAction;
+    use crate::termwindow::PaneCopyAction;
     use termwiz::cell::CellAttributes;
+
+    /// Out of the box masking is on but the plain Copy rows copy what the
+    /// pane holds, so the menu must offer the "(no secrets)" rows. They went
+    /// missing once already, when masking became the default.
+    #[test]
+    fn default_copy_menu_offers_no_secrets_rows() {
+        let config = SecretMaskingConfig::default();
+        assert!(config.enabled);
+        let redact = copy_actions_redact(&config, config.enabled);
+        assert!(!redact);
+
+        let rows = pane_copy_menu_items_with_redacted(&PaneToolbeltKind::Shell, redact);
+        let labels: Vec<_> = rows.iter().map(|(label, _)| *label).collect();
+        assert_eq!(
+            labels,
+            [
+                "Copy last output",
+                "Copy last command and output",
+                "Copy pane",
+                "Copy pane (no secrets)",
+                "Copy last output (no secrets)",
+            ]
+        );
+        assert!(rows.iter().any(
+            |(_, action)| *action == PaneCopyAction::ShellRedacted(ShellCopyAction::WholePane)
+        ));
+    }
+
+    /// The plain rows redact only when the user opts in and masking is on;
+    /// a window toggled off never redacts them.
+    #[test]
+    fn copy_actions_redact_needs_opt_in_and_masking_on() {
+        let mut config = SecretMaskingConfig::default();
+        assert!(!copy_actions_redact(&config, true));
+        config.redact_copy_actions = true;
+        assert!(copy_actions_redact(&config, true));
+        assert!(!copy_actions_redact(&config, false));
+    }
 
     fn rules() -> SecretRules {
         SecretRules::compile(&SecretMaskingConfig::default())
