@@ -202,7 +202,7 @@ impl super::TermWindow {
             let padding_top = config.window_padding.top.evaluate_as_pixels(v_context) as usize;
             let padding_bottom =
                 config.window_padding.bottom.evaluate_as_pixels(v_context) as usize;
-            let padding_right = effective_right_padding(&config, h_context);
+            let padding_right = self.right_padding(&config, h_context);
 
             let pixel_height = (rows * self.render_metrics.cell_size.height as usize)
                 + (padding_top + padding_bottom)
@@ -250,7 +250,7 @@ impl super::TermWindow {
             let padding_top = config.window_padding.top.evaluate_as_pixels(v_context) as usize;
             let padding_bottom =
                 config.window_padding.bottom.evaluate_as_pixels(v_context) as usize;
-            let padding_right = effective_right_padding(&config, h_context);
+            let padding_right = self.right_padding(&config, h_context);
 
             let avail_width = dimensions.pixel_width.saturating_sub(
                 (padding_left + padding_right) as usize
@@ -528,7 +528,7 @@ impl super::TermWindow {
         let dimensions = Dimensions {
             pixel_width: ((terminal_size.cols as usize * render_metrics.cell_size.width as usize)
                 + padding_left
-                + effective_right_padding(&config, h_context)
+                + self.right_padding(&config, h_context)
                 + sidebar_width),
             pixel_height: ((terminal_size.rows as usize * render_metrics.cell_size.height as usize)
                 + padding_top
@@ -562,7 +562,7 @@ impl super::TermWindow {
     }
 
     pub fn effective_right_padding(&self, config: &ConfigHandle) -> usize {
-        effective_right_padding(
+        self.right_padding(
             config,
             DimensionContext {
                 pixel_cell: self.render_metrics.cell_size.width as f32,
@@ -571,6 +571,30 @@ impl super::TermWindow {
             },
         )
     }
+
+    /// [`effective_right_padding`], narrowed while the Changes panel takes
+    /// columns on the right.
+    pub fn right_padding(&self, config: &ConfigHandle, context: DimensionContext) -> usize {
+        let padding = effective_right_padding(config, context);
+        if self.diff_panel_right_reserved() == 0 {
+            return padding;
+        }
+        padding_beside_diff_panel(
+            padding,
+            config.window_padding.right.evaluate_as_pixels(context) as usize,
+            self.render_metrics.cell_size.width as usize,
+        )
+    }
+}
+
+/// Right padding when the Changes panel sits beside the terminal on the right.
+///
+/// The scroll bar's gutter is sized for the window edge; beside the panel the
+/// same width reads as a gap between the text and the panel. Keep about two
+/// cells, still room for the scroll bar pill, never wider than the gutter and
+/// never narrower than the user's own padding.
+pub fn padding_beside_diff_panel(padding: usize, configured: usize, cell_width: usize) -> usize {
+    padding.min(configured.max(2 * cell_width))
 }
 
 /// Computes the effective padding for the RHS.
@@ -584,5 +608,24 @@ pub fn effective_right_padding(config: &ConfigHandle, context: DimensionContext)
         configured.max(scaled)
     } else {
         configured
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn panel_gutter_shrinks_to_two_cells() {
+        // A 70px scroll bar gutter beside the panel becomes two 19px cells.
+        assert_eq!(padding_beside_diff_panel(70, 12, 19), 38);
+    }
+
+    #[test]
+    fn panel_gutter_never_grows_or_drops_below_configured_padding() {
+        // Scroll bar off: the user's 12px is all there is, keep it.
+        assert_eq!(padding_beside_diff_panel(12, 12, 19), 12);
+        // A configured padding wider than two cells wins.
+        assert_eq!(padding_beside_diff_panel(90, 50, 19), 50);
     }
 }

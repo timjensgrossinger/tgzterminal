@@ -1447,7 +1447,7 @@ config.diff_panel = {
   enabled = true,
   position = "Right",      -- or "Left"
   default_mode = "Session", -- or "All"
-  raised_mode = "Auto",    -- or "Float", "Reserve"
+  raised_mode = "Float",   -- or "Auto", "Reserve"
   width_px = 840,
   snap_px = 56,
   refresh_ms = 2000,
@@ -1487,7 +1487,7 @@ config.keys = {
 | `enabled` | `true` | Offer the panel at all. `false` removes the toolbelt button and makes `ToggleDiffPanel` do nothing. |
 | `position` | `"Right"` | Which side of the terminal area the panel docks to. With the sidebar on the same side, the panel sits inside it. |
 | `default_mode` | `"Session"` | The mode a newly opened panel starts in: `"Session"` or `"All"`. |
-| `raised_mode` | `"Auto"` | What a panel shorter than the pane does to the terminal; see below. |
+| `raised_mode` | `"Float"` | What a panel shorter than the pane does to the terminal; see below. |
 | `width_px` | `840` | Initial width, calibrated for a 2x display like `sidebar_width_px`. A drag overrides it. |
 | `snap_px` | `56` | How close (at 2x) the dragged bottom edge must come to the bottom, or to the docked input strip, to snap onto it. |
 | `refresh_ms` | `2000` | How often the visible panel re-reads the directory when nothing tells it to. A tree that is slow to diff is re-read less often than this. A written file does not wait for it: the working copy is watched, and a change is re-read within about a third of a second. Where watching is not possible (a network share, a WSL distro's own filesystem seen from Windows) this poll is the only trigger. |
@@ -1541,12 +1541,12 @@ A panel snapped to the bottom always takes its columns from the terminal, so
 the pane's text reflows beside it like a split. A *raised* panel follows
 `raised_mode`:
 
-- `"Auto"` (default): by size. A panel up to 40% of the height floats; a
-  taller one takes its columns, so the text moves beside it.
-- `"Float"`: the terminal keeps its full width and the panel floats over its
-  top corner. An agent's own prompt at the bottom spans the window while the
-  panel is raised and narrows when the panel is snapped to the bottom; the
-  output behind a raised panel is covered.
+- `"Float"` (default): the terminal keeps its full width and the panel floats
+  over its top corner. An agent's own prompt at the bottom spans the window
+  while the panel is raised and narrows when the panel is snapped to the
+  bottom; the output behind a raised panel is covered.
+- `"Auto"`: by size. A panel up to 40% of the height floats; a taller one
+  takes its columns, so the text moves beside it.
 - `"Reserve"`: the panel keeps its columns, so nothing is covered.
   The space under it stays empty, except that a docked input strip widens to
   span the terminal and the panel.

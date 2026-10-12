@@ -286,7 +286,7 @@ pub enum DiffPanelRaisedMode {
 
 impl Default for DiffPanelRaisedMode {
     fn default() -> Self {
-        Self::Auto
+        Self::Float
     }
 }
 
@@ -4647,12 +4647,12 @@ mod agent_ui_tests {
     }
 
     #[test]
-    fn diff_panel_defaults_to_a_size_driven_panel_on_the_right() {
+    fn diff_panel_defaults_to_a_floating_panel_on_the_right() {
         let config = Config::default_config();
 
         assert!(config.diff_panel.enabled);
         assert_eq!(config.diff_panel.position, DiffPanelPosition::Right);
-        assert_eq!(config.diff_panel.raised_mode, DiffPanelRaisedMode::Auto);
+        assert_eq!(config.diff_panel.raised_mode, DiffPanelRaisedMode::Float);
         assert_eq!(config.diff_panel.width_px, 840);
         assert_eq!(config.diff_panel.nested_max_depth, 3);
         assert_eq!(config.diff_panel.nested_max_roots, 64);

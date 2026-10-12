@@ -7,7 +7,6 @@ use crate::quad::{
 };
 use crate::shapecache::*;
 use crate::termwindow::render::paint::AllowImage;
-use crate::termwindow::resize::effective_right_padding;
 use crate::termwindow::{BorrowedShapeCacheKey, RenderState, ShapedInfo, TermWindowNotif};
 use crate::utilsprites::RenderMetrics;
 use ::window::bitmaps::{TextureCoord, TextureRect, TextureSize};
@@ -416,7 +415,7 @@ impl crate::TermWindow {
             - self.sidebar_reserved_width() as f32
             - self.diff_panel_reserved_width() as f32
             - if self.show_scroll_bar {
-                effective_right_padding(&self.config, h_context) as f32
+                self.right_padding(&self.config, h_context) as f32
             } else {
                 padding_right.evaluate_as_pixels(h_context)
             };
