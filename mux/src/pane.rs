@@ -340,6 +340,12 @@ pub trait Pane: Downcast + Send + Sync {
     /// handling of clicks.
     fn is_mouse_grabbed(&self) -> bool;
     fn is_alt_screen_active(&self) -> bool;
+    /// Whether the pane is on the alternate screen with nobody left to switch
+    /// it back: the program that switched died and the pane's own shell is in
+    /// front again. Only a local pane can tell; everything else says `false`.
+    fn alt_screen_is_stranded(&self) -> bool {
+        false
+    }
 
     fn set_clipboard(&self, _clipboard: &Arc<dyn Clipboard>) {}
     fn set_download_handler(&self, _handler: &Arc<dyn DownloadHandler>) {}

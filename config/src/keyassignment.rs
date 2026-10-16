@@ -646,6 +646,10 @@ pub enum KeyAssignment {
     CharSelect(CharSelectArguments),
 
     ResetTerminal,
+    /// Switch the pane back to the primary screen and drop mouse reporting,
+    /// without the full reset `ResetTerminal` does. For a pane left on the
+    /// alternate screen by a program that died (TGZTerminal).
+    LeaveAlternateScreen,
     OpenUri(String),
     OpenFileBrowser,
     ActivateCommandPalette,

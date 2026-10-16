@@ -128,6 +128,7 @@ pub mod resize;
 mod selection;
 pub mod shell_copy;
 pub mod spawn;
+pub mod tgz_alt_screen;
 pub mod tgz_last_session;
 pub mod tgz_secret_mask;
 pub mod tgz_ssh_hosts;
@@ -5743,6 +5744,9 @@ done
                 pane.perform_actions(vec![termwiz::escape::Action::Esc(
                     termwiz::escape::Esc::Code(termwiz::escape::EscCode::FullReset),
                 )]);
+            }
+            LeaveAlternateScreen => {
+                pane.perform_actions(tgz_alt_screen::leave_alt_screen_actions());
             }
             OpenUri(link) => {
                 wezterm_open_url::open_url(link);

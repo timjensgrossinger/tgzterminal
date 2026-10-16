@@ -2078,6 +2078,18 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             menubar: &["Shell"],
             icon: None,
         },
+        LeaveAlternateScreen => CommandDef {
+            brief: "Leave alternate screen (fix wheel scrolling shell history)".into(),
+            doc: "Switches the current pane back to the primary screen and turns \
+                  off mouse reporting, keeping the screen and scrollback. Use it \
+                  when a program that died left the pane on the alternate screen: \
+                  the scrollbar is gone and the wheel steps through shell history."
+                .into(),
+            keys: vec![],
+            args: &[ArgType::ActivePane],
+            menubar: &["Shell"],
+            icon: None,
+        },
         ActivateCommandPalette => CommandDef {
             brief: "Activate Command Palette".into(),
             doc: "Shows the command palette modal".into(),
@@ -2175,6 +2187,7 @@ fn compute_default_actions() -> Vec<KeyAssignment> {
         DetachDomain(SpawnTabDomain::CurrentPaneDomain),
         ShowSshHostMenu,
         ResetTerminal,
+        LeaveAlternateScreen,
         // ----------------- Edit
         #[cfg(not(target_os = "macos"))]
         PasteFrom(ClipboardPasteSource::PrimarySelection),

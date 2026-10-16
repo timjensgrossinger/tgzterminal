@@ -78,5 +78,16 @@ local config = {}
 -- config.file_browser.wsl_distro = 'Ubuntu'
 
 -- ---------------------------------------------------------------------------
+-- Scrolling
+-- ---------------------------------------------------------------------------
+
+-- When a full-screen program dies without leaving the alternate screen, the
+-- wheel steps through shell history and the scrollbar disappears. With this
+-- on, the first wheel tick over such a pane (its own shell back in front)
+-- switches it back. Panes behind ssh/et/mosh are left alone; use the command
+-- palette's "Leave alternate screen" there.
+-- config.heal_stranded_alt_screen = true
+
+-- ---------------------------------------------------------------------------
 
 return config

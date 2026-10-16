@@ -2495,6 +2495,15 @@ pub struct Config {
     #[dynamic(default = "default_alternate_buffer_wheel_scroll_speed")]
     pub alternate_buffer_wheel_scroll_speed: u8,
 
+    /// TGZTerminal: when a wheel event lands on a pane that is on the
+    /// alternate screen while the pane's own shell is in front (the full-screen
+    /// program that switched died without switching back), return the pane to
+    /// the primary screen first, so the wheel scrolls output instead of
+    /// stepping through shell history. Panes behind ssh/et/mosh are never
+    /// touched; `LeaveAlternateScreen` is the manual fix there.
+    #[dynamic(default = "default_true")]
+    pub heal_stranded_alt_screen: bool,
+
     #[dynamic(default = "default_status_update_interval")]
     pub status_update_interval: u64,
 

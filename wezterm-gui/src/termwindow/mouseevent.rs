@@ -2496,6 +2496,24 @@ impl super::TermWindow {
                 self.current_event = Some(event_trigger_type.to_dynamic());
                 let mut modifiers = event.modifiers;
 
+                // A program that died on the alternate screen leaves the shell
+                // prompt there, and the wheel walks shell history instead of
+                // scrolling. Switch back first so everything below -- mouse
+                // reporting, the alt-screen binding filter -- sees the primary
+                // screen and the wheel scrolls the scrollback.
+                if matches!(event.kind, WMEK::VertWheel(_) | WMEK::HorzWheel(_))
+                    && self.config.heal_stranded_alt_screen
+                    && pane.alt_screen_is_stranded()
+                {
+                    log::info!(
+                        "pane {}: shell in front on the alternate screen; leaving it",
+                        pane.pane_id()
+                    );
+                    pane.perform_actions(
+                        crate::termwindow::tgz_alt_screen::leave_alt_screen_actions(),
+                    );
+                }
+
                 // Since we use shift to force assessing the mouse bindings, pretend
                 // that shift is not one of the mods when the mouse is grabbed.
                 let mut mouse_reporting = pane.is_mouse_grabbed();

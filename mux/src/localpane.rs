@@ -501,7 +501,23 @@ impl Pane for LocalPane {
     }
 
     fn perform_actions(&self, actions: Vec<termwiz::escape::Action>) {
-        self.terminal.lock().perform_actions(actions)
+        let (was_alt, is_alt) = {
+            let mut terminal = self.terminal.lock();
+            let was_alt = terminal.is_alt_screen_active();
+            terminal.perform_actions(actions);
+            (was_alt, terminal.is_alt_screen_active())
+        };
+        // A pane left on the alternate screen walks shell history on the wheel
+        // and loses its scrollbar. Logging every switch says which pane got the
+        // switch and from whom, when several panes end up there at once.
+        if was_alt != is_alt {
+            log::info!(
+                "pane {}: alt screen {}; foreground {:?}",
+                self.pane_id,
+                if is_alt { "entered" } else { "left" },
+                self.get_foreground_process_name(CachePolicy::AllowStale)
+            );
+        }
     }
 
     fn mouse_event(&self, event: MouseEvent) -> Result<(), Error> {
@@ -567,7 +583,7 @@ impl Pane for LocalPane {
             let spawn_title = self.spawn_title.lock().clone();
             let spawned_is_foreground =
                 matches!(spawn_title, Some((_, SpawnTitlePolicy::WhileForeground)))
-                    && self.spawned_process_is_foreground();
+                    && self.spawned_process_is_foreground(CachePolicy::AllowStale);
             let proc_name = self.get_foreground_process_name(CachePolicy::AllowStale);
             if let Some(name) = default_pane_title(
                 proc_name.as_deref(),
@@ -630,6 +646,15 @@ impl Pane for LocalPane {
         } else {
             self.terminal.lock().is_alt_screen_active()
         }
+    }
+
+    fn alt_screen_is_stranded(&self) -> bool {
+        // A live full-screen program is the tty's foreground leader for as long
+        // as it holds the alternate screen, so the pane's own shell back in
+        // front of it means that program died without switching back.
+        // FetchImmediate: a stale "shell in front" read just after `vim`
+        // started must never throw vim off its own screen.
+        self.is_alt_screen_active() && self.spawned_shell_is_foreground(CachePolicy::FetchImmediate)
     }
 
     fn get_current_working_dir(&self, policy: CachePolicy) -> Option<Url> {
@@ -1253,7 +1278,7 @@ impl LocalPane {
     /// unix the terminal's foreground process group is the child's own, on
     /// Windows the inferred foreground process is the child itself. Cached
     /// reads only, because `get_title` runs for every tab on every frame.
-    fn spawned_process_is_foreground(&self) -> bool {
+    fn spawned_process_is_foreground(&self, policy: CachePolicy) -> bool {
         let child = match &*self.process.lock() {
             ProcessState::Running { pid: Some(pid), .. } => *pid,
             _ => return false,
@@ -1261,19 +1286,60 @@ impl LocalPane {
 
         #[cfg(unix)]
         {
-            return self.get_leader(CachePolicy::AllowStale).pid == child;
+            return self.get_leader(policy).pid == child;
         }
 
         #[cfg(windows)]
         {
             return self
-                .divine_foreground_process(CachePolicy::AllowStale)
+                .divine_foreground_process(policy)
                 .is_some_and(|fg| fg.pid == child);
         }
 
         #[allow(unreachable_code)]
         false
     }
+
+    /// Whether the process this pane spawned is a shell and is in the
+    /// foreground: whatever ran on top of it has exited.
+    fn spawned_shell_is_foreground(&self, policy: CachePolicy) -> bool {
+        self.spawned_process_is_foreground(policy)
+            && self
+                .get_foreground_process_name(policy)
+                .is_some_and(|name| is_shell_program(&name))
+    }
+}
+
+/// Whether `program` (a path or a bare name) is an interactive shell.
+///
+/// Basename only, case-insensitive, with a login shell's leading `-` and a
+/// Windows `.exe` stripped. Remote clients (`ssh`, `et`, `mosh-client`) are
+/// deliberately not shells: what runs behind them cannot be seen from here.
+fn is_shell_program(program: &str) -> bool {
+    const SHELLS: &[&str] = &[
+        "sh",
+        "bash",
+        "zsh",
+        "fish",
+        "dash",
+        "ksh",
+        "mksh",
+        "tcsh",
+        "csh",
+        "nu",
+        "xonsh",
+        "elvish",
+        "pwsh",
+        "powershell",
+        "cmd",
+    ];
+    let base = program
+        .rsplit(|c| c == '/' || c == '\\')
+        .next()
+        .unwrap_or(program);
+    let base = base.strip_prefix('-').unwrap_or(base).to_ascii_lowercase();
+    let base = base.strip_suffix(".exe").unwrap_or(&base);
+    SHELLS.contains(&base)
 }
 
 impl Drop for LocalPane {
@@ -1422,5 +1488,39 @@ mod tests {
             Some("zsh".to_string())
         );
         assert_eq!(default_pane_title(None, None, false), None);
+    }
+
+    #[test]
+    fn shells_are_recognised_by_basename() {
+        for shell in [
+            "/bin/zsh",
+            "-zsh",
+            "bash",
+            "/opt/homebrew/bin/fish",
+            "pwsh.exe",
+            r"C:\Windows\System32\cmd.exe",
+            "/bin/BASH",
+        ] {
+            assert!(is_shell_program(shell), "{shell} is a shell");
+        }
+    }
+
+    #[test]
+    fn programs_that_own_the_alt_screen_are_not_shells() {
+        // A remote client hides what runs behind it, so it must never count as
+        // the shell having come back.
+        for program in [
+            "vim",
+            "/usr/bin/less",
+            "claude",
+            "ssh",
+            "et",
+            "mosh-client",
+            "zshdb",
+            "tmux",
+            "",
+        ] {
+            assert!(!is_shell_program(program), "{program} is not a shell");
+        }
     }
 }

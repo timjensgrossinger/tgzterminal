@@ -116,6 +116,42 @@ config.scroll_bar_auto_hide = false
 `scroll_bar_auto_hide` hides the terminal scrollbar thumb until it is hovered,
 dragged, or the pane is scrolled back.
 
+### Wheel scrolls shell history, scrollbar gone
+
+That pane is on the **alternate screen**: a full-screen program (vim, less,
+tmux, an upgrade dialog, Claude Code) switched to it and died before switching
+back. The alternate screen has no scrollback, so there is no scrollbar, and the
+wheel is sent as arrow keys — which the shell reads as history. A new tab is
+unaffected because it starts with a fresh terminal state.
+
+```lua
+config.heal_stranded_alt_screen = true -- default
+```
+
+With it on, a wheel event over a pane whose **own shell** is back in front on the
+alternate screen first returns the pane to the primary screen, so the wheel
+scrolls output again and the scrollbar comes back. Behind `ssh`, `et` or `mosh`
+the terminal cannot see what runs on the server — remote vim looks the same as a
+stranded prompt — so those panes are left alone. Fix them with the command
+palette entry **Leave alternate screen** (`LeaveAlternateScreen`), which keeps
+the screen and scrollback, unlike **Reset terminal** (`ResetTerminal`). It has no
+default key; bind one if you hit this often:
+
+```lua
+config.keys = {
+  { key = 'L', mods = 'CMD|SHIFT', action = wezterm.action.LeaveAlternateScreen },
+}
+```
+
+`mosh` always runs on the alternate screen (mosh-client draws the whole screen
+itself), so in a mosh tab the wheel stepping through history and the missing
+scrollbar are normal in every terminal; leaving the alternate screen there would
+only scramble mosh's output.
+
+Every switch onto or off the alternate screen is logged at `info` with the pane
+id and its foreground process (`pane 7: alt screen entered; foreground
+Some("/usr/bin/ssh")`), so the log says which pane was switched and by what.
+
 ## File Browser
 
 ```lua
