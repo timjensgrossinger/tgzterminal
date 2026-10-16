@@ -2,7 +2,9 @@ use crate::agent_herd::claude::session_is_live;
 use crate::agent_herd::vendor::{
     AgentVendor, SessionOrigin, SessionRoot, SessionSource, VendorSession,
 };
-use crate::agent_herd::{HerdActivity, HerdContent, HerdEvent, HerdEventKind, HerdStatus};
+use crate::agent_herd::{
+    HerdActivity, HerdContent, HerdEvent, HerdEventKind, HerdStatus, HerdSubagent, TurnState,
+};
 use rusqlite::{Connection, OpenFlags};
 use std::convert::TryFrom;
 use std::path::{Path, PathBuf};
@@ -20,7 +22,7 @@ const OPENCODE_WORKING_WINDOW: Duration = Duration::from_secs(2 * 60);
 /// `tokens_input`, `tokens_output`, `time_created`, `time_updated`,
 /// `time_archived`, `parent_id`) survive the rename verbatim.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OpencodeSchema {
+pub(crate) enum OpencodeSchema {
     /// `session` + `part` (OpenCode 1.x CLI).
     Legacy,
     /// `session_v2` + `session_message` (OpenCode 2.x CLI / desktop app).
@@ -28,14 +30,14 @@ enum OpencodeSchema {
 }
 
 impl OpencodeSchema {
-    fn sessions_table(self) -> &'static str {
+    pub(crate) fn sessions_table(self) -> &'static str {
         match self {
             Self::Legacy => "session",
             Self::V2 => "session_v2",
         }
     }
 
-    fn events_table(self) -> &'static str {
+    pub(crate) fn events_table(self) -> &'static str {
         match self {
             Self::Legacy => "part",
             Self::V2 => "session_message",
@@ -52,7 +54,7 @@ impl OpencodeSchema {
     }
 }
 
-fn detect_opencode_schema(conn: &Connection) -> Option<OpencodeSchema> {
+pub(crate) fn detect_opencode_schema(conn: &Connection) -> Option<OpencodeSchema> {
     let has_v2 = conn
         .query_row(
             "SELECT count(*) FROM sqlite_master \
@@ -85,7 +87,7 @@ fn detect_opencode_schema(conn: &Connection) -> Option<OpencodeSchema> {
 /// are whole messages whose parts sit in an array (observed both as a bare
 /// array and as an object with a `parts` field), so every shape is tolerated
 /// rather than coupled to one build.
-fn part_objects<'a>(data: &'a serde_json::Value) -> Vec<&'a serde_json::Value> {
+pub(crate) fn part_objects<'a>(data: &'a serde_json::Value) -> Vec<&'a serde_json::Value> {
     if let Some(array) = data.as_array() {
         return array.iter().collect();
     }
@@ -102,7 +104,7 @@ fn opencode_config_dir(home: &Path) -> PathBuf {
     home.join(".config").join("opencode")
 }
 
-fn opencode_db(home: &Path) -> PathBuf {
+pub(crate) fn opencode_db(home: &Path) -> PathBuf {
     home.join(".local")
         .join("share")
         .join("opencode")
@@ -334,70 +336,421 @@ fn collect_database_sessions(home: &Path) -> Vec<VendorSession> {
         }
     };
 
-    rows.filter_map(|row| {
-        let (
-            session_id,
-            directory,
-            title,
-            model,
-            cost,
-            input_tokens,
-            output_tokens,
-            created,
-            updated,
-        ) = row.ok()?;
-        if session_id.is_empty() || directory.is_empty() {
-            return None;
+    let mut sessions: Vec<VendorSession> = rows
+        .filter_map(|row| {
+            let (
+                session_id,
+                directory,
+                title,
+                model,
+                cost,
+                input_tokens,
+                output_tokens,
+                created,
+                updated,
+            ) = row.ok()?;
+            if session_id.is_empty() || directory.is_empty() {
+                return None;
+            }
+            let updated_at = epoch_millis(updated)?;
+            let age = now.duration_since(updated_at).ok()?;
+            // Derive status from the most recent part the session actually wrote,
+            // not from the row's `time_updated` (which the UI touches on open):
+            //   - newest part is a tool call  -> the agent is mid-action
+            //   - newest part is text/reasoning/step-finish -> it has stopped
+            // A session with no parts at all is just the start screen: idle.
+            let last_part_type = last_stored_part_type(&conn, &schema, &session_id);
+            let status = match last_part_type.as_deref() {
+                None => HerdStatus::Idle,
+                Some("tool") | Some("reasoning") if age <= OPENCODE_WORKING_WINDOW => {
+                    HerdStatus::Working
+                }
+                _ => HerdStatus::Idle,
+            };
+            let name = title.as_deref().and_then(clean_title);
+            let model = model.and_then(|raw| model_label(&raw));
+            let started_at = epoch_millis(created);
+            let cost = (cost > 0.0).then(|| format!("${cost:.4}"));
+            let activity = opencode_activity(&conn, schema, &session_id);
+            let turn = opencode_turn_state(&conn, schema, &session_id);
+            Some(VendorSession {
+                origin: SessionOrigin::Host,
+                home: None,
+                pane_hint: None,
+                // OpenCode's current database has no process id. Binding falls back
+                // to the unique cwd match, while pane detection still handles live
+                // sessions whose database row is too old.
+                pid: 0,
+                interactive: true,
+                vendor: AgentVendor::OpenCode,
+                // The newest message's own sign-off (see `opencode_turn_state`).
+                turn,
+                session_id,
+                cwd: PathBuf::from(directory),
+                project_root: None,
+                name,
+                model,
+                status,
+                blocked_reason: None,
+                started_at,
+                status_changed_at: Some(updated_at),
+                subagents: Vec::new(),
+                activity,
+                input_tokens: u64_count(input_tokens),
+                output_tokens: u64_count(output_tokens),
+                cost,
+            })
+        })
+        .collect();
+    drop(stmt);
+    attach_child_sessions(&conn, schema, &mut sessions, now);
+    sessions
+}
+
+/// What the newest message of a session says about its turn.
+///
+/// OpenCode stamps an assistant message with `time.completed` when it is done
+/// and with a `finish` reason: `tool-calls` means the model asked for tools
+/// and the turn goes on, anything else (`stop`, `length`, `other`, ...) is
+/// the turn over. An assistant message without `time.completed` is still
+/// streaming; a user message is a prompt just submitted. Verified against the
+/// 1.x `message` table; a v2 row is read the same way when it carries the
+/// same fields, and gives `Unknown` otherwise.
+pub(crate) fn turn_state_from_message(message: &serde_json::Value) -> TurnState {
+    match message.get("role").and_then(|role| role.as_str()) {
+        Some("assistant") => {
+            let completed = message
+                .get("time")
+                .and_then(|time| time.get("completed"))
+                .is_some_and(|completed| completed.is_number());
+            if !completed {
+                return TurnState::Working;
+            }
+            match message.get("finish").and_then(|finish| finish.as_str()) {
+                Some("tool-calls") => TurnState::Working,
+                _ => TurnState::Finished,
+            }
         }
-        let updated_at = epoch_millis(updated)?;
-        let age = now.duration_since(updated_at).ok()?;
-        // Derive status from the most recent part the session actually wrote,
-        // not from the row's `time_updated` (which the UI touches on open):
-        //   - newest part is a tool call  -> the agent is mid-action
-        //   - newest part is text/reasoning/step-finish -> it has stopped
-        // A session with no parts at all is just the start screen: idle.
-        let last_part_type = last_stored_part_type(&conn, &schema, &session_id);
-        let status = match last_part_type.as_deref() {
-            None => HerdStatus::Idle,
-            Some("tool") | Some("reasoning") if age <= OPENCODE_WORKING_WINDOW => {
+        Some("user") => TurnState::Working,
+        _ => TurnState::Unknown,
+    }
+}
+
+/// Whether a part is a `question` tool call still waiting on the human.
+///
+/// `question` is the one tool that cannot finish on its own. Permission asks
+/// are not stored at all; those only reach us through the TUI's OSC 7501
+/// program status.
+fn is_pending_question(part: &serde_json::Value) -> bool {
+    part.get("type").and_then(|kind| kind.as_str()) == Some("tool")
+        && part.get("tool").and_then(|tool| tool.as_str()) == Some("question")
+        && matches!(
+            part.get("state")
+                .and_then(|state| state.get("status"))
+                .and_then(|status| status.as_str()),
+            Some("pending") | Some("running")
+        )
+}
+
+fn newest_rows(conn: &Connection, sql: &str, session_id: &str) -> Vec<serde_json::Value> {
+    let Ok(mut stmt) = conn.prepare(sql) else {
+        return Vec::new();
+    };
+    let Ok(rows) = stmt.query_map([session_id], |row| row.get::<_, String>(0)) else {
+        return Vec::new();
+    };
+    rows.filter_map(Result::ok)
+        .filter_map(|data| serde_json::from_str(&data).ok())
+        .collect()
+}
+
+/// The session's turn, from its own records: a pending question holds it on
+/// the human; otherwise the newest message's sign-off decides.
+fn opencode_turn_state(conn: &Connection, schema: OpencodeSchema, session_id: &str) -> TurnState {
+    match schema {
+        OpencodeSchema::Legacy => {
+            let parts = newest_rows(
+                conn,
+                "SELECT data FROM part WHERE session_id = ?1 \
+                 ORDER BY time_created DESC LIMIT 8",
+                session_id,
+            );
+            if parts.iter().any(is_pending_question) {
+                return TurnState::AwaitingHuman;
+            }
+            newest_rows(
+                conn,
+                "SELECT data FROM message WHERE session_id = ?1 \
+                 ORDER BY time_created DESC LIMIT 1",
+                session_id,
+            )
+            .first()
+            .map(turn_state_from_message)
+            .unwrap_or_default()
+        }
+        OpencodeSchema::V2 => {
+            let rows = newest_rows(
+                conn,
+                "SELECT data FROM session_message WHERE session_id = ?1 \
+                 ORDER BY time_created DESC, seq DESC LIMIT 2",
+                session_id,
+            );
+            if rows
+                .iter()
+                .any(|row| part_objects(row).into_iter().any(is_pending_question))
+            {
+                return TurnState::AwaitingHuman;
+            }
+            rows.first()
+                .map(|row| row.get("info").unwrap_or(row))
+                .map(turn_state_from_message)
+                .unwrap_or_default()
+        }
+    }
+}
+
+/// `(@review-security subagent)` → `review-security`, with the title left
+/// without the suffix.
+fn split_subagent_title(title: &str) -> (Option<String>, String) {
+    let title = title.trim();
+    if let Some(start) = title.rfind("(@") {
+        if let Some(rest) = title[start + 2..].strip_suffix(" subagent)") {
+            let description = title[..start].trim();
+            return (Some(rest.to_string()), description.to_string());
+        }
+    }
+    (None, title.to_string())
+}
+
+/// Child sessions are OpenCode's subagents: its `task` tool runs each in a
+/// session whose `parent_id` is the caller. Attach the direct children of
+/// every listed session, so a parent keeps animating while they run.
+///
+/// A child whose own turn is still open is *pending* -- the OpenCode reading
+/// of Claude's launched-but-not-handed-back -- so it counts as working
+/// through a long silent tool call (see `subagent_is_working`).
+fn attach_child_sessions(
+    conn: &Connection,
+    schema: OpencodeSchema,
+    sessions: &mut [VendorSession],
+    now: SystemTime,
+) {
+    if sessions.is_empty() {
+        return;
+    }
+    let placeholders = vec!["?"; sessions.len()].join(", ");
+    let sql = format!(
+        "SELECT id, parent_id, title, time_updated FROM {} \
+         WHERE time_archived IS NULL AND parent_id IN ({placeholders}) \
+         ORDER BY time_created LIMIT 256",
+        schema.sessions_table()
+    );
+    let Ok(mut stmt) = conn.prepare(&sql) else {
+        return;
+    };
+    let ids: Vec<&str> = sessions.iter().map(|s| s.session_id.as_str()).collect();
+    let Ok(rows) = stmt.query_map(rusqlite::params_from_iter(ids.iter()), |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, i64>(3)?,
+        ))
+    }) else {
+        return;
+    };
+    let children: Vec<(String, String, Option<String>, i64)> =
+        rows.filter_map(Result::ok).collect();
+    drop(stmt);
+
+    for (id, parent_id, title, updated) in children {
+        let Some(parent) = sessions.iter_mut().find(|s| s.session_id == parent_id) else {
+            continue;
+        };
+        let last_activity = epoch_millis(updated);
+        let recent = last_activity
+            .and_then(|at| now.duration_since(at).ok())
+            .is_some_and(|age| age <= OPENCODE_WORKING_WINDOW);
+        let turn = opencode_turn_state(conn, schema, &id);
+        let last_part = last_stored_part_type(conn, &schema, &id);
+        let status = match turn {
+            TurnState::Finished => HerdStatus::Done,
+            TurnState::AwaitingHuman => HerdStatus::Blocked,
+            _ if recent && matches!(last_part.as_deref(), Some("tool") | Some("reasoning")) => {
                 HerdStatus::Working
             }
-            _ => HerdStatus::Idle,
+            _ => HerdStatus::Unknown,
         };
-        let name = title.as_deref().and_then(clean_title);
-        let model = model.and_then(|raw| model_label(&raw));
-        let started_at = epoch_millis(created);
-        let cost = (cost > 0.0).then(|| format!("${cost:.4}"));
-        let activity = opencode_activity(&conn, schema, &session_id);
-        Some(VendorSession {
-            origin: SessionOrigin::Host,
-            home: None,
-            pane_hint: None,
-            // OpenCode's current database has no process id. Binding falls back
-            // to the unique cwd match, while pane detection still handles live
-            // sessions whose database row is too old.
-            pid: 0,
-            interactive: true,
-            vendor: AgentVendor::OpenCode,
-            // This store exposes no turn boundary; freshness is all it has.
-            turn: crate::agent_herd::TurnState::Unknown,
-            session_id,
-            cwd: PathBuf::from(directory),
-            project_root: None,
-            name,
-            model,
+        let (agent_type, description) = split_subagent_title(title.as_deref().unwrap_or(""));
+        parent.subagents.push(HerdSubagent {
+            agent_id: id,
+            agent_type: agent_type.unwrap_or_else(|| "subagent".to_string()),
+            description,
             status,
-            blocked_reason: None,
-            started_at,
-            status_changed_at: Some(updated_at),
-            subagents: Vec::new(),
-            activity,
-            input_tokens: u64_count(input_tokens),
-            output_tokens: u64_count(output_tokens),
-            cost,
-        })
-    })
-    .collect()
+            depth: 1,
+            last_activity,
+            pending: turn == TurnState::Working,
+        });
+    }
+    for session in sessions.iter_mut() {
+        if session.subagents.is_empty() {
+            continue;
+        }
+        if let Some(activity) = session.activity.as_mut() {
+            activity.subagent_tree =
+                crate::agent_herd::sessions::build_subagent_tree(&session.subagents);
+        }
+    }
+}
+
+/// First thing the user typed in a v2 session (`session_message` rows embed
+/// their parts). Shapes are tolerated rather than assumed: a row with no
+/// role is read as long as its first text part is there.
+pub(crate) fn first_prompt_v2(conn: &Connection, session_id: &str) -> Option<String> {
+    let rows = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT data FROM session_message WHERE session_id = ?1 \
+                 ORDER BY time_created, seq LIMIT 4",
+            )
+            .ok()?;
+        let mapped = stmt
+            .query_map([session_id], |row| row.get::<_, String>(0))
+            .ok()?;
+        mapped.filter_map(Result::ok).collect::<Vec<String>>()
+    };
+    for data in rows {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&data) else {
+            continue;
+        };
+        let info = value.get("info").unwrap_or(&value);
+        match info.get("role").and_then(|role| role.as_str()) {
+            Some("user") | None => {}
+            Some(_) => continue,
+        }
+        let text = part_objects(&value).into_iter().find_map(|part| {
+            (part.get("type").and_then(|kind| kind.as_str()) == Some("text"))
+                .then(|| part.get("text").and_then(|text| text.as_str()))
+                .flatten()
+        });
+        if let Some(label) =
+            text.and_then(|text| crate::agent_herd::transcript::describe_prompt_min(text, 1))
+        {
+            return Some(label);
+        }
+    }
+    None
+}
+
+/// What an OpenCode session (and its subagents' child sessions) recorded
+/// about the files it changed, for the Changes panel.
+pub enum FileRecord {
+    /// Paths a `patch` part lists: OpenCode's own snapshot of the files a
+    /// step changed, absolute.
+    Changed(Vec<String>),
+    /// An `edit`/`write` tool call's `filePath`.
+    Edited(String),
+    /// An `apply_patch` call's patch text.
+    Patch(String),
+}
+
+fn file_records_of_part(part: &serde_json::Value, out: &mut Vec<FileRecord>) {
+    match part.get("type").and_then(|kind| kind.as_str()) {
+        Some("patch") => {
+            let files: Vec<String> = part
+                .get("files")
+                .and_then(|files| files.as_array())
+                .map(|files| {
+                    files
+                        .iter()
+                        .filter_map(|file| file.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !files.is_empty() {
+                out.push(FileRecord::Changed(files));
+            }
+        }
+        Some("tool") => {
+            let input = part.get("state").and_then(|state| state.get("input"));
+            match part.get("tool").and_then(|tool| tool.as_str()) {
+                Some("edit") | Some("write") | Some("multiedit") => {
+                    if let Some(path) = input
+                        .and_then(|input| input.get("filePath"))
+                        .and_then(|path| path.as_str())
+                    {
+                        out.push(FileRecord::Edited(path.to_string()));
+                    }
+                }
+                Some("apply_patch") | Some("patch") => {
+                    if let Some(text) = input
+                        .and_then(|input| input.get("patchText"))
+                        .and_then(|text| text.as_str())
+                    {
+                        out.push(FileRecord::Patch(text.to_string()));
+                    }
+                }
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Upper bound on the stored rows read for one session's file records.
+const FILE_RECORD_ROWS: usize = 20_000;
+
+/// File records of a session and of its direct child sessions, read from the
+/// database under `home` (`None` = this machine). Blocking: call it off the
+/// GUI thread.
+pub fn file_records(home: Option<&Path>, session_id: &str) -> std::io::Result<Vec<FileRecord>> {
+    let home = match home {
+        Some(home) => home.to_path_buf(),
+        None => dirs_home().ok_or_else(|| std::io::Error::other("no home directory"))?,
+    };
+    let db = opencode_db(&home);
+    let conn = Connection::open_with_flags(
+        db,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .map_err(std::io::Error::other)?;
+    let schema = detect_opencode_schema(&conn)
+        .ok_or_else(|| std::io::Error::other("unknown opencode database schema"))?;
+    // Only the rows that can name a file: the JSON filters run inside SQLite
+    // so the rest of a long session never crosses into Rust.
+    let sql = match schema {
+        OpencodeSchema::Legacy => format!(
+            "SELECT data FROM part \
+             WHERE (session_id = ?1 OR session_id IN \
+                    (SELECT id FROM session WHERE parent_id = ?1)) \
+             AND (json_extract(data, '$.type') = 'patch' \
+                  OR json_extract(data, '$.tool') IN \
+                     ('edit', 'write', 'multiedit', 'apply_patch', 'patch')) \
+             ORDER BY time_created LIMIT {FILE_RECORD_ROWS}"
+        ),
+        OpencodeSchema::V2 => format!(
+            "SELECT data FROM session_message \
+             WHERE session_id = ?1 OR session_id IN \
+                   (SELECT id FROM session_v2 WHERE parent_id = ?1) \
+             ORDER BY time_created LIMIT {FILE_RECORD_ROWS}"
+        ),
+    };
+    let mut stmt = conn.prepare(&sql).map_err(std::io::Error::other)?;
+    let rows = stmt
+        .query_map([session_id], |row| row.get::<_, String>(0))
+        .map_err(std::io::Error::other)?;
+    let mut out = Vec::new();
+    for data in rows.filter_map(Result::ok) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&data) else {
+            continue;
+        };
+        for part in part_objects(&value) {
+            file_records_of_part(part, &mut out);
+        }
+    }
+    Ok(out)
 }
 
 /// The type of the most recently stored part of a session, as the JSON sees
@@ -806,6 +1159,261 @@ mod tests {
         let sessions = OpenCodeDetector.collect_sessions(&SessionRoot::host(temp.path()));
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].status, HerdStatus::Idle);
+    }
+
+    /// A 1.x store with the `message` table the turn boundary is read from.
+    fn legacy_store(temp: &Path) -> Connection {
+        let db = temp.join(".local/share/opencode/opencode.db");
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session (
+                id TEXT PRIMARY KEY, project_id TEXT NOT NULL,
+                parent_id TEXT, directory TEXT NOT NULL, title TEXT NOT NULL,
+                model TEXT, cost REAL NOT NULL, tokens_input INTEGER NOT NULL,
+                tokens_output INTEGER NOT NULL, time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL, time_archived INTEGER
+            );
+            CREATE TABLE message (
+                id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+                time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL,
+                data TEXT NOT NULL
+            );
+            CREATE TABLE part (
+                id TEXT PRIMARY KEY, message_id TEXT NOT NULL,
+                session_id TEXT NOT NULL, time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL, data TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn now_ms() -> i64 {
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
+    }
+
+    fn add_session(conn: &Connection, id: &str, parent: Option<&str>, title: &str, at: i64) {
+        conn.execute(
+            "INSERT INTO session (id, project_id, parent_id, directory, title, model,
+                 cost, tokens_input, tokens_output, time_created, time_updated)
+             VALUES (?1, 'p', ?2, '/repo', ?3, NULL, 0, 0, 0, ?4, ?4)",
+            rusqlite::params![id, parent, title, at],
+        )
+        .unwrap();
+    }
+
+    fn add_message(conn: &Connection, id: &str, session: &str, data: &str, at: i64) {
+        conn.execute(
+            "INSERT INTO message (id, session_id, time_created, time_updated, data)
+             VALUES (?1, ?2, ?3, ?3, ?4)",
+            rusqlite::params![id, session, at, data],
+        )
+        .unwrap();
+    }
+
+    fn add_part(conn: &Connection, id: &str, session: &str, data: &str, at: i64) {
+        conn.execute(
+            "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data)
+             VALUES (?1, 'm', ?2, ?3, ?3, ?4)",
+            rusqlite::params![id, session, at, data],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn the_newest_message_says_whether_the_turn_is_over() {
+        let msg = |json: &str| serde_json::from_str::<serde_json::Value>(json).unwrap();
+        assert_eq!(
+            turn_state_from_message(&msg(
+                r#"{"role":"assistant","finish":"stop","time":{"created":1,"completed":2}}"#
+            )),
+            TurnState::Finished
+        );
+        assert_eq!(
+            turn_state_from_message(&msg(
+                r#"{"role":"assistant","finish":"tool-calls","time":{"created":1,"completed":2}}"#
+            )),
+            TurnState::Working,
+            "the model asked for tools; the turn goes on"
+        );
+        assert_eq!(
+            turn_state_from_message(&msg(r#"{"role":"assistant","time":{"created":1}}"#)),
+            TurnState::Working,
+            "still streaming"
+        );
+        assert_eq!(
+            turn_state_from_message(&msg(r#"{"role":"user","time":{"created":1}}"#)),
+            TurnState::Working
+        );
+        assert_eq!(turn_state_from_message(&msg(r#"{}"#)), TurnState::Unknown);
+    }
+
+    #[test]
+    fn a_pending_question_holds_the_turn_on_the_human() {
+        let temp = tempfile::tempdir().unwrap();
+        let conn = legacy_store(temp.path());
+        let now = now_ms();
+        add_session(&conn, "s1", None, "Ask me", now);
+        add_message(
+            &conn,
+            "m1",
+            "s1",
+            r#"{"role":"assistant","time":{"created":1}}"#,
+            now,
+        );
+        add_part(
+            &conn,
+            "p1",
+            "s1",
+            r#"{"type":"tool","tool":"question","state":{"status":"running"}}"#,
+            now,
+        );
+        assert_eq!(
+            opencode_turn_state(&conn, OpencodeSchema::Legacy, "s1"),
+            TurnState::AwaitingHuman
+        );
+        // Answered: the question no longer holds anything.
+        conn.execute(
+            "UPDATE part SET data = ?1 WHERE id = 'p1'",
+            [r#"{"type":"tool","tool":"question","state":{"status":"completed"}}"#],
+        )
+        .unwrap();
+        assert_eq!(
+            opencode_turn_state(&conn, OpencodeSchema::Legacy, "s1"),
+            TurnState::Working
+        );
+    }
+
+    #[test]
+    fn child_sessions_are_the_parents_subagents() {
+        let temp = tempfile::tempdir().unwrap();
+        let conn = legacy_store(temp.path());
+        let now = now_ms();
+        add_session(&conn, "parent", None, "Review the PR", now);
+        add_message(
+            &conn,
+            "pm",
+            "parent",
+            r#"{"role":"assistant","finish":"stop","time":{"created":1,"completed":2}}"#,
+            now,
+        );
+        // A child still mid-turn (silent for ten minutes) and one that is done.
+        let ten_min_ago = now - 600_000;
+        add_session(
+            &conn,
+            "child-1",
+            Some("parent"),
+            "Review security (@review-security subagent)",
+            ten_min_ago,
+        );
+        add_message(
+            &conn,
+            "c1",
+            "child-1",
+            r#"{"role":"assistant","finish":"tool-calls","time":{"created":1,"completed":2}}"#,
+            ten_min_ago,
+        );
+        add_session(
+            &conn,
+            "child-2",
+            Some("parent"),
+            "Review types (@review-types subagent)",
+            now,
+        );
+        add_message(
+            &conn,
+            "c2",
+            "child-2",
+            r#"{"role":"assistant","finish":"stop","time":{"created":1,"completed":2}}"#,
+            now,
+        );
+        drop(conn);
+
+        let sessions = OpenCodeDetector.collect_sessions(&SessionRoot::host(temp.path()));
+        assert_eq!(sessions.len(), 1, "children are not rows of their own");
+        let parent = &sessions[0];
+        assert_eq!(parent.turn, TurnState::Finished);
+        assert_eq!(parent.subagents.len(), 2);
+        let running = &parent.subagents[0];
+        assert_eq!(running.agent_type, "review-security");
+        assert_eq!(running.description, "Review security");
+        assert!(running.pending);
+        assert!(
+            crate::agent_herd::subagent_is_working(running, SystemTime::now()),
+            "an open child turn counts through a long silence"
+        );
+        let done = &parent.subagents[1];
+        assert_eq!(done.status, HerdStatus::Done);
+        assert!(!crate::agent_herd::subagent_is_working(
+            done,
+            SystemTime::now()
+        ));
+    }
+
+    #[test]
+    fn file_records_cover_patches_edits_and_children() {
+        let temp = tempfile::tempdir().unwrap();
+        let conn = legacy_store(temp.path());
+        let now = now_ms();
+        add_session(&conn, "parent", None, "Edit things", now);
+        add_session(&conn, "child", Some("parent"), "Sub (@build subagent)", now);
+        add_session(&conn, "other", None, "Unrelated", now);
+        add_part(
+            &conn,
+            "p1",
+            "parent",
+            r#"{"type":"patch","hash":"x","files":["/repo/a.rs","/repo/b.rs"]}"#,
+            now,
+        );
+        add_part(
+            &conn,
+            "p2",
+            "parent",
+            r#"{"type":"tool","tool":"edit","state":{"input":{"filePath":"/repo/c.rs"}}}"#,
+            now,
+        );
+        add_part(
+            &conn,
+            "p3",
+            "child",
+            r#"{"type":"tool","tool":"apply_patch","state":{"input":{"patchText":"*** Begin Patch\n*** Update File: /repo/d.rs\n@@\n*** End Patch"}}}"#,
+            now,
+        );
+        add_part(
+            &conn,
+            "p4",
+            "parent",
+            r#"{"type":"tool","tool":"read","state":{"input":{"filePath":"/repo/read-only.rs"}}}"#,
+            now,
+        );
+        add_part(
+            &conn,
+            "p5",
+            "other",
+            r#"{"type":"patch","files":["/repo/not-mine.rs"]}"#,
+            now,
+        );
+        drop(conn);
+
+        let records = file_records(Some(temp.path()), "parent").unwrap();
+        let touched = crate::agent_herd::touched::touched_by_source(
+            &crate::agent_herd::touched::TouchSource::OpenCode {
+                session_id: "parent".into(),
+                home: Some(temp.path().to_path_buf()),
+            },
+        )
+        .unwrap();
+        assert_eq!(records.len(), 3);
+        let mut spelled: Vec<&str> = touched.iter().map(|(_, spelled, _)| spelled).collect();
+        spelled.sort();
+        assert_eq!(
+            spelled,
+            vec!["/repo/a.rs", "/repo/b.rs", "/repo/c.rs", "/repo/d.rs"]
+        );
     }
 
     #[test]

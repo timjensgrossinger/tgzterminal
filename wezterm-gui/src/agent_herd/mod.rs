@@ -18,6 +18,7 @@
 #![allow(dead_code)]
 
 pub mod antigravity;
+pub mod background;
 pub mod claude;
 pub mod codex;
 pub mod copilot;
@@ -43,6 +44,15 @@ use std::time::{Duration, SystemTime};
 
 /// How long after its last write a subagent transcript still counts as active.
 const SUBAGENT_ACTIVITY_WINDOW: Duration = Duration::from_secs(10);
+
+/// How long a background subagent whose result the parent has not been handed
+/// yet (see `background`) may stay silent and still count as working.
+///
+/// A pending agent is working by its parent's own account, however long a
+/// single tool call keeps its transcript quiet; the cap only guards against a
+/// notification that never arrives, which would otherwise spin the row for
+/// the rest of the session.
+const SUBAGENT_PENDING_MAX_QUIET: Duration = Duration::from_secs(30 * 60);
 
 /// How long a nominally-`Working` agent may go without activity before the view
 /// stops believing it.
@@ -233,6 +243,9 @@ pub struct HerdSubagent {
     /// Nesting depth; 1 for a subagent spawned by the top-level session.
     pub depth: u32,
     pub last_activity: Option<SystemTime>,
+    /// A background agent the parent launched and has not been handed the
+    /// result of yet (see `background::pending_agents`).
+    pub pending: bool,
 }
 
 /// Colors resolved on the GUI thread and handed to the renderer,
@@ -470,6 +483,9 @@ pub struct HerdAgent {
     /// The home the session was found under (see [`vendor::VendorSession::home`]);
     /// `None` for a pane-only row, meaning this machine's home.
     pub home: Option<PathBuf>,
+    /// `status` came from the program's own live report (OSC 7501), so a
+    /// quiet transcript does not make it stale.
+    pub status_reported: bool,
 }
 
 impl HerdAgent {
@@ -498,12 +514,20 @@ impl HerdAgent {
         match self.status {
             HerdStatus::Blocked => HerdDisplayStatus::NeedsApproval,
             HerdStatus::Working => {
-                let stale = self
-                    .activity
-                    .as_ref()
-                    .and_then(HerdActivity::last_activity)
-                    .and_then(|at| now.duration_since(at).ok())
-                    .is_some_and(|age| age >= WORKING_STALE_AFTER);
+                // A parent whose own transcript has gone quiet is not stale
+                // while a subagent it spawned is still working, nor while the
+                // program itself says it is working.
+                let stale = !self.status_reported
+                    && !self
+                        .subagents
+                        .iter()
+                        .any(|sub| subagent_is_working(sub, now))
+                    && self
+                        .activity
+                        .as_ref()
+                        .and_then(HerdActivity::last_activity)
+                        .and_then(|at| now.duration_since(at).ok())
+                        .is_some_and(|age| age >= WORKING_STALE_AFTER);
                 if stale {
                     HerdDisplayStatus::WaitingForInput
                 } else {
@@ -618,6 +642,11 @@ pub struct PaneAgentRow {
     pub activity: Option<HerdActivity>,
     pub can_attach: bool,
     pub can_open_logs: bool,
+    /// `status` is the program's own live report (OSC 7501 program status),
+    /// not a reading of the screen. It already accounts for the program's
+    /// subagents and for its turn ending, so the transcript heuristics in
+    /// `join_sessions_with_panes` must not second-guess it.
+    pub program_reported: bool,
 }
 
 /// Promote a resolved status to `Working` when a subagent is working.
@@ -688,13 +717,26 @@ fn promote_awaiting_human(status: HerdStatus, turn: TurnState) -> HerdStatus {
 /// stopped happening at all, kept promoting its parent to `Working` long after
 /// the subagent had gone quiet. Re-checking the timestamp at the point of use
 /// makes the window mean what it says.
+///
+/// A pending background agent is the exception to the window: its parent has
+/// not been told it finished, so it counts as working through a silence as
+/// long as [`SUBAGENT_PENDING_MAX_QUIET`] -- one long tool call routinely
+/// keeps its transcript quiet far longer than ten seconds, and the parent row
+/// used to go still in the middle of exactly that work. A subagent that signed
+/// off (`Done`) is never working, pending or not.
 pub fn subagent_is_working(sub: &HerdSubagent, now: SystemTime) -> bool {
-    if sub.status != HerdStatus::Working {
+    let quiet_for = |window: Duration| {
+        sub.last_activity
+            .and_then(|at| now.duration_since(at).ok())
+            .is_none_or(|age| age < window)
+    };
+    if sub.status == HerdStatus::Done {
         return false;
     }
-    sub.last_activity
-        .and_then(|at| now.duration_since(at).ok())
-        .is_none_or(|age| age < SUBAGENT_ACTIVITY_WINDOW)
+    if sub.pending {
+        return quiet_for(SUBAGENT_PENDING_MAX_QUIET);
+    }
+    sub.status == HerdStatus::Working && quiet_for(SUBAGENT_ACTIVITY_WINDOW)
 }
 
 /// Join filesystem-discovered Claude sessions to detected panes.
@@ -777,31 +819,38 @@ pub fn join_sessions_with_panes(
             // reporting `Working` for a session that has already finished and
             // has no way to observe it going idle. Only fall back to the
             // session when the pane could not say.
-            status: {
-                let resolved = match pane.map(|p| p.status) {
-                    Some(HerdStatus::Unknown) | None => session.status,
-                    Some(live) => live,
-                };
-                // A subagent runs inside its parent's process, so the parent's
-                // screen can sit at a prompt -- and read as idle -- for the
-                // whole time one is working. Without this the pane status wins
-                // and the only signal that anything is happening is a line of
-                // text in the herd section.
-                let escalated = escalate_for_subagents(resolved, &session.subagents, now);
-                // A signed-off turn outranks both of the guesses above. The
-                // pane status is inferred from pixels and the session status is
-                // the agent's own unverifiable self-report; neither can observe
-                // a turn ending, which is why a finished agent used to sit at
-                // `working` indefinitely. The transcript can, so it wins --
-                // except over a subagent we can see is still going, and never
-                // over `Blocked`, where a human is the bottleneck.
-                let vetoed = veto_finished_turn(escalated, session.turn, &session.subagents, now);
-                // Last, and above everything: a question or a plan waiting to
-                // be approved is not a turn that ended, it is a turn that is
-                // held open on the human. Nothing the screen or the session
-                // file says can outrank that.
-                promote_awaiting_human(vetoed, session.turn)
+            status: match pane.filter(|p| p.program_reported && p.status != HerdStatus::Unknown) {
+                // The program reported this itself over OSC 7501, children and
+                // turn end included; only a human-gated call outranks it.
+                Some(reported) => promote_awaiting_human(reported.status, session.turn),
+                None => {
+                    let resolved = match pane.map(|p| p.status) {
+                        Some(HerdStatus::Unknown) | None => session.status,
+                        Some(live) => live,
+                    };
+                    // A subagent runs inside its parent's process, so the parent's
+                    // screen can sit at a prompt -- and read as idle -- for the
+                    // whole time one is working. Without this the pane status wins
+                    // and the only signal that anything is happening is a line of
+                    // text in the herd section.
+                    let escalated = escalate_for_subagents(resolved, &session.subagents, now);
+                    // A signed-off turn outranks both of the guesses above. The
+                    // pane status is inferred from pixels and the session status is
+                    // the agent's own unverifiable self-report; neither can observe
+                    // a turn ending, which is why a finished agent used to sit at
+                    // `working` indefinitely. The transcript can, so it wins --
+                    // except over a subagent we can see is still going, and never
+                    // over `Blocked`, where a human is the bottleneck.
+                    let vetoed =
+                        veto_finished_turn(escalated, session.turn, &session.subagents, now);
+                    // Last, and above everything: a question or a plan waiting to
+                    // be approved is not a turn that ended, it is a turn that is
+                    // held open on the human. Nothing the screen or the session
+                    // file says can outrank that.
+                    promote_awaiting_human(vetoed, session.turn)
+                }
             },
+            status_reported: pane.is_some_and(|p| p.program_reported),
             blocked_reason: session.blocked_reason.clone(),
             model: session
                 .model
@@ -888,6 +937,7 @@ pub fn join_sessions_with_panes(
             can_open_logs: row.can_open_logs,
             origin: vendor::SessionOrigin::Host,
             home: None,
+            status_reported: row.program_reported,
         });
     }
 
@@ -1199,6 +1249,7 @@ mod tests {
             activity: None,
             can_attach: true,
             can_open_logs: true,
+            program_reported: false,
         }
     }
 
@@ -1253,6 +1304,7 @@ mod tests {
             can_open_logs: true,
             origin: vendor::SessionOrigin::Host,
             home: None,
+            status_reported: false,
         }
     }
 
@@ -1394,6 +1446,132 @@ mod tests {
         assert_eq!(beta.pane_id, None);
     }
 
+    fn background_sub(
+        status: HerdStatus,
+        pending: bool,
+        quiet: Duration,
+        now: SystemTime,
+    ) -> HerdSubagent {
+        HerdSubagent {
+            agent_id: "bg-1".to_string(),
+            agent_type: "Explore".to_string(),
+            description: "run the test suite".to_string(),
+            status,
+            depth: 1,
+            last_activity: Some(now - quiet),
+            pending,
+        }
+    }
+
+    /// A background agent spends minutes inside one tool call with its
+    /// transcript silent. While the parent has not been handed its result, it
+    /// is working by the parent's own account.
+    #[test]
+    fn a_pending_background_agent_counts_as_working_through_a_long_silence() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100_000);
+        let five_min = Duration::from_secs(300);
+        assert!(subagent_is_working(
+            &background_sub(HerdStatus::Unknown, true, five_min, now),
+            now
+        ));
+        assert!(
+            !subagent_is_working(
+                &background_sub(HerdStatus::Unknown, false, five_min, now),
+                now
+            ),
+            "without the parent's account, ten quiet seconds still end it"
+        );
+        assert!(
+            !subagent_is_working(
+                &background_sub(HerdStatus::Done, true, Duration::ZERO, now),
+                now
+            ),
+            "a signed-off agent is done, whatever the parent has been told"
+        );
+        assert!(
+            !subagent_is_working(
+                &background_sub(HerdStatus::Unknown, true, SUBAGENT_PENDING_MAX_QUIET, now),
+                now
+            ),
+            "a notification that never lands must not spin the row forever"
+        );
+    }
+
+    /// The bug this guards: the parent signs off its turn the moment it
+    /// launches background agents, and the veto used to stop the row as soon
+    /// as an agent went ten seconds without writing.
+    #[test]
+    fn a_pending_background_agent_survives_the_veto_and_staleness() {
+        let now = SystemTime::now();
+        let quiet = background_sub(HerdStatus::Unknown, true, Duration::from_secs(120), now);
+        assert_eq!(
+            veto_finished_turn(
+                HerdStatus::Working,
+                TurnState::Finished,
+                std::slice::from_ref(&quiet),
+                now
+            ),
+            HerdStatus::Working
+        );
+        assert_eq!(
+            escalate_for_subagents(HerdStatus::Idle, std::slice::from_ref(&quiet), now),
+            HerdStatus::Working,
+            "a parent idle at its prompt is promoted"
+        );
+
+        let mut parent = agent("parent", HerdStatus::Working, "/repo");
+        parent.activity = Some(HerdActivity {
+            recent: vec![HerdEvent {
+                at: Some(now - Duration::from_secs(600)),
+                kind: HerdEventKind::Tool,
+                content: HerdContent::SingleLine("Bash cargo test".to_string()),
+                tool_use_id: None,
+                parent_id: None,
+            }],
+            ..HerdActivity::default()
+        });
+        assert_eq!(
+            parent.display_status(now),
+            HerdDisplayStatus::WaitingForInput,
+            "ten quiet minutes alone make a working row stale"
+        );
+        parent.subagents = vec![quiet];
+        assert_eq!(parent.display_status(now), HerdDisplayStatus::Working);
+        parent.subagents.clear();
+        parent.status_reported = true;
+        assert_eq!(
+            parent.display_status(now),
+            HerdDisplayStatus::Working,
+            "the program's own report is never stale"
+        );
+    }
+
+    /// A pane whose program reports over OSC 7501 has already accounted for
+    /// its children and its turn ending; the transcript must not overrule it.
+    #[test]
+    fn a_program_reported_status_is_not_second_guessed_by_the_transcript() {
+        let mut finished = session(42, "parent", "/repo");
+        finished.turn = TurnState::Finished;
+        let mut reported = pane(7, "claude", &[42]);
+        reported.status = HerdStatus::Working;
+        reported.program_reported = true;
+        let agents = join_sessions_with_panes(vec![finished.clone()], vec![reported.clone()]);
+        assert_eq!(agents[0].status, HerdStatus::Working);
+        assert!(agents[0].status_reported);
+
+        // Without the report, the same pair is vetoed to idle.
+        let mut guessed = reported.clone();
+        guessed.program_reported = false;
+        let agents = join_sessions_with_panes(vec![finished.clone()], vec![guessed]);
+        assert_eq!(agents[0].status, HerdStatus::Idle);
+
+        // A human-gated call still outranks the report.
+        let mut held = finished;
+        held.turn = TurnState::AwaitingHuman;
+        let agents = join_sessions_with_panes(vec![held], vec![reported]);
+        assert_eq!(agents[0].status, HerdStatus::Blocked);
+    }
+
     /// A vendor's own `busy` cannot be aged out -- it carries no timestamp we
     /// can trust -- so the transcript's sign-off is what has to overrule it.
     #[test]
@@ -1427,6 +1605,7 @@ mod tests {
             status: HerdStatus::Working,
             depth: 1,
             last_activity: Some(now),
+            pending: false,
         };
         assert_eq!(
             veto_finished_turn(
@@ -1482,6 +1661,7 @@ mod tests {
             status: HerdStatus::Working,
             depth: 1,
             last_activity: Some(now),
+            pending: false,
         };
         assert!(subagent_is_working(&sub, now));
 
@@ -1526,6 +1706,7 @@ mod tests {
             status: HerdStatus::Working,
             depth: 1,
             last_activity: None,
+            pending: false,
         }];
         let agents = join_sessions_with_panes(vec![held], vec![busy_pane]);
         assert_eq!(agents[0].status, HerdStatus::Blocked);
@@ -1540,6 +1721,7 @@ mod tests {
             status: HerdStatus::Working,
             depth: 1,
             last_activity: None,
+            pending: false,
         };
 
         // The parent's screen sits at a prompt while the subagent works, so the

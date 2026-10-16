@@ -640,6 +640,61 @@ pub fn touched_by(transcript: &Path) -> std::io::Result<TouchedPaths> {
     Ok(touched)
 }
 
+/// Where a session's touched files are read from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TouchSource {
+    /// A JSONL transcript (Claude, Codex), read by [`touched_by`].
+    Transcript(std::path::PathBuf),
+    /// OpenCode, which keeps no transcript file: its database is the record.
+    /// `home` is where the database lives; `None` for this machine.
+    OpenCode {
+        session_id: String,
+        home: Option<std::path::PathBuf>,
+    },
+}
+
+impl TouchSource {
+    /// The transcript file, for a source that has one.
+    pub fn transcript(&self) -> Option<&Path> {
+        match self {
+            Self::Transcript(path) => Some(path),
+            Self::OpenCode { .. } => None,
+        }
+    }
+}
+
+/// Every file the session behind `source` touched.
+///
+/// Blocking file I/O: call it off the GUI thread.
+pub fn touched_by_source(source: &TouchSource) -> std::io::Result<TouchedPaths> {
+    match source {
+        TouchSource::Transcript(path) => touched_by(path),
+        TouchSource::OpenCode { session_id, home } => Ok(touched_from_opencode(
+            super::opencode::file_records(home.as_deref(), session_id)?,
+        )),
+    }
+}
+
+/// Fold OpenCode's file records: what its `patch` parts list and what its
+/// edit tools named are edits; an `apply_patch` text is read like Codex's.
+/// OpenCode records absolute paths, so no working directory is needed.
+fn touched_from_opencode(records: Vec<super::opencode::FileRecord>) -> TouchedPaths {
+    use super::opencode::FileRecord;
+    let mut touched = TouchedPaths::default();
+    for record in records {
+        match record {
+            FileRecord::Changed(files) => {
+                for file in files {
+                    touched.add(&file, Touch::Edited);
+                }
+            }
+            FileRecord::Edited(path) => touched.add(&path, Touch::Edited),
+            FileRecord::Patch(text) => scan_apply_patch(&text, None, &mut touched),
+        }
+    }
+    touched
+}
+
 /// The set of paths in `touched`, for tests.
 #[cfg(test)]
 fn keys(touched: &TouchedPaths) -> std::collections::HashSet<(String, Touch)> {

@@ -401,6 +401,13 @@ fn read_subagent(transcript: &Path, agent_id: &str, now: SystemTime) -> HerdSuba
         .and_then(|m| m.get("spawnDepth"))
         .and_then(|v| v.as_u64())
         .unwrap_or(1) as u32;
+    // Claude marks the meta `finished` once the agent is done. Only `true`
+    // is acted on: what it holds while the agent still runs is not relied on.
+    let finished = meta
+        .as_ref()
+        .and_then(|m| m.get("finished"))
+        .and_then(|v| v.as_bool())
+        == Some(true);
 
     let mtime = std::fs::metadata(transcript)
         .and_then(|meta| meta.modified())
@@ -417,9 +424,15 @@ fn read_subagent(transcript: &Path, agent_id: &str, now: SystemTime) -> HerdSuba
         agent_id: agent_id.to_string(),
         agent_type,
         description,
-        status: subagent_status(last_type.as_deref(), stop_reason.as_deref(), mtime, now),
+        status: if finished {
+            super::HerdStatus::Done
+        } else {
+            subagent_status(last_type.as_deref(), stop_reason.as_deref(), mtime, now)
+        },
         depth,
         last_activity: mtime,
+        // Filled in by the detector from the parent transcript.
+        pending: false,
     }
 }
 
@@ -1204,15 +1217,26 @@ impl crate::agent_herd::vendor::SessionSource for ClaudeDetector {
         let claude_sessions = collect_sessions_in(root, true);
         claude_sessions
             .into_iter()
-            .map(|s| {
-                let activity = activity_for_session(home, &s);
+            .map(|mut s| {
                 // Read before the fields below move out of `s`.
                 let transcript = session_transcript_path(home, &s.cwd, &s.session_id);
+                // Before the activity read, so the subagent tree it builds
+                // shows a pending background agent as working.
+                if !s.subagents.is_empty() {
+                    if let Some(path) = transcript.as_deref() {
+                        let pending = super::background::pending_agents(path);
+                        for sub in &mut s.subagents {
+                            sub.pending = pending.contains(&sub.agent_id);
+                        }
+                    }
+                }
+                let activity = activity_for_session(home, &s);
                 let turn = transcript
                     .as_deref()
                     .map(turn_state_from_transcript)
                     .unwrap_or_default();
                 let name = session_name(transcript.as_deref(), s.name, s.name_is_derived);
+                let subagents = s.subagents;
                 let usage = transcript
                     .as_deref()
                     .and_then(|path| {
@@ -1239,7 +1263,7 @@ impl crate::agent_herd::vendor::SessionSource for ClaudeDetector {
                     blocked_reason: s.blocked_reason,
                     started_at: s.started_at,
                     status_changed_at: s.status_changed_at,
-                    subagents: s.subagents,
+                    subagents,
                     activity,
                     input_tokens: usage.input_tokens,
                     output_tokens: usage.output_tokens,

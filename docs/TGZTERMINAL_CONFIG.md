@@ -535,6 +535,48 @@ agent, the row is not finding the pane; if `spin=None` while `status=running`,
 check `gates` on the same line for `working_ring: false` (see
 [Sidebar animations](#sidebar-animations)).
 
+### Program status (OSC 7501)
+
+TGZTerminal speaks the [Program Status Protocol](https://www.superlogical.com/rex/docs/build/program-status)
+(OSC 7501): a program tells the terminal whether it is idle, working, blocked
+on the user (`permission`, `question`, `auth`), done or failed, as structured
+records instead of leaving the sidebar to read its screen. Programs probe for
+it at startup (`OSC 7501 ; ?`) and only report when the terminal answers,
+which TGZTerminal now does. Claude Code reports through it (every version
+checked does, 2.1.295 to 2.1.301; earlier ones were not checked). Codex 0.146
+and OpenCode 1.19 do not report it; their rows keep using the heuristics below.
+
+When a pane holds program status records, and the pane's identity is proven
+(by process, user var or the agent's own chrome), the records decide its
+status before any screen heuristic runs:
+
+| Records | Row status |
+|---|---|
+| root `working` | running (ring spins) |
+| root `blocked` | waiting for input — wins over everything below |
+| a child record `working`/`blocked` | running, even with the root idle |
+| root `idle`, `done` or `error` | waiting for input |
+
+The child rule is what keeps a row spinning while a parent's background
+subagents run after its own turn ended: Claude Code reports one child record
+per running background agent and clears it when the agent finishes. A pane's
+`agent.status` user var still has the last word. The records are status only,
+never evidence for control actions (Stop, Resume, Attach).
+
+Lifetime follows the spec: a report replaces its record, `clear` removes a
+record and its children, a new shell prompt (OSC 133 `A`) drops `working` and
+`blocked` records, and a full reset drops all of them. `working` and `blocked`
+are also dropped when the program is gone: when the pane's own process exits,
+or when the pane's shell is back in front of it (a program exiting to a shell
+without shell integration sends no prompt mark). Records are not carried
+over a mux-server connection, so a remote pane falls back to the heuristics.
+
+Without program status (an older Claude, `CLAUDE_CODE_DISABLE_TERMINAL_TITLE`
+set, a session read only from disk), a Claude parent stays working while a
+background agent it launched has not been handed back: its transcript records
+the launch (`async_launched`) and, later, the delivery (a `task-notification`).
+That holds through up to 30 minutes of silence from the agent.
+
 ### Waiting-queue UX
 
 Turning "which agent needs me?" into an inbox workflow. When a pane's inferred
@@ -983,6 +1025,16 @@ still show up). The two sources are **joined**, not concatenated: a session is
 bound to the pane running it by process tree (falling back to a *unique* cwd
 match), so an agent visible both ways is one row, not two. A session that binds
 to no pane is still listed, but it cannot be focused.
+
+Subagents are listed under their parent and keep it working while they run:
+Claude's `subagents/agent-*.jsonl` (a background agent counts until its result
+is handed back, see [Program status](#program-status-osc-7501)), and
+OpenCode's child sessions (a child counts while its own turn is open). An
+OpenCode row also reads its turn boundary from the database: an assistant
+message with `time.completed` and a `finish` other than `tool-calls` ends the
+turn, and a pending `question` tool call shows the row as blocked. Permission
+prompts are not stored, so those could only reach the row through program
+status, which OpenCode 1.19 does not report.
 
 Both sources are filtered before display:
 
@@ -1542,7 +1594,10 @@ config.keys = {
 Session mode starts from the agents, not the directory. For every Claude and
 Codex agent in the tab's panes it reads the session transcript for the files
 the agent edited (its edit tools, and shell commands that write: `sed -i`, a
-`>` redirect, `git mv`, `apply_patch`, …), and diffs only those. Nothing else
+`>` redirect, `git mv`, `apply_patch`, …), and diffs only those. An
+**OpenCode** agent has no transcript file; its database is read instead: the
+files each step's `patch` record lists, its `edit`/`write` calls and its
+`apply_patch` texts, including those of its subagents' child sessions. Nothing else
 in the tree is read, so the size of the directory does not matter, and the
 "More than 5000 files" limit of a snapshot never applies.
 
@@ -1553,8 +1608,8 @@ Each file is compared with its state **before an agent touched it**:
   the agent's lines show, even in a file that already had uncommitted changes
   of yours, and even in a directory under no version control. When two agents
   edited the same file, the older backup wins.
-- Anything without such a backup (Codex, a file changed only through the
-  shell, Claude with checkpointing turned off) is diffed against the working
+- Anything without such a backup (Codex, OpenCode, a file changed only
+  through the shell, Claude with checkpointing turned off) is diffed against the working
   copy's base by Git or Subversion, narrowed to those files. With no version
   control either, the file is listed with "no earlier copy to compare with".
 

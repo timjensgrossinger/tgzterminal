@@ -197,17 +197,30 @@ impl PaneSession {
         Some(path)
     }
 
+    /// Where the session's touched files are read from. OpenCode keeps no
+    /// transcript file: its database is the record.
+    fn touch_source(&self) -> Option<crate::agent_herd::touched::TouchSource> {
+        if self.provider == "opencode" {
+            return Some(crate::agent_herd::touched::TouchSource::OpenCode {
+                session_id: self.session_id.clone(),
+                home: self.home.clone(),
+            });
+        }
+        self.transcript()
+            .map(crate::agent_herd::touched::TouchSource::Transcript)
+    }
+
     /// Mark the files of `set` this session touched. `false` when its
     /// transcript cannot be read, so the filter is not offered.
     fn mark(&self, set: &mut diff_panel::ChangeSet) -> bool {
-        let Some(path) = self.transcript() else {
+        let Some(source) = self.touch_source() else {
             return false;
         };
         let label = self.label.clone();
-        let touched = match crate::agent_herd::touched::touched_by(&path) {
+        let touched = match crate::agent_herd::touched::touched_by_source(&source) {
             Ok(touched) => touched,
             Err(err) => {
-                log::debug!("diff panel: cannot read {}: {err}", path.display());
+                log::debug!("diff panel: cannot read {source:?}: {err}");
                 return false;
             }
         };
@@ -225,7 +238,7 @@ impl PaneSession {
     /// The session as the session scan reads it; `None` when its transcript
     /// or its project is not known.
     fn source(&self) -> Option<diff_panel::session::SessionSource> {
-        let transcript = self.transcript()?;
+        let transcript = self.touch_source()?;
         let project_view = self.project_view.clone()?;
         let to_host: diff_panel::session::ToHost = match self.distro.clone() {
             Some(distro) => Box::new(move |path: &str| {
@@ -736,7 +749,7 @@ impl crate::TermWindow {
         let mut sessions: Vec<(usize, PaneSession)> = herd
             .agents
             .iter()
-            .filter(|agent| matches!(agent.provider.as_str(), "claude" | "codex"))
+            .filter(|agent| matches!(agent.provider.as_str(), "claude" | "codex" | "opencode"))
             .filter_map(|agent| {
                 let order = panes.iter().position(|pane| Some(*pane) == agent.pane_id)?;
                 let distro = agent.origin.distro().map(str::to_string);

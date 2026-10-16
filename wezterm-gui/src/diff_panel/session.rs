@@ -27,7 +27,7 @@ use super::{
     FileStatus, Limits, Scan, Vcs,
 };
 use crate::agent_herd::file_history::{claude_dir_of_transcript, Baseline, ClaudeFileHistory};
-use crate::agent_herd::touched::{path_key, touched_by, Touch};
+use crate::agent_herd::touched::{path_key, touched_by_source, Touch, TouchSource};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -45,7 +45,9 @@ pub struct SessionSource {
     /// How the session is named next to its files.
     pub label: String,
     pub session_id: String,
-    pub transcript: PathBuf,
+    /// Where the session's touched files are read from: its transcript, or
+    /// OpenCode's database.
+    pub transcript: TouchSource,
     /// Whether the transcript is Claude's, whose sessions back files up.
     pub claude: bool,
     /// The project the session works in, as the session sees it: files
@@ -195,12 +197,12 @@ pub fn scan_session(sources: &[SessionSource], runner: &Runner, limits: Limits) 
                 roots.push(root);
             }
         }
-        let paths = match touched_by(&source.transcript) {
+        let paths = match touched_by_source(&source.transcript) {
             Ok(paths) => paths,
             Err(err) => {
                 log::debug!(
-                    "session changes: cannot read {}: {err}",
-                    source.transcript.display()
+                    "session changes: cannot read {:?}: {err}",
+                    source.transcript
                 );
                 continue;
             }
@@ -244,7 +246,7 @@ pub fn scan_session(sources: &[SessionSource], runner: &Runner, limits: Limits) 
             if !source.claude {
                 return None;
             }
-            let dir = claude_dir_of_transcript(&source.transcript)?;
+            let dir = claude_dir_of_transcript(source.transcript.transcript()?)?;
             Some(ClaudeFileHistory::open(dir, &source.session_id)).filter(|h| !h.is_empty())
         })
         .collect();
@@ -459,7 +461,7 @@ mod tests {
             SessionSource {
                 label: sid.to_string(),
                 session_id: sid.to_string(),
-                transcript,
+                transcript: TouchSource::Transcript(transcript),
                 claude: true,
                 project_view: cwd.to_string_lossy().into_owned(),
                 to_host: Box::new(|path| Some(PathBuf::from(path))),

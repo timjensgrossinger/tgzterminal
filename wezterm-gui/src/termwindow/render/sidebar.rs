@@ -4268,6 +4268,9 @@ pub(crate) struct AgentPaneState {
     cost: Option<String>,
     activity: Option<HerdActivity>,
     actions: AgentActions,
+    /// `status` is the program's own OSC 7501 report rather than a reading
+    /// of the screen.
+    program_reported: bool,
 }
 
 /// Narrow the herd to the active pane's project.
@@ -5093,6 +5096,14 @@ pub(crate) struct AgentDetectionCacheKey {
     viewport_top: isize,
     viewport_rows: usize,
     visible_fingerprint: u64,
+    /// Hash of the pane's OSC 7501 program status records; 0 when it holds
+    /// none. A program changing its report is a status change the screen
+    /// may never show.
+    program_status: u64,
+    /// Whether the herd sees a subagent working inside this pane's agent. In
+    /// the key so a subagent starting or going quiet is never answered from
+    /// an entry derived before it did, however still the parent's screen is.
+    subagent_working: bool,
 }
 
 /// One sample of a pane's output activity, carried from the top of
@@ -6150,6 +6161,52 @@ fn escalate_agent_status(
         return AgentStatus::Running;
     }
     inferred
+}
+
+/// Hash of a pane's OSC 7501 records for the detection cache key; 0 when it
+/// holds none, so a pane that never reports keys exactly as before.
+fn program_status_fingerprint(status: &wezterm_term::ProgramStatus) -> u64 {
+    use std::hash::{Hash, Hasher};
+    if status.is_empty() {
+        return 0;
+    }
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    status.hash(&mut hasher);
+    hasher.finish().max(1)
+}
+
+/// What a program's OSC 7501 records say about its status, when it reported
+/// any.
+///
+/// The root record is the program itself; child records are its subagents
+/// and background tasks (Claude Code reports one per running background
+/// agent and clears it when the agent finishes). A child that is working or
+/// blocked keeps the program `Running` even when the root sits idle at its
+/// prompt -- that is a parent whose own turn ended while the work it started
+/// goes on. Only a blocked root outranks it: the human is the bottleneck,
+/// whatever the children are doing.
+fn program_status_reading(status: &wezterm_term::ProgramStatus) -> Option<AgentStatus> {
+    use wezterm_term::ProgramState;
+    if status.is_empty() {
+        return None;
+    }
+    let root = status.root().map(|record| record.state);
+    if root == Some(ProgramState::Blocked) {
+        return Some(AgentStatus::WaitingForInput);
+    }
+    if root == Some(ProgramState::Working) || status.children().any(|(_, child)| child.is_live()) {
+        return Some(AgentStatus::Running);
+    }
+    match root {
+        // At rest, finished but unseen, or failed: the agent waits on the
+        // human either way.
+        Some(ProgramState::Idle | ProgramState::Done | ProgramState::Error) => {
+            Some(AgentStatus::WaitingForInput)
+        }
+        // Only finished children and no root: nothing about the program
+        // itself, so let the screen decide.
+        _ => None,
+    }
 }
 
 /// Whether an established identity may be replaced by a fresh candidate.
@@ -8165,6 +8222,8 @@ impl crate::TermWindow {
         let dims = pane.get_dimensions();
         let mut visible_text = String::new();
         let mut visible_text_loaded = false;
+        let program_status = pane.get_program_status();
+        let subagent_working = self.pane_has_working_subagent(pane.pane_id());
         let cache_key = AgentDetectionCacheKey {
             foreground_process: foreground_process.clone(),
             pane_title: pane_title.clone(),
@@ -8172,6 +8231,8 @@ impl crate::TermWindow {
             viewport_top: dims.physical_top,
             viewport_rows: dims.viewport_rows,
             visible_fingerprint: 0,
+            program_status: program_status_fingerprint(&program_status),
+            subagent_working,
         };
         let previous_entry = self
             .agent_detection_cache
@@ -8191,6 +8252,8 @@ impl crate::TermWindow {
                 && k.relevant_user_vars == cache_key.relevant_user_vars
                 && k.viewport_top == cache_key.viewport_top
                 && k.viewport_rows == cache_key.viewport_rows
+                && k.program_status == cache_key.program_status
+                && k.subagent_working == cache_key.subagent_working
                 && entry.detected_at.elapsed() < Duration::from_millis(500)
             {
                 return entry.state.clone();
@@ -8329,6 +8392,16 @@ impl crate::TermWindow {
             }
         }
 
+        // Program status records are trusted only on evidence from *this*
+        // frame: a sticky identity carries the evidence of an earlier one, so
+        // an agent killed without clearing its records would otherwise keep
+        // its last `working` driving the pane after it.
+        let proven_this_frame = fresh_identity.as_ref().is_some_and(|candidate| {
+            matches!(
+                candidate.evidence,
+                AgentEvidence::UserVar | AgentEvidence::Process | AgentEvidence::VisibleChrome
+            )
+        });
         let evidence = fresh_identity
             .as_ref()
             .map(|candidate| candidate.evidence)
@@ -8472,19 +8545,31 @@ impl crate::TermWindow {
         } else {
             previous_entry.as_ref().and_then(|entry| entry.spinner_line)
         };
+        // `waiting_when_quiet` reclassifies a quiet adapter pane as waiting,
+        // so it must only fire on identity evidence that proves the agent
+        // binary really owns the pane. Visible-text evidence would badge a
+        // pane that is merely *displaying* adapter-related text; a title
+        // could just be prose.
+        let strong_identity = matches!(
+            evidence,
+            AgentEvidence::UserVar | AgentEvidence::Process | AgentEvidence::VisibleChrome
+        );
+        // OSC 7501: the program's own report outranks anything read off the
+        // screen. Only while this frame's identity proves the agent owns the
+        // pane, though (see `proven_this_frame`). Status only -- never
+        // evidence for control actions, which stay gated on
+        // `trusted_controls`.
+        let program_reading = if explicit_status.is_none() && proven_this_frame {
+            program_status_reading(&program_status)
+        } else {
+            None
+        };
         let (fresh_status, activity_escalated) = if explicit_status.is_some() {
             (AgentStatus::from_hint(explicit_status), false)
+        } else if let Some(reading) = &program_reading {
+            (reading.clone(), false)
         } else {
             let inferred = if visible_text_loaded {
-                // `waiting_when_quiet` reclassifies a quiet adapter pane as
-                // waiting, so it must only fire on identity evidence that
-                // proves the agent binary really owns the pane. Visible-text
-                // evidence would badge a pane that is merely *displaying*
-                // adapter-related text; a title could just be prose.
-                let strong_identity = matches!(
-                    evidence,
-                    AgentEvidence::UserVar | AgentEvidence::Process | AgentEvidence::VisibleChrome
-                );
                 infer_agent_status_from_visible_text(
                     &visible_text,
                     adapter.as_ref(),
@@ -8497,19 +8582,25 @@ impl crate::TermWindow {
             let escalated = escalate_agent_status(
                 inferred.clone(),
                 activity.busy,
-                self.pane_has_working_subagent(pane.pane_id()),
+                subagent_working,
                 visible_text_loaded && visible_text_awaits_choice(&visible_text),
             );
             let changed = escalated != inferred;
             (escalated, changed)
         };
-        let status = stabilize_agent_status(
-            fresh_status.clone(),
-            previous_state.map(|state| state.status.clone()),
-            previous_entry.as_ref().map(|entry| entry.status_at),
-            now,
-            AGENT_RUNNING_GRACE,
-        );
+        // The grace bridges flicker in a screen reading; a program that says
+        // it stopped has stopped.
+        let status = if program_reading.is_some() {
+            fresh_status.clone()
+        } else {
+            stabilize_agent_status(
+                fresh_status.clone(),
+                previous_state.map(|state| state.status.clone()),
+                previous_entry.as_ref().map(|entry| entry.status_at),
+                now,
+                AGENT_RUNNING_GRACE,
+            )
+        };
         // Only a *fresh* observation refreshes the grace window; carrying the
         // old timestamp forward is what makes the grace expire. This has to use
         // the same test as the stabilizer: refreshing on a reading that was
@@ -8565,6 +8656,7 @@ impl crate::TermWindow {
                 .then(|| visible_agent_activity(&visible_text))
                 .flatten(),
             actions,
+            program_reported: program_reading.is_some(),
         });
         let previous_status = previous_entry
             .as_ref()
@@ -14439,6 +14531,7 @@ impl crate::TermWindow {
                     activity: agent.activity,
                     can_attach: agent.actions.attach,
                     can_open_logs: agent.actions.open_logs,
+                    program_reported: agent.program_reported,
                 });
             }
         }
@@ -14488,6 +14581,7 @@ impl crate::TermWindow {
                 activity: None,
                 can_attach: false,
                 can_open_logs: false,
+                program_reported: false,
             });
         }
 
@@ -14545,6 +14639,23 @@ impl crate::TermWindow {
         // Surface attention-needing agents first so they are not buried.
         if self.config.agent_ui.section.sort_attention_first {
             agents.sort_by_key(|agent| (!attention_live(agent), agent.name.clone()));
+        }
+
+        // Scans only run from paint. While a background subagent is pending,
+        // the only news is a notification landing in the parent transcript,
+        // and nothing on screen changes until it does -- so keep frames (and
+        // with them scans) coming at the refresh interval even when every
+        // animation gate is off.
+        let now = SystemTime::now();
+        if agents.iter().any(|agent| {
+            agent
+                .subagents
+                .iter()
+                .any(|sub| sub.pending && crate::agent_herd::subagent_is_working(sub, now))
+        }) {
+            let refresh =
+                Duration::from_millis(self.config.agent_ui.section.refresh_ms.clamp(100, 10000));
+            self.schedule_sidebar_frame(Instant::now() + refresh);
         }
 
         let mut state = self.agent_herd_state.borrow_mut();
@@ -15659,10 +15770,13 @@ impl crate::TermWindow {
                 }
 
                 if self.config.agent_ui.section.show_activity && !agent.subagents.is_empty() {
+                    // The same test that decides whether the row animates, so
+                    // the count cannot claim work the ring does not show.
+                    let now = std::time::SystemTime::now();
                     let working = agent
                         .subagents
                         .iter()
-                        .filter(|sub| sub.status == HerdStatus::Working)
+                        .filter(|sub| crate::agent_herd::subagent_is_working(sub, now))
                         .count();
                     let blocked = agent
                         .subagents
@@ -17868,6 +17982,7 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
             activity: None,
             can_attach: true,
             can_open_logs: true,
+            program_reported: false,
         };
 
         let agents = crate::agent_herd::join_sessions_with_panes(
@@ -17969,6 +18084,7 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
             can_open_logs: true,
             origin: crate::agent_herd::vendor::SessionOrigin::Host,
             home: None,
+            status_reported: false,
         }
     }
 
@@ -19255,6 +19371,7 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
             status: HerdStatus::Working,
             depth: 1,
             last_activity: None,
+            pending: false,
         }];
 
         let min_h = sidebar_agent_herd_metrics(32., 2., false, 1, Some(&minimal), true, true, None)
@@ -19296,6 +19413,7 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
             status: HerdStatus::Working,
             depth: 1,
             last_activity: None,
+            pending: false,
         }];
 
         // Cap + the "… N more" line.
@@ -19795,6 +19913,87 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
         );
         // Never in the past, or the frame scheduler would spin.
         assert!(first >= *AGENT_PULSE_EPOCH + AGENT_PULSE_FRAME_INTERVAL);
+    }
+
+    fn program_status(reports: &[&str]) -> wezterm_term::ProgramStatus {
+        let mut status = wezterm_term::ProgramStatus::default();
+        for body in reports {
+            match termwiz::escape::OperatingSystemCommand::parse(&[b"7501", body.as_bytes()]) {
+                termwiz::escape::OperatingSystemCommand::ProgramStatus(report) => {
+                    status.apply(report);
+                }
+                other => panic!("{body} did not parse: {other:?}"),
+            }
+        }
+        status
+    }
+
+    #[test]
+    fn a_program_status_report_maps_onto_agent_status() {
+        assert_eq!(program_status_reading(&program_status(&[])), None);
+        assert_eq!(
+            program_status_reading(&program_status(&["state=working:app=claude-code"])),
+            Some(AgentStatus::Running)
+        );
+        assert_eq!(
+            program_status_reading(&program_status(&["state=idle:app=claude-code"])),
+            Some(AgentStatus::WaitingForInput)
+        );
+        assert_eq!(
+            program_status_reading(&program_status(&["state=blocked:kind=permission"])),
+            Some(AgentStatus::WaitingForInput)
+        );
+        assert_eq!(
+            program_status_reading(&program_status(&["state=done"])),
+            Some(AgentStatus::WaitingForInput)
+        );
+        // Only finished children and no root: no opinion about the program.
+        assert_eq!(
+            program_status_reading(&program_status(&["state=done:id=a1"])),
+            None
+        );
+    }
+
+    /// The user-visible bug: the parent's own turn is over (root idle) while
+    /// background agents it launched still run. Claude Code reports each as a
+    /// child record, and the row has to keep spinning until they clear.
+    #[test]
+    fn a_working_child_keeps_an_idle_program_running_until_it_clears() {
+        let mut status = program_status(&[
+            "state=idle:app=claude-code",
+            "state=working:app=claude-code:id=a65e6abb:title=RXhwbG9yZQ==",
+        ]);
+        assert_eq!(program_status_reading(&status), Some(AgentStatus::Running));
+        let cleared = program_status(&["state=clear:id=a65e6abb"]);
+        assert!(cleared.is_empty(), "a clear stores nothing itself");
+        let clear: &[u8] = b"state=clear:id=a65e6abb";
+        assert!(status.apply(
+            match termwiz::escape::OperatingSystemCommand::parse(&[b"7501", clear]) {
+                termwiz::escape::OperatingSystemCommand::ProgramStatus(report) => report,
+                other => panic!("{other:?}"),
+            }
+        ));
+        assert_eq!(
+            program_status_reading(&status),
+            Some(AgentStatus::WaitingForInput)
+        );
+
+        // A blocked root outranks working children: the human is the
+        // bottleneck.
+        let blocked = program_status(&["state=blocked:kind=question", "state=working:id=a1"]);
+        assert_eq!(
+            program_status_reading(&blocked),
+            Some(AgentStatus::WaitingForInput)
+        );
+    }
+
+    #[test]
+    fn program_status_fingerprint_is_zero_only_without_records() {
+        assert_eq!(program_status_fingerprint(&program_status(&[])), 0);
+        let idle = program_status_fingerprint(&program_status(&["state=idle"]));
+        let working = program_status_fingerprint(&program_status(&["state=working"]));
+        assert_ne!(idle, 0);
+        assert_ne!(idle, working);
     }
 
     #[test]
@@ -20459,6 +20658,7 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
                 resume: true,
                 open_logs: true,
             },
+            program_reported: false,
         };
         let adapter = AgentAdapterConfig {
             detail_paths: Some(vec!["{home}/.codex/sessions".to_string()]),
@@ -21451,6 +21651,8 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
             viewport_top: 0,
             viewport_rows: 40,
             visible_fingerprint: 0,
+            program_status: 0,
+            subagent_working: false,
         }
     }
 
@@ -21526,6 +21728,7 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
             cost: None,
             activity: None,
             actions: AgentActions::default(),
+            program_reported: false,
         }
     }
 

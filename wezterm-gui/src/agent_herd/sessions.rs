@@ -1036,24 +1036,10 @@ fn collect_opencode_candidates(
     newer_than: Option<SystemTime>,
     out: &mut Vec<Candidate>,
 ) {
-    let db = home
-        .join(".local")
-        .join("share")
-        .join("opencode")
-        .join("opencode.db");
+    let db = super::opencode::opencode_db(home);
     if !db.is_file() {
         return;
     }
-    // `parent_id IS NULL` drops child sessions (OpenCode's subagents), which are
-    // not independently resumable. `time_archived IS NULL` drops the ones the
-    // user has already filed away. Times are epoch milliseconds. The age
-    // cutoff goes into the query rather than a later filter so that `LIMIT`
-    // counts only sessions that can actually be offered.
-    const QUERY: &str = "SELECT id, directory, title, time_updated \
-                         FROM session \
-                         WHERE parent_id IS NULL AND time_archived IS NULL \
-                         AND time_updated >= ?2 \
-                         ORDER BY time_updated DESC LIMIT ?1";
     let cutoff_ms = newer_than
         .and_then(|cutoff| cutoff.duration_since(SystemTime::UNIX_EPOCH).ok())
         .map_or(0, |since| since.as_millis().min(i64::MAX as u128) as i64);
@@ -1065,7 +1051,28 @@ fn collect_opencode_candidates(
                 | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
                 | rusqlite::OpenFlags::SQLITE_OPEN_URI,
         )?;
-        let mut stmt = conn.prepare(QUERY)?;
+        // OpenCode 2.x renamed `session` to `session_v2`; querying the old
+        // name on a 2.x store failed, and the failure was only logged, so the
+        // menu silently offered no OpenCode session at all.
+        let Some(schema) = super::opencode::detect_opencode_schema(&conn) else {
+            log::debug!("opencode session scan skipped: no known session table");
+            return Ok(());
+        };
+        // `parent_id IS NULL` drops child sessions (OpenCode's subagents),
+        // which are not independently resumable. `time_archived IS NULL` drops
+        // the ones the user has already filed away. Times are epoch
+        // milliseconds. The age cutoff goes into the query rather than a later
+        // filter so that `LIMIT` counts only sessions that can actually be
+        // offered.
+        let query = format!(
+            "SELECT id, directory, title, time_updated \
+             FROM {} \
+             WHERE parent_id IS NULL AND time_archived IS NULL \
+             AND time_updated >= ?2 \
+             ORDER BY time_updated DESC LIMIT ?1",
+            schema.sessions_table()
+        );
+        let mut stmt = conn.prepare(&query)?;
         let rows = stmt.query_map([limit as i64, cutoff_ms], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -1084,7 +1091,12 @@ fn collect_opencode_candidates(
             // back to what they actually typed first.
             let label = match title.as_deref().and_then(opencode_title) {
                 Some(title) => Some(title),
-                None => opencode_first_prompt(&conn, &id),
+                None => match schema {
+                    super::opencode::OpencodeSchema::Legacy => opencode_first_prompt(&conn, &id),
+                    super::opencode::OpencodeSchema::V2 => {
+                        super::opencode::first_prompt_v2(&conn, &id)
+                    }
+                },
             };
             out.push(Candidate::Ready(ready_session(
                 "opencode",
@@ -1282,7 +1294,11 @@ fn is_codex_instruction_blob(text: &str) -> bool {
 
 /// Build recursive tree from flat subagent list.
 ///
-/// Depth 0 = roots. Children follow their parent contiguously in the flat list.
+/// The shallowest depth present is the root level -- Claude writes
+/// `spawnDepth: 1` for a subagent of the top-level session, so a fixed root
+/// depth of 0 used to yield an empty tree. Children follow their parent
+/// contiguously in the flat list; a node whose parent cannot be placed that
+/// way becomes a root of its own rather than vanishing.
 pub fn build_subagent_tree(flat: &[super::HerdSubagent]) -> Vec<SubagentNode> {
     let mut nodes: Vec<SubagentNode> = flat
         .iter()
@@ -1290,13 +1306,24 @@ pub fn build_subagent_tree(flat: &[super::HerdSubagent]) -> Vec<SubagentNode> {
             agent_id: sub.agent_id.clone(),
             agent_type: sub.agent_type.clone(),
             description: sub.description.clone(),
-            status: sub.status,
+            // Pending in the background is working by the parent's account,
+            // however long the transcript has been quiet.
+            status: if sub.pending && sub.status != super::HerdStatus::Done {
+                super::HerdStatus::Working
+            } else {
+                sub.status
+            },
             depth: sub.depth,
             children: Vec::new(),
             events: Vec::new(),
         })
         .collect();
-    assemble_tree(&mut nodes, 0)
+    let mut tree = Vec::new();
+    // Each pass consumes at least the node it starts at, so this terminates.
+    while let Some(depth) = nodes.first().map(|node| node.depth) {
+        tree.extend(assemble_tree(&mut nodes, depth));
+    }
+    tree
 }
 
 /// Consume nodes from the front of the slice, building a tree at the given depth.
@@ -1898,6 +1925,106 @@ mod tests {
         let limited = collect_recent_sessions(dir.path(), 2);
         assert_eq!(limited.len(), 2);
         assert_eq!(limited[0].session_id, "aaaa-9999");
+    }
+
+    fn flat_sub(id: &str, depth: u32, pending: bool) -> crate::agent_herd::HerdSubagent {
+        crate::agent_herd::HerdSubagent {
+            agent_id: id.to_string(),
+            agent_type: "Explore".to_string(),
+            description: id.to_string(),
+            status: crate::agent_herd::HerdStatus::Unknown,
+            depth,
+            last_activity: None,
+            pending,
+        }
+    }
+
+    /// OpenCode 2.x names its table `session_v2`; the resume menu used to
+    /// query only `session` and offered nothing from a 2.x store.
+    #[test]
+    fn opencode_v2_sessions_are_offered_for_resume() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join(".local/share/opencode/opencode.db");
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session_v2 (
+                id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT NOT NULL,
+                title TEXT, time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL, time_archived INTEGER
+            );
+            CREATE TABLE session_message (
+                id TEXT PRIMARY KEY, session_id TEXT NOT NULL, seq INTEGER NOT NULL,
+                time_created INTEGER NOT NULL, data TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        conn.execute(
+            "INSERT INTO session_v2 (id, parent_id, directory, title, time_created, time_updated)
+             VALUES ('ses_v2', NULL, '/repo', 'New session - 2026', ?1, ?1),
+                    ('ses_child', 'ses_v2', '/repo', 'Child', ?1, ?1)",
+            [now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_message (id, session_id, seq, time_created, data)
+             VALUES ('m1', 'ses_v2', 1, ?1,
+                     '{\"role\":\"user\",\"parts\":[{\"type\":\"text\",\"text\":\"fix the flaky resume menu test\"}]}')",
+            [now],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut out = Vec::new();
+        collect_opencode_candidates(temp.path(), 10, None, &mut out);
+        assert_eq!(
+            out.len(),
+            1,
+            "the child session is not resumable on its own"
+        );
+        match &out[0] {
+            Candidate::Ready(session) => {
+                assert_eq!(session.session_id, "ses_v2");
+                assert!(
+                    session.label.contains("flaky resume menu"),
+                    "{}",
+                    session.label
+                );
+            }
+            _ => panic!("expected a ready candidate"),
+        }
+    }
+
+    /// Claude writes `spawnDepth: 1` for a subagent of the top-level session;
+    /// a tree assembled from a fixed depth of 0 came out empty.
+    #[test]
+    fn subagents_at_depth_one_form_the_tree() {
+        let tree = build_subagent_tree(&[
+            flat_sub("a", 1, true),
+            flat_sub("a-child", 2, false),
+            flat_sub("b", 1, false),
+        ]);
+        let roots: Vec<&str> = tree.iter().map(|node| node.agent_id.as_str()).collect();
+        assert_eq!(roots, vec!["a", "b"]);
+        assert_eq!(tree[0].children.len(), 1);
+        assert_eq!(
+            tree[0].status,
+            crate::agent_herd::HerdStatus::Working,
+            "a pending background agent shows as working"
+        );
+        assert_eq!(tree[1].status, crate::agent_herd::HerdStatus::Unknown);
+
+        // A node whose parent cannot be placed is kept as a root.
+        let tree = build_subagent_tree(&[flat_sub("a", 1, false), flat_sub("orphan", 3, false)]);
+        let roots: Vec<&str> = tree.iter().map(|node| node.agent_id.as_str()).collect();
+        assert_eq!(roots, vec!["a", "orphan"]);
+        let tree = build_subagent_tree(&[flat_sub("deep", 2, false), flat_sub("a", 1, false)]);
+        let roots: Vec<&str> = tree.iter().map(|node| node.agent_id.as_str()).collect();
+        assert_eq!(roots, vec!["deep", "a"]);
     }
 
     #[test]
