@@ -52,6 +52,14 @@ pub enum OperatingSystemCommand {
     ResetColors(Vec<u8>),
     RxvtExtension(Vec<String>),
     ConEmuProgress(Progress),
+    /// OSC 7501 `?`: a program asking whether the terminal understands
+    /// program status reports.
+    ProgramStatusQuery,
+    /// OSC 7501 `?:...`: the terminal's answer to `ProgramStatusQuery`.
+    /// Carried verbatim, from the `?` on.
+    ProgramStatusCapabilities(String),
+    /// OSC 7501 `key=value:...`: one program status report.
+    ProgramStatus(ProgramStatusReport),
 
     Unspecified(Vec<Vec<u8>>),
 }
@@ -351,6 +359,20 @@ impl OperatingSystemCommand {
                 single_string!(SystemNotification)
             }
             SetCurrentWorkingDirectory => single_string!(CurrentWorkingDirectory),
+            ProgramStatus => {
+                // Values cannot contain `;`, so a well-formed report is a
+                // single parameter.
+                ensure!(osc.len() == 2, "OSC 7501 with {} params", osc.len());
+                if osc[1] == b"?" {
+                    Ok(OperatingSystemCommand::ProgramStatusQuery)
+                } else if osc[1].starts_with(b"?") {
+                    Ok(OperatingSystemCommand::ProgramStatusCapabilities(
+                        String::from_utf8(osc[1].to_vec())?,
+                    ))
+                } else {
+                    ProgramStatusReport::parse(osc[1]).map(OperatingSystemCommand::ProgramStatus)
+                }
+            }
             ITermProprietary => {
                 self::ITermProprietary::parse(osc).map(OperatingSystemCommand::ITermProprietary)
             }
@@ -499,6 +521,8 @@ osc_entries!(
     RxvtProprietary = "777",
     FinalTermSemanticPrompt = "133",
     ITermProprietary = "1337",
+    /// Program Status Protocol, see `ProgramStatusReport`
+    ProgramStatus = "7501",
     /// Here the "Sun" suffix comes from the table in
     /// <https://invisible-island.net/xterm/ctlseqs/ctlseqs.html#h3-Miscellaneous>
     /// that lays out various window related escape sequences.
@@ -612,6 +636,9 @@ impl Display for OperatingSystemCommand {
             ConEmuProgress(Progress::SetError(pct)) => write!(f, "9;4;2;{pct}")?,
             ConEmuProgress(Progress::SetIndeterminate) => write!(f, "9;4;3")?,
             ConEmuProgress(Progress::Paused) => write!(f, "9;4;4")?,
+            ProgramStatusQuery => write!(f, "7501;?")?,
+            ProgramStatusCapabilities(body) => write!(f, "7501;{body}")?,
+            ProgramStatus(report) => write!(f, "7501;{report}")?,
         };
         // Use the longer form ST as neovim doesn't like the BEL version
         write!(f, "\x1b\\")?;
@@ -887,6 +914,312 @@ pub enum Progress {
     SetError(u8),
     SetIndeterminate,
     Paused,
+}
+
+/// OSC 7501, the Program Status Protocol: a program reports what it is doing
+/// (at rest, working, blocked on the user, finished, failed) as structured
+/// records, so a terminal does not have to scrape the screen for it.
+/// Spec (draft): <https://www.superlogical.com/rex/docs/build/program-status>
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProgramState {
+    Idle,
+    Working,
+    Done,
+    Blocked,
+    Error,
+    /// Removes the addressed record and everything beneath it.
+    Clear,
+}
+
+impl ProgramState {
+    fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "idle" => Self::Idle,
+            "working" => Self::Working,
+            "done" => Self::Done,
+            "blocked" => Self::Blocked,
+            "error" => Self::Error,
+            "clear" => Self::Clear,
+            _ => return None,
+        })
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Working => "working",
+            Self::Done => "done",
+            Self::Blocked => "blocked",
+            Self::Error => "error",
+            Self::Clear => "clear",
+        }
+    }
+}
+
+/// What a `blocked` record is waiting for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProgramBlockedKind {
+    Permission,
+    Question,
+    Auth,
+}
+
+impl ProgramBlockedKind {
+    fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "permission" => Self::Permission,
+            "question" => Self::Question,
+            "auth" => Self::Auth,
+            _ => return None,
+        })
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Permission => "permission",
+            Self::Question => "question",
+            Self::Auth => "auth",
+        }
+    }
+}
+
+/// One OSC 7501 report. A report replaces the record its `id` addresses
+/// wholesale; keys it leaves out are gone from that record.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ProgramStatusReport {
+    pub state: ProgramState,
+    /// `/`-separated path (`build/test` is a child of `build`); `None` is
+    /// the root record.
+    pub id: Option<String>,
+    /// Only ever set on a `blocked` report.
+    pub kind: Option<ProgramBlockedKind>,
+    /// 0..=100, only ever set on `working`/`blocked`; `None` = indeterminate.
+    pub progress: Option<u8>,
+    /// Stable machine-readable program name, e.g. `claude-code`.
+    pub app: Option<String>,
+    /// Short label, decoded from base64. Never contains control characters.
+    pub title: Option<String>,
+    /// One line of text, decoded from base64. Never contains control
+    /// characters.
+    pub msg: Option<String>,
+}
+
+/// The reply a terminal sends to `ProgramStatusQuery`, from the `?` on.
+pub const PROGRAM_STATUS_CAPABILITIES: &str =
+    "?:states=idle,working,done,blocked,error:kinds=permission,question,auth";
+
+const PROGRAM_STATUS_MAX_LEN: usize = 4096;
+const PROGRAM_STATUS_MAX_KEY: usize = 16;
+const PROGRAM_STATUS_MAX_TITLE_ENCODED: usize = 256;
+const PROGRAM_STATUS_MAX_TITLE: usize = 192;
+const PROGRAM_STATUS_MAX_MSG_ENCODED: usize = 2732;
+const PROGRAM_STATUS_MAX_MSG: usize = 2048;
+const PROGRAM_STATUS_MAX_APP: usize = 32;
+const PROGRAM_STATUS_MAX_ID: usize = 128;
+const PROGRAM_STATUS_MAX_SEGMENT: usize = 32;
+const PROGRAM_STATUS_MAX_DEPTH: usize = 8;
+
+fn is_program_status_value_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b',' | b'+' | b'/' | b'=' | b'-')
+}
+
+fn is_program_status_name_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'+' | b'-')
+}
+
+/// Whether `id` is a valid record path: at most 8 `/`-separated segments of
+/// `[A-Za-z0-9_.+-]{1,32}`, 128 bytes in all.
+pub fn is_valid_program_status_id(id: &str) -> bool {
+    id.len() <= PROGRAM_STATUS_MAX_ID
+        && id.split('/').count() <= PROGRAM_STATUS_MAX_DEPTH
+        && id.split('/').all(|segment| {
+            !segment.is_empty()
+                && segment.len() <= PROGRAM_STATUS_MAX_SEGMENT
+                && segment.bytes().all(is_program_status_name_byte)
+        })
+}
+
+/// Decode a `title`/`msg` value. The spec makes a bad one fatal for the
+/// whole report: oversized, invalid base64, invalid UTF-8 or any control
+/// character. Bidi overrides and other invisible formatting characters are
+/// dropped, because the text is shown outside the terminal grid.
+fn decode_program_status_text(
+    key: &str,
+    encoded: &str,
+    max_encoded: usize,
+    max_decoded: usize,
+) -> Result<Option<String>> {
+    use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
+    ensure!(
+        encoded.len() <= max_encoded,
+        "OSC 7501 {key} is {} bytes encoded",
+        encoded.len()
+    );
+    if encoded.is_empty() {
+        return Ok(None);
+    }
+    let bytes = GeneralPurpose::new(
+        &base64::alphabet::STANDARD,
+        GeneralPurposeConfig::new()
+            .with_decode_allow_trailing_bits(true)
+            .with_decode_padding_mode(DecodePaddingMode::Indifferent),
+    )
+    .decode(encoded)
+    .map_err(|err| format_err!("OSC 7501 {key}: {:#}", err))?;
+    ensure!(
+        bytes.len() <= max_decoded,
+        "OSC 7501 {key} is {} bytes decoded",
+        bytes.len()
+    );
+    let text = String::from_utf8(bytes)?;
+    ensure!(
+        !text
+            .chars()
+            .any(|c| c <= '\u{1f}' || ('\u{7f}'..='\u{9f}').contains(&c)),
+        "OSC 7501 {key} contains a control character"
+    );
+    let text: String = text
+        .chars()
+        .filter(|c| {
+            !matches!(
+                c,
+                '\u{200b}'..='\u{200f}'
+                    | '\u{202a}'..='\u{202e}'
+                    | '\u{2060}'..='\u{2064}'
+                    | '\u{2066}'..='\u{2069}'
+                    | '\u{feff}'
+            )
+        })
+        .collect();
+    Ok(if text.is_empty() { None } else { Some(text) })
+}
+
+impl ProgramStatusReport {
+    /// Parse a report body (`state=working:app=cargo:...`). A malformed pair
+    /// is skipped and an unknown key ignored; the last repeat of a key wins.
+    /// The whole report is rejected for a missing or unknown `state`, an
+    /// invalid `id`, a limit violation or bad `title`/`msg` text.
+    fn parse(body: &[u8]) -> Result<Self> {
+        ensure!(
+            body.len() <= PROGRAM_STATUS_MAX_LEN,
+            "OSC 7501 report is {} bytes",
+            body.len()
+        );
+        let body = str::from_utf8(body)?;
+
+        let mut state = None;
+        let mut id = None;
+        let mut kind = None;
+        let mut progress = None;
+        let mut app = None;
+        let mut title = None;
+        let mut msg = None;
+        for pair in body.split(':') {
+            let Some((key, value)) = pair.split_once('=') else {
+                continue;
+            };
+            let (key, value) = (key.trim(), value.trim());
+            if key.is_empty()
+                || key.len() > PROGRAM_STATUS_MAX_KEY
+                || !key.bytes().all(|b| b.is_ascii_lowercase())
+                || !value.bytes().all(is_program_status_value_byte)
+            {
+                continue;
+            }
+            match key {
+                "state" => state = Some(value),
+                "id" => id = Some(value),
+                "kind" => kind = Some(value),
+                "progress" => progress = Some(value),
+                "app" => app = Some(value),
+                "title" => title = Some(value),
+                "msg" => msg = Some(value),
+                _ => {}
+            }
+        }
+
+        let state = state
+            .and_then(ProgramState::parse)
+            .ok_or_else(|| format_err!("OSC 7501 report without a known state"))?;
+        let id = match id {
+            None => None,
+            Some(id) => {
+                ensure!(is_valid_program_status_id(id), "OSC 7501 invalid id");
+                Some(id.to_string())
+            }
+        };
+        let kind = match state {
+            ProgramState::Blocked => kind.and_then(ProgramBlockedKind::parse),
+            _ => None,
+        };
+        let progress = match state {
+            ProgramState::Working | ProgramState::Blocked => progress
+                .filter(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+                .and_then(|p| p.parse::<u8>().ok())
+                .filter(|p| *p <= 100),
+            _ => None,
+        };
+        let app = app
+            .filter(|a| {
+                !a.is_empty()
+                    && a.len() <= PROGRAM_STATUS_MAX_APP
+                    && a.bytes().all(is_program_status_name_byte)
+            })
+            .map(|a| a.to_string());
+        let title = match title {
+            Some(t) => decode_program_status_text(
+                "title",
+                t,
+                PROGRAM_STATUS_MAX_TITLE_ENCODED,
+                PROGRAM_STATUS_MAX_TITLE,
+            )?,
+            None => None,
+        };
+        let msg = match msg {
+            Some(m) => decode_program_status_text(
+                "msg",
+                m,
+                PROGRAM_STATUS_MAX_MSG_ENCODED,
+                PROGRAM_STATUS_MAX_MSG,
+            )?,
+            None => None,
+        };
+
+        Ok(Self {
+            state,
+            id,
+            kind,
+            progress,
+            app,
+            title,
+            msg,
+        })
+    }
+}
+
+impl Display for ProgramStatusReport {
+    fn fmt(&self, f: &mut Formatter) -> FmtResult {
+        write!(f, "state={}", self.state.as_str())?;
+        if let Some(id) = &self.id {
+            write!(f, ":id={id}")?;
+        }
+        if let Some(kind) = self.kind {
+            write!(f, ":kind={}", kind.as_str())?;
+        }
+        if let Some(progress) = self.progress {
+            write!(f, ":progress={progress}")?;
+        }
+        if let Some(app) = &self.app {
+            write!(f, ":app={app}")?;
+        }
+        if let Some(title) = &self.title {
+            write!(f, ":title={}", base64_encode(title))?;
+        }
+        if let Some(msg) = &self.msg {
+            write!(f, ":msg={}", base64_encode(msg))?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1722,6 +2055,123 @@ mod test {
             parse(&["9", "4", "4"], "\x1b]9;4;4\x1b\\"),
             OperatingSystemCommand::ConEmuProgress(Progress::Paused)
         );
+    }
+
+    #[test]
+    fn program_status() {
+        assert_eq!(
+            parse(&["7501", "?"], "\x1b]7501;?\x1b\\"),
+            OperatingSystemCommand::ProgramStatusQuery
+        );
+        assert_eq!(
+            parse(
+                &["7501", PROGRAM_STATUS_CAPABILITIES],
+                "\x1b]7501;?:states=idle,working,done,blocked,error:kinds=permission,question,auth\x1b\\"
+            ),
+            OperatingSystemCommand::ProgramStatusCapabilities(PROGRAM_STATUS_CAPABILITIES.into())
+        );
+        // The exact shape Claude Code 2.1.301 emits for a background agent.
+        assert_eq!(
+            parse(
+                &[
+                    "7501",
+                    "state=working:app=claude-code:id=a65e6abb:title=RXhwbG9yZQ=="
+                ],
+                "\x1b]7501;state=working:id=a65e6abb:app=claude-code:title=RXhwbG9yZQ==\x1b\\"
+            ),
+            OperatingSystemCommand::ProgramStatus(ProgramStatusReport {
+                state: ProgramState::Working,
+                id: Some("a65e6abb".into()),
+                kind: None,
+                progress: None,
+                app: Some("claude-code".into()),
+                title: Some("Explore".into()),
+                msg: None,
+            })
+        );
+        assert_eq!(
+            parse(
+                &[
+                    "7501",
+                    "state=blocked:kind=permission:progress=40:app=terraform"
+                ],
+                "\x1b]7501;state=blocked:kind=permission:progress=40:app=terraform\x1b\\"
+            ),
+            OperatingSystemCommand::ProgramStatus(ProgramStatusReport {
+                state: ProgramState::Blocked,
+                id: None,
+                kind: Some(ProgramBlockedKind::Permission),
+                progress: Some(40),
+                app: Some("terraform".into()),
+                title: None,
+                msg: None,
+            })
+        );
+    }
+
+    fn report(body: &str) -> Option<ProgramStatusReport> {
+        match OperatingSystemCommand::parse(&[b"7501", body.as_bytes()]) {
+            OperatingSystemCommand::ProgramStatus(r) => Some(r),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn program_status_tolerates_what_the_spec_says_to_skip() {
+        // Whitespace, a malformed pair, an unknown key, a repeat (last wins).
+        let r = report(" state = idle :garbage:future=1:app=a:app=b").unwrap();
+        assert_eq!(r.state, ProgramState::Idle);
+        assert_eq!(r.app.as_deref(), Some("b"));
+        // kind only on blocked, progress only on working/blocked.
+        let r = report("state=idle:kind=permission:progress=5").unwrap();
+        assert_eq!((r.kind, r.progress), (None, None));
+        // An unknown kind and an out-of-range progress are treated as absent.
+        let r = report("state=blocked:kind=coffee:progress=101").unwrap();
+        assert_eq!((r.kind, r.progress), (None, None));
+        // Padding is optional.
+        assert_eq!(
+            report("state=done:title=aGk").unwrap().title.as_deref(),
+            Some("hi")
+        );
+        // Bidi overrides are dropped from displayed text.
+        let r = report(&format!("state=done:msg={}", base64_encode("a\u{202e}b"))).unwrap();
+        assert_eq!(r.msg.as_deref(), Some("ab"));
+    }
+
+    #[test]
+    fn program_status_rejects_the_whole_report() {
+        assert!(report("app=x").is_none(), "no state");
+        assert!(report("state=sleeping").is_none(), "unknown state");
+        assert!(report("state=idle:id=a//b").is_none(), "empty segment");
+        assert!(report("state=idle:id=a,b").is_none(), "bad id char");
+        // A value outside the value alphabet is a malformed pair, skipped.
+        assert_eq!(report("state=idle:id=a b").unwrap().id, None);
+        assert!(
+            report(&format!("state=idle:id={}", ["a"; 9].join("/"))).is_none(),
+            "too deep"
+        );
+        assert!(report("state=idle:title=a").is_none(), "bad base64");
+        assert!(
+            report(&format!("state=idle:msg={}", base64_encode("line\nbreak"))).is_none(),
+            "control character"
+        );
+        assert!(
+            report(&format!(
+                "state=idle:msg={}",
+                base64_encode("x".repeat(2049))
+            ))
+            .is_none(),
+            "msg too long"
+        );
+        assert!(
+            report(&format!("state=idle:{}", "x".repeat(4096))).is_none(),
+            "report too long"
+        );
+        // A `;` makes a second parameter, which no valid report has.
+        assert!(matches!(
+            OperatingSystemCommand::parse(&[b"7501", b"state=idle", b"x"]),
+            OperatingSystemCommand::Unspecified(_)
+        ));
     }
 
     #[test]

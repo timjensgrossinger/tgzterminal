@@ -138,7 +138,7 @@ impl GuiFrontEnd {
                 }
                 MuxNotification::Alert {
                     pane_id: _,
-                    alert: Alert::Bell | Alert::Progress(_),
+                    alert: Alert::Bell | Alert::Progress(_) | Alert::ProgramStatusChanged,
                 } => {
                     // Handled via TermWindowNotif; NOP it here.
                 }

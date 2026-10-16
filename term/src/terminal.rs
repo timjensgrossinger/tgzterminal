@@ -71,6 +71,9 @@ pub enum Alert {
     OutputSinceFocusLost,
     /// A change to the progress bar state
     Progress(Progress),
+    /// The OSC 7501 program status records changed; read them with
+    /// `TerminalState::get_program_status`.
+    ProgramStatusChanged,
 }
 
 pub trait AlertHandler: Send + Sync {

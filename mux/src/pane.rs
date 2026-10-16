@@ -261,6 +261,12 @@ pub trait Pane: Downcast + Send + Sync {
     fn get_progress(&self) -> Progress {
         Progress::None
     }
+    /// OSC 7501 program status records (TGZTerminal). Only local panes hold
+    /// them; remote/mux-server panes report none, since the mux codec does
+    /// not carry them.
+    fn get_program_status(&self) -> wezterm_term::ProgramStatus {
+        wezterm_term::ProgramStatus::default()
+    }
     fn send_paste(&self, text: &str) -> anyhow::Result<()>;
     fn send_composed_text(&self, text: &str) -> anyhow::Result<()> {
         self.writer().write_all(text.as_bytes())?;

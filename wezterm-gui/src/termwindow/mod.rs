@@ -2248,7 +2248,8 @@ impl TermWindow {
                         | Alert::WindowTitleChanged(_)
                         | Alert::TabTitleChanged(_)
                         | Alert::IconTitleChanged(_)
-                        | Alert::Progress(_),
+                        | Alert::Progress(_)
+                        | Alert::ProgramStatusChanged,
                     ..
                 } => {
                     self.update_title();
@@ -2500,6 +2501,7 @@ impl TermWindow {
                     | Alert::TabTitleChanged(_)
                     | Alert::IconTitleChanged(_)
                     | Alert::Progress(_)
+                    | Alert::ProgramStatusChanged
                     | Alert::SetUserVar { .. }
                     | Alert::Bell,
             }

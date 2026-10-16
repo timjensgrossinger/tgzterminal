@@ -35,6 +35,8 @@ pub use wezterm_surface::line::*;
 pub mod screen;
 pub use crate::screen::*;
 
+pub mod program_status;
+pub use crate::program_status::*;
 pub mod terminal;
 pub use crate::terminal::*;
 

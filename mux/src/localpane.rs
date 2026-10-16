@@ -438,6 +438,9 @@ impl Pane for LocalPane {
                         (ExitBehavior::Hold, _, true) => *proc = ProcessState::Dead,
                     }
                     log::debug!("child terminated, new state is {:?}", proc);
+                    // A held pane stays on screen; what it last reported as
+                    // working or blocked is not happening any more.
+                    self.terminal.lock().program_status_process_exited();
                 }
             }
             ProcessState::DeadPendingClose { killed } => {
@@ -603,6 +606,24 @@ impl Pane for LocalPane {
 
     fn get_progress(&self) -> Progress {
         self.terminal.lock().get_progress()
+    }
+
+    fn get_program_status(&self) -> wezterm_term::ProgramStatus {
+        let status = self.terminal.lock().get_program_status();
+        // `working`/`blocked` describe a live process. A program that exits
+        // back to a shell without shell integration sends no OSC 133 prompt,
+        // so its pane's own shell back in front is the only sign it is gone.
+        // The cached reading is confirmed fresh before acting on it: just
+        // after a program starts, the cache can still name the shell.
+        if status.iter().any(|(_, record)| record.is_live())
+            && self.spawned_shell_is_foreground(CachePolicy::AllowStale)
+            && self.spawned_shell_is_foreground(CachePolicy::FetchImmediate)
+        {
+            let mut terminal = self.terminal.lock();
+            terminal.program_status_process_exited();
+            return terminal.get_program_status();
+        }
+        status
     }
 
     fn palette(&self) -> ColorPalette {

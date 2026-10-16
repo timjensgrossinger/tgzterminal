@@ -720,6 +720,9 @@ impl<'a> Performer<'a> {
                 self.suppress_initial_title_change = false;
                 self.accumulating_title.take();
                 self.progress = Progress::default();
+                if self.program_status.clear() {
+                    self.program_status_did_change();
+                }
 
                 self.screen.full_reset();
                 self.screen.activate_alt_screen(seqno);
@@ -872,6 +875,11 @@ impl<'a> Performer<'a> {
             ) => {
                 self.fresh_line();
                 self.pen.set_semantic_type(SemanticType::Prompt);
+                // A new shell prompt: OSC 7501 working/blocked records are
+                // stale (the program that reported them is gone).
+                if self.program_status.drop_live() {
+                    self.program_status_did_change();
+                }
             }
             OperatingSystemCommand::FinalTermSemanticPrompt(
                 FinalTermSemanticPrompt::StartPrompt(_),
@@ -1093,6 +1101,20 @@ impl<'a> Performer<'a> {
                     if let Some(handler) = self.alert_handler.as_mut() {
                         handler.alert(Alert::Progress(prog));
                     }
+                }
+            }
+            OperatingSystemCommand::ProgramStatusQuery => {
+                let reply = OperatingSystemCommand::ProgramStatusCapabilities(
+                    wezterm_escape_parser::osc::PROGRAM_STATUS_CAPABILITIES.to_string(),
+                );
+                write!(self.writer, "{}", reply).ok();
+                self.writer.flush().ok();
+            }
+            // Another terminal's reply to a query; nothing to do.
+            OperatingSystemCommand::ProgramStatusCapabilities(_) => {}
+            OperatingSystemCommand::ProgramStatus(report) => {
+                if self.program_status.apply(report) {
+                    self.program_status_did_change();
                 }
             }
         }

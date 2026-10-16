@@ -350,6 +350,8 @@ pub struct TerminalState {
     /// The icon title string (OSC 1)
     icon_title: Option<String>,
     progress: Progress,
+    /// OSC 7501 records (TGZTerminal addition).
+    program_status: crate::ProgramStatus,
 
     palette: Option<ColorPalette>,
 
@@ -595,6 +597,7 @@ impl TerminalState {
             bidi_enabled: None,
             bidi_hint: None,
             progress: Progress::default(),
+            program_status: crate::ProgramStatus::default(),
         }
     }
 
@@ -658,6 +661,25 @@ impl TerminalState {
 
     pub fn get_progress(&self) -> Progress {
         self.progress.clone()
+    }
+
+    /// The OSC 7501 program status records this terminal holds.
+    pub fn get_program_status(&self) -> crate::ProgramStatus {
+        self.program_status.clone()
+    }
+
+    /// The attached process exited: its `working`/`blocked` records no
+    /// longer describe anything (OSC 7501 record lifetime).
+    pub fn program_status_process_exited(&mut self) {
+        if self.program_status.drop_live() {
+            self.program_status_did_change();
+        }
+    }
+
+    fn program_status_did_change(&mut self) {
+        if let Some(handler) = self.alert_handler.as_mut() {
+            handler.alert(Alert::ProgramStatusChanged);
+        }
     }
 
     /// Returns the current working directory associated with the

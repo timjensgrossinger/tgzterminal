@@ -118,6 +118,12 @@ where
                     .await?;
                 stream.flush().await.context("flushing PDU to client")?;
             }
+            // OSC 7501 records are not carried by the codec (remote panes
+            // report none), and an older client could not decode the variant.
+            Ok(Item::Notif(MuxNotification::Alert {
+                alert: wezterm_term::Alert::ProgramStatusChanged,
+                ..
+            })) => {}
             Ok(Item::Notif(MuxNotification::Alert { pane_id, alert })) => {
                 {
                     let per_pane = handler.per_pane(pane_id);
