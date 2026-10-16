@@ -1073,6 +1073,7 @@ impl super::TermWindow {
                             y: item.y,
                             expanded: None,
                             scroll_offset: 0,
+                            pinned_top: None,
                         });
                     }
                 }
@@ -1085,6 +1086,7 @@ impl super::TermWindow {
                         y: item.y,
                         expanded: None,
                         scroll_offset: 0,
+                        pinned_top: None,
                     }),
                 };
             }
@@ -1152,6 +1154,7 @@ impl super::TermWindow {
                     y: item.y,
                     expanded: None,
                     scroll_offset: 0,
+                    pinned_top: None,
                 }),
             };
         }
@@ -1450,6 +1453,7 @@ impl super::TermWindow {
                         y: item.y,
                         expanded: None,
                         scroll_offset: 0,
+                        pinned_top: None,
                     })
                 }
             };

@@ -777,6 +777,11 @@ pub struct AgentLaunchMenuState {
     /// First row painted, for the dropdowns that scroll (the sessions menu and
     /// the launcher). Clamped at paint time; the new-tab dropdown ignores it.
     pub scroll_offset: usize,
+    /// Top edge the sessions menu was first painted at, so rows that arrive
+    /// from the background scan grow the panel downward instead of moving the
+    /// row under the pointer. `None` until the first paint; the other dropdowns
+    /// do not pin and leave it `None`.
+    pub pinned_top: Option<f32>,
 }
 
 /// Anchor for the sidebar SSH quick-launch dropdown. Mirrors

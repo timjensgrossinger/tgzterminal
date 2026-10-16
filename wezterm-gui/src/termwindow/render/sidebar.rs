@@ -284,6 +284,43 @@ fn dropdown_viewport(heights: &[f32], offset: usize, max_body: f32) -> Option<Dr
     })
 }
 
+/// Keeps a dropdown's top edge where its first paint put it.
+///
+/// The sessions menu opens with two rows and grows when the background scan
+/// lands. Placed afresh every frame, the taller panel stopped fitting below its
+/// button and flipped above it, so the row the user was reaching for slid away
+/// and an older session took its place under the pointer.
+#[derive(Clone, Copy, Debug)]
+struct DropdownPin {
+    /// Top edge from an earlier paint; `None` on the first.
+    top: Option<f32>,
+    /// Rows the menu is expected to grow to. Only the first paint reads it, to
+    /// pick the side the full menu fits on.
+    expected_rows: usize,
+}
+
+/// Top edge of a `menu_h` tall dropdown anchored at `anchor_y`: opens toward
+/// `downward`, flips to the other side when that would run off the window, and
+/// is clamped inside it either way.
+fn dropdown_top(anchor_y: f32, menu_h: f32, downward: bool, window_h: f32) -> f32 {
+    let max_y = (window_h - menu_h - FLOAT_GAP).max(FLOAT_GAP);
+    if downward {
+        let down_y = anchor_y + FLOAT_GAP;
+        if down_y + menu_h > window_h - FLOAT_GAP {
+            (anchor_y - menu_h - FLOAT_GAP).clamp(FLOAT_GAP, max_y)
+        } else {
+            down_y.clamp(FLOAT_GAP, max_y)
+        }
+    } else {
+        let up_y = anchor_y - menu_h - FLOAT_GAP;
+        if up_y < FLOAT_GAP {
+            (anchor_y + FLOAT_GAP).clamp(FLOAT_GAP, max_y)
+        } else {
+            up_y.clamp(FLOAT_GAP, max_y)
+        }
+    }
+}
+
 /// Scroll geometry of the open session dropdown as last painted, so the wheel,
 /// track and thumb handlers act on what the user actually sees.
 #[derive(Clone, Copy, Debug)]
@@ -10965,7 +11002,10 @@ impl crate::TermWindow {
         };
 
         let mut rows: Vec<SidebarDropdownRow> = Vec::new();
-        if let Some(candidates) = self.agent_restore_candidates() {
+        let restore_candidates = self.agent_restore_candidates();
+        let has_restore_row = restore_candidates.is_some();
+        let resume_limit = self.agent_resume_menu_limit();
+        if let Some(candidates) = restore_candidates {
             rows.push(SidebarDropdownRow {
                 label: restore_row_label(&candidates),
                 dot_color: None,
@@ -10977,7 +11017,7 @@ impl crate::TermWindow {
             });
         }
 
-        if self.agent_resume_menu_limit() > 0 {
+        if resume_limit > 0 {
             // `agent_resume_session_rows` builds rows for the launcher, where
             // they hang under an expander and are indented to show it. Here they
             // are a top-level group, so drop the indent and put the divider on
@@ -11018,9 +11058,24 @@ impl crate::TermWindow {
             .unwrap_or(0);
         let needed_cols = (longest_cols as f32 * cell_w + 64.0 * dpi) / dpi;
         let menu_w = AGENT_RESUME_MENU_W.max(needed_cols);
+        // The restore row is there at once, the sessions arrive with the scan.
+        // Pinned, so their arrival cannot move the restore row away from a
+        // pointer already on its way to it.
+        let expected_rows = rows.len().max(
+            usize::from(has_restore_row)
+                + if resume_limit > 0 {
+                    resume_limit + 1
+                } else {
+                    0
+                },
+        );
+        let mut pin = DropdownPin {
+            top: menu.pinned_top,
+            expected_rows,
+        };
         // Downward: the button sits in the agent section header, which is above
         // its rows, so there is room below and none above.
-        self.paint_sidebar_dropdown(
+        let painted = self.paint_sidebar_dropdown(
             layers,
             menu.x as f32,
             menu.y as f32,
@@ -11028,7 +11083,12 @@ impl crate::TermWindow {
             true,
             &rows,
             Some(menu.scroll_offset),
-        )
+            Some(&mut pin),
+        );
+        if let Some(menu) = self.sessions_menu.as_mut() {
+            menu.pinned_top = pin.top;
+        }
+        painted
     }
 
     pub fn paint_agent_launch_menu(
@@ -11161,6 +11221,7 @@ impl crate::TermWindow {
             false,
             &rows,
             Some(menu.scroll_offset),
+            None,
         )
     }
 
@@ -11286,6 +11347,7 @@ impl crate::TermWindow {
             false,
             &rows,
             None,
+            None,
         )
     }
 
@@ -11380,6 +11442,7 @@ impl crate::TermWindow {
             downward,
             &rows,
             None,
+            None,
         )
     }
 
@@ -11437,6 +11500,7 @@ impl crate::TermWindow {
             menu_w,
             false,
             &rows,
+            None,
             None,
         )
     }
@@ -11515,6 +11579,7 @@ impl crate::TermWindow {
             false,
             &rows,
             Some(menu.scroll_offset),
+            None,
         )
     }
 
@@ -11577,6 +11642,7 @@ impl crate::TermWindow {
         downward: bool,
         rows: &[SidebarDropdownRow],
         scroll: Option<usize>,
+        pin: Option<&mut DropdownPin>,
     ) -> anyhow::Result<()> {
         if scroll.is_some() {
             // Recomputed below; a menu that no longer overflows must not keep
@@ -11610,9 +11676,33 @@ impl crate::TermWindow {
             .iter()
             .map(|row| row_h + if row.divider_above { divider_band } else { 0. })
             .collect();
-        let max_body = (DROPDOWN_MAX_VISIBLE_ROWS as f32 * row_h)
-            .min(self.dimensions.pixel_height as f32 - FLOAT_GAP * 2. - menu_pad)
+        let window_h = self.dimensions.pixel_height as f32;
+        let cap_body = (DROPDOWN_MAX_VISIBLE_ROWS as f32 * row_h)
+            .min(window_h - FLOAT_GAP * 2. - menu_pad)
             .max(row_h);
+        // A pinned menu decides its side once, from the height it will grow
+        // to, and then only ever grows downward from that edge, scrolling
+        // whatever does not fit above the window's bottom.
+        let pinned_top = pin.map(|pin| {
+            let top = pin.top.unwrap_or_else(|| {
+                let expected_h =
+                    (pin.expected_rows as f32 * row_h + divider_band).min(cap_body) + menu_pad;
+                dropdown_top(anchor_y, expected_h, downward, window_h)
+            });
+            // The window may have shrunk since the first paint.
+            let top = top.clamp(
+                FLOAT_GAP,
+                (window_h - FLOAT_GAP - menu_pad - row_h).max(FLOAT_GAP),
+            );
+            pin.top = Some(top);
+            top
+        });
+        let max_body = match pinned_top {
+            Some(top) => cap_body
+                .min(window_h - top - FLOAT_GAP - menu_pad)
+                .max(row_h),
+            None => cap_body,
+        };
         let viewport = scroll.and_then(|offset| dropdown_viewport(&row_heights, offset, max_body));
         // A scrolling panel keeps one fixed height, so it neither jitters as a
         // divider scrolls in and out nor flips sides mid-scroll.
@@ -11631,25 +11721,11 @@ impl crate::TermWindow {
         let rows_w = menu_w - scrollbar_gutter;
 
         let max_x = (self.dimensions.pixel_width as f32 - menu_w - FLOAT_GAP).max(FLOAT_GAP);
-        let max_y = (self.dimensions.pixel_height as f32 - menu_h - FLOAT_GAP).max(FLOAT_GAP);
         let menu_x = anchor_x.clamp(FLOAT_GAP, max_x);
         // Open in the requested direction; if that would run off-screen,
         // flip to the other side so the menu stays visible.
-        let menu_y = if downward {
-            let down_y = anchor_y + FLOAT_GAP;
-            if down_y + menu_h > self.dimensions.pixel_height as f32 - FLOAT_GAP {
-                (anchor_y - menu_h - FLOAT_GAP).clamp(FLOAT_GAP, max_y)
-            } else {
-                down_y.clamp(FLOAT_GAP, max_y)
-            }
-        } else {
-            let up_y = anchor_y - menu_h - FLOAT_GAP;
-            if up_y < FLOAT_GAP {
-                (anchor_y + FLOAT_GAP).clamp(FLOAT_GAP, max_y)
-            } else {
-                up_y.clamp(FLOAT_GAP, max_y)
-            }
-        };
+        let menu_y =
+            pinned_top.unwrap_or_else(|| dropdown_top(anchor_y, menu_h, downward, window_h));
 
         let sb = self.sidebar_palette();
         let fg = sb.text_active;
@@ -22550,5 +22626,42 @@ gemini is a constellation\n";
         assert_eq!(view.max_offset, 1);
         let view = dropdown_viewport(&[30., 30.], 1, 20.).unwrap();
         assert_eq!((view.first, view.end), (1, 2));
+    }
+
+    #[test]
+    fn dropdown_top_opens_below_when_the_menu_fits() {
+        assert_eq!(dropdown_top(100., 200., true, 800.), 100. + FLOAT_GAP);
+    }
+
+    #[test]
+    fn dropdown_top_flips_above_when_the_menu_does_not_fit_below() {
+        assert_eq!(
+            dropdown_top(600., 300., true, 800.),
+            600. - 300. - FLOAT_GAP
+        );
+    }
+
+    #[test]
+    fn dropdown_top_from_expected_height_does_not_move_when_rows_arrive() {
+        // The sessions menu opens with two rows; the scan then fills it. Placed
+        // from the current height, the two-row panel opens below and the full
+        // one flips above -- the restore row (row 0) jumps under the pointer.
+        let (anchor, window_h) = (600., 800.);
+        let short = dropdown_top(anchor, 80., true, window_h);
+        let full = dropdown_top(anchor, 520., true, window_h);
+        assert_ne!(short, full, "the unpinned placement this guards against");
+        // Pinned, the first paint decides from the full height and keeps it.
+        let pinned = dropdown_top(anchor, 520., true, window_h);
+        assert_eq!(pinned, full);
+        assert!(
+            pinned + 520. <= anchor,
+            "grows down toward the button, not past it"
+        );
+    }
+
+    #[test]
+    fn dropdown_top_stays_inside_a_tiny_window() {
+        assert_eq!(dropdown_top(50., 400., true, 120.), FLOAT_GAP);
+        assert_eq!(dropdown_top(50., 400., false, 120.), FLOAT_GAP);
     }
 }
