@@ -210,25 +210,34 @@ jobs:
           7z a -tzip "${pkg}.zip" "$pkg" >/dev/null
           echo "PKG_ZIP=${pkg}.zip" >> "$GITHUB_ENV"
 
-      # Pinned rather than relying on whatever the runner image happens to
-      # carry: newer Inno Setup releases have changed preprocessor behavior
-      # enough to break ci/tgzterminal-windows-installer.iss ("Unknown
-      # preprocessor directive" compiling against a 6.7.1 preinstalled on a
-      # newer runner image), and the .iss's ArchitecturesAllowed=
-      # x64compatible needs at least 6.3. --allow-downgrade is required
-      # because recent runner images ship a newer Inno Setup than this pin,
-      # and choco otherwise refuses to "install" over it.
-      # The installer is best-effort: chocolatey is a third-party service and
-      # has returned 504s mid-release. A flaky installer build must never cost
-      # us the portable zip, which is the primary Windows artifact, so both
-      # installer steps are non-fatal and the publish steps tolerate a missing
-      # Setup exe.
+      # The Inno Setup the runner image already carries: 6.7.1 compiles
+      # ci/tgzterminal-windows-installer.iss cleanly (it built the
+      # tgz-v2026.10.15 installer; the "Unknown preprocessor directive" an
+      # older script hit with it is gone). The .iss's ArchitecturesAllowed=
+      # x64compatible needs at least 6.3, so an older or missing one falls back
+      # to a pinned 6.3.3 from Chocolatey. That is a third-party service which
+      # has returned 503s/504s mid-release, so it is only the fallback.
+      # The installer stays best-effort: a failed installer build must never
+      # cost us the portable zip, which is the primary Windows artifact, so
+      # both installer steps are non-fatal and the publish steps tolerate a
+      # missing Setup exe.
       - name: Install Inno Setup
         continue-on-error: true
         shell: pwsh
         run: |
-          choco install innosetup --version=6.3.3 --no-progress -y --allow-downgrade --force
-          "ISCC=C:\Program Files (x86)\Inno Setup 6\ISCC.exe" >> $env:GITHUB_ENV
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          $version = $null
+          if (Test-Path $iscc) {
+            try { $version = [version](Get-Item $iscc).VersionInfo.FileVersion } catch {}
+          }
+          if ($version -and $version -ge [version]"6.3") {
+            Write-Host "Using the runner's Inno Setup $version"
+          } else {
+            Write-Host "No Inno Setup >= 6.3 on the runner (found: $version); installing 6.3.3"
+            choco install innosetup --version=6.3.3 --no-progress -y --allow-downgrade --force
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          "ISCC=$iscc" >> $env:GITHUB_ENV
 
       - name: Build installer
         id: installer
