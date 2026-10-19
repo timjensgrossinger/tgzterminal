@@ -1,5 +1,6 @@
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    experimental_tab_views();
 
     #[cfg(windows)]
     {
@@ -215,4 +216,26 @@ END
             ))
             .unwrap();
     }
+}
+
+/// Opt-in, local-only experimental tab views. Enabled only when
+/// `TGZ_TOWER=1` is set *and* the untracked `tgz-tower/gui` sources are
+/// present next to this crate, so CI and release builds never compile it.
+fn experimental_tab_views() {
+    println!("cargo:rustc-check-cfg=cfg(tgz_tower)");
+    println!("cargo:rerun-if-env-changed=TGZ_TOWER");
+    if std::env::var("TGZ_TOWER").as_deref() != Ok("1") {
+        return;
+    }
+    let manifest_dir = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+    let gui_dir = manifest_dir.join("..").join("tgz-tower").join("gui");
+    if !gui_dir.join("mod.rs").exists() {
+        println!(
+            "cargo:warning=TGZ_TOWER=1 but tgz-tower/gui/mod.rs is missing; building without it"
+        );
+        return;
+    }
+    println!("cargo:rustc-cfg=tgz_tower");
+    println!("cargo:rerun-if-changed={}", gui_dir.display());
+    println!("cargo:warning=building with the experimental tgz-tower tab view (TGZ_TOWER=1)");
 }

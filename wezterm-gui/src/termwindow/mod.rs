@@ -134,6 +134,11 @@ pub mod tgz_secret_mask;
 pub mod tgz_ssh_hosts;
 pub mod tgz_ui_state;
 pub mod tgz_usage_menu;
+// Untracked, opt-in experimental tab view; see `experimental_tab_views` in build.rs.
+#[cfg(tgz_tower)]
+#[rustfmt::skip]
+#[path = "../../../tgz-tower/gui/mod.rs"]
+mod tgz_tower;
 pub mod webgpu;
 pub mod wsl_paths;
 use crate::spawn::SpawnWhere;
@@ -5483,6 +5488,10 @@ done
                 self.do_open_link_at_mouse_cursor(pane);
             }
             EmitEvent(name) => {
+                #[cfg(tgz_tower)]
+                if self.config.tower.enabled && tgz_tower::on_emit_event(self, pane, name) {
+                    return Ok(PerformAssignmentResult::Handled);
+                }
                 self.emit_window_event(name, None);
             }
             CompleteSelectionOrOpenLinkAtMouseCursor(dest) => {

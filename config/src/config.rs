@@ -146,6 +146,15 @@ impl Default for FileBrowserShellChoice {
     }
 }
 
+/// The experimental Tower tab (`tgz-tower/`). Release builds do not contain
+/// it; a build made with `TGZ_TOWER=1` does, and still keeps it closed until
+/// `enabled` is set.
+#[derive(Debug, Clone, Default, FromDynamic, ToDynamic)]
+pub struct TowerConfig {
+    #[dynamic(default)]
+    pub enabled: bool,
+}
+
 /// What the Worktree button and `OpenFileBrowser` open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, FromDynamic, ToDynamic)]
 pub enum FileBrowserUi {
@@ -2244,6 +2253,11 @@ pub struct Config {
     /// File browser pane behavior.
     #[dynamic(default)]
     pub file_browser: FileBrowserConfig,
+
+    /// The experimental Tower tab. Off unless switched on here, and only in
+    /// builds made with `TGZ_TOWER=1`.
+    #[dynamic(default)]
+    pub tower: TowerConfig,
 
     /// Vendor-neutral agent telemetry behavior.
     #[dynamic(default)]
@@ -4731,6 +4745,11 @@ mod agent_ui_tests {
         assert_eq!(config.diff_panel.width_px, 840);
         assert_eq!(config.diff_panel.nested_max_depth, 3);
         assert_eq!(config.diff_panel.nested_max_roots, 64);
+    }
+
+    #[test]
+    fn tower_is_off_by_default() {
+        assert!(!Config::default_config().tower.enabled);
     }
 
     #[test]

@@ -337,6 +337,16 @@ When the target pane reports an SSH working directory, the picker runs locally
 and lists the remote tree through `ssh` so selection can still control the
 target pane through the local mux.
 
+## Tower (experimental)
+
+```lua
+config.tower = { enabled = false }
+```
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `enabled` | bool | `false` | Lets the experimental Tower tab open. It only exists in builds made with `TGZ_TOWER=1` (see `tgz-tower/README.md`); release builds do not contain it, and this key does nothing there. |
+
 ## Agent Telemetry
 
 ```lua

@@ -34,6 +34,10 @@ impl crate::TermWindow {
         pos: &PositionedPane,
         layers: &mut TripleLayerQuadAllocator,
     ) -> anyhow::Result<()> {
+        #[cfg(tgz_tower)]
+        if crate::termwindow::tgz_tower::is_tower_pane(&pos.pane) {
+            return crate::termwindow::tgz_tower::paint(self, pos, layers);
+        }
         if self.config.use_box_model_render {
             return self.paint_pane_box_model(pos);
         }

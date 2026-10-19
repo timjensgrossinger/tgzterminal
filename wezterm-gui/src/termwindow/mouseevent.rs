@@ -1574,6 +1574,10 @@ impl super::TermWindow {
             // Unlike the project-root tick, this acts on the tab layout, so
             // the menu has no reason to stay open.
             self.agent_launch_menu = None;
+            #[cfg(tgz_tower)]
+            if self.config.tower.enabled {
+                super::tgz_tower::open(self);
+            }
         }
         context.invalidate();
     }
