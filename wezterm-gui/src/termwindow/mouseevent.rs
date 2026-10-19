@@ -64,6 +64,15 @@ impl super::TermWindow {
             | UIItemType::DiffPanelButton(_)
             | UIItemType::DiffPanelFile { .. }
             | UIItemType::DiffPanelChip { .. }
+            | UIItemType::FileTreeResize { .. }
+            | UIItemType::FileTreeBody
+            | UIItemType::FileTreeButton(_)
+            | UIItemType::FileTreeRow { .. }
+            | UIItemType::FileTreeScrollThumb
+            | UIItemType::FileTreeScrollTrack
+            | UIItemType::FileTreeMenuItem(_)
+            | UIItemType::FileTreePreview
+            | UIItemType::FileTreePreviewDivider
             | UIItemType::SidebarSearch
             | UIItemType::SidebarAutoHideToggle
             | UIItemType::SidebarWorktreeButton
@@ -122,6 +131,15 @@ impl super::TermWindow {
             | UIItemType::DiffPanelButton(_)
             | UIItemType::DiffPanelFile { .. }
             | UIItemType::DiffPanelChip { .. }
+            | UIItemType::FileTreeResize { .. }
+            | UIItemType::FileTreeBody
+            | UIItemType::FileTreeButton(_)
+            | UIItemType::FileTreeRow { .. }
+            | UIItemType::FileTreeScrollThumb
+            | UIItemType::FileTreeScrollTrack
+            | UIItemType::FileTreeMenuItem(_)
+            | UIItemType::FileTreePreview
+            | UIItemType::FileTreePreviewDivider
             | UIItemType::SidebarSearch
             | UIItemType::SidebarAutoHideToggle
             | UIItemType::SidebarWorktreeButton
@@ -249,6 +267,12 @@ impl super::TermWindow {
                         if matches!(item.item_type, UIItemType::DiffPanelResize { .. }) {
                             self.finish_diff_panel_resize();
                         }
+                        if matches!(item.item_type, UIItemType::FileTreeResize { .. }) {
+                            self.finish_file_tree_resize();
+                        }
+                        if matches!(item.item_type, UIItemType::FileTreeRow { .. }) {
+                            self.finish_file_tree_row_drag(&event, context);
+                        }
                         if matches!(item.item_type, UIItemType::PaneToolbeltHandle { .. }) {
                             self.finish_pane_toolbelt_drag(context);
                         }
@@ -355,6 +379,35 @@ impl super::TermWindow {
             );
             if !on_search {
                 self.sidebar_search = None;
+                context.invalidate();
+            }
+        }
+
+        // A press on the Worktree panel gives it the keyboard; one anywhere
+        // else gives the keyboard back.
+        if matches!(&event.kind, WMEK::Press(_)) {
+            let on_tree = matches!(
+                ui_item.as_ref().map(|item| &item.item_type),
+                Some(
+                    UIItemType::FileTreeBody
+                        | UIItemType::FileTreeRow { .. }
+                        | UIItemType::FileTreeButton(_)
+                        | UIItemType::FileTreeResize { .. }
+                        | UIItemType::FileTreeScrollThumb
+                        | UIItemType::FileTreeScrollTrack
+                        | UIItemType::FileTreeMenuItem(_)
+                        | UIItemType::FileTreePreview
+                        | UIItemType::FileTreePreviewDivider
+                )
+            );
+            if self.set_file_tree_focus(on_tree) {
+                context.invalidate();
+            }
+            let on_menu = matches!(
+                ui_item.as_ref().map(|item| &item.item_type),
+                Some(UIItemType::FileTreeMenuItem(_))
+            );
+            if !on_menu && self.close_file_tree_menu() {
                 context.invalidate();
             }
         }
@@ -635,6 +688,18 @@ impl super::TermWindow {
             UIItemType::DiffPanelResize { edge, .. } => {
                 self.drag_diff_panel_resize(edge, item, start_event, event, context);
             }
+            UIItemType::FileTreeResize { .. } => {
+                self.drag_file_tree_resize(item, start_event, event, context);
+            }
+            UIItemType::FileTreeRow { .. } => {
+                self.drag_file_tree_row(item, start_event, event, context);
+            }
+            UIItemType::FileTreeScrollThumb => {
+                self.drag_file_tree_scroll_thumb(item, start_event, event, context);
+            }
+            UIItemType::FileTreePreviewDivider => {
+                self.drag_file_tree_preview_divider(item, start_event, event, context);
+            }
             UIItemType::SidebarScrollThumb => {
                 self.drag_sidebar_scroll_thumb(item, start_event, event, context);
             }
@@ -751,6 +816,33 @@ impl super::TermWindow {
             }
             UIItemType::DiffPanelBody => {
                 self.mouse_event_diff_panel(None, pane, event, context);
+            }
+            UIItemType::FileTreeResize { .. } => {
+                self.mouse_event_file_tree_resize(item, event, context);
+            }
+            UIItemType::FileTreeBody => {
+                self.mouse_event_file_tree(None, event, context);
+            }
+            UIItemType::FileTreeButton(action) => {
+                self.mouse_event_file_tree(Some(Ok(action)), event, context);
+            }
+            UIItemType::FileTreeRow { index } => {
+                self.mouse_event_file_tree_row(item, index, event, context);
+            }
+            UIItemType::FileTreeScrollThumb => {
+                self.mouse_event_file_tree_scroll(item, true, event, context);
+            }
+            UIItemType::FileTreeScrollTrack => {
+                self.mouse_event_file_tree_scroll(item, false, event, context);
+            }
+            UIItemType::FileTreeMenuItem(action) => {
+                self.mouse_event_file_tree_menu_item(action, event, context);
+            }
+            UIItemType::FileTreePreview => {
+                self.mouse_event_file_tree_preview(event, context);
+            }
+            UIItemType::FileTreePreviewDivider => {
+                self.mouse_event_file_tree_preview_divider(item, event, context);
             }
             UIItemType::DiffPanelButton(action) => {
                 self.mouse_event_diff_panel(Some(Ok(action)), pane, event, context);
@@ -1040,7 +1132,7 @@ impl super::TermWindow {
         context: &dyn WindowOps,
     ) {
         if event.kind == WMEK::Release(MousePress::Left) {
-            self.open_file_browser(&pane);
+            self.toggle_file_tree(&pane);
             self.pressed_ui_item = None;
         }
         context.invalidate();

@@ -718,6 +718,12 @@ impl super::TermWindow {
                     return;
                 }
 
+                if self.file_tree_focused() && window_key.key_is_down {
+                    if self.file_tree_key_input(key.clone(), modifiers, context) {
+                        return;
+                    }
+                }
+
                 if self.sidebar_search.is_some() && window_key.key_is_down {
                     if self.sidebar_search_key_input(key, modifiers, context) {
                         return;
@@ -799,6 +805,13 @@ impl super::TermWindow {
                     return;
                 }
                 self.key_table_state.did_process_key();
+                // Composed text belongs to the Worktree panel's filter while
+                // the panel has the keyboard, never to the terminal.
+                if self.file_tree_focused() {
+                    self.file_tree_insert_str(&s);
+                    context.invalidate();
+                    return;
+                }
                 // Route composed/IME text into the docked strip when focused.
                 if self.docked_input_focused() {
                     self.docked_input_insert_str(&s);

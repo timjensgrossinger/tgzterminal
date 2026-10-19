@@ -1772,8 +1772,16 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             },
         },
         OpenFileBrowser => CommandDef {
-            brief: "Open File Browser".into(),
-            doc: "Open a file browser split using the configured list and editor commands".into(),
+            brief: "Toggle Worktree".into(),
+            doc: "Show or hide the Worktree panel (the file picker for remote panes)".into(),
+            keys: vec![],
+            args: &[ArgType::ActivePane],
+            menubar: &["Shell"],
+            icon: Some("md_folder_open"),
+        },
+        FocusFileTree => CommandDef {
+            brief: "Focus Worktree".into(),
+            doc: "Open the Worktree panel and move the keyboard into it".into(),
             keys: vec![],
             args: &[ArgType::ActivePane],
             menubar: &["Shell"],
@@ -2182,6 +2190,7 @@ fn compute_default_actions() -> Vec<KeyAssignment> {
             ..Default::default()
         }),
         OpenFileBrowser,
+        FocusFileTree,
         CloseCurrentTab { confirm: true },
         CloseCurrentPane { confirm: true },
         DetachDomain(SpawnTabDomain::CurrentPaneDomain),

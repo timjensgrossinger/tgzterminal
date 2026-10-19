@@ -44,6 +44,7 @@ pub mod corners;
 pub mod diff_panel;
 pub mod draw;
 pub mod fancy_tab_bar;
+pub mod file_tree;
 pub mod paint;
 pub mod pane;
 pub mod screen_line;
@@ -413,6 +414,7 @@ impl crate::TermWindow {
             - self.terminal_size.pixel_width as f32
             - padding_left
             - self.sidebar_reserved_width() as f32
+            - self.file_tree_reserved_width() as f32
             - self.diff_panel_reserved_width() as f32
             - if self.show_scroll_bar {
                 self.right_padding(&self.config, h_context) as f32
@@ -451,7 +453,11 @@ impl crate::TermWindow {
             };
 
         (
-            padding_left + left_gap + sidebar_left_offset + self.diff_panel_left_reserved() as f32,
+            padding_left
+                + left_gap
+                + sidebar_left_offset
+                + self.file_tree_reserved_width() as f32
+                + self.diff_panel_left_reserved() as f32,
             padding_top + top_gap,
         )
     }

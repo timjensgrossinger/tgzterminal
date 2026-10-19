@@ -41,6 +41,7 @@ mod commands;
 mod customglyph;
 mod diff_panel;
 mod download;
+mod file_tree;
 mod frontend;
 mod glyphcache;
 mod inputmap;

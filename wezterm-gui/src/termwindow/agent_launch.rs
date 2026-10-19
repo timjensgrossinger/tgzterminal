@@ -207,7 +207,7 @@ pub(crate) fn agent_placement(
 /// resolves its target as the tab's active pane inside the future — fine
 /// for a single launch, but nondeterministic once several splits are
 /// in flight.
-async fn split_spawn(
+pub(crate) async fn split_spawn(
     spawn: SpawnCommand,
     pane_id: PaneId,
     request: SplitRequest,

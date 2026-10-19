@@ -652,6 +652,8 @@ pub enum KeyAssignment {
     LeaveAlternateScreen,
     OpenUri(String),
     OpenFileBrowser,
+    /// Open the Worktree panel if needed and give it the keyboard.
+    FocusFileTree,
     ActivateCommandPalette,
     ActivateComposer,
     ToggleDockedInput,

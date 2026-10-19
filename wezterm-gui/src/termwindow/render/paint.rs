@@ -291,6 +291,8 @@ impl crate::TermWindow {
 
         // Before the menus so they still float above it, after the panes and
         // the sidebar so a floating panel wins clicks over what it covers.
+        self.paint_file_tree(&mut layers)
+            .context("paint_file_tree")?;
         self.paint_diff_panel(&mut layers)
             .context("paint_diff_panel")?;
 
@@ -322,6 +324,8 @@ impl crate::TermWindow {
             .context("paint_ssh_launch_menu")?;
         self.paint_usage_menu(&mut layers)
             .context("paint_usage_menu")?;
+        self.paint_file_tree_menu(&mut layers)
+            .context("paint_file_tree_menu")?;
 
         self.paint_window_borders(&mut layers)
             .context("paint_window_borders")?;

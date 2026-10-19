@@ -84,6 +84,9 @@ pub struct PaneView {
     scroll: usize,
     rows: Vec<Row>,
     digits: usize,
+    /// A file to scroll to once a scan shows it: asked for from outside
+    /// (the Worktree panel) while the scan was still running.
+    focus: Option<PathBuf>,
 }
 
 impl PaneView {
@@ -136,7 +139,7 @@ enum PaintRow {
 /// find the session's transcript. Captured on the GUI thread from the herd;
 /// the transcript lookup itself touches the filesystem, so it waits for the
 /// scan thread.
-struct PaneSession {
+pub(crate) struct PaneSession {
     /// How the session is named beside its files.
     label: String,
     provider: String,
@@ -235,6 +238,32 @@ impl PaneSession {
         true
     }
 
+    /// Add the files under `root` this session touched to `marks`, for the
+    /// Worktree panel. Quietly nothing when its record cannot be read.
+    pub(crate) fn mark_tree(
+        &self,
+        root: &std::path::Path,
+        marks: &mut crate::file_tree::status::AgentMarks,
+    ) {
+        let Some(source) = self.touch_source() else {
+            return;
+        };
+        let touched = match crate::agent_herd::touched::touched_by_source(&source) {
+            Ok(touched) => touched,
+            Err(err) => {
+                log::debug!("file tree: cannot read {source:?}: {err}");
+                return;
+            }
+        };
+        let root = root.to_string_lossy().into_owned();
+        let root_view = self
+            .distro
+            .as_deref()
+            .and_then(|distro| crate::termwindow::wsl_paths::windows_to_wsl(&root, distro))
+            .unwrap_or(root);
+        marks.add(&root_view, &touched);
+    }
+
     /// The session as the session scan reads it; `None` when its transcript
     /// or its project is not known.
     fn source(&self) -> Option<diff_panel::session::SessionSource> {
@@ -264,7 +293,7 @@ fn snapshot_base() -> PathBuf {
 /// Where a pane's changes are to be looked for. Decided on the GUI thread
 /// from what the pane says about itself, and settled into a directory and a
 /// [`Runner`] on the scan thread, which may have to ask a WSL distro.
-enum ScanTarget {
+pub(crate) enum ScanTarget {
     /// A directory this process can open.
     Dir(PathBuf),
     /// A pane whose program runs inside a WSL distro, where only the distro
@@ -290,7 +319,7 @@ enum ScanTarget {
 /// distro by that distro's. The other side is the fallback for a client that
 /// is installed on one side only. `other_distro` is the default WSL distro,
 /// which stands in when the pane itself is not in one.
-fn settle_scan_target(
+pub(crate) fn settle_scan_target(
     target: ScanTarget,
     other_distro: Option<String>,
 ) -> Result<(PathBuf, Runner), String> {
@@ -429,7 +458,7 @@ impl DiffPanelState {
     }
 }
 
-fn opaque(color: LinearRgba) -> LinearRgba {
+pub(crate) fn opaque(color: LinearRgba) -> LinearRgba {
     LinearRgba(color.0, color.1, color.2, 1.0)
 }
 
@@ -463,8 +492,17 @@ impl crate::TermWindow {
         sidebar_width_scale_for_dpi(self.dimensions.dpi as f64)
     }
 
-    /// The window region the terminal and the panel share.
+    /// The window region the terminal and the Changes panel share: what the
+    /// sidebar and the Worktree panel leave.
     fn diff_panel_area(&self) -> PanelArea {
+        let mut area = self.side_panel_area();
+        area.left += self.file_tree_reserved_width() as f32;
+        area
+    }
+
+    /// The window region beside the sidebar and the tab bar, where the
+    /// terminal and the docked panels sit.
+    pub(crate) fn side_panel_area(&self) -> PanelArea {
         let border = self.get_os_border();
         let tab_bar_height = if self.show_tab_bar && !self.sidebar_is_active() {
             self.tab_bar_pixel_height().unwrap_or(0.)
@@ -587,7 +625,7 @@ impl crate::TermWindow {
         }
     }
 
-    fn relayout_for_diff_panel(&mut self) {
+    pub(crate) fn relayout_for_diff_panel(&mut self) {
         if let Some(window) = self.window.as_ref().map(|w| w.clone()) {
             let dims = self.dimensions;
             self.apply_dimensions(&dims, None, &window);
@@ -644,7 +682,7 @@ impl crate::TermWindow {
     }
 
     /// Where the changes `pane` should show are to be looked for.
-    fn diff_panel_target(&self, pane: &Arc<dyn Pane>) -> Result<ScanTarget, String> {
+    pub(crate) fn diff_panel_target(&self, pane: &Arc<dyn Pane>) -> Result<ScanTarget, String> {
         let domain = Mux::get()
             .get_domain(pane.domain_id())
             .filter(|domain| domain.downcast_ref::<mux::domain::LocalDomain>().is_some())
@@ -721,7 +759,7 @@ impl crate::TermWindow {
         running
     }
 
-    fn default_wsl_distro() -> Option<String> {
+    pub(crate) fn default_wsl_distro() -> Option<String> {
         if !cfg!(windows) {
             return None;
         }
@@ -734,7 +772,7 @@ impl crate::TermWindow {
     /// The agent sessions bound to the panes of `tab_id`, for vendors whose
     /// transcript records the files they touch, in pane order. `None` while
     /// the herd is being updated: not known, which is not the same as none.
-    fn diff_panel_sessions(&self, tab_id: TabId) -> Option<Vec<PaneSession>> {
+    pub(crate) fn diff_panel_sessions(&self, tab_id: TabId) -> Option<Vec<PaneSession>> {
         let Some(tab) = Mux::get().get_tab(tab_id) else {
             return Some(vec![]);
         };
@@ -845,8 +883,55 @@ impl crate::TermWindow {
             }
         }
         view.scroll = view.scroll.min(view.rows.len().saturating_sub(visible));
+        // A file asked for gets one scan to show up in.
+        if let Some(path) = view.focus.take() {
+            self.diff_panel_scroll_to_path(tab_id, &path);
+        }
         if let Some(window) = self.window.as_ref() {
             window.invalidate();
+        }
+    }
+
+    /// Show the panel for the tab `pane_id` is in and scroll it to the file
+    /// at `path` (absolute), now or once a scan shows it.
+    pub fn diff_panel_focus_path(&mut self, pane_id: PaneId, path: PathBuf) {
+        if !self.config.diff_panel.enabled {
+            return;
+        }
+        if !self.diff_panel_shown() {
+            self.toggle_diff_panel_pane(pane_id);
+        }
+        let Some(tab_id) = self.diff_panel_active_tab() else {
+            return;
+        };
+        if !self.diff_panel_scroll_to_path(tab_id, &path) {
+            if let Some(view) = self.diff_panel.views.get_mut(&tab_id) {
+                view.focus = Some(path);
+            }
+        }
+    }
+
+    /// Scroll to the file at `path`; `false` when the scan on show has none.
+    fn diff_panel_scroll_to_path(&mut self, tab_id: TabId, path: &std::path::Path) -> bool {
+        let index = match self
+            .diff_panel
+            .views
+            .get(&tab_id)
+            .and_then(|view| view.scan.as_ref())
+        {
+            Some(Scan::Changes(set)) => set.files.iter().position(|file| {
+                let mut at = set.root.clone();
+                at.extend(file.path.split('/'));
+                at == path
+            }),
+            _ => None,
+        };
+        match index {
+            Some(index) => {
+                self.diff_panel_jump_to_file(index);
+                true
+            }
+            None => false,
         }
     }
 
@@ -1219,7 +1304,7 @@ impl crate::TermWindow {
         self.relayout_for_diff_panel();
     }
 
-    fn diff_panel_text(
+    pub(crate) fn diff_panel_text(
         &mut self,
         layers: &mut TripleLayerQuadAllocator,
         text: &str,

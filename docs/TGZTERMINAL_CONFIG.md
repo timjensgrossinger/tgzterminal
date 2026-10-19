@@ -154,24 +154,176 @@ Some("/usr/bin/ssh")`), so the log says which pane was switched and by what.
 
 ## File Browser
 
+The Worktree button (and `wezterm.action.OpenFileBrowser`) opens the
+**Worktree panel**: a folder tree the terminal draws itself, docked on the left
+beside the sidebar. It follows the directory of the tab's shell pane — the
+repository root when that directory is inside a git or svn working copy — and is
+read again every couple of seconds while it is open.
+
+- Click a folder to open or close it. Open folders are remembered per root
+  across restarts.
+- Click a file to select it, and click it again to open it in the editor.
+  The editor runs in a new split to the right of the shell pane, in the same
+  domain, so a WSL tab gets the distro's own `vim`.
+- The header buttons close the panel, read it again now, close every
+  folder, open the filter, and open the quick preview. Drag the panel's right edge to resize it.
+- Files git reports carry a letter on the right — `M` modified, `A` added,
+  `U` untracked, `R` renamed, `D` deleted, `!` conflicted — in the terminal's
+  ANSI yellow, green or red, and a folder carries a dot in the colour of the
+  strongest change inside it. A dot in the accent colour marks files an agent
+  in the tab edited (fainter: only mentioned in a shell command), and the
+  folders holding them.
+- The panel watches its root, so a written file shows up at once; across the
+  WSL filesystem bridge, where change notifications are unreliable, it relies
+  on the two-second re-read.
+
+### Quick preview
+
+The eye button (or <kbd>Space</kbd> on a file, or <kbd>p</kbd>) opens a
+read-only preview under the rows: the first 2,000 lines (128 KB) of the
+selected file, with line numbers, following the selection while it is open.
+Binary files show their size instead. The wheel scrolls it, and the line
+between the rows and the preview drags to share the height. When git reports
+the file as changed, a **Changes** button opens the Changes panel scrolled to
+its diff.
+
+### Opening files
+
+Files open in `editor_command` (`vim` unless set), by default in a split to
+the right of the shell pane; `editor_placement = "Tab"` opens them in a new
+tab instead (middle click always does).
+
+With `reuse_editor_pane = true` (the default) and a vim-family editor (`vim`,
+`nvim`, `vi`), the next file goes to the vim the panel opened earlier in the
+same tab, while it is still running there: the panel sends it
+<kbd>Ctrl-\</kbd><kbd>Ctrl-N</kbd> `:drop <file>`, which switches to the
+file's window if it is open and edits it otherwise. Other editors, a vim that
+has quit, and WSL panes (whose running program cannot be seen from Windows)
+get a new split each time.
+
+To decide yourself what happens, handle `file-tree-open-file`. It receives
+the window, the pane the tree follows and the file's path; return `false` to
+skip the default:
+
+```lua
+wezterm.on('file-tree-open-file', function(window, pane, path)
+  if path:match('%.md$') then
+    window:perform_action(
+      wezterm.action.SpawnCommandInNewTab { args = { 'glow', '-p', path } },
+      pane
+    )
+    return false
+  end
+  -- anything else: the default editor
+end)
+```
+
+### Mouse
+
+| Gesture | Action |
+|---|---|
+| Click | Select a file; open or close a folder |
+| Click a selected file again (double click) | Open it in the editor |
+| <kbd>Cmd</kbd>-click (<kbd>Ctrl</kbd>-click off macOS) | Add the row to the selection, or take it out |
+| <kbd>Shift</kbd>-click | Select every row from the last one clicked |
+| Middle click on a file | Open it in the editor in a new tab |
+| Right click | The menu below, for the row (or every selected row) |
+| Drag onto a folder | Move the dragged rows there. Rest on a closed folder to open it; drop below the last row for the top folder. Moving more than one item asks first, and nothing is ever overwritten: when a name is taken, nothing moves. |
+| Drag onto a terminal pane | Paste the dragged paths into it, quoted for its shell (Linux paths for a WSL pane), and move the keyboard there |
+| Drag near the top or bottom edge | Scroll while dragging |
+| Scroll bar | Drag the thumb; click the track to page |
+
+Dragging a selected row takes the whole selection along. The pointer turns
+into a "no drop" sign over places a drop would do nothing, such as the folder
+the rows are already in.
+
+### Right-click menu
+
+On a file: **Open**, **Open in New Tab**, **Open with Default App**,
+**Reveal in Finder** (Explorer, file manager), **Copy Path**, **Copy Relative
+Path**, **Paste Path into Shell** (into the pane the tree follows), **cd
+Here**, **New File…**, **New Folder…**, **Rename…** and **Move to Trash**.
+A folder has the same without the two Opens. With several rows selected the
+menu offers what applies to all of them: reveal, the copies, paste and trash.
+Below the last row it offers New File/Folder, cd Here, Reveal and Copy Path
+for the top folder.
+
+- **cd Here** types `cd -- <folder>` into the shell, quoted for it (also
+  PowerShell and cmd). When the pane runs an agent instead, a new shell opens
+  in that folder beside it rather than typing into the agent's prompt.
+- **New File… / New Folder… / Rename…** name the row in place: a field opens
+  in the tree, <kbd>Enter</kbd> saves, <kbd>Esc</kbd> or a click elsewhere
+  cancels. A name that is taken is refused; nothing is overwritten.
+- **Move to Trash** uses the system trash (Finder's on macOS, the Recycle Bin
+  on Windows through the PowerShell that ships with it, and on Linux `gio
+  trash` or trash-cli, else the home trash `~/.local/share/Trash` directly,
+  laid out as file managers expect), so it can be undone from there; nothing
+  is deleted outright. Without `gio`, items on another disk than your home
+  cannot be trashed and say so. Several items ask first. Network and WSL
+  paths have no Recycle Bin on Windows, so trashing there fails and says so.
+
+### Keyboard
+
+Click the panel, or use `wezterm.action.FocusFileTree`, to give it the
+keyboard; its edge takes on the accent colour. A click anywhere else, or
+<kbd>Esc</kbd>, gives the keyboard back to the terminal. Keys held with
+<kbd>Ctrl</kbd>, <kbd>Alt</kbd> or <kbd>Super</kbd> always go on to your key
+bindings.
+
+| Key | Action |
+|---|---|
+| <kbd>↑</kbd> <kbd>↓</kbd> / <kbd>k</kbd> <kbd>j</kbd> | Move the selection |
+| <kbd>←</kbd> / <kbd>h</kbd> | Close the folder, or go to the folder holding the row |
+| <kbd>→</kbd> / <kbd>l</kbd> | Open the folder, or step into it |
+| <kbd>Enter</kbd> / <kbd>o</kbd> | Open the file in the editor, or open/close the folder |
+| <kbd>Space</kbd> on a folder | Open/close it |
+| <kbd>PgUp</kbd> <kbd>PgDn</kbd>, <kbd>Home</kbd>/<kbd>g</kbd>, <kbd>End</kbd>/<kbd>G</kbd> | Page, first, last |
+| <kbd>/</kbd> | Filter |
+| <kbd>-</kbd> | Close every folder |
+| <kbd>R</kbd> | Read the tree again now |
+| <kbd>.</kbd> | Show or hide dotfiles until restart |
+| <kbd>Space</kbd> on a file, <kbd>p</kbd> | Open or close the quick preview |
+| <kbd>F2</kbd> | Rename |
+| <kbd>a</kbd> / <kbd>A</kbd> | New file / new folder beside the selection (inside a selected folder) |
+| <kbd>Delete</kbd> | Move the selection to the Trash |
+| <kbd>y</kbd> / <kbd>Y</kbd> | Copy the absolute / relative paths of the selection |
+
+The filter fuzzy-matches every file under the root (from `git ls-files` in a
+repository, else a walk honouring the same ignore rules, up to 200,000 files)
+and shows the best 500 matches as a tree of their own with the matched
+characters highlighted. Typing edits the query, the arrows and <kbd>Enter</kbd>
+still move through and open the matches, and <kbd>Esc</kbd> (or
+<kbd>Backspace</kbd> on an empty query) closes the filter and lands on the
+selected file in the full tree.
+
+Panes on another machine (an `ssh` session, an SSH domain) still open the
+fzf **picker** in a split pane, as do all panes with `ui = "Picker"`.
+
 ```lua
 config.file_browser = {
-  editor_command = { "nvim" },
-  list_command = { "find", ".", "-maxdepth", "3", "-type", "f" },
-  split_size_percent = 30,
-  reuse_editor_pane = true,
-  shell = "Auto",
-  wsl_distro = nil, -- falls back to agent_ui.launcher.wsl_distro
+  editor_command = { "nvim" }, -- default: vim
+  ui = "Panel",               -- or "Picker"
+  width_px = 560,
+  show_hidden = true,
+  respect_gitignore = true,
+  split_size_percent = 30,    -- picker only
+  shell = "Auto",             -- picker only
+  wsl_distro = nil,           -- picker only; falls back to agent_ui.launcher.wsl_distro
 }
 ```
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `editor_command` | list of string | unset | Receives the selected file path as its final argument. |
+| `editor_command` | list of string | unset (`vim`) | The editor files open in. Receives the file path as its final argument. Unset runs `vim` — or, where it is not installed, `vi`, then `nano` — through your login shell so its `PATH` applies. On Windows outside WSL, unset hands the file to the system's default application. |
+| `ui` | string | `"Panel"` | `"Panel"` for the docked tree, `"Picker"` for the fzf picker in a split pane. |
+| `editor_placement` | string | `"Split"` | Where the panel opens files: `"Split"` (right of the shell pane) or `"Tab"`. |
+| `reuse_editor_pane` | bool | `true` | Send the next file to the vim the panel already opened in the tab (see *Opening files*). |
+| `width_px` | int | `560` | Initial panel width in pixels, calibrated for a 2x display; scales with display density like `sidebar_width_px`. Dragging overrides it and is remembered. |
+| `show_hidden` | bool | `true` | Show names starting with a dot in the panel. `.git`, `.svn` and `.hg` are never shown. |
+| `respect_gitignore` | bool | `true` | Leave out of the panel what `.gitignore`, `.ignore` and git's exclude files leave out. |
 | `editor_is_gui` | bool | `false` | `editor_command` opens its own window (VS Code, Notepad++): start it directly instead of in a split pane. Without `editor_command` the platform opener (`explorer.exe`, `start`) is always treated this way. |
 | `list_command` | list of string | `{ "find", ".", "-maxdepth", "3", "-type", "f" }` | Accepted by the schema but **not currently read by any code**. |
 | `split_size_percent` | int | `30` | Clamped to `5..=95`. |
-| `reuse_editor_pane` | bool | `true` | Accepted by the schema but **not currently read by any code**. |
 | `shell` | string | `"Auto"` | Which shell runs the picker: `"Auto"` prefers the target pane's own distro, then Git Bash; `"Wsl"` always runs it inside WSL; `"GitBash"` demands Git for Windows. |
 | `wsl_distro` | string | unset | Distro for the picker when the target pane is not a WSL pane. Falls back to `agent_ui.launcher.wsl_distro`, then nothing (Git Bash is required). |
 
@@ -181,11 +333,7 @@ and `fzf`), and `shell = "Wsl"` plus `wsl_distro` extends that to any tab —
 useful when your projects live in Ubuntu but the tab happens to be PowerShell.
 Without either, Git for Windows' `bash.exe` carries it.
 
-The file browser configuration is public schema for the browser pane behavior.
-The editor command receives the selected file path as its final argument.
-Use `wezterm.action.OpenFileBrowser` from a key binding or the command palette
-to open the browser split.
-When the target pane reports an SSH working directory, the browser runs locally
+When the target pane reports an SSH working directory, the picker runs locally
 and lists the remote tree through `ssh` so selection can still control the
 target pane through the local mux.
 
@@ -1993,6 +2141,7 @@ you are not left hunting for one.
 | Secret mask character, `[REDACTED]` text and the built-in rule list | Hardcoded. `secret_masking.builtin_patterns = false` drops the built-in rules as a whole; individual ones cannot be switched off. |
 | Individual sidebar colors | No per-element keys. The whole palette is derived — see `sidebar_theme` for which source it derives from. The attention colour (waiting-queue dot, pip, selection bar, attention line) comes from the palette too, so it follows the theme rather than being separately settable. |
 | Worktree picker behavior | `config.file_browser` — `shell` picks where the picker runs (`"Auto"` / `"Wsl"` / `"GitBash"`), `wsl_distro` names the distro when the target pane is not a WSL pane, `editor_command` opens selections, and `split_size_percent` sizes the split. The picker's internal script, its cache location and the fzf fallback prompt are not configurable. |
+| Worktree panel behavior | `ui`, `width_px`, `show_hidden`, `respect_gitignore`, `editor_command`, `editor_placement` and `reuse_editor_pane`, plus the `file-tree-open-file` event. The panel docks on the left, the editor split goes to the right of the shell pane at 50%, the panel re-reads every 2 seconds, the filter searches at most 200,000 files and shows 500 matches, the preview reads 2,000 lines / 128 KB, and the panel's keys and menu are fixed; none of these are configurable. |
 
-Two keys are accepted by the schema but currently read by no code:
-`file_browser.list_command` and `file_browser.reuse_editor_pane`.
+One key is accepted by the schema but currently read by no code:
+`file_browser.list_command`.

@@ -146,11 +146,65 @@ impl Default for FileBrowserShellChoice {
     }
 }
 
+/// What the Worktree button and `OpenFileBrowser` open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromDynamic, ToDynamic)]
+pub enum FileBrowserUi {
+    /// The docked folder tree the terminal draws itself. Panes on another
+    /// machine (ssh) still get the picker until the panel can list them.
+    Panel,
+    /// The fzf picker in a split pane.
+    Picker,
+}
+
+impl Default for FileBrowserUi {
+    fn default() -> Self {
+        Self::Panel
+    }
+}
+
+/// Where a file picked in the Worktree panel opens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromDynamic, ToDynamic)]
+pub enum FileBrowserEditorPlacement {
+    /// A split to the right of the pane the panel follows.
+    Split,
+    /// A new tab.
+    Tab,
+}
+
+impl Default for FileBrowserEditorPlacement {
+    fn default() -> Self {
+        Self::Split
+    }
+}
+
 #[derive(Debug, Clone, FromDynamic, ToDynamic)]
 pub struct FileBrowserConfig {
     /// Command used to open a selected file. The file path is appended.
+    /// Unset means `vim`.
     #[dynamic(default)]
     pub editor_command: Option<Vec<String>>,
+
+    /// Panel or picker; see [`FileBrowserUi`].
+    #[dynamic(default)]
+    pub ui: FileBrowserUi,
+
+    /// Where the panel opens a file; see [`FileBrowserEditorPlacement`].
+    #[dynamic(default)]
+    pub editor_placement: FileBrowserEditorPlacement,
+
+    /// Initial panel width in pixels, calibrated for a 2x (Retina) display;
+    /// scales with display density like `sidebar_width_px`. A drag-resize
+    /// overrides it and is remembered across restarts.
+    #[dynamic(default = "default_file_browser_width_px")]
+    pub width_px: usize,
+
+    /// Show names starting with a dot in the panel.
+    #[dynamic(default = "default_true")]
+    pub show_hidden: bool,
+
+    /// Leave out of the panel what `.gitignore` and friends leave out.
+    #[dynamic(default = "default_true")]
+    pub respect_gitignore: bool,
 
     /// `editor_command` opens a window of its own (VS Code, Notepad++):
     /// launch it directly instead of in a split that would only wait for it.
@@ -184,6 +238,11 @@ impl Default for FileBrowserConfig {
     fn default() -> Self {
         Self {
             editor_command: None,
+            ui: FileBrowserUi::default(),
+            editor_placement: FileBrowserEditorPlacement::default(),
+            width_px: default_file_browser_width_px(),
+            show_hidden: true,
+            respect_gitignore: true,
             editor_is_gui: false,
             list_command: default_file_browser_list_command(),
             split_size_percent: default_file_browser_split_size_percent(),
@@ -3722,6 +3781,10 @@ fn default_file_browser_split_size_percent() -> u8 {
     30
 }
 
+fn default_file_browser_width_px() -> usize {
+    560
+}
+
 fn default_agent_telemetry_fields() -> Vec<AgentTelemetryField> {
     vec![
         AgentTelemetryField::Kind,
@@ -4668,6 +4731,22 @@ mod agent_ui_tests {
         assert_eq!(config.diff_panel.width_px, 840);
         assert_eq!(config.diff_panel.nested_max_depth, 3);
         assert_eq!(config.diff_panel.nested_max_roots, 64);
+    }
+
+    #[test]
+    fn file_browser_defaults_to_the_panel_with_vim() {
+        let config = Config::default_config();
+
+        assert_eq!(config.file_browser.ui, FileBrowserUi::Panel);
+        assert_eq!(
+            config.file_browser.editor_placement,
+            FileBrowserEditorPlacement::Split
+        );
+        assert!(config.file_browser.reuse_editor_pane);
+        assert_eq!(config.file_browser.editor_command, None);
+        assert_eq!(config.file_browser.width_px, 560);
+        assert!(config.file_browser.show_hidden);
+        assert!(config.file_browser.respect_gitignore);
     }
 
     #[test]

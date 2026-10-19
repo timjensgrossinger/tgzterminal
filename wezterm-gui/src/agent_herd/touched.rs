@@ -72,6 +72,11 @@ impl TouchedPaths {
         *entry = (*entry).max(touch);
     }
 
+    #[cfg(test)]
+    pub fn insert_for_test(&mut self, path: &str, touch: Touch) {
+        self.add(path, touch);
+    }
+
     /// Every touched path: `(key, spelling, touch)`.
     pub fn iter(&self) -> impl Iterator<Item = (&str, &str, Touch)> {
         let spellings = &self.spelled;

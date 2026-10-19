@@ -421,6 +421,37 @@ pub enum DiffPanelAction {
     ToggleSessionFilter,
 }
 
+/// A row of the Worktree panel's right-click menu.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FileTreeMenuAction {
+    Open,
+    OpenInTab,
+    OpenWithSystem,
+    Reveal,
+    CopyPath,
+    CopyRelativePath,
+    PastePath,
+    CdHere,
+    NewFile,
+    NewFolder,
+    Rename,
+    Trash,
+}
+
+/// A header button of the Worktree panel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FileTreeAction {
+    Close,
+    Refresh,
+    CollapseAll,
+    /// Open or close the filter field.
+    Filter,
+    /// Open or close the quick preview.
+    Preview,
+    /// The Changes panel, at the previewed file.
+    ShowChanges,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PaneToolbeltAction {
     Interrupt,
@@ -531,6 +562,27 @@ pub enum UIItemType {
     DiffPanelChip {
         index: usize,
     },
+    /// The Worktree panel's draggable right edge; `start_reserved` as for
+    /// [`UIItemType::DiffPanelResize`].
+    FileTreeResize {
+        start_reserved: usize,
+    },
+    /// The Worktree panel's surface: swallows clicks and the wheel.
+    FileTreeBody,
+    FileTreeButton(FileTreeAction),
+    /// A row of the Worktree panel: a folder toggles, a file is selected and
+    /// opened on a second click.
+    FileTreeRow {
+        index: usize,
+    },
+    /// The Worktree panel's scroll bar: its thumb drags, its track pages.
+    FileTreeScrollThumb,
+    FileTreeScrollTrack,
+    FileTreeMenuItem(FileTreeMenuAction),
+    /// The quick preview's lines: the wheel scrolls them.
+    FileTreePreview,
+    /// The line between the rows and the preview: drag to share the height.
+    FileTreePreviewDivider,
     SidebarSearch,
     SidebarAutoHideToggle,
     SidebarWorktreeButton,
@@ -1336,6 +1388,9 @@ pub struct TermWindow {
     /// The Changes (diff) panel: which panes show it, and its dragged size.
     diff_panel: crate::termwindow::render::diff_panel::DiffPanelState,
 
+    /// The Worktree panel: which tabs show it, their trees, its dragged width.
+    file_tree: crate::termwindow::render::file_tree::FileTreeState,
+
     event_states: HashMap<String, EventState>,
     pub current_event: Option<Value>,
     has_animation: RefCell<Option<Instant>>,
@@ -1711,6 +1766,7 @@ impl TermWindow {
             composer_history: RefCell::new(Vec::new()),
             docked_input: crate::termwindow::composer::DockedInput::new(),
             diff_panel: crate::termwindow::render::diff_panel::DiffPanelState::load(),
+            file_tree: crate::termwindow::render::file_tree::FileTreeState::load(),
             sidebar_scroll_offset: 0,
             sidebar_drop_flash: None,
             sidebar_expanded_tabs: tgz_ui_state::load_sidebar_expanded_tabs().unwrap_or_default(),
@@ -5754,7 +5810,10 @@ done
                 wezterm_open_url::open_url(link);
             }
             OpenFileBrowser => {
-                self.open_file_browser(pane);
+                self.toggle_file_tree(pane);
+            }
+            FocusFileTree => {
+                self.focus_file_tree(pane);
             }
             ActivateCommandPalette => {
                 let modal = crate::termwindow::palette::CommandPalette::new(self);

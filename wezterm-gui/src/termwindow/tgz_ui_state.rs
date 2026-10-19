@@ -65,7 +65,20 @@ struct TgzUiState {
     /// Whether the agent pane toolbelt is hidden from the sidebar toggle.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pane_toolbelt_hidden: Option<bool>,
+
+    /// Dragged width of the Worktree panel, in physical pixels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    file_tree_width: Option<usize>,
+
+    /// Open folders of the Worktree panel per root, most recently used root
+    /// first: `(root, folders relative to it)`. Capped at
+    /// [`FILE_TREE_MAX_ROOTS`] roots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    file_tree_expanded: Option<Vec<(String, Vec<String>)>>,
 }
+
+/// Most roots whose open folders are remembered.
+const FILE_TREE_MAX_ROOTS: usize = 32;
 
 fn state_path() -> PathBuf {
     config::DATA_DIR.join(config::brand::state_file_name("tgz-ui-state", "json"))
@@ -195,6 +208,44 @@ pub fn save_diff_panel_size(width: Option<usize>, height: Option<usize>) {
     let mut state = read_state();
     state.diff_panel_width = width;
     state.diff_panel_height = height;
+    write_state(&state);
+}
+
+/// Persisted Worktree panel width, or `None` when it was never dragged.
+pub fn load_file_tree_width() -> Option<usize> {
+    read_state().file_tree_width
+}
+
+/// Persist the Worktree panel width. Best-effort.
+pub fn save_file_tree_width(width: Option<usize>) {
+    let mut state = read_state();
+    state.file_tree_width = width;
+    write_state(&state);
+}
+
+/// The Worktree panel's open folders under `root`, empty when none were
+/// remembered.
+pub fn load_file_tree_expanded(root: &str) -> Vec<String> {
+    read_state()
+        .file_tree_expanded
+        .unwrap_or_default()
+        .into_iter()
+        .find(|(known, _)| known == root)
+        .map(|(_, folders)| folders)
+        .unwrap_or_default()
+}
+
+/// Remember the open folders under `root`, making it the most recent root.
+/// Best-effort; reads and writes the state file, so not for every frame.
+pub fn save_file_tree_expanded(root: &str, folders: Vec<String>) {
+    let mut state = read_state();
+    let mut roots = state.file_tree_expanded.take().unwrap_or_default();
+    roots.retain(|(known, _)| known != root);
+    if !folders.is_empty() {
+        roots.insert(0, (root.to_string(), folders));
+    }
+    roots.truncate(FILE_TREE_MAX_ROOTS);
+    state.file_tree_expanded = (!roots.is_empty()).then_some(roots);
     write_state(&state);
 }
 
@@ -413,6 +464,8 @@ mod tests {
             diff_panel_height: Some(0),
             pane_toolbelt_offset: Some([120.0, 300.0]),
             pane_toolbelt_hidden: Some(true),
+            file_tree_width: Some(500),
+            file_tree_expanded: Some(vec![("/repo".into(), vec!["src".into()])]),
         };
         let json = serde_json::to_string_pretty(&state).unwrap();
         let parsed: TgzUiState = serde_json::from_str(&json).unwrap();
@@ -424,6 +477,11 @@ mod tests {
         assert_eq!(parsed.agent_launcher_project_root, Some(true));
         assert_eq!(parsed.sidebar_expanded_tabs, Some(vec![0, 2]));
         assert_eq!(parsed.wsl_session_distros, Some(vec!["Ubuntu".into()]));
+        assert_eq!(parsed.file_tree_width, Some(500));
+        assert_eq!(
+            parsed.file_tree_expanded,
+            Some(vec![("/repo".into(), vec!["src".into()])])
+        );
     }
 
     #[test]
@@ -479,6 +537,8 @@ mod tests {
             // Toolbelt state is window state, not config: never an override.
             pane_toolbelt_offset: Some([10.0, 20.0]),
             pane_toolbelt_hidden: Some(true),
+            file_tree_width: Some(500),
+            file_tree_expanded: None,
         });
         assert_eq!(overrides, Value::Null);
     }

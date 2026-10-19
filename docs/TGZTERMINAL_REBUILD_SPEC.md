@@ -64,9 +64,11 @@ The rebuild includes a file browser pane controlled by public configuration:
 - split size
 - reuse-editor-pane toggle
 
-The browser opens files through the configured editor command, can reuse an
-existing editor pane when requested, and keeps pane management compatible with
-normal terminal splits.
+The browser is a docked folder tree drawn by the terminal (collapsible folders,
+remembered per root), falling back to a picker split for remote panes. It opens
+files through the configured editor command (`vim` by default) in a split beside
+the shell pane, and keeps pane management compatible with normal terminal
+splits. Listing never blocks the GUI thread.
 
 ## Agent Telemetry
 

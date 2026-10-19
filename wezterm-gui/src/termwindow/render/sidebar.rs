@@ -291,7 +291,7 @@ fn dropdown_viewport(heights: &[f32], offset: usize, max_body: f32) -> Option<Dr
 /// button and flipped above it, so the row the user was reaching for slid away
 /// and an older session took its place under the pointer.
 #[derive(Clone, Copy, Debug)]
-struct DropdownPin {
+pub(crate) struct DropdownPin {
     /// Top edge from an earlier paint; `None` on the first.
     top: Option<f32>,
     /// Rows the menu is expected to grow to. Only the first paint reads it, to
@@ -495,6 +495,12 @@ pub(crate) struct SidebarPalette {
 }
 
 impl SidebarPalette {
+    /// The accent the active rail is drawn in: midway between the ring's
+    /// two stops.
+    pub(crate) fn accent(&self) -> LinearRgba {
+        lerp_rgba(self.ring.a, self.ring.b, 0.5)
+    }
+
     fn modern(ring: RingColors) -> Self {
         Self {
             ring,
@@ -4157,19 +4163,19 @@ fn discovered_shells() -> Vec<(String, Vec<String>)> {
 
 /// One row in a sidebar dropdown. `dot_color` and `checkbox` are mutually
 /// exclusive leading markers; a row with neither is plain text.
-struct SidebarDropdownRow {
-    label: String,
-    dot_color: Option<LinearRgba>,
-    checkbox: Option<bool>,
+pub(crate) struct SidebarDropdownRow {
+    pub(crate) label: String,
+    pub(crate) dot_color: Option<LinearRgba>,
+    pub(crate) checkbox: Option<bool>,
     /// Draw a separator band above this row.
-    divider_above: bool,
+    pub(crate) divider_above: bool,
     /// Indent this row under the item above it, e.g. a launch-target row
     /// nested under its agent.
-    indent: bool,
+    pub(crate) indent: bool,
     /// Draw a trailing `>` chevron, marking a row that expands into a
     /// submenu rather than acting immediately.
-    trailing_chevron: bool,
-    item_type: UIItemType,
+    pub(crate) trailing_chevron: bool,
+    pub(crate) item_type: UIItemType,
 }
 
 /// Walk up from `start` to the nearest directory containing one of `markers`.
@@ -11678,7 +11684,7 @@ impl crate::TermWindow {
     /// Downward chevron centered on `(cx, cy)`, drawn as stacked rounded bars
     /// of decreasing width. Hand-drawn rather than a `▾` glyph, which is not
     /// guaranteed to be in the user's font.
-    fn draw_sidebar_chevron(
+    pub(crate) fn draw_sidebar_chevron(
         &self,
         layers: &mut TripleLayerQuadAllocator,
         cx: f32,
@@ -11725,7 +11731,7 @@ impl crate::TermWindow {
     /// the rows from `offset`, and adds a scroll thumb once they overflow. The
     /// geometry lands in `sidebar_dropdown_scroll` for the mouse handlers.
     /// `None` paints every row, as a menu that never scrolls always has.
-    fn paint_sidebar_dropdown(
+    pub(crate) fn paint_sidebar_dropdown(
         &mut self,
         layers: &mut TripleLayerQuadAllocator,
         anchor_x: f32,

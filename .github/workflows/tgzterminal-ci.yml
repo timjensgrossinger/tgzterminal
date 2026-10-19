@@ -78,6 +78,9 @@ jobs:
       - name: Test SSH host list
         run: cargo test -p wezterm-gui termwindow::tgz_ssh_hosts
 
+      - name: Test Worktree panel
+        run: cargo test -p wezterm-gui file_tree
+
       - name: Test updater asset matching
         run: cargo test -p wezterm-gui update::tests
 
