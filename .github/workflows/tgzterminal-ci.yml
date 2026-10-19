@@ -110,10 +110,21 @@ jobs:
           $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
           $version = $null
           if (Test-Path $iscc) {
-            # ISCC.exe leaves FileVersion at 0.0.0.0; ProductVersion carries
-            # the release ("6.7.1"). Take the first real one either offers.
+            # ISCC.exe's own version fields are blank or 0.0.0.0, so ask the
+            # entry Inno Setup's installer writes for uninstalling ("6.7.1"),
+            # then the file fields. Each source is logged.
+            $keys = @(
+              "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Inno Setup 6_is1",
+              "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Inno Setup 6_is1"
+            )
+            $sources = @()
+            foreach ($key in $keys) {
+              $sources += (Get-ItemProperty -Path $key -ErrorAction SilentlyContinue).DisplayVersion
+            }
             $info = (Get-Item $iscc).VersionInfo
-            foreach ($text in @($info.ProductVersion, $info.FileVersion)) {
+            $sources += @($info.ProductVersion, $info.FileVersion)
+            Write-Host "Inno Setup version sources: [$($sources -join '] [')]"
+            foreach ($text in $sources) {
               if ($text -match '^(\d+\.\d+(\.\d+)?)') {
                 $candidate = [version]$Matches[1]
                 if ($candidate.Major -gt 0) {
@@ -122,6 +133,8 @@ jobs:
                 }
               }
             }
+          } else {
+            Write-Host "No $iscc on the runner"
           }
           if ($version -and $version -ge [version]"6.3") {
             Write-Host "Using the runner's Inno Setup $version"
