@@ -228,7 +228,18 @@ jobs:
           $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
           $version = $null
           if (Test-Path $iscc) {
-            try { $version = [version](Get-Item $iscc).VersionInfo.FileVersion } catch {}
+            # ISCC.exe leaves FileVersion at 0.0.0.0; ProductVersion carries
+            # the release ("6.7.1"). Take the first real one either offers.
+            $info = (Get-Item $iscc).VersionInfo
+            foreach ($text in @($info.ProductVersion, $info.FileVersion)) {
+              if ($text -match '^(\d+\.\d+(\.\d+)?)') {
+                $candidate = [version]$Matches[1]
+                if ($candidate.Major -gt 0) {
+                  $version = $candidate
+                  break
+                }
+              }
+            }
           }
           if ($version -and $version -ge [version]"6.3") {
             Write-Host "Using the runner's Inno Setup $version"
