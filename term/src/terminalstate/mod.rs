@@ -156,6 +156,9 @@ struct ScreenOrAlt {
     alt_screen: Screen,
     /// Tells us which screen is active
     alt_screen_is_active: bool,
+    /// TGZTerminal: a shell prompt mark (OSC 133) arrived while the
+    /// alternate screen was active. Cleared on every switch.
+    prompt_on_alt: bool,
 }
 
 impl Deref for ScreenOrAlt {
@@ -194,6 +197,7 @@ impl ScreenOrAlt {
             screen,
             alt_screen,
             alt_screen_is_active: false,
+            prompt_on_alt: false,
         }
     }
 
@@ -212,11 +216,13 @@ impl ScreenOrAlt {
 
     pub fn activate_alt_screen(&mut self, seqno: SequenceNo) {
         self.alt_screen_is_active = true;
+        self.prompt_on_alt = false;
         self.dirty_top_phys_rows(seqno);
     }
 
     pub fn activate_primary_screen(&mut self, seqno: SequenceNo) {
         self.alt_screen_is_active = false;
+        self.prompt_on_alt = false;
         self.dirty_top_phys_rows(seqno);
     }
 
@@ -235,6 +241,17 @@ impl ScreenOrAlt {
 
     pub fn is_alt_screen_active(&self) -> bool {
         self.alt_screen_is_active
+    }
+
+    /// A shell marked a prompt; noted only on the alternate screen.
+    pub fn note_prompt(&mut self) {
+        if self.alt_screen_is_active {
+            self.prompt_on_alt = true;
+        }
+    }
+
+    pub fn prompt_on_alt_screen(&self) -> bool {
+        self.prompt_on_alt
     }
 
     pub fn saved_cursor(&mut self) -> &mut Option<SavedCursor> {
@@ -793,6 +810,16 @@ impl TerminalState {
     /// to handle operations like scrollback that only apply to the primary screen.
     pub fn is_alt_screen_active(&self) -> bool {
         self.screen.is_alt_screen_active()
+    }
+
+    /// TGZTerminal: whether a shell marked its prompt (OSC 133 A/P/N) since
+    /// the alternate screen was entered. Full-screen programs never send
+    /// these, and multiplexers (tmux, screen) keep their inner shells' marks
+    /// to themselves, so this means whatever switched to the alternate screen
+    /// is gone -- even when it ran behind ssh/et/mosh, where the foreground
+    /// process cannot tell.
+    pub fn prompt_on_alt_screen(&self) -> bool {
+        self.screen.prompt_on_alt_screen()
     }
 
     /// Returns true if the associated application has enabled basic mouse

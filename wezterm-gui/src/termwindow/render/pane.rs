@@ -1,3 +1,4 @@
+use crate::diff_panel::wrap::{self, PaneRect, WrapLayout, WrapZone};
 use crate::quad::{HeapQuadAllocator, QuadTrait, TripleLayerQuadAllocator};
 use crate::selection::SelectionRange;
 use crate::termwindow::box_model::*;
@@ -27,6 +28,31 @@ impl crate::TermWindow {
         self.ui_items.append(&mut ui_items);
         let gl_state = self.render_state.as_ref().unwrap();
         self.render_element(&computed, gl_state, None)
+    }
+
+    /// `(padding_top, y)`: the top padding, and the window pixel row where
+    /// pane row 0 of the topmost pane starts (a pane `pos.top` cells down
+    /// starts that many cell heights below it).
+    pub fn pane_grid_top(&self) -> anyhow::Result<(f32, f32)> {
+        let (_, padding_top) = self.padding_left_top();
+
+        let tab_bar_height = if self.show_tab_bar && !self.sidebar_is_active() {
+            self.tab_bar_pixel_height()
+                .context("tab_bar_pixel_height")?
+        } else {
+            0.
+        };
+        let top_bar_height = if self.config.tab_bar_at_bottom {
+            0.0
+        } else {
+            tab_bar_height
+        };
+
+        let border = self.get_os_border();
+        Ok((
+            padding_top,
+            top_bar_height + padding_top + border.top.get() as f32,
+        ))
     }
 
     pub fn paint_pane(
@@ -64,22 +90,10 @@ impl crate::TermWindow {
         let config = self.config.clone();
         let palette = pos.pane.palette();
 
-        let (padding_left, padding_top) = self.padding_left_top();
-
-        let tab_bar_height = if self.show_tab_bar && !self.sidebar_is_active() {
-            self.tab_bar_pixel_height()
-                .context("tab_bar_pixel_height")?
-        } else {
-            0.
-        };
-        let top_bar_height = if self.config.tab_bar_at_bottom {
-            0.0
-        } else {
-            tab_bar_height
-        };
+        let (padding_left, _) = self.padding_left_top();
+        let (padding_top, top_pixel_y) = self.pane_grid_top()?;
 
         let border = self.get_os_border();
-        let top_pixel_y = top_bar_height + padding_top + border.top.get() as f32;
 
         let cursor = pos.pane.get_cursor_position();
         if pos.is_active {
@@ -327,11 +341,23 @@ impl crate::TermWindow {
                 window_is_transparent: bool,
                 layers: &'a mut TripleLayerQuadAllocator<'b>,
                 error: Option<anyhow::Error>,
+                /// Rows beside a raised Changes panel, wrapped on screen.
+                wrap_zone: Option<WrapZone>,
+                wrap_layout: Option<WrapLayout>,
             }
 
             let left_pixel_x = padding_left
                 + border.left.get() as f32
                 + (pos.left as f32 * self.render_metrics.cell_size.width as f32);
+
+            let wrap_zone = self.diff_panel_wrap_zone(PaneRect {
+                x: left_pixel_x,
+                y: top_pixel_y + pos.top as f32 * cell_height,
+                cols: dims.cols,
+                rows: dims.viewport_rows,
+                cell_width,
+                cell_height,
+            });
 
             let mut render = LineRender {
                 term_window: self,
@@ -357,32 +383,76 @@ impl crate::TermWindow {
                 window_is_transparent,
                 layers,
                 error: None,
+                wrap_zone,
+                wrap_layout: None,
             };
 
             impl<'a, 'b> LineRender<'a, 'b> {
+                /// Paints viewport row `line_idx` on screen row `screen_row`;
+                /// with `piece`, only those of its cells, starting at that
+                /// screen column (a row wrapped around the Changes panel).
                 fn render_line(
                     &mut self,
                     stable_top: StableRowIndex,
                     line_idx: usize,
                     line: &&mut Line,
+                    screen_row: usize,
+                    piece: Option<(std::ops::Range<usize>, usize)>,
                 ) -> anyhow::Result<()> {
                     let stable_row = stable_top + line_idx as StableRowIndex;
                     let masked =
                         self.term_window
                             .secret_masked_line(self.pane_id, stable_row, line);
                     let line: &Line = masked.as_ref().unwrap_or(line);
+                    let piece_line;
+                    let (line, cols, x_offset) = match &piece {
+                        Some((cols, offset)) => {
+                            let mut whole = line.clone();
+                            let seqno = whole.current_seqno();
+                            let mut cut = whole.split_off(cols.start, seqno);
+                            cut.split_off(cols.len(), seqno);
+                            piece_line = cut;
+                            (&piece_line, cols.clone(), *offset)
+                        }
+                        None => (line, 0..self.dims.cols, 0),
+                    };
                     let selrange = self
                         .selrange
                         .map_or(0..0, |sel| sel.cols_for_row(stable_row, self.rectangular));
-                    // Constrain to the pane width!
-                    let selrange = selrange.start..selrange.end.min(self.dims.cols);
+                    // Constrain to the pane width, then to the piece.
+                    let selrange = selrange.start.max(cols.start) - cols.start
+                        ..selrange
+                            .end
+                            .min(self.dims.cols)
+                            .min(cols.end)
+                            .max(cols.start)
+                            - cols.start;
+                    let selrange = selrange.start..selrange.end.max(selrange.start);
 
-                    let (cursor, composing, password_input) = if self.cursor.y == stable_row {
+                    // The cursor, relative to the piece; on another piece of
+                    // its row it is not drawn here at all.
+                    let cursor_col = self.cursor.x.min(self.dims.cols.saturating_sub(1));
+                    let cursor_here = self.cursor.y == stable_row
+                        && cursor_col >= cols.start
+                        && cursor_col < cols.end.max(cols.start + 1);
+                    let piece_cursor = if cursor_here {
+                        StableCursorPosition {
+                            x: self.cursor.x - cols.start,
+                            ..*self.cursor
+                        }
+                    } else {
+                        StableCursorPosition {
+                            y: StableRowIndex::MIN,
+                            ..*self.cursor
+                        }
+                    };
+
+                    let (cursor, composing, password_input) = if cursor_here {
                         (
                             Some(CursorProperties {
                                 position: StableCursorPosition {
                                     y: 0,
-                                    ..*self.cursor
+                                    ..piece_cursor
                                 },
                                 dead_key_or_leader: self.term_window.dead_key_status
                                     != DeadKeyStatus::None
@@ -418,6 +488,8 @@ impl crate::TermWindow {
                     };
 
                     let shape_hash = self.term_window.shape_hash_for_line(line);
+                    let left_pixel_x = self.left_pixel_x
+                        + x_offset as f32 * self.term_window.render_metrics.cell_size.width as f32;
 
                     let quad_key = LineQuadCacheKey {
                         pane_id: self.pane_id,
@@ -431,10 +503,10 @@ impl crate::TermWindow {
                         cursor,
                         shape_hash,
                         top_pixel_y: NotNan::new(self.top_pixel_y).unwrap()
-                            + (line_idx + self.pos.top) as f32
+                            + (screen_row + self.pos.top) as f32
                                 * self.term_window.render_metrics.cell_size.height as f32,
-                        left_pixel_x: NotNan::new(self.left_pixel_x).unwrap(),
-                        phys_line_idx: line_idx,
+                        left_pixel_x: NotNan::new(left_pixel_x).unwrap(),
+                        phys_line_idx: screen_row,
                         reverse_video: self.dims.reverse_video,
                     };
 
@@ -469,11 +541,11 @@ impl crate::TermWindow {
                     let shape_key = LineToEleShapeCacheKey {
                         shape_hash,
                         shape_generation: quad_key.shape_generation,
-                        composing: if self.cursor.y == stable_row && self.pos.is_active {
+                        composing: if cursor_here && self.pos.is_active {
                             if let DeadKeyStatus::Composing(composing) =
                                 &self.term_window.dead_key_status
                             {
-                                Some((self.cursor.x, composing.to_string()))
+                                Some((piece_cursor.x, composing.to_string()))
                             } else {
                                 None
                             }
@@ -487,13 +559,13 @@ impl crate::TermWindow {
                         .render_screen_line(
                             RenderScreenLineParams {
                                 top_pixel_y: *quad_key.top_pixel_y,
-                                left_pixel_x: self.left_pixel_x,
-                                pixel_width: self.dims.cols as f32
+                                left_pixel_x,
+                                pixel_width: cols.len() as f32
                                     * self.term_window.render_metrics.cell_size.width as f32,
                                 stable_line_idx: Some(stable_row),
                                 line: &line,
                                 selection: selrange.clone(),
-                                cursor: &self.cursor,
+                                cursor: &piece_cursor,
                                 palette: &self.palette,
                                 dims: &self.dims,
                                 config: &self.term_window.config,
@@ -552,8 +624,50 @@ impl crate::TermWindow {
 
             impl<'a, 'b> WithPaneLines for LineRender<'a, 'b> {
                 fn with_lines_mut(&mut self, stable_top: StableRowIndex, lines: &mut [&mut Line]) {
+                    if let Some(zone) = self.wrap_zone {
+                        let cursor_row = self.cursor.y - stable_top;
+                        let (lens, shown): (Vec<usize>, Vec<usize>) = lines
+                            .iter()
+                            .enumerate()
+                            .map(|(idx, line)| {
+                                let (text, shown) = content_lens(line);
+                                if idx as StableRowIndex == cursor_row {
+                                    let cursor_end = self.cursor.x + 1;
+                                    (text.max(cursor_end), shown.max(cursor_end))
+                                } else {
+                                    (text, shown)
+                                }
+                            })
+                            .unzip();
+                        let keep = shown
+                            .iter()
+                            .rposition(|&len| len > 0)
+                            .map_or(0, |idx| idx + 1);
+                        let layout = wrap::layout(zone, self.dims.cols, &lens, keep);
+                        for piece in layout.pieces() {
+                            let cells = if piece.cols == (0..self.dims.cols) && piece.offset == 0 {
+                                None
+                            } else {
+                                Some((piece.cols, piece.offset))
+                            };
+                            if let Err(err) = self.render_line(
+                                stable_top,
+                                piece.row,
+                                &lines[piece.row],
+                                piece.screen_row,
+                                cells,
+                            ) {
+                                self.error.replace(err);
+                                return;
+                            }
+                        }
+                        self.wrap_layout = Some(layout);
+                        return;
+                    }
                     for (line_idx, line) in lines.iter().enumerate() {
-                        if let Err(err) = self.render_line(stable_top, line_idx, line) {
+                        if let Err(err) =
+                            self.render_line(stable_top, line_idx, line, line_idx, None)
+                        {
                             self.error.replace(err);
                             return;
                         }
@@ -562,7 +676,10 @@ impl crate::TermWindow {
             }
 
             pos.pane.with_lines_mut(stable_range.clone(), &mut render);
-            if let Some(error) = render.error.take() {
+            let wrap_layout = render.wrap_layout.take();
+            let error = render.error.take();
+            self.diff_panel_set_wrap(pane_id, wrap_layout);
+            if let Some(error) = error {
                 return Err(error).context("error while calling with_lines_mut");
             }
         }
@@ -683,4 +800,30 @@ impl crate::TermWindow {
             content: ComputedElementContent::Children(vec![]),
         })
     }
+}
+
+/// Two lengths of `line`, in leading cells, for wrapping it around the
+/// Changes panel: `(text, shown)`. `shown` runs to the last cell showing
+/// anything (text, a background colour, reverse video, an image), so what
+/// follows is blank. `text` stops at the last cell that is neither padding
+/// nor line art (`wrap::is_wrap_filler`): only that much is worth continuing
+/// on the next screen row.
+fn content_lens(line: &Line) -> (usize, usize) {
+    let (mut text, mut shown) = (0, 0);
+    for cell in line.visible_cells() {
+        let attrs = cell.attrs();
+        let end = cell.cell_index() + cell.width();
+        let has_image = attrs.images().is_some();
+        if has_image || !wrap::is_wrap_filler(cell.str()) {
+            text = end;
+        }
+        if cell.str() != " "
+            || attrs.background() != ColorAttribute::Default
+            || attrs.reverse()
+            || has_image
+        {
+            shown = end;
+        }
+    }
+    (text, shown)
 }

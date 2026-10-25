@@ -259,18 +259,28 @@ impl crate::TermWindow {
             .context("filled_rectangle for window background")?;
         }
 
+        // Before any pane: the panel's height feeds every pane's wrap zone.
+        self.diff_panel_update_input_ceiling(&panes);
         let mut toolbelt_panes = Vec::with_capacity(panes.len());
         for pos in panes {
-            if pos.is_active {
-                self.update_text_cursor(&pos);
-                if focused {
-                    pos.pane.advise_focus();
-                    mux::Mux::get().record_focus_for_current_identity(pos.pane.pane_id());
-                }
+            if pos.is_active && focused {
+                pos.pane.advise_focus();
+                mux::Mux::get().record_focus_for_current_identity(pos.pane.pane_id());
             }
             self.paint_pane(&pos, &mut layers).context("paint_pane")?;
+            // After painting: the IME cursor follows the row wrapping around
+            // the Changes panel that this paint just laid out.
+            if pos.is_active {
+                self.update_text_cursor(&pos);
+            }
             toolbelt_panes.push(pos);
         }
+        self.diff_panel_retain_wraps(
+            &toolbelt_panes
+                .iter()
+                .map(|pos| pos.pane.pane_id())
+                .collect(),
+        );
 
         self.paint_scrollbar_edge_overlay(&mut layers)
             .context("paint_scrollbar_edge_overlay")?;

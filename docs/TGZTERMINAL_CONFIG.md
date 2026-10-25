@@ -128,14 +128,32 @@ unaffected because it starts with a fresh terminal state.
 config.heal_stranded_alt_screen = true -- default
 ```
 
-With it on, a wheel event over a pane whose **own shell** is back in front on the
-alternate screen first returns the pane to the primary screen, so the wheel
-scrolls output again and the scrollbar comes back. Behind `ssh`, `et` or `mosh`
-the terminal cannot see what runs on the server — remote vim looks the same as a
-stranded prompt — so those panes are left alone. Fix them with the command
-palette entry **Leave alternate screen** (`LeaveAlternateScreen`), which keeps
-the screen and scrollback, unlike **Reset terminal** (`ResetTerminal`). It has no
-default key; bind one if you hit this often:
+With it on, a wheel event over a stranded pane first returns it to the primary
+screen, so the wheel scrolls output again and the scrollbar comes back. A pane
+counts as stranded when it is on the alternate screen and either
+
+- its **own shell** is back in front (local panes), or
+- a shell has **marked its prompt** there with OSC 133 since the switch. This is
+  the case that also works behind `ssh` and `et`, such as tmux on a server that
+  died in an upgrade. Full-screen programs never send the mark, and tmux and
+  screen keep their inner shells' marks to themselves, so a live tmux or a
+  remote vim is never touched.
+
+The remote shell has to send the mark. fish 4.0 and newer do it by default.
+For bash or zsh, source WezTerm's shell integration (`wezterm.sh`) on the server.
+For older fish, add to `~/.config/fish/config.fish`:
+
+```fish
+function __osc133_prompt --on-event fish_prompt
+    printf '\e]133;A\a'
+end
+```
+
+Without a mark the terminal cannot tell a stranded remote prompt from remote vim,
+so the pane is left alone. Fix it with the command palette entry **Leave
+alternate screen** (`LeaveAlternateScreen`), which keeps the screen and
+scrollback, unlike **Reset terminal** (`ResetTerminal`). It has no default key;
+bind one if you hit this often:
 
 ```lua
 config.keys = {
@@ -1698,7 +1716,9 @@ config.diff_panel = {
   enabled = true,
   position = "Right",      -- or "Left"
   default_mode = "Session", -- or "All"
-  raised_mode = "Float",   -- or "Auto", "Reserve"
+  raised_mode = "Wrap",    -- or "Float", "Auto", "Reserve"
+  avoid_input = false,     -- true: a raised panel rises above a growing prompt
+  long_lines = "Wrap",     -- or "Scroll", "Clip"
   width_px = 840,
   snap_px = 56,
   refresh_ms = 2000,
@@ -1738,8 +1758,10 @@ config.keys = {
 | `enabled` | `true` | Offer the panel at all. `false` removes the toolbelt button and makes `ToggleDiffPanel` do nothing. |
 | `position` | `"Right"` | Which side of the terminal area the panel docks to. With the sidebar on the same side, the panel sits inside it. |
 | `default_mode` | `"Session"` | The mode a newly opened panel starts in: `"Session"` or `"All"`. |
-| `raised_mode` | `"Float"` | What a panel shorter than the pane does to the terminal; see below. |
+| `raised_mode` | `"Wrap"` | What a panel shorter than the pane does to the terminal; see below. |
 | `width_px` | `840` | Initial width, calibrated for a 2x display like `sidebar_width_px`. A drag overrides it. |
+| `avoid_input` | `false` | Keep a raised panel above the active pane's input; see "Keeping clear of the prompt". |
+| `long_lines` | `"Wrap"` | A diff line wider than the panel: `"Wrap"` continues it on the next rows (under its own text, without line numbers or marker), `"Scroll"` keeps it on one row and scrolls the diff sideways with a horizontal wheel or Shift + wheel (a bar along the bottom shows where), `"Clip"` cuts it at the edge. |
 | `snap_px` | `56` | How close (at 2x) the dragged bottom edge must come to the bottom, or to the docked input strip, to snap onto it. |
 | `refresh_ms` | `2000` | How often the visible panel re-reads the directory when nothing tells it to. A tree that is slow to diff is re-read less often than this. A written file does not wait for it: the working copy is watched, and a change is re-read within about a third of a second. Where watching is not possible (a network share, a WSL distro's own filesystem seen from Windows) this poll is the only trigger. |
 | `max_file_bytes` | `1048576` | Files larger than this are listed without a diff. |
@@ -1791,11 +1813,28 @@ A bottom edge released within `snap_px` of the bottom snaps to it, and the
 panel then runs the full height. With the docked input strip showing
 (`rich_input.docked`), the edge also snaps onto the top of the strip.
 
-A panel snapped to the bottom always takes its columns from the terminal, so
-the pane's text reflows beside it like a split. A *raised* panel follows
-`raised_mode`:
+A panel snapped to the bottom, or resting on the docked input strip, always
+takes its columns from the terminal, so the pane's text reflows beside it like
+a split; the strip then widens to span the terminal and the panel. Either way
+the panel covers the terminal's full height, so it never floats. A *raised*
+panel — one that ends part-way down the terminal — follows `raised_mode`:
 
-- `"Float"` (default): the terminal keeps its full width and the panel floats
+- `"Wrap"` (default): the text flows around the panel like text around a
+  picture in a document. Rows beside the panel end two columns short of it
+  and continue on the next row; below the panel, after a one-row gap, rows
+  use the full width again. The lines below move down to make room, and the
+  oldest lines at the top give way so the prompt and cursor stay in view.
+  Only the display wraps: the program keeps its full width, so anything it
+  draws across the whole width (a horizontal rule, a right-aligned status)
+  is split onto two rows beside the panel. Dragging the panel's edges
+  re-flows the text live, and shrinking it gives the freed rows and columns
+  back at once. Full-screen programs (anything on the alternate screen —
+  agents such as Claude Code run there, as do vim, htop and less) wrap the
+  same way: their rows beside the panel are split, and the top rows give
+  way. For an editor whose layout must stay intact, snap the panel to the
+  bottom (it then takes its columns) or use `"Reserve"`.
+  See also `avoid_input` below.
+- `"Float"`: the terminal keeps its full width and the panel floats
   over its top corner. An agent's own prompt at the bottom spans the window
   while the panel is raised and narrows when the panel is snapped to the
   bottom; the output behind a raised panel is covered.
@@ -1804,6 +1843,19 @@ the pane's text reflows beside it like a split. A *raised* panel follows
 - `"Reserve"`: the panel keeps its columns, so nothing is covered.
   The space under it stays empty, except that a docked input strip widens to
   span the terminal and the panel.
+
+### Keeping clear of the prompt
+
+With `avoid_input = true`, a raised panel (any `raised_mode`) never reaches
+down to the active pane's input. The input starts at the nearest horizontal
+rule above the cursor — the `────` line that opens Claude Code's input box —
+or, with no rule within 24 rows (a shell prompt), at the cursor's row. The
+panel's bottom edge stays one row above it: as a prompt grows by a line the
+panel rises by a row, and as it shrinks the panel goes back down to the
+height it was dragged to, which is what is remembered. A panel snapped to the
+bottom or resting on the docked strip is not moved; neither is one over a
+pane other than the active one. Off by default: the panel then stays exactly
+where it was dragged.
 
 Under the header, one line sums up the set: how many files, and how many of
 them were modified, added, deleted, renamed or left in conflict.

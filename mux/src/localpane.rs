@@ -670,12 +670,21 @@ impl Pane for LocalPane {
     }
 
     fn alt_screen_is_stranded(&self) -> bool {
+        if !self.is_alt_screen_active() {
+            return false;
+        }
+        // A shell marked its prompt (OSC 133) on the alternate screen. This is
+        // the only signal that reaches us through ssh/et/mosh, where the
+        // foreground process is the remote client whatever runs behind it.
+        if self.terminal.lock().prompt_on_alt_screen() {
+            return true;
+        }
         // A live full-screen program is the tty's foreground leader for as long
         // as it holds the alternate screen, so the pane's own shell back in
         // front of it means that program died without switching back.
         // FetchImmediate: a stale "shell in front" read just after `vim`
         // started must never throw vim off its own screen.
-        self.is_alt_screen_active() && self.spawned_shell_is_foreground(CachePolicy::FetchImmediate)
+        self.spawned_shell_is_foreground(CachePolicy::FetchImmediate)
     }
 
     fn get_current_working_dir(&self, policy: CachePolicy) -> Option<Url> {

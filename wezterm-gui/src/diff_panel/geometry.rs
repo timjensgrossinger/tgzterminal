@@ -38,6 +38,11 @@ pub struct PanelRequest {
     pub snap: f32,
     pub min_width: f32,
     pub min_height: f32,
+    /// Lowest a raised panel's bottom edge may sit, from
+    /// `diff_panel.avoid_input`: it rises above a growing prompt and comes
+    /// back down to `height` as the prompt shrinks. `height` itself is left
+    /// alone, so the cap never changes what is remembered.
+    pub max_bottom: Option<f32>,
 }
 
 /// What the panel's bottom edge is attached to.
@@ -120,11 +125,26 @@ pub fn panel_geometry(area: PanelArea, request: PanelRequest) -> Option<PanelGeo
         (bottom, snap)
     };
 
+    // `raised_mode` only applies to a panel that ends part-way down the
+    // terminal. One resting on the strip spans the terminal's full height
+    // (the strip is below the terminal), so floating it would cover the end
+    // of every line: it reserves exactly like one snapped to the bottom.
+    // `Auto` decides on the uncapped bottom: a prompt growing by a line must
+    // not flip the panel between floating and reserving (a resize).
     let reserves = match (snap, request.raised_mode) {
-        (PanelSnap::Bottom, _) => true,
+        (PanelSnap::Bottom | PanelSnap::Strip, _) => true,
         (_, DiffPanelRaisedMode::Reserve) => true,
-        (_, DiffPanelRaisedMode::Float) => false,
+        // Wrapping is done on screen; the terminal keeps its width.
+        (_, DiffPanelRaisedMode::Float | DiffPanelRaisedMode::Wrap) => false,
         (_, DiffPanelRaisedMode::Auto) => bottom - area.top > area_height * AUTO_FLOAT_SHARE,
+    };
+    // Only a raised panel moves for the input: one on the bottom or the
+    // strip already has the columns beside the prompt.
+    let bottom = match request.max_bottom {
+        Some(max) if snap == PanelSnap::Raised && max.is_finite() => {
+            bottom.min(max).max(area.top + request.min_height)
+        }
+        _ => bottom,
     };
     let reserved_width = if reserves { width } else { 0. };
     // The strip is as wide as the terminal. It only needs widening when the
@@ -174,6 +194,7 @@ mod tests {
             snap: 30.,
             min_width: 200.,
             min_height: 100.,
+            max_bottom: None,
         }
     }
 
@@ -236,22 +257,20 @@ mod tests {
     #[test]
     fn a_panel_near_the_strip_rests_on_it_and_the_strip_goes_full_width() {
         // Strip occupies 720..820.
-        let g = panel_geometry(
-            area(100.),
-            request(Some(690.), DiffPanelRaisedMode::Reserve),
-        )
-        .unwrap();
-        assert_eq!(g.snap, PanelSnap::Strip);
-        assert_eq!(g.bottom(), 720.);
-        assert_eq!(g.reserved_width, 300.);
-        assert_eq!(g.strip_extra_width, 300.);
-
-        // Floating: the terminal, and so the strip, is already full width.
-        let g =
-            panel_geometry(area(100.), request(Some(690.), DiffPanelRaisedMode::Float)).unwrap();
-        assert_eq!(g.snap, PanelSnap::Strip);
-        assert_eq!(g.reserved_width, 0.);
-        assert_eq!(g.strip_extra_width, 0.);
+        for mode in [
+            DiffPanelRaisedMode::Float,
+            DiffPanelRaisedMode::Reserve,
+            DiffPanelRaisedMode::Auto,
+        ] {
+            let g = panel_geometry(area(100.), request(Some(690.), mode)).unwrap();
+            assert_eq!(g.snap, PanelSnap::Strip);
+            assert_eq!(g.bottom(), 720.);
+            // Resting on the strip, the panel covers the terminal's whole
+            // height: floating would hide the end of every line.
+            assert_eq!(g.reserved_width, 300.);
+            assert!(!g.floats());
+            assert_eq!(g.strip_extra_width, 300.);
+        }
     }
 
     #[test]
@@ -325,5 +344,46 @@ mod tests {
         let g = panel_geometry(squat, request(Some(40.), DiffPanelRaisedMode::Float)).unwrap();
         assert_eq!(g.snap, PanelSnap::Bottom);
         assert_eq!(g.height, 150.);
+    }
+
+    #[test]
+    fn a_raised_panel_rises_above_the_input_and_keeps_its_height() {
+        // Asked to end at 420; the input starts at 320.
+        let mut req = request(Some(400.), DiffPanelRaisedMode::Wrap);
+        req.max_bottom = Some(320.);
+        let g = panel_geometry(area(0.), req).unwrap();
+        assert_eq!(g.snap, PanelSnap::Raised);
+        assert_eq!(g.bottom(), 320.);
+        // Clear of the input already: untouched.
+        req.max_bottom = Some(600.);
+        assert_eq!(panel_geometry(area(0.), req).unwrap().bottom(), 420.);
+        // Never shorter than the minimum, however tall the prompt.
+        req.max_bottom = Some(30.);
+        assert_eq!(panel_geometry(area(0.), req).unwrap().height, 100.);
+    }
+
+    #[test]
+    fn a_panel_on_the_bottom_or_the_strip_ignores_the_input() {
+        let mut req = request(None, DiffPanelRaisedMode::Wrap);
+        req.max_bottom = Some(320.);
+        let g = panel_geometry(area(0.), req).unwrap();
+        assert_eq!(g.snap, PanelSnap::Bottom);
+        assert_eq!(g.bottom(), 820.);
+
+        let mut req = request(Some(690.), DiffPanelRaisedMode::Wrap);
+        req.max_bottom = Some(320.);
+        let g = panel_geometry(area(100.), req).unwrap();
+        assert_eq!(g.snap, PanelSnap::Strip);
+        assert_eq!(g.bottom(), 720.);
+    }
+
+    #[test]
+    fn in_auto_mode_the_input_cap_does_not_flip_a_tall_panel_to_floating() {
+        // 500 of 800 reserves in Auto; capped to 200 it would float.
+        let mut req = request(Some(500.), DiffPanelRaisedMode::Auto);
+        req.max_bottom = Some(220.);
+        let g = panel_geometry(area(0.), req).unwrap();
+        assert_eq!(g.bottom(), 220.);
+        assert_eq!(g.reserved_width, 300.);
     }
 }

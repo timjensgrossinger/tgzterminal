@@ -21,6 +21,7 @@ pub mod svn;
 pub mod unified;
 pub mod view;
 pub mod watch;
+pub mod wrap;
 
 use crate::agent_herd::touched::{Touch, TouchedPaths};
 use std::path::{Path, PathBuf};

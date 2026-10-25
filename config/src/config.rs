@@ -344,7 +344,8 @@ impl Default for DiffPanelPosition {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, FromDynamic, ToDynamic)]
 pub enum DiffPanelRaisedMode {
     /// The terminal keeps its full width and the panel floats over its top
-    /// corner. Only a panel snapped to the bottom takes columns away.
+    /// corner. Only a panel snapped to the bottom or resting on the docked
+    /// input strip takes columns away.
     Float,
     /// The panel always takes its columns from the terminal, so nothing is
     /// ever covered; the space under a short panel stays empty.
@@ -352,11 +353,37 @@ pub enum DiffPanelRaisedMode {
     /// By size: a short panel floats, so the text below it keeps the full
     /// width; a tall one takes its columns, so the text moves beside it.
     Auto,
+    /// Text flows around the panel like text around a picture in a
+    /// document: rows beside it are wrapped on screen two columns short of
+    /// it, and rows below it (after a one-row gap) use the full width. The
+    /// program keeps its full width; only the display wraps. This holds for
+    /// full-screen programs (alternate screen) too: their rows beside the
+    /// panel are split the same way.
+    Wrap,
 }
 
 impl Default for DiffPanelRaisedMode {
     fn default() -> Self {
-        Self::Float
+        Self::Wrap
+    }
+}
+
+/// What the Changes panel does with a diff line wider than the panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromDynamic, ToDynamic)]
+pub enum DiffPanelLongLines {
+    /// The line continues on the next rows, under its own text, so the
+    /// whole of it can be read without scrolling.
+    Wrap,
+    /// The line stays on one row; a horizontal wheel (or Shift + wheel)
+    /// scrolls the diff sideways, and a bar under it shows where.
+    Scroll,
+    /// The line is cut at the panel's edge.
+    Clip,
+}
+
+impl Default for DiffPanelLongLines {
+    fn default() -> Self {
+        Self::Wrap
     }
 }
 
@@ -408,6 +435,19 @@ pub struct DiffPanelConfig {
     #[dynamic(default = "default_diff_panel_snap_px")]
     pub snap_px: usize,
 
+    /// Keep a raised panel above the active pane's input. As a prompt grows
+    /// (an agent's input box, from the cursor up to the rule that opens it)
+    /// the panel's bottom edge rises to stay one row clear of it, and drops
+    /// back to the dragged height as the prompt shrinks. Off by default: the
+    /// panel then stays exactly where it was dragged.
+    #[dynamic(default)]
+    pub avoid_input: bool,
+
+    /// What a diff line wider than the panel does: `"Wrap"` (continue on
+    /// the next rows), `"Scroll"` (scroll sideways) or `"Clip"`.
+    #[dynamic(default)]
+    pub long_lines: DiffPanelLongLines,
+
     /// How often the visible panel re-reads the working copy, in
     /// milliseconds.
     #[dynamic(default = "default_diff_panel_refresh_ms")]
@@ -443,6 +483,8 @@ impl Default for DiffPanelConfig {
             width_px: default_diff_panel_width_px(),
             raised_mode: DiffPanelRaisedMode::default(),
             snap_px: default_diff_panel_snap_px(),
+            avoid_input: false,
+            long_lines: DiffPanelLongLines::default(),
             refresh_ms: default_diff_panel_refresh_ms(),
             max_file_bytes: default_diff_panel_max_file_bytes(),
             snapshot_max_files: default_diff_panel_snapshot_max_files(),
@@ -2569,11 +2611,13 @@ pub struct Config {
     pub alternate_buffer_wheel_scroll_speed: u8,
 
     /// TGZTerminal: when a wheel event lands on a pane that is on the
-    /// alternate screen while the pane's own shell is in front (the full-screen
-    /// program that switched died without switching back), return the pane to
-    /// the primary screen first, so the wheel scrolls output instead of
-    /// stepping through shell history. Panes behind ssh/et/mosh are never
-    /// touched; `LeaveAlternateScreen` is the manual fix there.
+    /// alternate screen while the pane's own shell is in front, or after a
+    /// shell marked its prompt there (OSC 133; the full-screen program that
+    /// switched died without switching back), return the pane to the primary
+    /// screen first, so the wheel scrolls output instead of stepping through
+    /// shell history. Behind ssh/et/mosh only the prompt mark counts;
+    /// `LeaveAlternateScreen` is the manual fix when the remote shell sends
+    /// none.
     #[dynamic(default = "default_true")]
     pub heal_stranded_alt_screen: bool,
 
@@ -4736,15 +4780,17 @@ mod agent_ui_tests {
     }
 
     #[test]
-    fn diff_panel_defaults_to_a_floating_panel_on_the_right() {
+    fn diff_panel_defaults_to_a_wrapping_panel_on_the_right() {
         let config = Config::default_config();
 
         assert!(config.diff_panel.enabled);
         assert_eq!(config.diff_panel.position, DiffPanelPosition::Right);
-        assert_eq!(config.diff_panel.raised_mode, DiffPanelRaisedMode::Float);
+        assert_eq!(config.diff_panel.raised_mode, DiffPanelRaisedMode::Wrap);
         assert_eq!(config.diff_panel.width_px, 840);
         assert_eq!(config.diff_panel.nested_max_depth, 3);
         assert_eq!(config.diff_panel.nested_max_roots, 64);
+        assert!(!config.diff_panel.avoid_input);
+        assert_eq!(config.diff_panel.long_lines, DiffPanelLongLines::Wrap);
     }
 
     #[test]

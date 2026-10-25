@@ -84,7 +84,7 @@ impl super::TermWindow {
             | UIItemType::SidebarUsageMenuRow { .. }
             | UIItemType::SidebarAgentMenuItem { .. }
             | UIItemType::SidebarAgentMenuProjectRootToggle
-            | UIItemType::SidebarAgentMenuHerd
+            | UIItemType::SidebarAgentMenuTower
             | UIItemType::SidebarAgentMenuTarget { .. }
             | UIItemType::SidebarAgentMenuResume
             | UIItemType::SidebarAgentMenuResumeSession { .. }
@@ -151,7 +151,7 @@ impl super::TermWindow {
             | UIItemType::SidebarUsageMenuRow { .. }
             | UIItemType::SidebarAgentMenuItem { .. }
             | UIItemType::SidebarAgentMenuProjectRootToggle
-            | UIItemType::SidebarAgentMenuHerd
+            | UIItemType::SidebarAgentMenuTower
             | UIItemType::SidebarAgentMenuTarget { .. }
             | UIItemType::SidebarAgentMenuResume
             | UIItemType::SidebarAgentMenuResumeSession { .. }
@@ -479,7 +479,7 @@ impl super::TermWindow {
                         UIItemType::SidebarAgentLaunchButton
                             | UIItemType::SidebarAgentMenuItem { .. }
                             | UIItemType::SidebarAgentMenuProjectRootToggle
-                            | UIItemType::SidebarAgentMenuHerd
+                            | UIItemType::SidebarAgentMenuTower
                             | UIItemType::SidebarAgentMenuTarget { .. }
                             | UIItemType::SidebarAgentMenuResume
                             | UIItemType::SidebarAgentMenuResumeSession { .. }
@@ -899,8 +899,8 @@ impl super::TermWindow {
             UIItemType::SidebarAgentMenuProjectRootToggle => {
                 self.mouse_event_sidebar_agent_menu_project_root_toggle(event, context);
             }
-            UIItemType::SidebarAgentMenuHerd => {
-                self.mouse_event_sidebar_agent_menu_herd(event, context);
+            UIItemType::SidebarAgentMenuTower => {
+                self.mouse_event_sidebar_agent_menu_tower(event, context);
             }
             UIItemType::SidebarAgentMenuTarget { adapter_id, target } => {
                 self.mouse_event_sidebar_agent_menu_target(&adapter_id, target, event, context);
@@ -1158,7 +1158,7 @@ impl super::TermWindow {
                         self.launch_agent(&entry, None, invert);
                     } else {
                         // No adapter configured: open the dropdown so the
-                        // "Agent insight" and "Resume session" rows are
+                        // "Tower" and "Resume session" rows are
                         // still reachable.
                         self.agent_launch_menu = Some(AgentLaunchMenuState {
                             x: item.x,
@@ -1464,7 +1464,7 @@ impl super::TermWindow {
             item_type,
             UIItemType::SidebarAgentMenuItem { .. }
                 | UIItemType::SidebarAgentMenuProjectRootToggle
-                | UIItemType::SidebarAgentMenuHerd
+                | UIItemType::SidebarAgentMenuTower
                 | UIItemType::SidebarAgentMenuTarget { .. }
                 | UIItemType::SidebarAgentMenuResume
                 | UIItemType::SidebarAgentMenuResumeSession { .. }
@@ -1568,14 +1568,14 @@ impl super::TermWindow {
         context.invalidate();
     }
 
-    fn mouse_event_sidebar_agent_menu_herd(&mut self, event: MouseEvent, context: &dyn WindowOps) {
+    fn mouse_event_sidebar_agent_menu_tower(&mut self, event: MouseEvent, context: &dyn WindowOps) {
         if event.kind == WMEK::Release(MousePress::Left) {
             self.pressed_ui_item = None;
             // Unlike the project-root tick, this acts on the tab layout, so
             // the menu has no reason to stay open.
             self.agent_launch_menu = None;
             #[cfg(tgz_tower)]
-            if self.config.tower.enabled {
+            if self.tower_available() {
                 super::tgz_tower::open(self);
             }
         }
@@ -2436,6 +2436,15 @@ impl super::TermWindow {
             event
         );
 
+        // Rows beside a raised Changes panel were wrapped on screen: map the
+        // screen cell back to the cell the program wrote.
+        if let Some((wrapped_row, wrapped_column)) =
+            self.diff_panel_wrap_hit(pane.pane_id(), row, column)
+        {
+            row = wrapped_row.max(0);
+            column = wrapped_column;
+        }
+
         let dims = pane.get_dimensions();
         let stable_row = self
             .get_viewport(pane.pane_id())
@@ -2602,7 +2611,7 @@ impl super::TermWindow {
                     && pane.alt_screen_is_stranded()
                 {
                     log::info!(
-                        "pane {}: shell in front on the alternate screen; leaving it",
+                        "pane {}: shell prompt on the alternate screen; leaving it",
                         pane.pane_id()
                     );
                     pane.perform_actions(

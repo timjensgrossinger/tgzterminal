@@ -875,6 +875,9 @@ impl<'a> Performer<'a> {
             ) => {
                 self.fresh_line();
                 self.pen.set_semantic_type(SemanticType::Prompt);
+                // A shell prompt on the alternate screen: the program that
+                // switched to it died without switching back.
+                self.screen.note_prompt();
                 // A new shell prompt: OSC 7501 working/blocked records are
                 // stale (the program that reported them is gone).
                 if self.program_status.drop_live() {
@@ -885,12 +888,14 @@ impl<'a> Performer<'a> {
                 FinalTermSemanticPrompt::StartPrompt(_),
             ) => {
                 self.pen.set_semantic_type(SemanticType::Prompt);
+                self.screen.note_prompt();
             }
             OperatingSystemCommand::FinalTermSemanticPrompt(
                 FinalTermSemanticPrompt::MarkEndOfCommandWithFreshLine { .. },
             ) => {
                 self.fresh_line();
                 self.pen.set_semantic_type(SemanticType::Prompt);
+                self.screen.note_prompt();
             }
             OperatingSystemCommand::FinalTermSemanticPrompt(
                 FinalTermSemanticPrompt::MarkEndOfPromptAndStartOfInputUntilNextMarker { .. },

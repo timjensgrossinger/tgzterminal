@@ -347,8 +347,10 @@ pub trait Pane: Downcast + Send + Sync {
     fn is_mouse_grabbed(&self) -> bool;
     fn is_alt_screen_active(&self) -> bool;
     /// Whether the pane is on the alternate screen with nobody left to switch
-    /// it back: the program that switched died and the pane's own shell is in
-    /// front again. Only a local pane can tell; everything else says `false`.
+    /// it back: the program that switched died, and either a shell has marked
+    /// its prompt there (OSC 133, which also works behind ssh/et/mosh) or the
+    /// pane's own shell is in front again. Only a local pane can tell;
+    /// everything else says `false`.
     fn alt_screen_is_stranded(&self) -> bool {
         false
     }

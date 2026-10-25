@@ -265,10 +265,18 @@ fn command_blocks(
         while k < kinds.len() && is_after_input(kinds[k]) {
             k += 1;
         }
+        // Trailing blank rows are not output. A live pane that is not full has
+        // empty viewport rows under the prompt the user is sitting at; counted
+        // as output, they made that idle prompt the "last command" — and a
+        // no-output command coalesced with it was copied with no output.
+        let mut output_end = k;
+        while output_end > j && kinds[output_end - 1] == RowKind::Blank {
+            output_end -= 1;
+        }
         blocks.push(CommandBlock {
             prompt_start: first_row + start as StableRowIndex,
             input_end: first_row + j as StableRowIndex,
-            output_end: first_row + k as StableRowIndex,
+            output_end: first_row + output_end as StableRowIndex,
             head_clipped: false,
         });
         if k == start {
@@ -284,7 +292,8 @@ fn command_blocks(
 
 /// The newest block that actually produced output.
 ///
-/// This deliberately skips an idle prompt at the bottom, a command typed but
+/// This deliberately skips an idle prompt at the bottom (the blank rows below
+/// it are never counted as output, see [`command_blocks`]), a command typed but
 /// not yet run, and a command running with nothing printed yet — none of those
 /// have output to copy. A command running *with* partial output is chosen:
 /// clicking Copy in the middle of a `cargo build` should hand over the bytes
@@ -1387,5 +1396,88 @@ mod tests {
             !shell_copy_toast_message(ShellCopyAction::LastCommandOutput, &known)
                 .contains("guessed")
         );
+    }
+
+    /// Rows exactly as the terminal model leaves them after `bytes`: real
+    /// OSC 133 handling, and a viewport taller than the output, so the empty
+    /// rows under the prompt are part of the scan just as in a live pane.
+    fn scan_from_bytes(bytes: &str) -> PaneScan {
+        let mut term = wezterm_term::Terminal::new(
+            wezterm_term::TerminalSize {
+                rows: 12,
+                cols: 60,
+                ..Default::default()
+            },
+            Arc::new(config::TermConfig::new()),
+            "test",
+            "0",
+            Box::new(Vec::new()),
+        );
+        term.advance_bytes(bytes);
+        let rows = term.screen().scrollback_rows();
+        make_scan(term.screen().lines_in_phys_range(0..rows), 0, false)
+    }
+
+    /// `wezterm.sh`: prompt, `B` before the typed command, `C` before output.
+    fn wezterm_sh_command(command: &str, output: &[&str]) -> String {
+        let mut s = format!("\x1b]133;A\x07$ \x1b]133;B\x07{command}\r\n\x1b]133;C\x07");
+        for line in output {
+            s.push_str(line);
+            s.push_str("\r\n");
+        }
+        s.push_str("\x1b]133;D;0\x07");
+        s
+    }
+
+    const WEZTERM_SH_IDLE_PROMPT: &str = "\x1b]133;A\x07$ \x1b]133;B\x07";
+
+    /// The empty rows under the prompt a user is sitting at are not output:
+    /// counting them made the idle prompt the "last command", so both copies
+    /// came back empty in any pane that was not full yet.
+    #[test]
+    fn blank_rows_under_the_idle_prompt_are_not_its_output() {
+        let bytes = format!(
+            "{}{WEZTERM_SH_IDLE_PROMPT}",
+            wezterm_sh_command("ls -l", &["a.txt", "b.txt"])
+        );
+        let scan = scan_from_bytes(&bytes);
+        assert_eq!(scan.kinds.last(), Some(&RowKind::Blank));
+
+        let output = shell_copy_payload(ShellCopyAction::LastCommandOutput, &scan);
+        assert_eq!(output.text, "a.txt\nb.txt");
+        let both = shell_copy_payload(ShellCopyAction::LastCommandWithOutput, &scan);
+        assert_eq!(both.text, "ls -l\na.txt\nb.txt");
+        assert!(!both.pending_below);
+    }
+
+    /// The reported bug: after a command that printed nothing, its prompt row
+    /// coalesced with the idle prompt below it, the blank rows were taken for
+    /// that block's output, and "last command and output" copied only the
+    /// silent command.
+    #[test]
+    fn a_silent_last_command_does_not_hide_the_output_before_it() {
+        let bytes = format!(
+            "{}{}{WEZTERM_SH_IDLE_PROMPT}",
+            wezterm_sh_command("ls -l", &["a.txt", "b.txt"]),
+            wezterm_sh_command("cd /tmp", &[]),
+        );
+        let scan = scan_from_bytes(&bytes);
+        let both = shell_copy_payload(ShellCopyAction::LastCommandWithOutput, &scan);
+        assert_eq!(both.source, ShellCopySource::SemanticMarks);
+        assert_eq!(both.text, "ls -l\na.txt\nb.txt");
+    }
+
+    /// fish 4 emits OSC 133 natively, with kitty's `click_events` on `A` and
+    /// `cmdline_url` on `C`; the parameters must not change the row kinds.
+    #[test]
+    fn fish_native_marks_copy_the_command_and_its_output() {
+        let prompt = "\x1b]133;A;click_events=1\x07user@host /srv> \x1b]133;B\x07";
+        let bytes = format!(
+            "{prompt}ls -l\r\n\x1b]133;C;cmdline_url=ls%20-l\x07a.txt\r\nb.txt\r\n\
+             \x1b]133;D;0\x07{prompt}"
+        );
+        let scan = scan_from_bytes(&bytes);
+        let both = shell_copy_payload(ShellCopyAction::LastCommandWithOutput, &scan);
+        assert_eq!(both.text, "ls -l\na.txt\nb.txt");
     }
 }

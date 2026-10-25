@@ -604,9 +604,9 @@ pub enum UIItemType {
     },
     /// The sticky project-root toggle row in the launch dropdown.
     SidebarAgentMenuProjectRootToggle,
-    /// The "Agent overview" row in the launch dropdown: opens the herd
-    /// overview in the active pane.
-    SidebarAgentMenuHerd,
+    /// The "Tower" row in the launch dropdown: opens the experimental Tower
+    /// tab. Painted only when `TermWindow::tower_available`.
+    SidebarAgentMenuTower,
     /// An indented target row under an expanded agent in the launch
     /// dropdown: split / fullscreen (zoomed) / new tab, for that one launch.
     SidebarAgentMenuTarget {
@@ -3233,12 +3233,22 @@ impl TermWindow {
                 };
             let (padding_left, padding_top) = self.padding_left_top();
 
+            // Where the cursor's row was drawn, if it was wrapped around a
+            // raised Changes panel.
+            let (cursor_x, cursor_row) = match self.diff_panel_wrap_locate(
+                pos.pane.pane_id(),
+                (cursor.y - top).max(0) as usize,
+                cursor.x,
+            ) {
+                Some(Some((row, col))) => (col, row as isize),
+                _ => (cursor.x, cursor.y - top),
+            };
+
             let r = Rect::new(
                 Point::new(
-                    (((cursor.x + pos.left) as isize).max(0) * self.render_metrics.cell_size.width)
+                    (((cursor_x + pos.left) as isize).max(0) * self.render_metrics.cell_size.width)
                         .add(padding_left as isize),
-                    ((cursor.y + pos.top as isize - top).max(0)
-                        * self.render_metrics.cell_size.height)
+                    ((cursor_row + pos.top as isize).max(0) * self.render_metrics.cell_size.height)
                         .add(tab_bar_height as isize)
                         .add(padding_top as isize),
                 ),

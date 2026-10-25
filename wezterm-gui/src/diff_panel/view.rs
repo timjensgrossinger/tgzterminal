@@ -191,6 +191,12 @@ pub fn display_text(text: &str) -> String {
     out
 }
 
+/// How many characters [`display_text`] makes of `text`, without building
+/// it: what wrapping and sideways scrolling measure.
+pub fn display_chars(text: &str) -> usize {
+    text.chars().map(|c| if c == '\t' { 4 } else { 1 }).sum()
+}
+
 /// `text` cut to `cols` characters, keeping its end: for a path, the file
 /// name matters more than the directories leading to it.
 pub fn elide_start(text: &str, cols: usize) -> String {
@@ -208,14 +214,60 @@ pub fn elide_start(text: &str, cols: usize) -> String {
 /// The scroll offset after a wheel movement of `delta` notches (positive is
 /// up), kept within what there is to scroll.
 pub fn scrolled(offset: usize, delta: isize, total: usize, visible: usize) -> usize {
-    let max = total.saturating_sub(visible);
-    let step = delta.unsigned_abs().max(1) * 3;
+    stepped(offset, delta, total.saturating_sub(visible), 3)
+}
+
+/// `offset` moved `step` per notch of `delta` (positive is up or left),
+/// kept within `0..=max`.
+pub fn stepped(offset: usize, delta: isize, max: usize, step: usize) -> usize {
+    let step = delta.unsigned_abs().max(1) * step;
     if delta > 0 {
         offset.saturating_sub(step)
     } else {
         (offset + step).min(max)
     }
     .min(max)
+}
+
+/// Screen rows a line of `chars` characters takes when wrapped to `cols`.
+pub fn wrapped_rows(chars: usize, cols: usize) -> usize {
+    chars.div_ceil(cols.max(1)).max(1)
+}
+
+/// `text` cut into pieces of `cols` characters, the last one shorter; an
+/// empty line is one empty piece.
+pub fn wrap_pieces(text: &str, cols: usize) -> Vec<String> {
+    let cols = cols.max(1);
+    let chars: Vec<char> = text.chars().collect();
+    if chars.is_empty() {
+        return vec![String::new()];
+    }
+    chars
+        .chunks(cols)
+        .map(|piece| piece.iter().collect())
+        .collect()
+}
+
+/// The largest first row that still fills the view when rows take
+/// `height(row)` screen rows each: the end of the list then sits on the
+/// last visible row rather than leaving the view half empty. Walks back
+/// from the end only as far as one view, so it costs `visible` rows, not
+/// the whole list.
+pub fn max_scroll(count: usize, visible: usize, height: impl Fn(usize) -> usize) -> usize {
+    let mut used = 0;
+    for row in (0..count).rev() {
+        used += height(row).max(1);
+        if used > visible {
+            return (row + 1).min(count - 1);
+        }
+    }
+    0
+}
+
+/// `text` without its first `cols` characters, for a diff scrolled
+/// sideways.
+pub fn skip_cols(text: &str, cols: usize) -> String {
+    text.chars().skip(cols).collect()
 }
 
 #[cfg(test)]
@@ -365,5 +417,57 @@ mod tests {
         assert_eq!(scrolled(10, 2, 100, 10), 4);
         // Nothing to scroll: stay at the top whatever the offset was.
         assert_eq!(scrolled(5, -1, 8, 10), 0);
+    }
+
+    #[test]
+    fn stepping_stays_within_the_maximum() {
+        assert_eq!(stepped(0, -1, 20, 8), 8);
+        assert_eq!(stepped(15, -1, 20, 8), 20);
+        assert_eq!(stepped(5, 1, 20, 8), 0);
+        assert_eq!(stepped(30, 1, 20, 8), 20);
+    }
+
+    #[test]
+    fn long_lines_wrap_into_pieces_of_the_width() {
+        assert_eq!(wrap_pieces("abcdefg", 3), ["abc", "def", "g"]);
+        assert_eq!(wrap_pieces("abc", 3), ["abc"]);
+        assert_eq!(wrap_pieces("", 3), [""]);
+        assert_eq!(wrap_pieces("äöü", 2), ["äö", "ü"]);
+        // A zero width still makes progress.
+        assert_eq!(wrap_pieces("ab", 0), ["a", "b"]);
+        assert_eq!(wrapped_rows(7, 3), 3);
+        assert_eq!(wrapped_rows(0, 3), 1);
+        assert_eq!(wrapped_rows(6, 3), 2);
+    }
+
+    #[test]
+    fn the_scroll_limit_counts_screen_rows() {
+        // One row per entry: the classic `count - visible`.
+        assert_eq!(max_scroll(100, 10, |_| 1), 90);
+        // The last two entries take 4 rows each: 1 + 1 + 4 + 4 fills the view.
+        assert_eq!(max_scroll(100, 10, |row| if row >= 98 { 4 } else { 1 }), 96);
+        // Everything fits.
+        assert_eq!(max_scroll(5, 10, |_| 1), 0);
+        assert_eq!(max_scroll(0, 10, |_| 1), 0);
+        // The last entry alone is taller than the view: it is the top.
+        assert_eq!(max_scroll(3, 2, |_| 5), 2);
+        assert_eq!(max_scroll(3, 0, |_| 1), 2);
+    }
+
+    #[test]
+    fn display_chars_matches_display_text() {
+        for text in ["", "a\tb", "\x1b[0m", "äö\t"] {
+            assert_eq!(
+                display_chars(text),
+                display_text(text).chars().count(),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn scrolling_sideways_drops_leading_characters() {
+        assert_eq!(skip_cols("abcdef", 2), "cdef");
+        assert_eq!(skip_cols("ab", 5), "");
     }
 }

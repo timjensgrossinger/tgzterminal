@@ -9,6 +9,7 @@ use crate::diff_panel::geometry::{
     panel_geometry, PanelArea, PanelGeometry, PanelRequest, PanelSnap,
 };
 use crate::diff_panel::view::{self, Row};
+use crate::diff_panel::wrap::{self, PaneRect, WrapLayout, WrapZone};
 use crate::diff_panel::{self, ChangeSource, FileStatus, Limits, LineKind, Scan};
 use crate::quad::TripleLayerQuadAllocator;
 use crate::termwindow::render::sidebar::{
@@ -17,15 +18,16 @@ use crate::termwindow::render::sidebar::{
 };
 use crate::termwindow::render::RenderScreenLineParams;
 use crate::termwindow::{
-    tgz_ui_state, DiffPanelAction, DiffPanelEdge, TermWindowNotif, UIItem, UIItemType,
+    tgz_ui_state, DiffPanelAction, DiffPanelEdge, PositionedPane, TermWindowNotif, UIItem,
+    UIItemType,
 };
 use ::window::{CursorIcon, MouseEvent, MouseEventKind as WMEK, MousePress, RectF, WindowOps};
-use config::{DiffPanelPosition, SidebarPosition};
+use config::{DiffPanelLongLines, DiffPanelPosition, DiffPanelRaisedMode, SidebarPosition};
 use mux::pane::{CachePolicy, Pane, PaneId};
 use mux::renderable::RenderableDimensions;
 use mux::tab::TabId;
 use mux::Mux;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -33,6 +35,7 @@ use std::time::{Duration, Instant};
 use termwiz::cell::{CellAttributes, Intensity};
 use termwiz::color::ColorAttribute;
 use termwiz::surface::{Line, SEQ_ZERO};
+use wezterm_term::{KeyModifiers, StableRowIndex};
 use window::color::LinearRgba;
 
 /// Narrowest and shortest the panel may be dragged, in pixels at 2x.
@@ -60,6 +63,18 @@ const MAX_CHIPS: usize = 40;
 const MAX_CHIPS_EXPANDED: usize = 400;
 const MAX_CHIP_ROWS: usize = 3;
 const REMOTE_PANE: &str = "Changes are not available for remote panes yet";
+/// Characters one notch of a sideways wheel moves the diff.
+const H_SCROLL_STEP: usize = 8;
+
+/// The largest scroll offset for `rows` rows outside a paint. `max_scroll`
+/// is the last paint's measure, which counts wrapped screen rows; it can be
+/// stale when the rows just changed, so it is bounded by the list, and the
+/// next paint clamps exactly.
+fn scroll_limit(rows: usize, visible: usize, max_scroll: usize) -> usize {
+    rows.saturating_sub(visible)
+        .max(max_scroll)
+        .min(rows.saturating_sub(1))
+}
 
 /// What the panel shows for one tab.
 #[derive(Default)]
@@ -82,6 +97,8 @@ pub struct PaneView {
     /// Whether the file index shows every chip rather than its first rows.
     chips_expanded: bool,
     scroll: usize,
+    /// Characters the diff is scrolled sideways (`long_lines = "Scroll"`).
+    h_scroll: usize,
     rows: Vec<Row>,
     digits: usize,
     /// A file to scroll to once a scan shows it: asked for from outside
@@ -131,6 +148,9 @@ enum PaintRow {
         old_no: Option<u32>,
         new_no: Option<u32>,
         text: String,
+        /// A later piece of a line wrapped onto several rows: no numbers
+        /// and no marker, only the text, under the first piece's text.
+        continued: bool,
     },
     Note(String),
 }
@@ -424,6 +444,19 @@ pub struct DiffPanelState {
     watch: Option<diff_panel::watch::Watch>,
     /// Body rows that fit, as of the last paint; the wheel scrolls within it.
     visible_rows: Cell<usize>,
+    /// Largest scroll offset, as of the last paint. Rows wrapped onto
+    /// several screen rows make it larger than `rows - visible_rows`.
+    max_scroll: Cell<usize>,
+    /// Largest sideways scroll, as of the last paint: how far the widest
+    /// visible line runs past the panel.
+    h_max: Cell<usize>,
+    /// How each pane's rows flowed around the panel in the last paint, so a
+    /// click and the IME cursor land where the text was drawn. Only panes
+    /// that were wrapped have an entry.
+    wraps: RefCell<HashMap<PaneId, WrapLayout>>,
+    /// Top of the active pane's input in window pixels, less the gap, as of
+    /// this paint (`diff_panel.avoid_input`); a raised panel ends above it.
+    input_ceiling: Cell<Option<f32>>,
 }
 
 impl DiffPanelState {
@@ -443,6 +476,10 @@ impl DiffPanelState {
             scan_started_at: Cell::new(None),
             watch: None,
             visible_rows: Cell::new(0),
+            max_scroll: Cell::new(0),
+            h_max: Cell::new(0),
+            wraps: RefCell::new(HashMap::new()),
+            input_ceiling: Cell::new(None),
         }
     }
 
@@ -542,22 +579,146 @@ impl crate::TermWindow {
             PanelHeight::Bottom => None,
             PanelHeight::Px(px) => Some(px as f32),
         };
-        panel_geometry(
-            area,
-            PanelRequest {
-                position: config.position,
-                raised_mode: config.raised_mode,
-                width: self
-                    .diff_panel
-                    .width
-                    .map(|w| w as f32)
-                    .unwrap_or(config.width_px as f32 * scale),
-                height,
-                snap: config.snap_px as f32 * scale,
-                min_width: MIN_WIDTH_PX * scale,
-                min_height: MIN_HEIGHT_PX * scale,
+        let request = PanelRequest {
+            position: config.position,
+            raised_mode: config.raised_mode,
+            width: self
+                .diff_panel
+                .width
+                .map(|w| w as f32)
+                .unwrap_or(config.width_px as f32 * scale),
+            height,
+            snap: config.snap_px as f32 * scale,
+            min_width: MIN_WIDTH_PX * scale,
+            min_height: MIN_HEIGHT_PX * scale,
+            max_bottom: if config.avoid_input {
+                self.diff_panel.input_ceiling.get()
+            } else {
+                None
             },
-        )
+        };
+        // Deliberately the same for a pane on the alternate screen. Agents
+        // run full-screen there (Claude Code does), and taking the columns
+        // for it narrowed the pane for its whole height, so nothing below a
+        // raised panel ever got the width back. A wrapped full-screen row is
+        // split like any other; clicks are mapped back through the layout.
+        panel_geometry(area, request)
+    }
+
+    /// Finds where the active pane's input starts, for
+    /// `diff_panel.avoid_input`. Runs once per paint, before the panes are
+    /// painted, so their wrap zones, the panel and hit-testing until the next
+    /// paint all use the same cap.
+    pub fn diff_panel_update_input_ceiling(&self, panes: &[PositionedPane]) {
+        self.diff_panel.input_ceiling.set(None);
+        if self.config.diff_panel.avoid_input {
+            let ceiling = self.diff_panel_input_ceiling(panes);
+            self.diff_panel.input_ceiling.set(ceiling);
+        }
+    }
+
+    /// Window pixel row a raised panel must end above to keep
+    /// [`wrap::GAP_ROWS`] clear above the active pane's input, or `None`
+    /// when the panel is not raised over that pane or its cursor is out of
+    /// view. Reads at most [`wrap::INPUT_SEARCH_ROWS`] lines, no I/O.
+    fn diff_panel_input_ceiling(&self, panes: &[PositionedPane]) -> Option<f32> {
+        // Uncapped: the caller cleared the previous ceiling.
+        let geometry = self.diff_panel_geometry()?;
+        if geometry.snap != PanelSnap::Raised {
+            return None;
+        }
+        let pos = panes.iter().find(|pos| pos.is_active)?;
+        let cell_width = self.render_metrics.cell_size.width as f32;
+        let cell_height = self.render_metrics.cell_size.height as f32;
+        let (padding_left, _) = self.padding_left_top();
+        let left =
+            padding_left + self.get_os_border().left.get() as f32 + pos.left as f32 * cell_width;
+        let right = left + pos.width as f32 * cell_width;
+        if right <= geometry.x || left >= geometry.right() {
+            return None;
+        }
+        let (_, grid_top) = self.pane_grid_top().ok()?;
+        let pane_top = grid_top + pos.top as f32 * cell_height;
+
+        let dims = pos.pane.get_dimensions();
+        let viewport_top = self
+            .get_viewport(pos.pane.pane_id())
+            .unwrap_or(dims.physical_top);
+        let cursor_row = pos.pane.get_cursor_position().y - viewport_top;
+        if cursor_row < 0 || cursor_row >= dims.viewport_rows as StableRowIndex {
+            return None;
+        }
+        let cursor_row = cursor_row as usize;
+        let first = cursor_row.saturating_sub(wrap::INPUT_SEARCH_ROWS);
+        let (_, lines) = pos.pane.get_lines(
+            viewport_top + first as StableRowIndex..viewport_top + cursor_row as StableRowIndex + 1,
+        );
+        let rules: Vec<bool> = lines
+            .iter()
+            .map(|line| wrap::is_rule(line.visible_cells().map(|cell| wrap::rule_cell(cell.str()))))
+            .collect();
+        let top = first + wrap::input_top(&rules, cursor_row - first);
+        Some(pane_top + (top as f32 - wrap::GAP_ROWS as f32) * cell_height)
+    }
+
+    /// The zone of `pane` the panel's text flows around, when the panel is
+    /// raised in `Wrap` mode and reaches the pane.
+    pub fn diff_panel_wrap_zone(&self, pane: PaneRect) -> Option<WrapZone> {
+        if self.config.diff_panel.raised_mode != DiffPanelRaisedMode::Wrap {
+            return None;
+        }
+        let geometry = self.diff_panel_geometry()?;
+        if !geometry.floats() {
+            return None;
+        }
+        wrap::wrap_zone(pane, &geometry, self.config.diff_panel.position)
+    }
+
+    /// Records how `pane_id`'s rows were laid out, or that they were not.
+    pub fn diff_panel_set_wrap(&self, pane_id: PaneId, layout: Option<WrapLayout>) {
+        let mut wraps = self.diff_panel.wraps.borrow_mut();
+        match layout {
+            Some(layout) => {
+                wraps.insert(pane_id, layout);
+            }
+            None => {
+                wraps.remove(&pane_id);
+            }
+        }
+    }
+
+    /// Forgets the layouts of panes that are no longer painted.
+    pub fn diff_panel_retain_wraps(&self, live: &HashSet<PaneId>) {
+        self.diff_panel
+            .wraps
+            .borrow_mut()
+            .retain(|pane_id, _| live.contains(pane_id));
+    }
+
+    /// The viewport cell under a pane-local screen cell, if the pane's text
+    /// was wrapped around the panel.
+    pub fn diff_panel_wrap_hit(
+        &self,
+        pane_id: PaneId,
+        row: i64,
+        column: usize,
+    ) -> Option<(i64, usize)> {
+        let wraps = self.diff_panel.wraps.borrow();
+        let (row, column) = wraps.get(&pane_id)?.hit(row as isize, column);
+        Some((row as i64, column))
+    }
+
+    /// The pane-local screen cell a viewport cell was drawn at, if the
+    /// pane's text was wrapped around the panel. `Some(None)` when it
+    /// scrolled out of view.
+    pub fn diff_panel_wrap_locate(
+        &self,
+        pane_id: PaneId,
+        row: usize,
+        column: usize,
+    ) -> Option<Option<(usize, usize)>> {
+        let wraps = self.diff_panel.wraps.borrow();
+        Some(wraps.get(&pane_id)?.locate(row, column))
     }
 
     /// Pixels of width the terminal gives up for the panel.
@@ -846,6 +1007,7 @@ impl crate::TermWindow {
             return;
         }
         let visible = self.diff_panel.visible_rows.get();
+        let max_scroll = self.diff_panel.max_scroll.get();
         let Some(view) = self.diff_panel.views.get_mut(&tab_id) else {
             return;
         };
@@ -882,7 +1044,9 @@ impl crate::TermWindow {
                 view.scroll = row + delta;
             }
         }
-        view.scroll = view.scroll.min(view.rows.len().saturating_sub(visible));
+        view.scroll = view
+            .scroll
+            .min(scroll_limit(view.rows.len(), visible, max_scroll));
         // A file asked for gets one scan to show up in.
         if let Some(path) = view.focus.take() {
             self.diff_panel_scroll_to_path(tab_id, &path);
@@ -1107,6 +1271,7 @@ impl crate::TermWindow {
     /// it if it was folded.
     pub fn diff_panel_jump_to_file(&mut self, index: usize) {
         let visible = self.diff_panel.visible_rows.get();
+        let max_scroll = self.diff_panel.max_scroll.get();
         let Some(tab_id) = self.diff_panel_active_tab() else {
             return;
         };
@@ -1123,7 +1288,7 @@ impl crate::TermWindow {
             }
         }
         if let Some(row) = view::row_of_file(&view.rows, index) {
-            view.scroll = row.min(view.rows.len().saturating_sub(visible));
+            view.scroll = row.min(scroll_limit(view.rows.len(), visible, max_scroll));
         }
     }
 
@@ -1141,10 +1306,34 @@ impl crate::TermWindow {
         let Some(tab_id) = self.diff_panel_active_tab() else {
             return;
         };
+        // Sideways: a horizontal wheel, or Shift + wheel for a mouse that
+        // has none. Only when lines scroll sideways at all.
+        let sideways = match event.kind {
+            WMEK::HorzWheel(amount) => Some(amount),
+            WMEK::VertWheel(amount) if event.modifiers.contains(KeyModifiers::SHIFT) => {
+                Some(amount)
+            }
+            _ => None,
+        };
+        if let Some(amount) = sideways {
+            if self.config.diff_panel.long_lines == DiffPanelLongLines::Scroll {
+                let h_max = self.diff_panel.h_max.get();
+                if let Some(view) = self.diff_panel.views.get_mut(&tab_id) {
+                    let next = view::stepped(view.h_scroll, amount as isize, h_max, H_SCROLL_STEP);
+                    if next != view.h_scroll {
+                        view.h_scroll = next;
+                        context.invalidate();
+                    }
+                }
+                return;
+            }
+        }
         if let WMEK::VertWheel(amount) = event.kind {
             let visible = self.diff_panel.visible_rows.get();
+            let max_scroll = self.diff_panel.max_scroll.get();
             if let Some(view) = self.diff_panel.views.get_mut(&tab_id) {
-                let next = view::scrolled(view.scroll, amount as isize, view.rows.len(), visible);
+                let max = scroll_limit(view.rows.len(), visible, max_scroll);
+                let next = view::stepped(view.scroll, amount as isize, max, 3);
                 if next != view.scroll {
                     view.scroll = next;
                     context.invalidate();
@@ -1211,7 +1400,10 @@ impl crate::TermWindow {
                         }
                         view.rebuild();
                         let visible = self.diff_panel.visible_rows.get();
-                        view.scroll = view.scroll.min(view.rows.len().saturating_sub(visible));
+                        let max_scroll = self.diff_panel.max_scroll.get();
+                        view.scroll =
+                            view.scroll
+                                .min(scroll_limit(view.rows.len(), visible, max_scroll));
                     }
                 }
                 context.invalidate();
@@ -1871,9 +2063,12 @@ impl crate::TermWindow {
         let visible = (body_h / row_h) as usize;
         self.diff_panel.visible_rows.set(visible);
 
+        let inset = 6. * dpi_scale;
+        let long_lines = self.config.diff_panel.long_lines;
         let mut message: Vec<String> = Vec::new();
         let mut rows: Vec<PaintRow> = Vec::new();
         let (mut total_rows, mut scroll, mut digits) = (0, 0, 1);
+        let (mut h_scroll, mut h_max, mut text_cols) = (0, 0, 1);
         match self.diff_panel.views.get_mut(&tab_id) {
             None | Some(PaneView { scan: None, .. }) => {
                 message.push("Reading changes\u{2026}".into())
@@ -1883,13 +2078,47 @@ impl crate::TermWindow {
                 ..
             }) => message.push(reason.clone()),
             Some(view) => {
-                view.scroll = view.scroll.min(view.rows.len().saturating_sub(visible));
-                total_rows = view.rows.len();
-                scroll = view.scroll;
-                digits = view.digits;
                 let Some(Scan::Changes(set)) = &view.scan else {
                     unreachable!("the other scan states were matched above");
                 };
+                // Columns a line's text gets: the body less the insets, the
+                // two line-number columns and the marker (see `PaintRow::Line`).
+                let gutter_cols = view.digits * 2 + 1;
+                text_cols = ((body_w - inset * 2.) / cell_w - (gutter_cols + 3) as f32)
+                    .floor()
+                    .max(1.) as usize;
+                let line_chars = |row: &Row| match *row {
+                    Row::Line { file, hunk, line } => {
+                        view::display_chars(&set.files[file].hunks[hunk].lines[line].text)
+                    }
+                    _ => 0,
+                };
+                let max = view::max_scroll(view.rows.len(), visible, |row| match long_lines {
+                    DiffPanelLongLines::Wrap => {
+                        view::wrapped_rows(line_chars(&view.rows[row]), text_cols)
+                    }
+                    DiffPanelLongLines::Scroll | DiffPanelLongLines::Clip => 1,
+                });
+                self.diff_panel.max_scroll.set(max);
+                let scroll_to = view.scroll.min(max);
+                if long_lines == DiffPanelLongLines::Scroll {
+                    let widest = view
+                        .rows
+                        .iter()
+                        .skip(scroll_to)
+                        .take(visible)
+                        .map(line_chars)
+                        .max()
+                        .unwrap_or(0);
+                    h_max = widest.saturating_sub(text_cols);
+                    h_scroll = view.h_scroll.min(h_max);
+                }
+                self.diff_panel.h_max.set(h_max);
+                view.scroll = scroll_to;
+                view.h_scroll = h_scroll;
+                total_rows = view.rows.len();
+                scroll = view.scroll;
+                digits = view.digits;
                 if set.files.is_empty() {
                     message.push("No changes".into());
                 }
@@ -1903,7 +2132,11 @@ impl crate::TermWindow {
                         .any(|agent| seen.insert(agent.as_str()) && seen.len() > 1)
                 };
                 message.extend(set.note.clone());
-                for row in view.rows.iter().skip(scroll).take(visible) {
+                // Fill the view's screen rows; a wrapped line takes several.
+                for row in view.rows.iter().skip(scroll) {
+                    if rows.len() >= visible {
+                        break;
+                    }
                     rows.push(match *row {
                         Row::File(index) => {
                             let file = &set.files[index];
@@ -1927,11 +2160,39 @@ impl crate::TermWindow {
                         Row::Gap => PaintRow::Gap,
                         Row::Line { file, hunk, line } => {
                             let line = &set.files[file].hunks[hunk].lines[line];
+                            let text = view::display_text(&line.text);
+                            let text = match long_lines {
+                                DiffPanelLongLines::Wrap => {
+                                    let mut pieces =
+                                        view::wrap_pieces(&text, text_cols).into_iter();
+                                    let first = pieces.next().unwrap_or_default();
+                                    rows.push(PaintRow::Line {
+                                        kind: line.kind,
+                                        old_no: line.old_no,
+                                        new_no: line.new_no,
+                                        text: first,
+                                        continued: false,
+                                    });
+                                    for piece in pieces.take(visible.saturating_sub(rows.len())) {
+                                        rows.push(PaintRow::Line {
+                                            kind: line.kind,
+                                            old_no: None,
+                                            new_no: None,
+                                            text: piece,
+                                            continued: true,
+                                        });
+                                    }
+                                    continue;
+                                }
+                                DiffPanelLongLines::Scroll => view::skip_cols(&text, h_scroll),
+                                DiffPanelLongLines::Clip => text,
+                            };
                             PaintRow::Line {
                                 kind: line.kind,
                                 old_no: line.old_no,
                                 new_no: line.new_no,
-                                text: view::display_text(&line.text),
+                                text,
+                                continued: false,
                             }
                         }
                         Row::Note(index) => {
@@ -1968,7 +2229,6 @@ impl crate::TermWindow {
         let added_bg = opaque(lerp_rgba(sb.surface, green, 0.16));
         let removed_bg = opaque(lerp_rgba(sb.surface, red, 0.16));
         let text_dy = (row_h - cell_h) * 0.5;
-        let inset = 6. * dpi_scale;
         let gutter_w = (digits * 2 + 1) as f32 * cell_w;
         for row in rows {
             match row {
@@ -2108,12 +2368,14 @@ impl crate::TermWindow {
                     old_no,
                     new_no,
                     text,
+                    continued,
                 } => {
                     let (bg, marker, marker_color) = match kind {
                         LineKind::Added => (added_bg, "+", green),
                         LineKind::Removed => (removed_bg, "-", red),
                         LineKind::Context => (surface, " ", sb.text_meta),
                     };
+                    let marker = if continued { " " } else { marker };
                     if kind != LineKind::Context {
                         self.filled_rectangle(
                             layers,
@@ -2184,6 +2446,20 @@ impl crate::TermWindow {
                     thumb_h.min(body_h),
                 ),
                 thumb_w * 0.5,
+                opaque(lerp_rgba(sb.surface, sb.text_active, 0.3)),
+            )?;
+        }
+        // How far the diff is scrolled sideways, along the body's bottom.
+        if h_max > 0 && body_w > 0. {
+            let thumb_h = 3. * dpi_scale;
+            let share = text_cols as f32 / (text_cols + h_max) as f32;
+            let thumb_w = (body_w * share).max(24. * dpi_scale).min(body_w);
+            let thumb_x = body_x + (body_w - thumb_w) * h_scroll as f32 / h_max as f32;
+            self.sidebar_pill_fill(
+                layers,
+                1,
+                euclid::rect(thumb_x, body_y + body_h - thumb_h - 1., thumb_w, thumb_h),
+                thumb_h * 0.5,
                 opaque(lerp_rgba(sb.surface, sb.text_active, 0.3)),
             )?;
         }

@@ -97,6 +97,20 @@ mod tests {
     }
 
     #[test]
+    fn a_remote_prompt_on_the_alt_screen_is_cleared_by_leaving() {
+        let mut term = terminal();
+        // tmux behind et dies; the remote shell's next prompt carries OSC 133.
+        term.advance_bytes("\x1b[?1049h\x1b[?1000h");
+        term.advance_bytes("\x1b]133;A\x1b\\$ ");
+        assert!(term.prompt_on_alt_screen());
+
+        term.perform_actions(leave_alt_screen_actions());
+
+        assert!(!term.is_alt_screen_active());
+        assert!(!term.prompt_on_alt_screen());
+    }
+
+    #[test]
     fn leaving_the_primary_screen_is_a_no_op() {
         let mut term = terminal();
         term.advance_bytes("hello\r\n");

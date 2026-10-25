@@ -7408,6 +7408,18 @@ impl crate::TermWindow {
         let cwd = self.agent_launch_cwd(&domain, forced_local, &entry.argv);
         let mut argv = entry.argv.clone();
         let cwd = wsl_exec_start_dir(&mut argv, cwd);
+        #[cfg(tgz_tower)]
+        if let Some(why) =
+            crate::termwindow::tgz_tower::launch_refusal(&entry.adapter_id, cwd.as_deref())
+        {
+            wezterm_toast_notification::show(wezterm_toast_notification::ToastNotification {
+                title: "Agent not started".to_string(),
+                message: why,
+                url: None,
+                timeout: Some(std::time::Duration::from_secs(8)),
+            });
+            return;
+        }
         let placement = self.agent_launch_placement(invert_target, override_target);
         // A configured per-adapter title wins over the derived
         // "Claude agent"-style label; both become the pane's spawn title,
@@ -11197,9 +11209,9 @@ impl crate::TermWindow {
             return Ok(());
         };
         let entries = self.agent_launcher_entries();
-        // Don't bail when entries is empty: the "Agent insight" and
-        // "Resume session" rows are useful even with no adapters configured,
-        // so the dropdown stays open and shows them.
+        // Don't bail when entries is empty: the "Tower" and "Resume session"
+        // rows are useful even with no adapters configured, so the dropdown
+        // stays open and shows them.
 
         const TARGET_ROWS: [(&str, AgentLaunchTarget); 3] = [
             ("Split pane", AgentLaunchTarget::SplitPane),
@@ -11248,16 +11260,19 @@ impl crate::TermWindow {
             trailing_chevron: false,
             item_type: UIItemType::SidebarAgentMenuProjectRootToggle,
         });
-        // Below the launch actions: this one inspects rather than launches.
-        rows.push(SidebarDropdownRow {
-            label: "Agent insight".to_string(),
-            dot_color: None,
-            checkbox: None,
-            divider_above: false,
-            indent: false,
-            trailing_chevron: false,
-            item_type: UIItemType::SidebarAgentMenuHerd,
-        });
+        // Below the launch actions: this opens a whole tab rather than one
+        // agent. Hidden where clicking it could do nothing.
+        if self.tower_available() {
+            rows.push(SidebarDropdownRow {
+                label: "Tower".to_string(),
+                dot_color: None,
+                checkbox: None,
+                divider_above: false,
+                indent: false,
+                trailing_chevron: false,
+                item_type: UIItemType::SidebarAgentMenuTower,
+            });
+        }
 
         // Past sessions. Unlike the agent rows above, which launch something
         // new, these continue something that already exists.
@@ -11334,6 +11349,12 @@ impl crate::TermWindow {
     }
 
     /// How many past sessions the resume submenu may offer.
+    /// Whether the launch dropdown offers the Tower row: only a build with
+    /// `TGZ_TOWER=1` contains Tower, and even then Lua must switch it on.
+    pub(crate) fn tower_available(&self) -> bool {
+        cfg!(tgz_tower) && self.config.tower.enabled
+    }
+
     fn agent_resume_menu_limit(&self) -> usize {
         self.config
             .agent_ui
@@ -14040,7 +14061,7 @@ impl crate::TermWindow {
             let launcher_entry = self.agent_launcher_default();
             let dot_size = sidebar_status_dot_size(cell_height as f32);
             // Always reserve the agent launcher area even when no adapter is
-            // installed: the button opens a dropdown whose "Agent insight" and
+            // installed: the button opens a dropdown whose "Tower" and
             // "Resume session" rows are useful without any adapter.
             let mut bottom_row =
                 sidebar_bottom_row_layout(item_x, item_w, content_x, content_w, dot_size, true);
