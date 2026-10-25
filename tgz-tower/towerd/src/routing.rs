@@ -43,6 +43,7 @@ pub fn engine_infos(
                 available: why.is_none(),
                 why,
                 trained: bandit.arms.get(&arm(t, id)).map(|a| a.n).unwrap_or(0),
+                locality: cfg.engine_model(e).locality,
             });
         }
     }

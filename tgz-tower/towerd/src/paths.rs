@@ -45,6 +45,11 @@ impl Paths {
         }
     }
 
+    /// The pane token file: what `tower mcp` in an ordinary pane shows.
+    pub fn pane_token(&self) -> PathBuf {
+        pane_token_path(&self.token())
+    }
+
     pub fn state(&self) -> PathBuf {
         self.data.join("state.json")
     }
@@ -52,6 +57,13 @@ impl Paths {
     pub fn agent_dir(&self, agent_id: &str) -> PathBuf {
         self.data.join("agents").join(agent_id)
     }
+}
+
+/// `<master token file>.pane`.
+pub fn pane_token_path(master: &Path) -> PathBuf {
+    let mut p = master.as_os_str().to_owned();
+    p.push(".pane");
+    PathBuf::from(p)
 }
 
 pub fn token_path(socket: &Path) -> PathBuf {

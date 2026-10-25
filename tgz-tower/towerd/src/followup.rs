@@ -280,10 +280,18 @@ impl Engine {
             self.activity_last.insert(fid.clone(), now);
             self.activity_busy.insert(fid.clone());
             let iref = self.st.flight_issue.get(&fid).cloned().unwrap_or_default();
+            let sla_fields = self
+                .st
+                .sources
+                .get(w.name())
+                .and_then(|s| s.sla_fields.clone())
+                .unwrap_or_default();
             let tx = self.tx.clone();
             tokio::spawn(async move {
                 let result = match (&w, token) {
-                    (Watch::Jira(j), Some(t)) => crate::jira::activity(j, &t, &key).await,
+                    (Watch::Jira(j), Some(t)) => {
+                        crate::jira::activity(j, &t, &key, &sla_fields).await
+                    }
                     _ => match iref.number {
                         Some(n) => issues::activity_cli(&w, n).await,
                         None => Err("no issue number".into()),
@@ -299,12 +307,20 @@ impl Engine {
 
     pub(super) fn on_activity(&mut self, fid: &str, result: Result<Activity, String>) {
         self.activity_busy.remove(fid);
-        let Ok(act) = result else {
+        let Ok(mut act) = result else {
             return;
         };
         let Some(f) = self.flight(fid).cloned() else {
             return;
         };
+        // Tower's own comments are not news, whatever their wording.
+        act.comments
+            .retain(|c| !self.st.own_comments.contains(&c.id));
+        // A reply from anyone but the reporter answers Tower's own clock.
+        let answered = act.comments.iter().any(|c| {
+            c.at_unix >= f.created_unix && !act.reporter.is_empty() && c.author != act.reporter
+        });
+        self.set_clocks(fid, act.sla.clone(), answered);
         let (updates, next, was_closed) =
             issue_updates(self.st.issue_seen.get(fid), &act, f.created_unix);
         self.st.issue_seen.insert(fid.to_string(), next);
@@ -314,7 +330,24 @@ impl Engine {
         if was_closed {
             self.offer_close(fid, &act.status);
         }
-        match self.cfg.triage_role().cloned() {
+        // Filtering is a model run: only when `intake.triage` says so;
+        // otherwise every update is passed on (and asked about).
+        let overrides = self.overrides_for(fid);
+        let triage = match self.cfg.triage_role().cloned() {
+            Some(t)
+                if self.decide_action(
+                    crate::policy::Action::IntakeTriage,
+                    overrides.as_ref(),
+                    false,
+                    Some(fid),
+                    Some(&f.key),
+                ) == crate::policy::Decision::Run =>
+            {
+                Some(t)
+            }
+            _ => None,
+        };
+        match triage {
             Some(t) => {
                 let numbered: Vec<String> = updates
                     .iter()
@@ -337,7 +370,7 @@ impl Engine {
                     numbered.join("\n")
                 );
                 let flight_id = fid.to_string();
-                self.ask_triage(&t, system, user, move |result| Input::Relevance {
+                self.ask_triage(fid, &t, system, user, move |result| Input::Relevance {
                     flight_id,
                     updates,
                     result,
@@ -421,9 +454,7 @@ impl Engine {
             .filter(|a| a.status.is_live())
             .map(|a| a.id.clone());
         match live {
-            Some(a) => {
-                let _ = self.deliver(&a, text);
-            }
+            Some(a) => self.deliver_tower_update(&a, text, "the issue update"),
             None if f.role_id.is_some() => {
                 let id = self.add_inbox(InboxItem {
                     kind: InboxKind::Clearance,
@@ -535,6 +566,8 @@ mod tests {
     #[test]
     fn updates_are_new_comments_and_real_changes_only() {
         let act = Activity {
+            reporter: String::new(),
+            sla: vec![],
             summary: "Crash".into(),
             description: "steps".into(),
             status: "Open".into(),

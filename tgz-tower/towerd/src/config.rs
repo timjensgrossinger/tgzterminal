@@ -7,10 +7,13 @@
 //! ```
 //! A repo can override gates with its own `.tower.toml`.
 
+use crate::compliance::Auth;
+use crate::policy::{Action, PolicyCfg};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tower_proto::{DriverKind, Endpoint, Health, Locality, ModelRef, Role};
 
 #[derive(Deserialize)]
@@ -48,6 +51,32 @@ struct RoleFile {
     /// A named subagent definition to run as (`claude --agent`, ACP `agent`).
     #[serde(default)]
     agent: Option<String>,
+    /// How the program signs in: `subscription`, `api_key` or `cloud`.
+    /// Decides which vendor-terms notes apply (see docs/VENDOR_TERMS.md).
+    #[serde(default)]
+    auth: Auth,
+    /// Extra stdio MCP servers this role's agents get, besides Tower's own.
+    #[serde(default)]
+    mcp: BTreeMap<String, McpServerCfg>,
+}
+
+/// A stdio MCP server handed to a role's agents: `[mcp.<name>]`.
+#[derive(Deserialize, Clone, Debug, PartialEq)]
+pub struct McpServerCfg {
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Passed in the agent's environment, never on a command line.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+}
+
+/// Is `name` usable as an MCP server name in every CLI's config syntax?
+fn valid_mcp_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "tower"
+        && name.len() <= 40
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
 fn one() -> u32 {
@@ -74,31 +103,78 @@ pub struct RoleCfg {
     pub agent: Option<String>,
     /// `driver = "routed"`: the engine comes from `[routing]` by task tier.
     pub routed: bool,
+    pub auth: Auth,
+    pub mcp: BTreeMap<String, McpServerCfg>,
+    /// `models.toml`, so `<endpoint>/<model>` ladder entries resolve.
+    pub registry: Arc<Registry>,
 }
 
 /// Is this endpoint on this machine or the local network?
+/// Only a real private or loopback address, `localhost`, or a name under
+/// `.local` / `.lan` / `.home.arpa` counts; anything else (an internal
+/// hostname included) needs `local = true` on its endpoint.
 pub fn is_local_url(url: &str) -> bool {
-    let host = host_of(url);
-    let h = host.split(':').next().unwrap_or("").to_lowercase();
-    let private_172 = h.starts_with("172.")
-        && h.split('.')
-            .nth(1)
-            .and_then(|o| o.parse::<u8>().ok())
-            .map(|o| (16..=31).contains(&o))
-            .unwrap_or(false);
-    h == "localhost"
-        || h.starts_with("127.")
-        || h.starts_with("10.")
-        || h.starts_with("192.168.")
-        || private_172
-        || h.ends_with(".local")
-        || h.ends_with(".lan")
-        || h.ends_with(".home.arpa")
+    let h = url_host(url);
+    if let Ok(ip) = h.parse::<std::net::Ipv4Addr>() {
+        return ip.is_loopback() || ip.is_private();
+    }
+    if let Ok(ip) = h
+        .trim_matches(|c| c == '[' || c == ']')
+        .parse::<std::net::Ipv6Addr>()
+    {
+        return ip.is_loopback();
+    }
+    let name_ok = !h.is_empty()
+        && h.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.');
+    name_ok
+        && (h == "localhost"
+            || h.ends_with(".localhost")
+            || h.ends_with(".local")
+            || h.ends_with(".lan")
+            || h.ends_with(".home.arpa"))
+}
+
+/// The host of a URL, lowercased, without user info or port.
+fn url_host(url: &str) -> String {
+    let rest = url.split("://").nth(1).unwrap_or(url);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    let host = if host.starts_with('[') {
+        host.split(']')
+            .next()
+            .map(|h| format!("{h}]"))
+            .unwrap_or_default()
+    } else {
+        host.split(':').next().unwrap_or("").to_string()
+    };
+    host.to_lowercase()
+}
+
+/// Ollama tags ending in `-cloud` are served through the local daemon but
+/// run on Ollama's servers.
+fn is_ollama_cloud(model: &str) -> bool {
+    model
+        .rsplit(['/', ':'])
+        .next()
+        .map(|tag| tag.ends_with("-cloud") || tag == "cloud")
+        .unwrap_or(false)
+        || model.contains("-cloud:")
 }
 
 impl RoleCfg {
     /// The endpoint and key an `llm` role talks to, for `model`.
     pub fn llm_spec(&self, model: &str) -> crate::drivers::llm::LlmSpec {
+        if let Some((ep, name)) = self.registry.resolve(model) {
+            return crate::drivers::llm::LlmSpec {
+                base_url: ep.api_base(),
+                model: name.to_string(),
+                api_key: ep
+                    .api_key_env
+                    .as_deref()
+                    .and_then(|v| std::env::var(v).ok()),
+            };
+        }
         crate::drivers::llm::LlmSpec {
             base_url: self
                 .base_url
@@ -113,39 +189,14 @@ impl RoleCfg {
     }
 
     pub fn model_ref(&self, id: &str) -> ModelRef {
-        if self.driver == DriverKind::Llm {
-            let base = self
-                .base_url
-                .clone()
-                .unwrap_or_else(|| "http://localhost:11434/v1".into());
-            let local = is_local_url(&base);
-            return ModelRef {
-                id: id.to_string(),
-                label: id.rsplit('/').next().unwrap_or(id).to_string(),
-                locality: if local {
-                    Locality::Local
-                } else {
-                    Locality::Cloud
-                },
-                host: local.then(|| host_of(&base)),
-            };
-        }
-        let (locality, host) = if let Some(_m) = id.strip_prefix("ollama/") {
-            let base = self
-                .ollama_base_url
-                .clone()
-                .unwrap_or_else(|| "http://localhost:11434/v1".into());
-            (Locality::Local, Some(host_of(&base)))
-        } else {
-            (Locality::Cloud, None)
-        };
-        let label = id.rsplit('/').next().unwrap_or(id).to_string();
-        ModelRef {
-            id: id.to_string(),
-            label,
-            locality,
-            host,
-        }
+        model_ref_for(
+            id,
+            self.driver,
+            &self.command,
+            self.base_url.as_deref(),
+            self.ollama_base_url.as_deref(),
+            &self.registry,
+        )
     }
 
     /// This role, run on a routing engine: the role keeps its name, mission
@@ -161,6 +212,8 @@ impl RoleCfg {
         r.acp_options.extend(e.acp_options.clone());
         r.effort = e.effort.clone().or(r.effort);
         r.agent = e.agent.clone().or(r.agent);
+        // The engine's program replaces the role's, and so does its sign-in.
+        r.auth = e.auth;
         r.routed = false;
         r
     }
@@ -182,16 +235,195 @@ impl RoleCfg {
             max_concurrency: self.max_concurrency,
             file: Some(self.file.display().to_string()),
             warning,
+            command: self.command.clone(),
+            routed: self.routed,
+            builtin: self.id == LOCAL_ROLE && !self.file.exists(),
         }
+    }
+
+    /// Does every model this role can run on stay inside your network?
+    /// A routed role's engine is only known at launch, so it does not count.
+    pub fn all_local(&self) -> bool {
+        !self.routed
+            && !self.ladder.is_empty()
+            && self
+                .ladder
+                .iter()
+                .all(|m| self.model_ref(m).locality == Locality::Local)
     }
 
     /// The local models this role's ladder needs from Ollama.
     pub fn ollama_models(&self) -> Vec<String> {
         self.ladder
             .iter()
+            .filter(|m| self.registry.resolve(m).is_none())
             .filter_map(|m| m.strip_prefix("ollama/").map(str::to_string))
             .collect()
     }
+
+    /// The `models.toml` servers this role's ladder uses, each with the
+    /// model names it needs from it.
+    pub fn endpoint_models(&self) -> Vec<(EndpointCfg, Vec<String>)> {
+        let mut out: Vec<(EndpointCfg, Vec<String>)> = Vec::new();
+        for m in &self.ladder {
+            if let Some((ep, name)) = self.registry.resolve(m) {
+                match out.iter_mut().find(|(e, _)| e.name == ep.name) {
+                    Some((_, names)) => names.push(name.to_string()),
+                    None => out.push((ep.clone(), vec![name.to_string()])),
+                }
+            }
+        }
+        out
+    }
+
+    /// `OPENCODE_CONFIG_CONTENT` for an opencode agent of this role running
+    /// `model`: one OpenAI-compatible provider per model server the ladder
+    /// uses. On a local model opencode's side tasks (titles, sharing) and
+    /// other providers are switched off, so nothing leaves for a cloud model.
+    pub fn opencode_config(&self, model: Option<&str>) -> Option<serde_json::Value> {
+        use serde_json::json;
+        let mut providers = serde_json::Map::new();
+        let mut local_ids = Vec::new();
+        let ollama = self.ollama_models();
+        if !ollama.is_empty() {
+            let base = self
+                .ollama_base_url
+                .clone()
+                .unwrap_or_else(|| "http://localhost:11434/v1".into());
+            providers.insert(
+                "ollama".into(),
+                opencode_provider("Ollama (Tower)", &base, None, &ollama),
+            );
+            local_ids.push("ollama".to_string());
+        }
+        for (ep, names) in self.endpoint_models() {
+            providers.insert(
+                ep.name.clone(),
+                opencode_provider(
+                    &format!("{} (Tower)", ep.name),
+                    &ep.api_base(),
+                    ep.api_key_env.as_deref(),
+                    &names,
+                ),
+            );
+            if ep.is_local() {
+                local_ids.push(ep.name.clone());
+            }
+        }
+        if providers.is_empty() {
+            return None;
+        }
+        let mut cfg = json!({ "provider": providers });
+        if let Some(m) = model.filter(|m| self.model_ref(m).locality == Locality::Local) {
+            cfg["small_model"] = json!(m);
+            cfg["share"] = json!("disabled");
+            cfg["enabled_providers"] = json!(local_ids);
+        }
+        Some(cfg)
+    }
+}
+
+fn opencode_provider(
+    label: &str,
+    base: &str,
+    key_env: Option<&str>,
+    models: &[String],
+) -> serde_json::Value {
+    let models: serde_json::Map<String, serde_json::Value> = models
+        .iter()
+        .map(|m| (m.clone(), serde_json::json!({ "name": m })))
+        .collect();
+    let mut options = serde_json::json!({ "baseURL": base });
+    if let Some(v) = key_env {
+        // opencode reads it from its own environment, never from the config.
+        options["apiKey"] = serde_json::json!(format!("{{env:{v}}}"));
+    }
+    serde_json::json!({
+        "npm": "@ai-sdk/openai-compatible",
+        "name": label,
+        "options": options,
+        "models": models,
+    })
+}
+
+/// What model `id` is, and where it runs. `<endpoint>/<model>` ids name a
+/// `models.toml` server and take its locality; `ollama/<model>` is served
+/// from `ollama_base_url`; an `llm` driver's locality is its `base_url`'s.
+///
+/// A model only counts as local when Tower itself points the program at
+/// it: an `llm` call, or OpenCode over ACP (which gets Tower's providers and
+/// nothing else). Any other program decides for itself where a model name
+/// goes, so it is cloud whatever the name says.
+pub fn model_ref_for(
+    id: &str,
+    driver: DriverKind,
+    command: &[String],
+    base_url: Option<&str>,
+    ollama_base_url: Option<&str>,
+    registry: &Registry,
+) -> ModelRef {
+    let mut m = model_ref_named(id, driver, base_url, ollama_base_url, registry);
+    let tower_points_it = match driver {
+        DriverKind::Llm => true,
+        DriverKind::Acp => {
+            crate::compliance::vendor_of(driver, command) == crate::compliance::Vendor::Opencode
+        }
+        DriverKind::Pane => false,
+    };
+    if !tower_points_it || is_ollama_cloud(id) {
+        m.locality = Locality::Cloud;
+        m.host = None;
+    }
+    m
+}
+
+fn model_ref_named(
+    id: &str,
+    driver: DriverKind,
+    base_url: Option<&str>,
+    ollama_base_url: Option<&str>,
+    registry: &Registry,
+) -> ModelRef {
+    let label = |fallback: &str| {
+        registry
+            .model(id)
+            .and_then(|m| m.label.clone())
+            .unwrap_or_else(|| fallback.to_string())
+    };
+    let made = |locality: Locality, host: Option<String>, label: String| ModelRef {
+        id: id.to_string(),
+        label,
+        locality,
+        host: (locality == Locality::Local).then_some(host).flatten(),
+    };
+    if let Some((ep, name)) = registry.resolve(id) {
+        let locality = if ep.is_local() {
+            Locality::Local
+        } else {
+            Locality::Cloud
+        };
+        return made(locality, Some(host_of(&ep.base_url)), label(name));
+    }
+    let short = id.rsplit('/').next().unwrap_or(id);
+    if driver == DriverKind::Llm {
+        let base = base_url.unwrap_or("http://localhost:11434/v1");
+        let locality = if is_local_url(base) {
+            Locality::Local
+        } else {
+            Locality::Cloud
+        };
+        return made(locality, Some(host_of(base)), label(short));
+    }
+    if id.starts_with("ollama/") {
+        let base = ollama_base_url.unwrap_or("http://localhost:11434/v1");
+        let locality = if is_local_url(base) {
+            Locality::Local
+        } else {
+            Locality::Cloud
+        };
+        return made(locality, Some(host_of(base)), label(short));
+    }
+    made(Locality::Cloud, None, label(short))
 }
 
 fn host_of(url: &str) -> String {
@@ -324,6 +556,8 @@ pub struct EngineCfg {
     pub api_key_env: Option<String>,
     #[serde(default)]
     pub acp_options: BTreeMap<String, String>,
+    #[serde(default)]
+    pub auth: Auth,
 }
 
 fn parse_driver(s: &str) -> Option<DriverKind> {
@@ -451,6 +685,10 @@ pub fn engine_blocked(
     }
     // Only model servers Tower probes can say no; cloud agents are tried.
     let model = e.model.as_deref().unwrap_or("");
+    let named = model.split_once('/').map(|(ep, _)| ep);
+    if endpoints.iter().any(|ep| Some(ep.name.as_str()) == named) {
+        return served_problem(model, endpoints);
+    }
     let (base, local_model) = match (e.driver, model.strip_prefix("ollama/")) {
         (DriverKind::Llm, _) => (e.base_url.clone(), model),
         (_, Some(m)) => (e.ollama_base_url.clone(), m),
@@ -475,6 +713,32 @@ pub fn engine_blocked(
         }
     }
     None
+}
+
+/// For a `<endpoint>/<model>` id: is that server down, or up without the
+/// model? `None` when fine, unprobed, or not a `models.toml` model.
+pub fn served_problem(model: &str, endpoints: &[Endpoint]) -> Option<String> {
+    let (ep, name) = model.split_once('/')?;
+    let ep = endpoints.iter().find(|e| e.name == ep)?;
+    match ep.health {
+        Health::Down => Some(format!("{} is not reachable", ep.name)),
+        Health::Up if !ep.models.is_empty() => {
+            let have = ep
+                .models
+                .iter()
+                .any(|h| h == name || *h == format!("{name}:latest"));
+            if have {
+                None
+            } else if ep.kind == "ollama" {
+                Some(format!(
+                    "{name} is not pulled yet: run `ollama pull {name}`"
+                ))
+            } else {
+                Some(format!("{} does not serve {name}", ep.name))
+            }
+        }
+        _ => None,
+    }
 }
 
 /// Is `prog` an existing path or a program on `PATH`?
@@ -517,6 +781,12 @@ struct TowerFile {
     project: Vec<crate::projects::ProjectRule>,
     #[serde(default)]
     access: AccessCfg,
+    #[serde(default)]
+    policy: PolicyCfg,
+    #[serde(default)]
+    ack: crate::responses::AckCfg,
+    #[serde(default)]
+    privacy: crate::privacy::PrivacyCfg,
 }
 
 /// `[access]`: what agents must never touch.
@@ -534,6 +804,106 @@ pub struct EndpointCfg {
     pub name: String,
     pub kind: String,
     pub base_url: String,
+    /// Is this server inside your own network? Unset: guessed from the URL
+    /// (localhost, private addresses, `.local`/`.lan`). Set it for a company
+    /// server on an internal hostname, which the guess calls cloud.
+    #[serde(default)]
+    pub local: Option<bool>,
+    /// Environment variable holding the server's API key, if it needs one.
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+}
+
+impl EndpointCfg {
+    pub fn is_local(&self) -> bool {
+        self.local.unwrap_or_else(|| is_local_url(&self.base_url))
+    }
+
+    /// The OpenAI-compatible base (`…/v1`) agents are pointed at.
+    pub fn api_base(&self) -> String {
+        let b = self.base_url.trim_end_matches('/');
+        let b = b.strip_suffix("/v1").unwrap_or(b);
+        format!("{b}/v1")
+    }
+}
+
+/// A model agents may run on or hand work to: `[[model]]` in `models.toml`.
+#[derive(Deserialize, Clone, Debug, PartialEq)]
+pub struct ModelCfg {
+    /// `<endpoint>/<model name on that server>`, e.g. `company/qwen3.8-27b`.
+    pub id: String,
+    #[serde(default)]
+    pub label: Option<String>,
+    /// Parameter count as people say it: `27B`, `300B`.
+    #[serde(default)]
+    pub size: Option<String>,
+    /// Context window in tokens.
+    #[serde(default)]
+    pub context: Option<u32>,
+    /// What it does well, in a few words each; agents read this when they
+    /// decide what to hand it.
+    #[serde(default)]
+    pub good_for: Vec<String>,
+    #[serde(default)]
+    pub notes: Option<String>,
+    /// How many agents may run on it at once.
+    #[serde(default = "one")]
+    pub max_concurrency: u32,
+}
+
+/// `models.toml`: model servers, and the models on them agents may use.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct Registry {
+    pub endpoints: Vec<EndpointCfg>,
+    pub models: Vec<ModelCfg>,
+}
+
+impl Registry {
+    /// The server a `<endpoint>/<model>` id names, and the model's name there.
+    pub fn resolve<'a>(&'a self, id: &'a str) -> Option<(&'a EndpointCfg, &'a str)> {
+        let (ep, name) = id.split_once('/')?;
+        if name.is_empty() {
+            return None;
+        }
+        self.endpoints
+            .iter()
+            .find(|e| e.name == ep)
+            .map(|e| (e, name))
+    }
+
+    pub fn model(&self, id: &str) -> Option<&ModelCfg> {
+        self.models.iter().find(|m| m.id == id)
+    }
+
+    /// `models.toml` mistakes: odd endpoint names, models on unknown servers.
+    pub fn problems(&self) -> Vec<String> {
+        let mut out = vec![];
+        for e in &self.endpoints {
+            let ok = !e.name.is_empty()
+                && e.name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+            if !ok {
+                out.push(format!(
+                    "models.toml: endpoint name {:?}: use letters, digits, '-', '_' and '.'",
+                    e.name
+                ));
+            }
+        }
+        for m in &self.models {
+            if self.resolve(&m.id).is_none() {
+                out.push(format!(
+                    "models.toml: model {:?} must be <endpoint>/<model> with a known endpoint",
+                    m.id
+                ));
+            }
+            if self.models.iter().filter(|o| o.id == m.id).count() > 1 {
+                out.push(format!("models.toml: model {:?} is listed twice", m.id));
+            }
+        }
+        out.dedup();
+        out
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -544,12 +914,16 @@ struct SourcesFile {
     github: Vec<crate::issues::GithubWatch>,
     #[serde(default)]
     gitlab: Vec<crate::issues::GitlabWatch>,
+    #[serde(default)]
+    scout: Vec<crate::scout::ScoutCfg>,
 }
 
 #[derive(Deserialize, Default)]
 struct ModelsFile {
     #[serde(default)]
     endpoint: Vec<EndpointCfg>,
+    #[serde(default)]
+    model: Vec<ModelCfg>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -560,18 +934,27 @@ pub struct Config {
     pub triage: TriageCfg,
     pub routing: RoutingCfg,
     pub endpoints: Vec<EndpointCfg>,
+    /// `[[model]]` entries of `models.toml`.
+    pub models: Vec<ModelCfg>,
     pub jira: Vec<crate::jira::JiraWatch>,
     pub github: Vec<crate::issues::GithubWatch>,
     pub gitlab: Vec<crate::issues::GitlabWatch>,
+    pub scouts: Vec<crate::scout::ScoutCfg>,
     pub autofix: crate::projects::AutofixCfg,
     pub projects: crate::projects::ProjectsCfg,
     /// `[[project]]` rules, paths expanded.
     pub project_rules: Vec<crate::projects::ProjectRule>,
     pub access: AccessCfg,
-    /// Follow issue comments and changes of open flights.
-    pub follow_issues: bool,
+    pub policy: PolicyCfg,
+    pub ack: crate::responses::AckCfg,
+    /// `[privacy]`: local-only folders, and what cloud agents hear back.
+    pub privacy: crate::privacy::PrivacyCfg,
+    /// `schedules.toml`.
+    pub schedules: Vec<tower_proto::ScheduleSpec>,
     /// Files that failed to parse, with the reason; shown, never fatal.
     pub errors: Vec<String>,
+    /// Deprecated settings that still work, with what replaced them.
+    pub notices: Vec<String>,
 }
 
 impl Config {
@@ -600,6 +983,36 @@ impl Config {
         }
     }
 
+    pub fn registry(&self) -> Registry {
+        Registry {
+            endpoints: self.endpoints.clone(),
+            models: self.models.clone(),
+        }
+    }
+
+    /// Where an engine's model runs.
+    pub fn engine_model(&self, e: &EngineCfg) -> ModelRef {
+        model_ref_for(
+            e.model.as_deref().unwrap_or(""),
+            e.driver,
+            &e.command,
+            e.base_url.as_deref(),
+            e.ollama_base_url.as_deref(),
+            &self.registry(),
+        )
+    }
+
+    /// API keys for probing: endpoint name → key, for servers that need one.
+    pub fn endpoint_keys(&self) -> BTreeMap<String, String> {
+        self.endpoints
+            .iter()
+            .filter_map(|e| {
+                let v = e.api_key_env.as_deref()?;
+                Some((e.name.clone(), std::env::var(v).ok()?))
+            })
+            .collect()
+    }
+
     pub fn endpoints_unprobed(&self) -> Vec<Endpoint> {
         self.endpoints
             .iter()
@@ -611,6 +1024,9 @@ impl Config {
                 health: Health::Unknown,
                 latency_ms: None,
                 models: vec![],
+                local: e.is_local(),
+                local_set: e.local,
+                api_key_env: e.api_key_env.clone(),
             })
             .collect()
     }
@@ -656,6 +1072,23 @@ pub fn parse_role(id: &str, file: &Path, text: &str) -> Result<RoleCfg, String> 
     if driver == DriverKind::Llm && f.ladder.is_empty() {
         return Err("an llm role needs a model in its ladder".into());
     }
+    for (name, server) in &f.mcp {
+        if !valid_mcp_name(name) {
+            return Err(format!(
+                "[mcp.{name}]: use letters, digits and dashes (and not \"tower\")"
+            ));
+        }
+        if server.command.trim().is_empty() {
+            return Err(format!("[mcp.{name}]: command must name a program"));
+        }
+        for key in server.env.keys() {
+            if !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') || key.is_empty() {
+                return Err(format!(
+                    "[mcp.{name}]: bad environment variable name {key:?}"
+                ));
+            }
+        }
+    }
     let mut h = std::collections::hash_map::DefaultHasher::new();
     id.hash(&mut h);
     let fallback = PALETTE[(h.finish() as usize) % PALETTE.len()];
@@ -677,6 +1110,9 @@ pub fn parse_role(id: &str, file: &Path, text: &str) -> Result<RoleCfg, String> 
         effort: f.effort,
         agent: f.agent,
         routed,
+        auth: f.auth,
+        mcp: f.mcp,
+        registry: Arc::default(),
     })
 }
 
@@ -718,6 +1154,13 @@ pub fn load(dir: &Path) -> Config {
                 cfg.routing = f.routing;
                 cfg.autofix = f.autofix;
                 cfg.access = f.access;
+                for k in crate::policy::unknown_keys(&f.policy.actions) {
+                    cfg.errors
+                        .push(format!("tower.toml: [policy.actions] has no action {k:?}"));
+                }
+                cfg.policy = f.policy;
+                cfg.ack = f.ack;
+                cfg.privacy = f.privacy;
                 cfg.projects = f.projects;
                 cfg.project_rules = f
                     .project
@@ -737,26 +1180,173 @@ pub fn load(dir: &Path) -> Config {
                 cfg.jira = f.jira;
                 cfg.github = f.github;
                 cfg.gitlab = f.gitlab;
+                for s in &f.scout {
+                    for k in crate::policy::unknown_keys(&s.policy) {
+                        cfg.errors.push(format!(
+                            "sources.toml: scout {:?} policy has no action {k:?}",
+                            s.name
+                        ));
+                    }
+                }
+                cfg.scouts = f.scout;
+                for w in cfg.watches() {
+                    for k in crate::policy::unknown_keys(w.own_policy()) {
+                        cfg.errors.push(format!(
+                            "sources.toml: watch {:?} policy has no action {k:?}",
+                            w.name()
+                        ));
+                    }
+                }
             }
             Err(e) => cfg.errors.push(format!("sources.toml: {e}")),
         }
     }
+    match crate::schedule::load(dir) {
+        Ok(list) => cfg.schedules = list,
+        Err(e) => cfg.errors.push(e),
+    }
     if let Ok(t) = std::fs::read_to_string(dir.join("models.toml")) {
         match toml::from_str::<ModelsFile>(&t) {
-            Ok(f) => cfg.endpoints = f.endpoint,
+            Ok(f) => {
+                cfg.endpoints = f.endpoint;
+                cfg.models = f.model;
+            }
             Err(e) => cfg.errors.push(format!("models.toml: {e}")),
         }
     }
+    let registry = Arc::new(cfg.registry());
+    cfg.errors.extend(registry.problems());
+    for r in &mut cfg.roles {
+        r.registry = registry.clone();
+    }
+    // Delegation needs a role to run local models; roles/local.toml can
+    // replace this one.
+    if cfg.role(LOCAL_ROLE).is_none() {
+        if let Some(r) = local_worker(&roles_dir, &registry) {
+            cfg.roles.push(r);
+        }
+    }
+    cfg.notices = legacy_notices(&cfg);
     cfg
 }
 
-/// Gates for a flight: the repo's `.tower.toml` wins over `tower.toml`.
-pub fn gates_for(workdir: &Path, default: &GatesCfg) -> GatesCfg {
+/// The role `tower_delegate` hands work to.
+pub const LOCAL_ROLE: &str = "local";
+
+const LOCAL_MISSION: &str = "You execute exactly one handoff packet on a model inside the user's own network. Stay inside its goal and constraints, change only what it asks for, and verify the acceptance criteria yourself. When done, call tower_return with a short summary of what changed and how you checked it. If you are blocked or the packet is unclear, call tower_return saying exactly what is missing. Never push, never rewrite history.";
+
+/// The built-in Local role: OpenCode over ACP, on every local `[[model]]`.
+/// `None` when `models.toml` lists no local model.
+fn local_worker(roles_dir: &Path, registry: &Arc<Registry>) -> Option<RoleCfg> {
+    let ladder: Vec<String> = registry
+        .models
+        .iter()
+        .filter(|m| registry.resolve(&m.id).map(|(e, _)| e.is_local()) == Some(true))
+        .map(|m| m.id.clone())
+        .collect();
+    if ladder.is_empty() {
+        return None;
+    }
+    let max_concurrency = registry
+        .models
+        .iter()
+        .filter(|m| ladder.contains(&m.id))
+        .map(|m| m.max_concurrency.max(1))
+        .sum();
+    Some(RoleCfg {
+        id: LOCAL_ROLE.into(),
+        file: roles_dir.join("local.toml"),
+        name: "Local".into(),
+        color: [0x73, 0xda, 0xca],
+        driver: DriverKind::Acp,
+        command: vec!["opencode".into(), "acp".into()],
+        mission: LOCAL_MISSION.into(),
+        ladder,
+        auto_release: false,
+        max_concurrency,
+        ollama_base_url: None,
+        base_url: None,
+        api_key_env: None,
+        acp_options: BTreeMap::new(),
+        effort: None,
+        agent: None,
+        routed: false,
+        auth: Auth::default(),
+        mcp: BTreeMap::new(),
+        registry: registry.clone(),
+    })
+}
+
+/// The pre-`[policy]` knobs still in use, each with what it means now.
+fn legacy_notices(cfg: &Config) -> Vec<String> {
+    let mut out = Vec::new();
+    for w in cfg.watches() {
+        if w.auto_launch() || w.autofix() {
+            let knob = if w.autofix() {
+                "autofix"
+            } else {
+                "auto_launch"
+            };
+            if let Some((_, msg)) = crate::policy::legacy(Action::IntakeLaunch, knob, true) {
+                out.push(format!("watch {:?}: {msg}", w.name()));
+            }
+        }
+    }
+    if !cfg.gates.human {
+        if let Some((_, msg)) = crate::policy::legacy(Action::Land, "[gates] human = false", true) {
+            out.push(format!("tower.toml: {msg}"));
+        }
+    }
+    let releasing: Vec<&str> = cfg
+        .roles
+        .iter()
+        .filter(|r| r.auto_release)
+        .map(|r| r.id.as_str())
+        .collect();
+    if !releasing.is_empty() {
+        if let Some((_, msg)) = crate::policy::legacy(Action::HandoffRelease, "auto_release", true)
+        {
+            out.push(format!("roles {}: {msg}", releasing.join(", ")));
+        }
+    }
+    out
+}
+
+/// Just `tower.toml [privacy]`, for the hooks that run on every prompt and
+/// tool call. No file: the defaults. A file (or a `[privacy]` table) that
+/// does not parse is an error, which the guard treats as "local-only": it
+/// cannot tell which folders are, so it does not guess "none".
+pub fn load_privacy(dir: &Path) -> Result<crate::privacy::PrivacyCfg, String> {
+    let file = dir.join("tower.toml");
+    let text = match std::fs::read_to_string(&file) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
+        Err(e) => return Err(format!("{} cannot be read ({e})", file.display())),
+    };
+    let broken = |e: String| {
+        format!(
+            "{} does not parse ({e}), so Tower cannot tell which folders are local-only",
+            file.display()
+        )
+    };
+    let v: toml::Value = toml::from_str(&text).map_err(|e| broken(e.message().to_string()))?;
+    match v.get("privacy") {
+        None => Ok(Default::default()),
+        Some(p) => p
+            .clone()
+            .try_into::<crate::privacy::PrivacyCfg>()
+            .map_err(|e| broken(e.message().to_string())),
+    }
+}
+
+/// The repo's own `.tower.toml` for work in `workdir`, and the folder it
+/// is in: the nearest one up to the repository root.
+fn repo_file(workdir: &Path) -> Option<(PathBuf, TowerFile)> {
     let mut dir = Some(workdir);
     while let Some(d) = dir {
         if let Ok(t) = std::fs::read_to_string(d.join(".tower.toml")) {
             if let Ok(f) = toml::from_str::<TowerFile>(&t) {
-                return f.gates;
+                return Some((d.to_path_buf(), f));
             }
         }
         if d.join(".git").exists() {
@@ -764,7 +1354,54 @@ pub fn gates_for(workdir: &Path, default: &GatesCfg) -> GatesCfg {
         }
         dir = d.parent();
     }
-    default.clone()
+    None
+}
+
+/// Gates for a flight: the repo's `.tower.toml` wins over `tower.toml`.
+pub fn gates_for(workdir: &Path, default: &GatesCfg) -> GatesCfg {
+    repo_file(workdir)
+        .map(|(_, f)| f.gates)
+        .unwrap_or_else(|| default.clone())
+}
+
+/// `[privacy]` from every `.tower.toml` between `workdir` and its
+/// repository root, merged: local-only if any says so, every file's
+/// sensitive paths (each relative to its own folder). A file that does not
+/// parse makes the work local-only rather than silently dropping its rules.
+pub fn repo_privacy(workdir: &Path) -> crate::privacy::RepoPrivacy {
+    let mut out = crate::privacy::RepoPrivacy::default();
+    let mut dir = Some(workdir);
+    while let Some(d) = dir {
+        let file = d.join(".tower.toml");
+        if let Ok(t) = std::fs::read_to_string(&file) {
+            match toml::from_str::<TowerFile>(&t) {
+                Ok(f) => {
+                    if f.privacy.local_only && out.reason.is_none() {
+                        out.reason = Some(format!("{} marks it local-only", file.display()));
+                    }
+                    let base = d.canonicalize().unwrap_or_else(|_| d.to_path_buf());
+                    out.globs.extend(
+                        f.privacy
+                            .sensitive_paths
+                            .into_iter()
+                            .map(|g| (base.clone(), g)),
+                    );
+                }
+                Err(e) => {
+                    out.reason = Some(format!(
+                        "{} does not parse ({}), so it counts as local-only",
+                        file.display(),
+                        e.message()
+                    ));
+                }
+            }
+        }
+        if d.join(".git").exists() {
+            break;
+        }
+        dir = d.parent();
+    }
+    out
 }
 
 /// Cheap change detector for the config folder: names, sizes and mtimes.
@@ -792,6 +1429,65 @@ pub fn fingerprint(dir: &Path) -> u64 {
     h.finish()
 }
 
+/// Roles for other vendors' CLIs, added once each when the CLI is on PATH
+/// (first run or later), so every installed agent can be tried from Tower.
+/// `(file, program, contents)`.
+pub const VENDOR_SEEDS: [(&str, &str, &str); 4] = [
+    ("approach-codex.toml", "codex", SEED_APPROACH_CODEX),
+    ("approach-opencode.toml", "opencode", SEED_APPROACH_OPENCODE),
+    ("approach-agy.toml", "agy", SEED_APPROACH_AGY),
+    ("approach-gemini.toml", "gemini", SEED_APPROACH_GEMINI),
+];
+
+const VENDOR_MISSION: &str = r##"mission = """
+You own a flight end to end: understand the task, plan the change and make it,
+verify it, then call tower_complete once it is done.
+"""
+"##;
+
+pub const SEED_APPROACH_CODEX: &str = r##"# Codex in a pane next to Tower, on your own Codex login.
+# Tower passes its tools (-c mcp_servers.tower...), the role's instructions
+# (-c developer_instructions) and a turn-end notifier (-c notify). Running it
+# on a ChatGPT plan is a vendor-terms grey zone once Tower types into it; set
+# auth = "api_key" if you use an OpenAI API key. See docs/VENDOR_TERMS.md.
+name = "Approach (Codex)"
+color = "#10a37f"
+driver = "pane"
+command = ["codex"]
+# auth = "api_key"
+"##;
+
+pub const SEED_APPROACH_OPENCODE: &str = r##"# OpenCode's TUI in a pane next to Tower. Tower's tools arrive through
+# OPENCODE_CONFIG_CONTENT; your own opencode.json is not touched. OpenCode
+# reports no turn ends to Tower, so messages are typed in right away.
+# Never sign OpenCode in with a Claude Pro/Max plan (Anthropic forbids it).
+name = "Approach (OpenCode)"
+color = "#f5a742"
+driver = "pane"
+command = ["opencode"]
+# auth = "api_key"
+"##;
+
+pub const SEED_APPROACH_AGY: &str = r##"# The Antigravity CLI in a pane next to Tower, on your own Google login (a
+# vendor-terms grey zone, see docs/VENDOR_TERMS.md). Tower's tools are only
+# available in folders Tower made (it writes .agents/mcp_config.json there
+# and keeps it out of git).
+name = "Approach (Antigravity)"
+color = "#9b7cff"
+driver = "pane"
+command = ["agy"]
+# auth = "api_key"
+"##;
+
+pub const SEED_APPROACH_GEMINI: &str = r##"# Gemini CLI in a pane. It has no way to receive Tower's tools in a pane:
+# for those, use an ACP role with command = ["gemini", "--experimental-acp"].
+name = "Approach (Gemini)"
+color = "#4285f4"
+driver = "pane"
+command = ["gemini"]
+# auth = "api_key"
+"##;
+
 pub const SEED_APPROACH: &str = r##"# A Tower role. Edit freely: Tower reloads this folder when you save.
 name = "Approach"
 color = "#7aa2f7"
@@ -801,7 +1497,6 @@ command = ["claude"]
 # Cheapest first; Escalate moves up one rung. For claude these are --model values.
 ladder = ["sonnet", "opus"]
 # Handoffs addressed to this role wait for your clearance in the Inbox.
-auto_release = false
 max_concurrency = 2
 mission = """
 You own a flight end to end: understand the task, plan the change and make it.
@@ -819,7 +1514,7 @@ driver = "acp"
 command = ["opencode", "acp"]
 # OpenCode model ids (provider/model). See `opencode models`.
 ladder = ["opencode-go/kimi-k2.7-code", "opencode-go/glm-5.3"]
-auto_release = true
+# Handoffs to this role follow [policy] "handoff.release" in tower.toml.
 max_concurrency = 3
 mission = """
 You execute exactly one handoff packet. Stay inside its goal and constraints,
@@ -839,7 +1534,7 @@ command = ["opencode", "acp"]
 #   ollama pull qwen3.6:27b
 ladder = ["ollama/qwen3.6:27b"]
 ollama_base_url = "http://localhost:11434/v1"
-auto_release = true
+# Handoffs to this role follow [policy] "handoff.release" in tower.toml.
 max_concurrency = 1
 mission = """
 You execute exactly one handoff packet. Stay inside its goal and constraints,
@@ -855,7 +1550,7 @@ color = "#bb9af7"
 driver = "acp"
 command = ["opencode", "acp"]
 ladder = ["opencode-go/glm-5.3", "opencode-go/kimi-k2.7-code"]
-auto_release = true
+# Handoffs to this role follow [policy] "handoff.release" in tower.toml.
 max_concurrency = 1
 mission = """
 You review a change against its packet's acceptance criteria. Read the diff
@@ -896,6 +1591,18 @@ bandit_min_updates = 50
 
 # An engine: driver (pane / acp / llm), command, model, optional effort
 # ("low" … "max") and agent (a subagent definition: claude --agent).
+# Other vendors over ACP (Tower checks they are installed). With an API key,
+# declare it: Tower then picks the agent's API-key sign-in and never your plan.
+# [routing.engines.codex-acp]
+# driver = "acp"
+# command = ["codex-acp"]
+# auth = "api_key"
+#
+# [routing.engines.gemini-acp]
+# driver = "acp"
+# command = ["gemini", "--experimental-acp"]
+# auth = "api_key"
+
 [routing.engines.qwen-local]
 driver = "acp"
 command = ["opencode", "acp"]
@@ -944,6 +1651,30 @@ depth = 3
 deny_hosts = []
 # deny_hosts = ["payroll.internal", "*.prod.example.com"]
 
+# What Tower may do without a click: off | draft | confirm | auto.
+# "auto" only runs while Tower is armed (Policy view, key 7), which turns
+# itself off after armed_ttl_secs. Unlisted actions: confirm, except
+# ack.post = draft and scout.run = off. A watch can override with
+# policy = { "intake.launch" = "auto" }.
+[policy]
+armed_ttl_secs = 28800
+max_auto_per_hour = 20
+# [policy.actions]
+# "intake.launch" = "auto"
+# "land" = "confirm"
+
+# Acknowledgements: one per running response clock (a new ticket, a new
+# customer comment), drafted unless [policy] "ack.post" says otherwise. Keep
+# the text honest: it says the request arrived, not that work is done.
+# Placeholders: {key} {summary} {reporter} {sla}.
+[ack]
+template = "Thanks, we have received this and are looking into it. We will get back to you here."
+signature = "— posted by Tower"
+# "public": in Jira Service Management the customer sees it and is notified.
+# "internal": Jira only, restricted to internal_role.
+visibility = "public"
+internal_role = "Service Desk Team"
+
 # Explicit mappings win over discovery, e.g.:
 # [[project]]
 # path = "~/code/acme-api"
@@ -969,8 +1700,8 @@ pub const SEED_SOURCES: &str = r##"# Intake: where flights come from besides you
 # A Jira watch polls a JQL query through the Atlassian Rovo MCP server and
 # turns new issues into flights. Store an Atlassian API token first:
 #   tower auth jira yourteam.atlassian.net      (reads the token from stdin)
-# Issue text is untrusted: triage reads it with no tools, and nothing is
-# written back to Jira without your clearance in the Inbox.
+# Issue text is untrusted: triage reads it with no tools. What Tower may write
+# back on its own is [policy] in tower.toml; by default it asks first.
 #
 # [[jira]]
 # name = "Team backlog"
@@ -983,8 +1714,12 @@ pub const SEED_SOURCES: &str = r##"# Intake: where flights come from besides you
 # workdir = "/Users/you/src/proj"
 # interval_secs = 120
 # comment_on_land = true             # offer to comment when a flight lands
-# done_transition = "Done"           # and move the issue
+# done_transition = "Done"           # and move the issue (a name or an id)
 # autofix = false                    # see below
+# sla = true                         # read Jira Service Management SLAs
+# ack_visibility = "public"          # acknowledgements: public | internal
+# ack_template = "Hi {reporter}, we have {key} and are on it."
+# policy = { "ack.post" = "confirm" }
 #
 # GitHub and GitLab watches use the gh / glab CLIs and your login there.
 #
@@ -992,6 +1727,9 @@ pub const SEED_SOURCES: &str = r##"# Intake: where flights come from besides you
 # name = "Bugs"
 # repo = "owner/repo"
 # search = "label:bug no:assignee"   # gh issue list --search terms
+# assignee = "@me"                   # only issues assigned to you
+# labels = ["bug"]                   # only issues with all these labels
+# respond_within_hours = 24          # Tower's own response clock
 # autofix = true
 # auto_launch = true
 #
@@ -1000,8 +1738,23 @@ pub const SEED_SOURCES: &str = r##"# Intake: where flights come from besides you
 # project = "group/api"
 # host = "gitlab.example.com"        # self-hosted only
 # label = "bug"
+# assignee = "@me"
 # autofix = true
 # auto_launch = true
+#
+# A scout reads mail or Teams through an agent's own Microsoft 365 tools
+# (Tower has no M365 login) and reports each message that needs work with
+# tower_intake_submit. It only reads; Tower cannot send anything. Run it with
+# "Run scout" in the Intake view; on a timer only with [policy] scout.run.
+#
+# [[scout]]
+# name = "Support mailbox"
+# kind = "mail"                       # or "teams"
+# role = "approach"                   # a role whose agent has the M365 tools
+# prompt = "Unread mail in my Support folder received since {since}."
+# target_role = "approach"            # new items are cleared to this role
+# internal_domains = ["example.com"]  # other senders count as customers
+# respond_within_hours = 24           # customer reply clock (mail default)
 #
 # autofix = true: Tower finds the issue's project on this machine ([[project]]
 # rules and [projects] roots in tower.toml, else triage, else it asks you),
@@ -1019,7 +1772,7 @@ driver = "llm"
 base_url = "http://localhost:11434/v1"
 # api_key_env = "OPENAI_API_KEY"
 ladder = ["qwen3.6:27b"]
-auto_release = true
+# Handoffs to this role follow [policy] "handoff.release" in tower.toml.
 max_concurrency = 2
 mission = """
 You read incoming issues and decide which role should take them. You have no
@@ -1037,7 +1790,6 @@ command = ["npx", "-y", "@agentclientprotocol/claude-agent-acp"]
 ladder = ["sonnet", "opus"]
 # Session options the adapter offers: mode = default | acceptEdits | plan | auto
 acp_options = { mode = "acceptEdits" }
-auto_release = false
 max_concurrency = 2
 mission = """
 You own a flight end to end: understand the task, plan the change and make it.
@@ -1053,7 +1805,7 @@ driver = "acp"
 command = ["npx", "-y", "@agentclientprotocol/claude-agent-acp"]
 ladder = ["haiku", "sonnet"]
 acp_options = { mode = "acceptEdits" }
-auto_release = true
+# Handoffs to this role follow [policy] "handoff.release" in tower.toml.
 max_concurrency = 3
 mission = """
 You execute exactly one handoff packet. Stay inside its goal and constraints,
@@ -1069,7 +1821,7 @@ pub const SEED_CREW: &str = r##"# A routed role: Tower picks the engine (program
 name = "Crew"
 color = "#e0af68"
 driver = "routed"
-auto_release = true
+# Handoffs to this role follow [policy] "handoff.release" in tower.toml.
 max_concurrency = 3
 mission = """
 You own one flight. Do the whole task in its working directory, check your
@@ -1091,6 +1843,27 @@ base_url = "http://localhost:11434"
 # name = "studio.lan"
 # kind = "lmstudio"
 # base_url = "http://studio.lan:1234"
+
+# A company server on an internal hostname: say it is local, or Tower treats
+# it as cloud. The key is read from the environment, never stored here.
+# [[endpoint]]
+# name = "company"
+# kind = "vllm"
+# base_url = "https://llm.example.internal/v1"
+# local = true
+# api_key_env = "COMPANY_LLM_KEY"
+
+# Models agents may hand work to. The id is <endpoint>/<model on that server>;
+# use the same id in a role's ladder. good_for and notes are what an agent
+# reads when it decides whether a subtask suits the model.
+# [[model]]
+# id = "localhost/qwen3.6:27b"
+# label = "Qwen 3.6 27B"
+# size = "27B"
+# context = 131072
+# good_for = ["code edits", "docs", "tests", "refactors"]
+# notes = "Strong on code; slow on very long files."
+# max_concurrency = 1
 "##;
 
 /// Write the default files that do not exist yet. Never overwrites.
@@ -1121,6 +1894,33 @@ pub fn seed(dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Add a role for each vendor CLI that is installed, once: `.seeded` records
+/// what was added, so a role you delete stays deleted.
+pub fn seed_vendor_roles(dir: &Path, installed: fn(&str) -> bool) -> std::io::Result<()> {
+    let record = dir.join(".seeded");
+    let mut done: Vec<String> = std::fs::read_to_string(&record)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    let mut changed = false;
+    for (file, program, text) in VENDOR_SEEDS {
+        if done.iter().any(|d| d == file) || !installed(program) {
+            continue;
+        }
+        let path = dir.join("roles").join(file);
+        if !path.exists() {
+            std::fs::write(&path, format!("{text}{VENDOR_MISSION}"))?;
+        }
+        done.push(file.to_string());
+        changed = true;
+    }
+    if changed {
+        std::fs::write(&record, done.join("\n") + "\n")?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1130,6 +1930,44 @@ mod tests {
             std::env::temp_dir().join(format!("tower-cfg-{}-{}", name, crate::paths::random_u64()));
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn roles_can_bring_their_own_mcp_servers() {
+        let base = "name = \"R\"\ndriver = \"pane\"\ncommand = [\"claude\"]\nmission = \"m\"\n";
+        let ok = format!("{base}[mcp.github]\ncommand = \"gh-mcp\"\nargs = [\"stdio\"]\nenv = {{ GH_TOKEN = \"x\" }}\n");
+        let r = parse_role("r", Path::new("r.toml"), &ok).unwrap();
+        assert_eq!(r.mcp["github"].args, vec!["stdio".to_string()]);
+        for bad in [
+            format!("{base}[mcp.tower]\ncommand = \"x\"\n"),
+            format!("{base}[mcp.\"a b\"]\ncommand = \"x\"\n"),
+            format!("{base}[mcp.x]\ncommand = \" \"\n"),
+            format!("{base}[mcp.x]\ncommand = \"y\"\nenv = {{ \"A-B\" = \"1\" }}\n"),
+        ] {
+            assert!(parse_role("r", Path::new("r.toml"), &bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn vendor_roles_are_seeded_once_and_only_when_installed() {
+        let d = tmpdir("vendor");
+        std::fs::create_dir_all(d.join("roles")).unwrap();
+        seed_vendor_roles(&d, |p| p == "codex").unwrap();
+        assert!(d.join("roles/approach-codex.toml").exists());
+        assert!(!d.join("roles/approach-opencode.toml").exists());
+        let role = std::fs::read_to_string(d.join("roles/approach-codex.toml")).unwrap();
+        let parsed = parse_role("approach-codex", Path::new("x"), &role).unwrap();
+        assert_eq!(parsed.command, vec!["codex".to_string()]);
+        // Deleted by the user: not brought back.
+        std::fs::remove_file(d.join("roles/approach-codex.toml")).unwrap();
+        seed_vendor_roles(&d, |p| p == "codex").unwrap();
+        assert!(!d.join("roles/approach-codex.toml").exists());
+        // Installed later: added then.
+        seed_vendor_roles(&d, |p| p == "opencode").unwrap();
+        assert!(d.join("roles/approach-opencode.toml").exists());
+        for (_, _, text) in VENDOR_SEEDS {
+            assert!(parse_role("x", Path::new("x"), &format!("{text}{VENDOR_MISSION}")).is_ok());
+        }
     }
 
     #[test]
@@ -1211,6 +2049,7 @@ mod tests {
             health,
             latency_ms: None,
             models: models.iter().map(|m| m.to_string()).collect(),
+            ..Default::default()
         };
         let qwen = &r.engines["qwen-local"];
         let opus = &r.engines["claude-opus"];
@@ -1319,5 +2158,223 @@ mod tests {
         )
         .unwrap();
         assert_ne!(a, fingerprint(&d));
+    }
+
+    const REGISTRY: &str = r#"
+[[endpoint]]
+name = "localhost"
+kind = "ollama"
+base_url = "http://localhost:11434"
+
+[[endpoint]]
+name = "company"
+kind = "vllm"
+base_url = "https://llm.example.internal/v1"
+local = true
+api_key_env = "COMPANY_LLM_KEY"
+
+[[endpoint]]
+name = "rented"
+kind = "openai-compatible"
+base_url = "https://api.rented.example"
+
+[[model]]
+id = "company/qwen3.8-27b"
+label = "Qwen 3.8 27B"
+size = "27B"
+good_for = ["code edits", "docs"]
+max_concurrency = 2
+"#;
+
+    fn with_registry(role: &str) -> Config {
+        let d = tmpdir("registry");
+        std::fs::create_dir_all(d.join("roles")).unwrap();
+        std::fs::write(d.join("models.toml"), REGISTRY).unwrap();
+        std::fs::write(d.join("roles").join("worker.toml"), role).unwrap();
+        load(&d)
+    }
+
+    const WORKER: &str = "name = \"W\"\ndriver = \"acp\"\ncommand = [\"opencode\", \"acp\"]\nmission = \"m\"\nladder = [\"company/qwen3.8-27b\", \"rented/big\", \"opencode-go/kimi\"]\n";
+
+    #[test]
+    fn endpoint_models_take_their_servers_locality() {
+        let cfg = with_registry(WORKER);
+        assert!(cfg.errors.is_empty(), "{:?}", cfg.errors);
+        let w = cfg.role("worker").unwrap();
+        let q = w.model_ref("company/qwen3.8-27b");
+        assert_eq!(
+            q.locality,
+            Locality::Local,
+            "local = true wins over the URL"
+        );
+        assert_eq!(q.label, "Qwen 3.8 27B");
+        assert_eq!(q.host.as_deref(), Some("llm.example.internal"));
+        let big = w.model_ref("rented/big");
+        assert_eq!(big.locality, Locality::Cloud, "a public URL guesses cloud");
+        assert_eq!(big.host, None);
+        assert_eq!(w.model_ref("opencode-go/kimi").locality, Locality::Cloud);
+        let eps: Vec<_> = w
+            .endpoint_models()
+            .into_iter()
+            .map(|(e, m)| (e.name, m))
+            .collect();
+        assert_eq!(
+            eps,
+            vec![
+                ("company".to_string(), vec!["qwen3.8-27b".to_string()]),
+                ("rented".to_string(), vec!["big".to_string()]),
+            ]
+        );
+    }
+
+    #[test]
+    fn opencode_gets_a_provider_per_server_and_stays_local_on_a_local_model() {
+        let cfg = with_registry(WORKER);
+        let w = cfg.role("worker").unwrap();
+        let c = w.opencode_config(Some("company/qwen3.8-27b")).unwrap();
+        let company = &c["provider"]["company"];
+        assert_eq!(
+            company["options"]["baseURL"],
+            "https://llm.example.internal/v1"
+        );
+        assert_eq!(company["options"]["apiKey"], "{env:COMPANY_LLM_KEY}");
+        assert!(company["models"]["qwen3.8-27b"].is_object());
+        assert_eq!(
+            c["provider"]["rented"]["options"]["baseURL"],
+            "https://api.rented.example/v1"
+        );
+        assert_eq!(c["small_model"], "company/qwen3.8-27b");
+        assert_eq!(c["share"], "disabled");
+        assert_eq!(c["enabled_providers"], serde_json::json!(["company"]));
+        // On a cloud rung nothing is restricted.
+        let cloud = w.opencode_config(Some("rented/big")).unwrap();
+        assert!(cloud.get("small_model").is_none());
+        assert!(cloud.get("enabled_providers").is_none());
+    }
+
+    #[test]
+    fn llm_roles_can_name_a_registry_model() {
+        let cfg = with_registry(
+            "name = \"T\"\ndriver = \"llm\"\nmission = \"m\"\nladder = [\"company/qwen3.8-27b\"]\n",
+        );
+        let t = cfg.role("worker").unwrap();
+        let spec = t.llm_spec("company/qwen3.8-27b");
+        assert_eq!(spec.base_url, "https://llm.example.internal/v1");
+        assert_eq!(spec.model, "qwen3.8-27b");
+        assert_eq!(t.model_ref("company/qwen3.8-27b").locality, Locality::Local);
+    }
+
+    #[test]
+    fn registry_mistakes_are_reported() {
+        let d = tmpdir("registry-bad");
+        std::fs::write(
+            d.join("models.toml"),
+            "[[endpoint]]\nname = \"a b\"\nkind = \"ollama\"\nbase_url = \"http://x\"\n[[model]]\nid = \"nowhere/m\"\n",
+        )
+        .unwrap();
+        let cfg = load(&d);
+        assert_eq!(cfg.errors.len(), 2, "{:?}", cfg.errors);
+    }
+
+    #[test]
+    fn served_problem_reads_the_probe() {
+        let ep = |health, models: &[&str]| Endpoint {
+            id: "company".into(),
+            name: "company".into(),
+            base_url: "https://llm.example.internal/v1".into(),
+            kind: "vllm".into(),
+            health,
+            latency_ms: None,
+            models: models.iter().map(|m| m.to_string()).collect(),
+            ..Default::default()
+        };
+        let m = "company/qwen3.8-27b";
+        assert_eq!(served_problem(m, &[ep(Health::Unknown, &[])]), None);
+        assert_eq!(served_problem(m, &[ep(Health::Up, &["qwen3.8-27b"])]), None);
+        assert!(served_problem(m, &[ep(Health::Up, &["other"])])
+            .unwrap()
+            .contains("does not serve"));
+        assert!(served_problem(m, &[ep(Health::Down, &[])])
+            .unwrap()
+            .contains("not reachable"));
+        assert_eq!(
+            served_problem("opencode-go/kimi", &[ep(Health::Down, &[])]),
+            None
+        );
+    }
+
+    #[test]
+    fn locality_is_not_fooled_by_names_or_programs() {
+        for (url, local) in [
+            ("http://localhost:11434", true),
+            ("http://127.0.0.1:8000/v1", true),
+            ("http://10.1.2.3:8000", true),
+            ("http://172.20.0.5", true),
+            ("http://192.168.1.9:1234", true),
+            ("http://gpu-box.lan:8000", true),
+            ("http://10.example.com", false),
+            ("http://127.evil.net", false),
+            ("http://10.0.0.1@api.openai.com/v1", false),
+            ("https://llm.example.internal/v1", false),
+            ("http://172.40.0.1", false),
+        ] {
+            assert_eq!(is_local_url(url), local, "{url}");
+        }
+        let reg = Registry::default();
+        let opencode = vec!["opencode".to_string(), "acp".to_string()];
+        let claude = vec!["claude".to_string()];
+        let local = |id: &str, driver, cmd: &[String], ollama: Option<&str>| {
+            model_ref_for(id, driver, cmd, None, ollama, &reg).locality == Locality::Local
+        };
+        assert!(local(
+            "ollama/qwen3.6:27b",
+            DriverKind::Acp,
+            &opencode,
+            None
+        ));
+        assert!(
+            !local("ollama/qwen3.6:27b", DriverKind::Pane, &claude, None),
+            "Claude decides itself where a model name goes"
+        );
+        assert!(!local("ollama/qwen3.6:27b", DriverKind::Acp, &claude, None));
+        assert!(
+            !local(
+                "ollama/gpt-oss:120b-cloud",
+                DriverKind::Acp,
+                &opencode,
+                None
+            ),
+            "Ollama cloud models run off-site"
+        );
+        assert!(!local(
+            "ollama/qwen3.6:27b",
+            DriverKind::Acp,
+            &opencode,
+            Some("https://ollama.com/v1")
+        ));
+    }
+
+    #[test]
+    fn privacy_settings_fail_closed() {
+        let d = tmpdir("privacy-load");
+        assert_eq!(
+            load_privacy(&d),
+            Ok(Default::default()),
+            "no file: defaults"
+        );
+        std::fs::write(
+            d.join("tower.toml"),
+            "[privacy]\nlocal_only_paths = [\"~/p\"]\n[gates]\nhuman = \"maybe\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            load_privacy(&d).unwrap().local_only_paths,
+            vec!["~/p"],
+            "another table's mistake does not drop [privacy]"
+        );
+        std::fs::write(d.join("tower.toml"), "[privacy\n").unwrap();
+        assert!(load_privacy(&d).unwrap_err().contains("cannot tell"));
+        std::fs::write(d.join("tower.toml"), "[privacy]\nlocal_only_paths = 3\n").unwrap();
+        assert!(load_privacy(&d).is_err());
     }
 }

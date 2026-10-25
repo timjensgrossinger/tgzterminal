@@ -129,6 +129,18 @@ impl Theme {
         c.alpha(if self.dark { 0.18 } else { 0.14 })
     }
 
+    /// Colour `i` of a chart's series: distinct hues first, then blends.
+    pub fn series(&self, i: usize) -> Color {
+        let base = [self.info, self.ok, self.warn, self.violet, self.bad];
+        match i {
+            0..=4 => base[i],
+            5 => self.info.mix(self.ok, 0.5),
+            6 => self.warn.mix(self.bad, 0.5),
+            7 => self.violet.mix(self.info, 0.5),
+            _ => self.muted,
+        }
+    }
+
     /// Make an arbitrary role colour readable as text on cards.
     pub fn readable(&self, c: Color) -> Color {
         if self.dark {

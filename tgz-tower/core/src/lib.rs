@@ -4,6 +4,7 @@
 //! returns the next state or a decision, so all of it is unit-testable.
 
 pub mod bandit;
+pub mod cron;
 pub mod router;
 pub mod work;
 
@@ -354,6 +355,8 @@ mod tests {
             acceptance: vec!["tests pass".into()],
             return_to: "a-1".into(),
             state,
+            model: None,
+            local_only: false,
         }
     }
 

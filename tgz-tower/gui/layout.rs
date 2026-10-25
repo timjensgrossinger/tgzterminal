@@ -3,13 +3,20 @@
 //! Everything is computed in window pixels inside `area`, the pane's content
 //! rectangle. Nothing here touches the GPU; `render.rs` replays the list.
 
+use super::chart::{
+    bar_chart, compact, compact_money, share_bar, spark_bars, BarChartSpec, Column,
+};
 use super::clip::Rect;
-use super::forms::{caret_segment, segments, Field, FieldId, Place, Sheet, AUTO_ROLE};
+use super::forms::{
+    caret_segment, civil_label, hex_rgb, local_civil, looks_local, segments, when_preview, Field,
+    FieldId, Place, Sheet, SheetFlag, AUTO_ROLE, DRIVERS, ENDPOINT_KINDS, ROLE_COLORS, TEMPLATES,
+};
 use super::model::{Action, Conn, Drawer, Hit, Model, ScrollId, ScrollRegion, View};
 use super::proto::{
-    Agent, AgentStatus, ChatKind, DriverKind, Flight, GateState, HandDirection, HandoffPacket,
-    HandoffState, Health, InboxItem, InboxKind, Locality, ModelRef, Role, RouteInfo,
-    SnapshotOrigin, Stage, TimelineBody, TimelineEntry,
+    Agent, AgentStatus, ChatKind, DayStats, DriverKind, Flight, GateState, HandDirection,
+    HandoffPacket, HandoffState, Health, InboxItem, InboxKind, IssueInfo, Locality, ModelInfo,
+    ModelRef, Role, RouteInfo, RoutineRow, RunResult, ScheduleRow, SlaClock, SnapshotOrigin, Stage,
+    TimelineBody, TimelineEntry,
 };
 use super::text::{age, ellipsize, usage_label, wrap, Font, Measure};
 use super::theme::{Color, Theme};
@@ -588,6 +595,9 @@ impl<'a> L<'a> {
             && md.snap.flights.is_empty()
             && md.view != View::Models
             && md.view != View::Intake
+            && md.view != View::Policy
+            && md.view != View::Routines
+            && md.view != View::Activity
         {
             self.offline_state(content);
         } else {
@@ -598,6 +608,9 @@ impl<'a> L<'a> {
                 View::Frequencies => self.frequencies(content),
                 View::Models => self.models(content),
                 View::Intake => self.intake(content),
+                View::Policy => self.policy(content),
+                View::Routines => self.routines(content),
+                View::Activity => self.activity(content),
             }
         }
         match &md.drawer {
@@ -712,6 +725,41 @@ impl<'a> L<'a> {
         };
         let sh = self.lh_of(Font::Small);
         let by = r.bottom() - self.u * 4.0 - sh * 2.0;
+        if let Some(left) = self.armed_left() {
+            // Armed is loud on purpose: things may happen without a click.
+            let ay = by - sh * 2.0 - self.u * 3.0;
+            let row = Rect::new(
+                r.x + self.u * 1.5,
+                ay,
+                r.w - self.u * 3.0,
+                sh * 2.0 + self.u,
+            );
+            let hit = Hit::Nav(View::Policy);
+            self.fill(row, self.t.tint(self.t.bad), self.u * 1.6);
+            self.dot(
+                x + self.u,
+                ay + self.u * 0.5 + sh / 2.0,
+                self.u * 1.4,
+                self.t.bad,
+            );
+            self.text(
+                x + self.u * 3.0,
+                ay + self.u * 0.5,
+                "Armed",
+                Font::SmallStrong,
+                self.t.bad,
+            );
+            let max_w = r.w - self.u * 6.0;
+            self.text_fit(
+                x,
+                ay + self.u * 0.5 + sh,
+                &format!("{} left", duration(left)),
+                Font::Small,
+                self.t.muted,
+                max_w,
+            );
+            self.hit(row, hit);
+        }
         self.dot(x + self.u, by + sh / 2.0, self.u * 1.4, dot);
         self.text(
             x + self.u * 3.0,
@@ -763,6 +811,46 @@ impl<'a> L<'a> {
                     .count();
                 format!("{} of {} model servers up", up, snap.endpoints.len())
             }
+            View::Policy => match self.armed_left() {
+                Some(left) => format!(
+                    "Armed · auto actions run on their own for {}",
+                    duration(left)
+                ),
+                None => "Disarmed · Tower asks before everything".to_string(),
+            },
+            View::Routines => {
+                let next = snap
+                    .schedules
+                    .iter()
+                    .filter_map(|s| s.next_fire_unix.map(|t| (t, s.spec.name.as_str())))
+                    .min_by_key(|(t, _)| *t);
+                let others = snap.routines.iter().filter(|r| r.yours).count();
+                match next {
+                    Some((t, name)) => format!(
+                        "Next: {} in {} · {} other job{} here",
+                        name,
+                        duration(t.saturating_sub(self.now)),
+                        others,
+                        if others == 1 { "" } else { "s" }
+                    ),
+                    None => format!(
+                        "{} schedule{} · {} other job{} here",
+                        snap.schedules.len(),
+                        if snap.schedules.len() == 1 { "" } else { "s" },
+                        others,
+                        if others == 1 { "" } else { "s" }
+                    ),
+                }
+            }
+            View::Activity => {
+                let days = self.activity_days();
+                let auto: u32 = days.iter().map(|d| d.auto.values().sum::<u32>()).sum();
+                let asked: u32 = days.iter().map(|d| d.asked).sum();
+                format!(
+                    "Last {} days · {} ran by itself · {} asked you",
+                    md.activity_days, auto, asked
+                )
+            }
             View::Intake => {
                 let broken = snap.sources.iter().filter(|s| s.error.is_some()).count();
                 match (snap.sources.len(), broken) {
@@ -795,27 +883,37 @@ impl<'a> L<'a> {
                     Hit::Button(Action::NewFlight),
                 ),
             ],
-            View::Roster if !cfg.is_empty() => vec![
-                (
-                    "Roles folder".to_string(),
-                    false,
-                    Hit::Button(Action::OpenTerminal {
-                        cwd: Some(format!("{}/roles", cfg)),
-                    }),
-                ),
+            View::Roster => vec![
+                ("New role".to_string(), false, Hit::Button(Action::NewRole)),
                 (
                     "New flight".to_string(),
                     true,
                     Hit::Button(Action::NewFlight),
                 ),
             ],
-            View::Models if !cfg.is_empty() => vec![
+            View::Models => vec![
+                if snap.connected_clis.is_empty() {
+                    (
+                        "Connect agents".to_string(),
+                        false,
+                        Hit::Button(Action::OpenConnect(true)),
+                    )
+                } else {
+                    (
+                        format!("Connected: {}", snap.connected_clis.join(", ")),
+                        false,
+                        Hit::Button(Action::OpenConnect(false)),
+                    )
+                },
                 (
-                    "Edit models.toml".to_string(),
+                    "Add server".to_string(),
                     false,
-                    Hit::Button(Action::EditFile {
-                        path: format!("{}/models.toml", cfg),
-                    }),
+                    Hit::Button(Action::NewEndpoint),
+                ),
+                (
+                    "Add model".to_string(),
+                    false,
+                    Hit::Button(Action::NewModel(None)),
                 ),
                 ("Probe".to_string(), true, Hit::Button(Action::Probe)),
             ],
@@ -833,6 +931,53 @@ impl<'a> L<'a> {
                     Hit::Button(Action::PollSources),
                 ),
             ],
+            View::Routines => {
+                let mut v = vec![];
+                if !cfg.is_empty() {
+                    v.push((
+                        "Edit schedules.toml".to_string(),
+                        false,
+                        Hit::Button(Action::EditFile {
+                            path: format!("{}/schedules.toml", cfg),
+                        }),
+                    ));
+                }
+                v.push((
+                    "New schedule".to_string(),
+                    true,
+                    Hit::Button(Action::NewSchedule),
+                ));
+                v
+            }
+            View::Activity => [7usize, 30, 90]
+                .iter()
+                .map(|n| {
+                    (
+                        format!("{} days", n),
+                        md.activity_days == *n,
+                        Hit::Button(Action::ActivityDays(*n)),
+                    )
+                })
+                .collect(),
+            View::Policy => {
+                let armed = self.armed_left().is_some();
+                let n = snap.local_only_paths.len();
+                let mut v = vec![(
+                    if n == 0 {
+                        "Local-only folders".to_string()
+                    } else {
+                        format!("Local-only folders ({})", n)
+                    },
+                    false,
+                    Hit::Button(Action::OpenLocalOnly),
+                )];
+                v.push((
+                    if armed { "Disarm" } else { "Arm" }.to_string(),
+                    !armed,
+                    Hit::Button(Action::SetArmed(!armed)),
+                ));
+                v
+            }
             _ => vec![terminal],
         };
         self.buttons_right(right, by, items);
@@ -1025,8 +1170,18 @@ impl<'a> L<'a> {
             }
             _ => {}
         }
-        let age = age(self.now, f.updated_unix);
-        self.text_right(right, y, &age, Font::Small, self.t.faint);
+        // A running response clock outranks the age: it is what you act on.
+        match most_urgent(&f.sla) {
+            Some(c) => {
+                let (text, tone) = sla_status(c, self.now);
+                let color = self.tone_color(tone);
+                self.text_right(right, y, &text, Font::SmallStrong, color);
+            }
+            None => {
+                let age = age(self.now, f.updated_unix);
+                self.text_right(right, y, &age, Font::Small, self.t.faint);
+            }
+        }
         y += self.lh_of(Font::SmallStrong) + self.u;
 
         for line in self.card_title_lines(f, r.w) {
@@ -1045,6 +1200,10 @@ impl<'a> L<'a> {
                 let c = self.tier_chip(cx, y, &route.tier);
                 cx = c.right() + self.u * 1.5;
             }
+        }
+        if f.local_only && cx + self.chip_w("local only") + self.u * 10.0 < right {
+            let c = self.local_only_chip(cx, y);
+            cx = c.right() + self.u * 1.5;
         }
         if let Some(model) = &f.model {
             if cx + self.u * 10.0 < right {
@@ -1212,6 +1371,10 @@ impl<'a> L<'a> {
         }
         if let Some(route) = &f.route {
             let c = self.tier_chip(cx, y, &route.tier);
+            cx = c.right() + self.u * 1.5;
+        }
+        if f.local_only {
+            let c = self.local_only_chip(cx, y);
             cx = c.right() + self.u * 1.5;
         }
         if let Some(model) = &f.model {
@@ -1406,6 +1569,21 @@ impl<'a> L<'a> {
                 w - d - self.u * 2.0,
             );
             y += self.lh_of(Font::Small) + self.u * 5.0;
+        }
+        if f.issue.is_some() || !f.sla.is_empty() {
+            y += self.section_label(x, y, "TRACKER");
+            if let Some(line) = f.issue.as_ref().map(tracker_line).filter(|l| !l.is_empty()) {
+                self.text_fit(x, y, &line, Font::Small, self.t.muted, w);
+                y += self.lh_of(Font::Small) + self.u;
+            }
+            for c in &f.sla {
+                let (text, tone) = sla_status(c, self.now);
+                let color = self.tone_color(tone);
+                let line = format!("{} · {}", c.name, text);
+                self.text_fit(x, y, &line, Font::Small, color, w);
+                y += self.lh_of(Font::Small) + self.u;
+            }
+            y += self.u * 3.0;
         }
         if f.kind.is_some() || f.outcome.is_some() {
             y += self.section_label(x, y, "WORK");
@@ -2075,6 +2253,29 @@ impl<'a> L<'a> {
         self.lh_of(Font::SmallStrong) + self.u * 1.5
     }
 
+    /// Selectable chips that wrap at `w`: (label, selected, colour, hit).
+    /// Returns the height.
+    fn chip_row(&mut self, x: f32, y: f32, w: f32, items: Vec<(String, bool, Color, Hit)>) -> f32 {
+        let ch = self.lh_of(Font::Strong) + self.u * 2.0;
+        let mut cx = x;
+        let mut cy = y;
+        for (label, selected, color, hit) in items {
+            let cw = self.m.width(&label, Font::Strong) + ch;
+            if cx + cw > x + w && cx > x {
+                cx = x;
+                cy += ch + self.u * 1.5;
+            }
+            let r = self.pick_chip(cx, cy, &label, color, selected, hit);
+            cx = r.right() + self.u * 1.5;
+        }
+        cy + ch - y
+    }
+
+    /// A small hint line under a field; returns its height.
+    fn hint(&mut self, x: f32, y: f32, w: f32, text: &str) -> f32 {
+        self.para(x, y, text, Font::Small, self.t.faint, w, 3)
+    }
+
     fn role_picker(
         &mut self,
         x: f32,
@@ -2082,6 +2283,7 @@ impl<'a> L<'a> {
         w: f32,
         selected: Option<&str>,
         allow_none: bool,
+        nobody: bool,
         exclude: Option<&str>,
     ) -> f32 {
         let md = self.md;
@@ -2094,7 +2296,9 @@ impl<'a> L<'a> {
             if !md.snap.triage_role.is_empty() {
                 items.push(("Auto".into(), Some(AUTO_ROLE.to_string()), self.t.accent));
             }
-            items.push(("Nobody yet".into(), None, self.t.muted));
+            if nobody {
+                items.push(("Nobody yet".into(), None, self.t.muted));
+            }
         }
         for r in md.snap.roles.iter() {
             if Some(r.id.as_str()) == exclude {
@@ -2202,7 +2406,7 @@ impl<'a> L<'a> {
                 self.field(Rect::new(x, y, w, h), FieldId::Brief, &f.brief, 6);
                 y += h + gap;
                 y += self.labeled(x, y, "ASSIGN TO");
-                y += self.role_picker(x, y, w, f.role.as_deref(), true, None);
+                y += self.role_picker(x, y, w, f.role.as_deref(), true, true, None);
                 if f.role.as_deref() == Some(AUTO_ROLE) {
                     let who = md
                         .snap
@@ -2230,7 +2434,8 @@ impl<'a> L<'a> {
                 y += self.labeled(x, y, "HOW HARD");
                 y += self.tier_picker(x, y, w, f.tier.as_deref()) + gap;
                 y += self.labeled(x, y, "WHERE");
-                y += self.place_picker(x, y, w, f.place, true) + gap + self.u * 2.0;
+                y += self.place_picker(x, y, w, f.place, true) + gap;
+                y += self.local_only_toggle(x, y, w, f.local_only) + gap + self.u * 2.0;
                 let launch = f.role.is_some();
                 let mut items: Vec<(String, bool, Hit)> =
                     vec![("Cancel".into(), false, Hit::Button(Action::CloseSheet))];
@@ -2313,8 +2518,15 @@ impl<'a> L<'a> {
                     .snap
                     .flight(&f.flight_id)
                     .and_then(|fl| fl.role_id.clone());
-                y += self.role_picker(x, y, w, f.to_role.as_deref(), false, exclude.as_deref())
-                    + gap;
+                y += self.role_picker(
+                    x,
+                    y,
+                    w,
+                    f.to_role.as_deref(),
+                    false,
+                    false,
+                    exclude.as_deref(),
+                ) + gap;
                 let fields = [
                     ("GOAL", FieldId::Goal, &f.goal, 3usize),
                     ("CONTEXT", FieldId::Context, &f.context, 3),
@@ -2336,6 +2548,628 @@ impl<'a> L<'a> {
                             "Release handoff".into(),
                             true,
                             Hit::Button(Action::Submit { launch: true }),
+                        ),
+                    ],
+                );
+                y += bh;
+            }
+            Sheet::Schedule(f) => {
+                let title = if f.id.is_empty() {
+                    "New schedule"
+                } else {
+                    "Edit schedule"
+                };
+                self.text(x, y, title, Font::Heading, self.t.text);
+                y += self.lh_of(Font::Heading) + gap;
+                if f.id.is_empty() {
+                    y += self.labeled(x, y, "START FROM");
+                    let th = self.lh_of(Font::Strong);
+                    let ch = th + self.u * 2.0;
+                    let mut cx = x;
+                    let mut cy = y;
+                    let color = self.t.violet;
+                    for (i, t) in TEMPLATES.iter().enumerate() {
+                        let cw = self.m.width(t.0, Font::Strong) + ch;
+                        if cx + cw > x + w && cx > x {
+                            cx = x;
+                            cy += ch + self.u * 1.5;
+                        }
+                        let r = self.pick_chip(
+                            cx,
+                            cy,
+                            t.0,
+                            color,
+                            false,
+                            Hit::Button(Action::ScheduleTemplate(i)),
+                        );
+                        cx = r.right() + self.u * 1.5;
+                    }
+                    y = cy + ch + gap;
+                }
+                y += self.labeled(x, y, "NAME");
+                let h = self.field_height(1);
+                self.field(Rect::new(x, y, w, h), FieldId::SchedName, &f.name, 1);
+                y += h + gap;
+                y += self.labeled(x, y, "WHEN");
+                self.field(Rect::new(x, y, w, h), FieldId::SchedWhen, &f.when, 1);
+                y += h + self.u;
+                let (hint, color) = match when_preview(&f.when.text(), self.now) {
+                    Ok(p) => (p, self.t.muted),
+                    Err(_) if f.when.is_empty() => (
+                        "A cron line in local time (30 8 * * 1-5 = weekdays 08:30), @daily, or every 2h"
+                            .to_string(),
+                        self.t.faint,
+                    ),
+                    Err(e) => (e, self.t.bad),
+                };
+                self.text_fit(x, y, &hint, Font::Small, color, w);
+                y += self.lh_of(Font::Small) + gap;
+                y += self.labeled(x, y, "ASSIGN TO");
+                y += self.role_picker(x, y, w, f.role.as_deref(), true, false, None) + gap;
+                y += self.labeled(x, y, "HOW HARD");
+                y += self.tier_picker(x, y, w, f.tier.as_deref()) + gap;
+                y += self.labeled(x, y, "WHERE");
+                let th = self.lh_of(Font::Strong);
+                let ch = th + self.u * 2.0;
+                let mut cx = x;
+                let mut cy = y;
+                let color = self.t.accent;
+                for (label, place) in [
+                    ("New folder each run", Place::NewFolder),
+                    ("A folder", Place::Here),
+                    ("Worktree of a repo", Place::Worktree),
+                ]
+                .iter()
+                {
+                    let cw = self.m.width(label, Font::Strong) + ch;
+                    if cx + cw > x + w && cx > x {
+                        cx = x;
+                        cy += ch + self.u * 1.5;
+                    }
+                    let r = self.pick_chip(
+                        cx,
+                        cy,
+                        label,
+                        color,
+                        *place == f.place,
+                        Hit::Button(Action::SheetPlace(*place)),
+                    );
+                    cx = r.right() + self.u * 1.5;
+                }
+                y = cy + ch + self.u * 2.0;
+                if f.place != Place::NewFolder {
+                    self.field(Rect::new(x, y, w, h), FieldId::SchedPath, &f.path, 1);
+                    y += h + self.u;
+                    let hint = if f.place == Place::Here {
+                        "Every run works directly in this folder."
+                    } else {
+                        "Every run gets a fresh branch in a worktree of this repo."
+                    };
+                    self.text_fit(x, y, hint, Font::Small, self.t.faint, w);
+                    y += self.lh_of(Font::Small);
+                }
+                y += gap;
+                y += self.labeled(x, y, "FLIGHT TITLE");
+                self.field(Rect::new(x, y, w, h), FieldId::Title, &f.title, 1);
+                y += h + gap;
+                y += self.labeled(x, y, "TASK");
+                let bh5 = self.field_height(5);
+                self.field(Rect::new(x, y, w, bh5), FieldId::Brief, &f.brief, 5);
+                y += bh5 + gap;
+                y += self.labeled(x, y, "WHEN A RUN IS DUE");
+                let mut cx = x;
+                let flags = [
+                    (
+                        "Skip it while the last run is open",
+                        !f.overlap_run,
+                        SheetFlag::Overlap,
+                    ),
+                    (
+                        "Catch up after Tower was off",
+                        f.catch_up,
+                        SheetFlag::CatchUp,
+                    ),
+                    (
+                        "Sensitive: local models only",
+                        f.local_only,
+                        SheetFlag::LocalOnly,
+                    ),
+                ];
+                let mut cy = y;
+                for (label, on, flag) in flags.iter() {
+                    let cw = self.m.width(label, Font::Strong) + ch;
+                    if cx + cw > x + w && cx > x {
+                        cx = x;
+                        cy += ch + self.u * 1.5;
+                    }
+                    let r = self.pick_chip(
+                        cx,
+                        cy,
+                        label,
+                        self.t.info,
+                        *on,
+                        Hit::Button(Action::SheetFlag(*flag)),
+                    );
+                    cx = r.right() + self.u * 1.5;
+                }
+                y = cy + ch + gap;
+                y += self.para(
+                    x,
+                    y,
+                    "Saving it is your OK: it runs on time without Armed. What its agent then writes outside Tower (comments, PRs, landing) still follows Policy.",
+                    Font::Small,
+                    self.t.faint,
+                    w,
+                    3,
+                ) + gap;
+                self.buttons_right(
+                    x + w,
+                    y,
+                    vec![
+                        ("Cancel".into(), false, Hit::Button(Action::CloseSheet)),
+                        (
+                            "Save schedule".into(),
+                            true,
+                            Hit::Button(Action::Submit { launch: false }),
+                        ),
+                    ],
+                );
+                y += bh;
+            }
+            Sheet::Endpoint(f) => {
+                let editing = f.old_name.is_some();
+                let title = if editing {
+                    "Edit model server"
+                } else {
+                    "Add model server"
+                };
+                self.text(x, y, title, Font::Heading, self.t.text);
+                y += self.lh_of(Font::Heading) + gap;
+                let h = self.field_height(1);
+                y += self.labeled(x, y, "NAME");
+                self.field(Rect::new(x, y, w, h), FieldId::EpName, &f.name, 1);
+                y += h + self.u;
+                let name = f.name.text();
+                let name = if name.trim().is_empty() {
+                    "<name>".to_string()
+                } else {
+                    name.trim().to_string()
+                };
+                let hint = format!(
+                    "Its models are named {}/<model> in roles and handoffs.",
+                    name
+                );
+                y += self.hint(x, y, w, &hint) + gap;
+                y += self.labeled(x, y, "KIND");
+                let accent = self.t.accent;
+                let kinds = ENDPOINT_KINDS
+                    .iter()
+                    .map(|(k, _)| {
+                        (
+                            k.to_string(),
+                            f.kind == *k,
+                            accent,
+                            Hit::Button(Action::SheetKind(k.to_string())),
+                        )
+                    })
+                    .collect();
+                y += self.chip_row(x, y, w, kinds) + gap;
+                y += self.labeled(x, y, "ADDRESS");
+                self.field(Rect::new(x, y, w, h), FieldId::EpUrl, &f.url, 1);
+                y += h + gap;
+                y += self.labeled(x, y, "WHERE IT RUNS");
+                let guess = if looks_local(&f.url.text()) {
+                    "local"
+                } else {
+                    "cloud"
+                };
+                let (ok, info) = (self.t.ok, self.t.info);
+                let places = vec![
+                    (
+                        format!("Guess from the address ({})", guess),
+                        f.local.is_none(),
+                        self.t.muted,
+                        Hit::Button(Action::SheetLocal(None)),
+                    ),
+                    (
+                        "Inside our network".to_string(),
+                        f.local == Some(true),
+                        ok,
+                        Hit::Button(Action::SheetLocal(Some(true))),
+                    ),
+                    (
+                        "Cloud".to_string(),
+                        f.local == Some(false),
+                        info,
+                        Hit::Button(Action::SheetLocal(Some(false))),
+                    ),
+                ];
+                y += self.chip_row(x, y, w, places) + self.u;
+                y += self.hint(
+                    x,
+                    y,
+                    w,
+                    "Local-only work only ever goes to servers inside your network. A company server on an internal hostname looks like cloud to the guess: say so here.",
+                ) + gap;
+                y += self.labeled(x, y, "API KEY");
+                self.field(Rect::new(x, y, w, h), FieldId::EpKeyEnv, &f.key_env, 1);
+                y += h + self.u;
+                y += self.hint(
+                    x,
+                    y,
+                    w,
+                    "The name of an environment variable holding the key. Tower never stores the key itself.",
+                ) + gap;
+                if let Some(old) = &f.old_name {
+                    let armed = md.confirm_delete.as_deref() == Some(&format!("endpoint:{}", old));
+                    let label = if armed { "Delete: sure?" } else { "Delete" };
+                    self.buttons_left(
+                        x,
+                        y,
+                        vec![(
+                            label.into(),
+                            false,
+                            Hit::Button(Action::DeleteEndpoint(old.clone())),
+                        )],
+                    );
+                }
+                self.buttons_right(
+                    x + w,
+                    y,
+                    vec![
+                        ("Cancel".into(), false, Hit::Button(Action::CloseSheet)),
+                        (
+                            if editing { "Save server" } else { "Add server" }.into(),
+                            true,
+                            Hit::Button(Action::Submit { launch: false }),
+                        ),
+                    ],
+                );
+                y += bh;
+            }
+            Sheet::Role(f) => {
+                let title = if f.old_id.is_some() {
+                    "Edit role"
+                } else {
+                    "New role"
+                };
+                self.text(x, y, title, Font::Heading, self.t.text);
+                y += self.lh_of(Font::Heading) + gap;
+                let h = self.field_height(1);
+                y += self.labeled(x, y, "NAME");
+                self.field(Rect::new(x, y, w, h), FieldId::RoleName, &f.name, 1);
+                y += h + gap;
+                y += self.labeled(x, y, "COLOUR");
+                let colors = ROLE_COLORS
+                    .iter()
+                    .map(|(name, hex)| {
+                        (
+                            name.to_string(),
+                            f.color.eq_ignore_ascii_case(hex),
+                            Color::from_u8(hex_rgb(hex).unwrap_or([0x80, 0x80, 0x80])),
+                            Hit::Button(Action::SheetColor(hex.to_string())),
+                        )
+                    })
+                    .collect();
+                y += self.chip_row(x, y, w, colors) + gap;
+                y += self.labeled(x, y, "HOW IT RUNS");
+                let accent = self.t.accent;
+                let drivers = DRIVERS
+                    .iter()
+                    .map(|(d, _)| {
+                        (
+                            d.to_string(),
+                            f.driver == *d,
+                            accent,
+                            Hit::Button(Action::SheetDriver(d.to_string())),
+                        )
+                    })
+                    .collect();
+                y += self.chip_row(x, y, w, drivers) + self.u;
+                let what = DRIVERS
+                    .iter()
+                    .find(|(d, _)| *d == f.driver)
+                    .map(|(_, w)| *w)
+                    .unwrap_or("");
+                y += self.hint(x, y, w, what) + gap;
+                if !matches!(f.driver.as_str(), "routed" | "llm") {
+                    y += self.labeled(x, y, "PROGRAM");
+                    self.field(Rect::new(x, y, w, h), FieldId::RoleCommand, &f.command, 1);
+                    y += h + self.u;
+                    y += self.hint(
+                        x,
+                        y,
+                        w,
+                        "The command and its arguments, e.g. claude, codex, opencode acp.",
+                    ) + gap;
+                }
+                y += self.labeled(x, y, "MISSION");
+                let h5 = self.field_height(5);
+                self.field(Rect::new(x, y, w, h5), FieldId::RoleMission, &f.mission, 5);
+                y += h5 + gap;
+                if f.driver != "routed" {
+                    y += self.labeled(x, y, "MODELS, CHEAPEST FIRST");
+                    let h3 = self.field_height(3);
+                    self.field(Rect::new(x, y, w, h3), FieldId::RoleLadder, &f.ladder, 3);
+                    y += h3 + self.u;
+                    let ok = self.t.ok;
+                    let local: Vec<(String, bool, Color, Hit)> = md
+                        .snap
+                        .models
+                        .iter()
+                        .filter(|m| m.locality == Locality::Local)
+                        .map(|m| {
+                            (
+                                format!("+ {}", m.label),
+                                false,
+                                ok,
+                                Hit::Button(Action::RoleAddModel(m.id.clone())),
+                            )
+                        })
+                        .collect();
+                    if !local.is_empty() {
+                        y += self.chip_row(x, y, w, local) + self.u;
+                    }
+                    y += self.hint(
+                        x,
+                        y,
+                        w,
+                        "Escalate moves one step down this list. Local models are <server>/<model> from the Models view; cloud ones are what the program calls them (sonnet, opencode-go/kimi-k2.7-code).",
+                    ) + gap;
+                }
+                y += self.labeled(x, y, "AGENTS AT ONCE");
+                let half = (w - gap) / 2.0;
+                self.field(Rect::new(x, y, half, h), FieldId::RoleAtOnce, &f.at_once, 1);
+                y += h + gap;
+                y += self.hint(
+                    x,
+                    y,
+                    w,
+                    "MCP servers, ACP options, effort and sign-in stay in the role's file: Open file.",
+                ) + gap;
+                let mut left: Vec<(String, bool, Hit)> = vec![];
+                if let Some(old) = &f.old_id {
+                    let armed = md.confirm_delete.as_deref() == Some(&format!("role:{}", old));
+                    let label = if armed { "Delete: sure?" } else { "Delete" };
+                    left.push((
+                        label.into(),
+                        false,
+                        Hit::Button(Action::DeleteRole(old.clone())),
+                    ));
+                    if let Some(file) = &f.file {
+                        left.push((
+                            "Open file".into(),
+                            false,
+                            Hit::Button(Action::EditFile { path: file.clone() }),
+                        ));
+                    }
+                }
+                if !left.is_empty() {
+                    self.buttons_left(x, y, left);
+                }
+                self.buttons_right(
+                    x + w,
+                    y,
+                    vec![
+                        ("Cancel".into(), false, Hit::Button(Action::CloseSheet)),
+                        (
+                            "Save role".into(),
+                            true,
+                            Hit::Button(Action::Submit { launch: false }),
+                        ),
+                    ],
+                );
+                y += bh;
+            }
+            Sheet::Routing(f) => {
+                self.text(x, y, "Routing", Font::Heading, self.t.text);
+                y += self.lh_of(Font::Heading) + gap;
+                y += self.para(
+                    x,
+                    y,
+                    "Which engines run each task size, in order of preference. Routed roles (Crew) take the first one that is available; local-only work only ever gets local ones.",
+                    Font::Small,
+                    self.t.muted,
+                    w,
+                    4,
+                ) + gap;
+                let h = self.field_height(1);
+                for (label, id, field) in [
+                    ("LOW", FieldId::RouteLow, &f.low),
+                    ("MEDIUM", FieldId::RouteMedium, &f.medium),
+                    ("HIGH", FieldId::RouteHigh, &f.high),
+                ]
+                .iter()
+                {
+                    y += self.labeled(x, y, label);
+                    self.field(Rect::new(x, y, w, h), *id, field, 1);
+                    y += h + gap;
+                }
+                let known = if md.snap.engine_ids.is_empty() {
+                    "No engines in tower.toml [routing.engines] yet.".to_string()
+                } else {
+                    format!("Engines: {}", md.snap.engine_ids.join(", "))
+                };
+                y += self.hint(x, y, w, &known) + gap;
+                self.buttons_right(
+                    x + w,
+                    y,
+                    vec![
+                        ("Cancel".into(), false, Hit::Button(Action::CloseSheet)),
+                        (
+                            "Save routing".into(),
+                            true,
+                            Hit::Button(Action::Submit { launch: false }),
+                        ),
+                    ],
+                );
+                y += bh;
+            }
+            Sheet::LocalOnly(field) => {
+                self.text(x, y, "Local-only folders", Font::Heading, self.t.text);
+                y += self.lh_of(Font::Heading) + gap;
+                y += self.para(
+                    x,
+                    y,
+                    "Work in these folders is sensitive: Tower never starts a cloud model on it, triage included, and a cloud agent that handed part of it to a local model only hears whether it is done. A repo can also mark itself with [privacy] local_only = true in its .tower.toml, and list sensitive_paths there.",
+                    Font::Small,
+                    self.t.muted,
+                    w,
+                    6,
+                ) + gap;
+                y += self.labeled(x, y, "ONE FOLDER PER LINE");
+                let h5 = self.field_height(5);
+                self.field(Rect::new(x, y, w, h5), FieldId::LocalPaths, field, 5);
+                y += h5 + gap;
+                self.buttons_right(
+                    x + w,
+                    y,
+                    vec![
+                        ("Cancel".into(), false, Hit::Button(Action::CloseSheet)),
+                        (
+                            "Save folders".into(),
+                            true,
+                            Hit::Button(Action::Submit { launch: false }),
+                        ),
+                    ],
+                );
+                y += bh;
+            }
+            Sheet::Connect(on) => {
+                let title = if *on {
+                    "Connect your agents"
+                } else {
+                    "Disconnect your agents"
+                };
+                self.text(x, y, title, Font::Heading, self.t.text);
+                y += self.lh_of(Font::Heading) + gap;
+                let text = if *on {
+                    "Claude Code and Codex sessions you start yourself in any TGZTerminal pane get three tools: tower_models, tower_delegate and tower_await. With them they hand well-specified subtasks to your local models, keep working, and pick up the result. Tower never types into those panes.\n\nThis adds one MCP server named \"tower\" to ~/.claude.json and ~/.codex/config.toml (Codex only when it is installed). Nothing else in those files changes, and each is backed up once first (.tower-backup). Outside TGZTerminal the server offers no tools.\n\nSessions already running pick it up when you restart them."
+                } else {
+                    "Removes the \"tower\" MCP server from ~/.claude.json and ~/.codex/config.toml. Nothing else changes. Sessions already running keep it until you restart them."
+                };
+                y += self.para(x, y, text, Font::Body, self.t.text, w, 20) + gap;
+                self.buttons_right(
+                    x + w,
+                    y,
+                    vec![
+                        ("Cancel".into(), false, Hit::Button(Action::CloseSheet)),
+                        (
+                            if *on { "Connect" } else { "Disconnect" }.into(),
+                            true,
+                            Hit::Button(Action::Submit { launch: false }),
+                        ),
+                    ],
+                );
+                y += bh;
+            }
+            Sheet::Model(f) => {
+                let editing = f.old_id.is_some();
+                let title = if editing { "Edit model" } else { "Add model" };
+                self.text(x, y, title, Font::Heading, self.t.text);
+                y += self.lh_of(Font::Heading) + gap;
+                y += self.labeled(x, y, "SERVER");
+                if md.snap.endpoints.is_empty() {
+                    y += self.hint(x, y, w, "Add a model server first.") + gap;
+                } else {
+                    let (ok, info) = (self.t.ok, self.t.info);
+                    let servers = md
+                        .snap
+                        .endpoints
+                        .iter()
+                        .map(|e| {
+                            (
+                                e.name.clone(),
+                                f.endpoint.as_deref() == Some(e.name.as_str()),
+                                if e.local { ok } else { info },
+                                Hit::Button(Action::SheetEndpoint(e.name.clone())),
+                            )
+                        })
+                        .collect();
+                    y += self.chip_row(x, y, w, servers) + gap;
+                }
+                let h = self.field_height(1);
+                y += self.labeled(x, y, "NAME ON THE SERVER");
+                self.field(Rect::new(x, y, w, h), FieldId::ModelName, &f.name, 1);
+                y += h + self.u;
+                let served = f
+                    .endpoint
+                    .as_deref()
+                    .and_then(|n| md.snap.endpoints.iter().find(|e| e.name == n))
+                    .map(|e| e.models.clone())
+                    .unwrap_or_default();
+                let hint = if served.is_empty() {
+                    "As the server lists it (ollama list, /v1/models).".to_string()
+                } else {
+                    format!("It serves: {}", served.join(", "))
+                };
+                y += self.hint(x, y, w, &hint) + gap;
+                let half = (w - gap) / 2.0;
+                self.labeled(x, y, "LABEL");
+                y += self.labeled(x + half + gap, y, "SIZE");
+                self.field(Rect::new(x, y, half, h), FieldId::ModelLabel, &f.label, 1);
+                self.field(
+                    Rect::new(x + half + gap, y, half, h),
+                    FieldId::ModelSize,
+                    &f.size,
+                    1,
+                );
+                y += h + gap;
+                self.labeled(x, y, "CONTEXT (TOKENS)");
+                y += self.labeled(x + half + gap, y, "AGENTS AT ONCE");
+                self.field(
+                    Rect::new(x, y, half, h),
+                    FieldId::ModelContext,
+                    &f.context,
+                    1,
+                );
+                self.field(
+                    Rect::new(x + half + gap, y, half, h),
+                    FieldId::ModelAtOnce,
+                    &f.at_once,
+                    1,
+                );
+                y += h + gap;
+                y += self.labeled(x, y, "GOOD FOR");
+                let h3 = self.field_height(3);
+                self.field(
+                    Rect::new(x, y, w, h3),
+                    FieldId::ModelGoodFor,
+                    &f.good_for,
+                    3,
+                );
+                y += h3 + self.u;
+                y += self.hint(
+                    x,
+                    y,
+                    w,
+                    "Agents read this when they decide which subtasks to hand the model.",
+                ) + gap;
+                y += self.labeled(x, y, "NOTES");
+                self.field(Rect::new(x, y, w, h3), FieldId::ModelNotes, &f.notes, 3);
+                y += h3 + gap;
+                if let Some(old) = &f.old_id {
+                    let armed = md.confirm_delete.as_deref() == Some(&format!("model:{}", old));
+                    let label = if armed { "Delete: sure?" } else { "Delete" };
+                    self.buttons_left(
+                        x,
+                        y,
+                        vec![(
+                            label.into(),
+                            false,
+                            Hit::Button(Action::DeleteModel(old.clone())),
+                        )],
+                    );
+                }
+                self.buttons_right(
+                    x + w,
+                    y,
+                    vec![
+                        ("Cancel".into(), false, Hit::Button(Action::CloseSheet)),
+                        (
+                            if editing { "Save model" } else { "Add model" }.into(),
+                            true,
+                            Hit::Button(Action::Submit { launch: false }),
                         ),
                     ],
                 );
@@ -2525,15 +3359,13 @@ impl<'a> L<'a> {
                 role_id: role.id.clone(),
             }),
         );
-        if let Some(file) = &role.file {
-            self.button(
-                b.right() + self.u * 2.0,
-                y,
-                "Edit role",
-                false,
-                Hit::Button(Action::EditFile { path: file.clone() }),
-            );
-        }
+        self.button(
+            b.right() + self.u * 2.0,
+            y,
+            "Edit role",
+            false,
+            Hit::Button(Action::EditRole(role.id.clone())),
+        );
         y += b.h + pad;
         y - y0
     }
@@ -2674,7 +3506,7 @@ impl<'a> L<'a> {
             InboxKind::Permission => self.t.warn,
             InboxKind::Clearance => self.t.info,
             InboxKind::Question => self.t.violet,
-            InboxKind::GateFailure => self.t.bad,
+            InboxKind::GateFailure | InboxKind::Deadline => self.t.bad,
         };
         let x = x0 + pad;
         let right = x0 + w - pad;
@@ -2896,6 +3728,7 @@ impl<'a> L<'a> {
         let area = self.list_area(area);
         let md = self.md;
         let eps = &md.snap.endpoints;
+        let models = &md.snap.models;
         let pad = self.u * 4.0;
         let gap = self.u * 3.0;
         let warnings: Vec<(String, String)> = md
@@ -2909,6 +3742,7 @@ impl<'a> L<'a> {
             + self.lh_of(Font::Small)
             + self.u * 2.5
             + self.chip_h();
+        let model_h = self.model_card_h();
         let measure = self.push_clip(EMPTY);
         let mut warn_h = 0.0;
         for (name, w) in &warnings {
@@ -2919,22 +3753,28 @@ impl<'a> L<'a> {
         self.pop_clip(measure);
         let engines = &md.snap.engines;
         let eng_row = self.lh_of(Font::Body).max(self.chip_h()) + self.u * 2.0;
+        let label_h = self.lh_of(Font::SmallStrong) + self.u;
         let route_h = if engines.is_empty() {
             0.0
         } else {
-            self.lh_of(Font::SmallStrong)
-                + self.u
-                + pad
-                + engines.len() as f32 * eng_row
-                + pad
-                + gap * 2.0
+            label_h + pad + engines.len() as f32 * eng_row + pad + gap * 2.0
         };
-        let content = warn_h + route_h + eps.len() as f32 * (row_h + gap);
-        if eps.is_empty() && warnings.is_empty() && engines.is_empty() {
+        let models_h = if models.is_empty() {
+            0.0
+        } else {
+            label_h + models.len() as f32 * (model_h + gap) + gap
+        };
+        let eps_h = if eps.is_empty() {
+            0.0
+        } else {
+            label_h + eps.len() as f32 * (row_h + gap)
+        };
+        let content = warn_h + models_h + route_h + eps_h;
+        if eps.is_empty() && warnings.is_empty() && engines.is_empty() && models.is_empty() {
             self.empty_state(
                 area,
                 "No model servers",
-                "Add Ollama, LM Studio, llama.cpp, vLLM or MLX hosts to models.toml.",
+                "Add server: Ollama, LM Studio, llama.cpp, vLLM, MLX or any OpenAI-compatible host, on this Mac, the LAN or your company network. Then add the models on it that agents may hand work to.",
             );
             return;
         }
@@ -2946,19 +3786,37 @@ impl<'a> L<'a> {
             let c = self.t.warn;
             y += self.banner(area.x, y, area.w, &text, c) + gap;
         }
+        if !models.is_empty() {
+            y += self.section_label(area.x, y, "MODELS AGENTS CAN HAND WORK TO");
+            for m in models.iter() {
+                self.model_card(m, Rect::new(area.x, y, area.w, model_h));
+                y += model_h + gap;
+            }
+            y += gap;
+        }
         if !engines.is_empty() {
             let mode = if md.snap.bandit_mode.is_empty() {
                 "shadow"
             } else {
                 md.snap.bandit_mode.as_str()
             };
-            let label = format!("ROUTING  ·  learned policy: {}", mode);
+            let label = format!(
+                "ROUTING  ·  learned policy: {}  ·  click to change the tiers",
+                mode
+            );
             y += self.section_label(area.x, y, &label);
             let card_h = pad * 2.0 + engines.len() as f32 * eng_row;
             let r = Rect::new(area.x, y, area.w, card_h);
             let radius = self.u * 2.4;
+            let hit = Hit::Button(Action::EditRouting);
+            let bg = if self.hovered(&hit) {
+                self.t.card_hover
+            } else {
+                self.t.card
+            };
             self.shadow(r, radius);
-            self.fill(r, self.t.card, radius);
+            self.fill(r, bg, radius);
+            self.hit(r, hit);
             let x = r.x + pad;
             let right = r.right() - pad;
             let mut ry = r.y + pad;
@@ -2972,6 +3830,7 @@ impl<'a> L<'a> {
                 self.tier_chip(x + d + self.u * 2.0, cy, &e.tier);
                 let nx = x + d + self.u * 4.0 + tier_w;
                 let nw = self.text(nx, ty, &e.id, Font::Strong, self.t.text);
+                let lc = self.locality_chip(nx + nw + self.u * 2.0, cy, e.locality);
                 let mut detail = format!("{} {}", e.driver.label(), e.model);
                 if !e.effort.is_empty() {
                     detail.push_str(&format!(" · effort {}", e.effort));
@@ -2982,7 +3841,7 @@ impl<'a> L<'a> {
                     None => ("ready".to_string(), self.t.muted),
                 };
                 let sw = self.text_right(right, ty, &status, Font::Small, sc);
-                let dx = nx + nw + self.u * 2.5;
+                let dx = lc.right() + self.u * 2.5;
                 self.text_fit(
                     dx,
                     ty,
@@ -2995,11 +3854,21 @@ impl<'a> L<'a> {
             }
             y += card_h + gap * 2.0;
         }
+        if !eps.is_empty() {
+            y += self.section_label(area.x, y, "MODEL SERVERS");
+        }
         for ep in eps.iter() {
             let r = Rect::new(area.x, y, area.w, row_h);
             let radius = self.u * 2.4;
+            let card_hit = Hit::Button(Action::EditEndpoint(ep.name.clone()));
+            let bg = if self.hovered(&card_hit) {
+                self.t.card_hover
+            } else {
+                self.t.card
+            };
             self.shadow(r, radius);
-            self.fill(r, self.t.card, radius);
+            self.fill(r, bg, radius);
+            self.hit(r, card_hit);
             let x = r.x + pad;
             let ty = r.y + pad;
             let (hc, hl) = match ep.health {
@@ -3013,13 +3882,14 @@ impl<'a> L<'a> {
             let nw = self.text(nx, ty, &ep.name, Font::Strong, self.t.text);
             let fg = self.t.muted;
             let bg = self.t.tint(self.t.muted);
-            self.chip(
-                nx + nw + self.u * 2.0,
-                ty + (self.lh_of(Font::Strong) - self.chip_h()) / 2.0,
-                &ep.kind,
-                fg,
-                bg,
-            );
+            let cy = ty + (self.lh_of(Font::Strong) - self.chip_h()) / 2.0;
+            let kc = self.chip(nx + nw + self.u * 2.0, cy, &ep.kind, fg, bg);
+            let locality = if ep.local {
+                Locality::Local
+            } else {
+                Locality::Cloud
+            };
+            self.locality_chip(kc.right() + self.u * 1.5, cy, locality);
             let status = match ep.latency_ms {
                 Some(ms) => format!("{} · {} ms", hl, ms),
                 None => hl.to_string(),
@@ -3045,19 +3915,166 @@ impl<'a> L<'a> {
                 self.text(cx, my, msg, Font::Small, self.t.faint);
             }
             for model in &ep.models {
-                let cw = self.chip_w(model);
+                // Served models: click one to describe it for agents.
+                let id = format!("{}/{}", ep.name, model);
+                let known = models.iter().any(|m| m.id == id);
+                let label = if known {
+                    model.clone()
+                } else {
+                    format!("+ {}", model)
+                };
+                let cw = self.chip_w(&label);
                 if cx + cw > r.right() - pad {
                     break;
                 }
-                let fg = self.t.text;
-                let bg = self.t.tint(self.t.ok);
-                let c = self.chip(cx, my, model, fg, bg);
+                let (fg, bg) = if known {
+                    (self.t.text, self.t.tint(self.t.ok))
+                } else {
+                    (self.t.muted, self.t.tint(self.t.muted))
+                };
+                let c = self.chip(cx, my, &label, fg, bg);
+                let hit = if known {
+                    Hit::Button(Action::EditModel(id))
+                } else {
+                    Hit::Button(Action::NewModel(Some(id)))
+                };
+                self.hit(c, hit);
                 cx = c.right() + self.u * 1.5;
             }
             y += row_h + gap;
         }
         self.pop_clip(old);
         self.scrollbar(area, content, off);
+    }
+
+    fn model_card_h(&self) -> f32 {
+        let pad = self.u * 4.0;
+        pad * 2.0
+            + self.lh_of(Font::Strong)
+            + self.u
+            + self.lh_of(Font::Small)
+            + self.u * 2.0
+            + self.chip_h()
+            + self.u
+            + self.lh_of(Font::Small)
+    }
+
+    /// One `[[model]]`: what agents read before handing it work.
+    fn model_card(&mut self, m: &ModelInfo, r: Rect) {
+        let pad = self.u * 4.0;
+        let radius = self.u * 2.4;
+        let hit = Hit::Button(Action::EditModel(m.id.clone()));
+        let bg = if self.hovered(&hit) {
+            self.t.card_hover
+        } else {
+            self.t.card
+        };
+        self.shadow(r, radius);
+        self.fill(r, bg, radius);
+        self.hit(r, hit);
+        let x = r.x + pad;
+        let right = r.right() - pad;
+        let ty = r.y + pad;
+        let d = self.u * 1.6;
+        let dc = if m.available { self.t.ok } else { self.t.bad };
+        self.dot(x + d / 2.0, ty + self.lh_of(Font::Strong) / 2.0, d, dc);
+        let nx = x + d + self.u * 2.5;
+        let nw = self.text(nx, ty, &m.label, Font::Strong, self.t.text);
+        let cy = ty + (self.lh_of(Font::Strong) - self.chip_h()) / 2.0;
+        self.locality_chip(nx + nw + self.u * 2.0, cy, m.locality);
+        let (status, sc) = match &m.why {
+            Some(w) => (w.clone(), self.t.warn),
+            None => (
+                format!("{} of {} running", m.busy, m.max_concurrency),
+                self.t.muted,
+            ),
+        };
+        self.text_right(right, ty, &status, Font::Small, sc);
+        let mut facts = vec![m.id.clone()];
+        if !m.size.is_empty() {
+            facts.push(m.size.clone());
+        }
+        if let Some(c) = m.context {
+            facts.push(format!("{} context", compact(c as f64)));
+        }
+        let ly = ty + self.lh_of(Font::Strong) + self.u;
+        self.text_fit(
+            nx,
+            ly,
+            &facts.join("  ·  "),
+            Font::Small,
+            self.t.muted,
+            right - nx,
+        );
+        let gy = ly + self.lh_of(Font::Small) + self.u * 2.0;
+        let mut cx = nx;
+        if m.good_for.is_empty() {
+            self.text(
+                cx,
+                gy,
+                "Say what it is good for, so agents know what to hand it",
+                Font::Small,
+                self.t.faint,
+            );
+        }
+        for g in &m.good_for {
+            let cw = self.chip_w(g);
+            if cx + cw > right {
+                break;
+            }
+            let fg = self.t.text;
+            let bg = self.t.tint(self.t.violet);
+            let c = self.chip(cx, gy, g, fg, bg);
+            cx = c.right() + self.u * 1.5;
+        }
+        let ny = gy + self.chip_h() + self.u;
+        if !m.notes.is_empty() {
+            let note = m.notes.lines().next().unwrap_or("");
+            self.text_fit(nx, ny, note, Font::Small, self.t.faint, right - nx);
+        }
+    }
+
+    /// Sensitive work: only models inside your network may see it.
+    fn local_only_chip(&mut self, x: f32, y: f32) -> Rect {
+        let c = self.t.ok;
+        let fg = self.t.readable(c);
+        let bg = self.t.tint(c);
+        self.dot_chip(x, y, "local only", c, fg, bg)
+    }
+
+    /// The "sensitive" toggle of the New flight form; returns its height.
+    fn local_only_toggle(&mut self, x: f32, y: f32, w: f32, on: bool) -> f32 {
+        let ok = self.t.ok;
+        let h = self.chip_row(
+            x,
+            y,
+            w,
+            vec![(
+                "Sensitive: local models only".to_string(),
+                on,
+                ok,
+                Hit::Button(Action::SheetFlag(SheetFlag::LocalOnly)),
+            )],
+        );
+        let hint = if on {
+            "Only models inside your network work on it; cloud agents are refused, triage too."
+        } else {
+            "Credentials, customer or personal data? Keep it on your own models."
+        };
+        let hy = y + h + self.u;
+        self.text_fit(x, hy, hint, Font::Small, self.t.faint, w);
+        hy + self.lh_of(Font::Small) - y
+    }
+
+    /// "local" (inside your network) or "cloud".
+    fn locality_chip(&mut self, x: f32, y: f32, l: Locality) -> Rect {
+        let (label, c) = match l {
+            Locality::Local => ("local", self.t.ok),
+            Locality::Cloud => ("cloud", self.t.info),
+        };
+        let fg = self.t.readable(c);
+        let bg = self.t.tint(c);
+        self.chip(x, y, label, fg, bg)
     }
 
     // -- intake -------------------------------------------------------------
@@ -3070,7 +4087,7 @@ impl<'a> L<'a> {
             self.empty_state(
                 area,
                 "No intake yet",
-                "Add a [[jira]] watch to sources.toml and store an API token with `tower auth jira <site>`. New issues then arrive as flights, and nothing is written back to Jira without your clearance.",
+                "Add a [[jira]], [[github]] or [[gitlab]] watch to sources.toml (Jira: store a token with `tower auth jira <site>`; GitHub/GitLab use your gh/glab login), or a [[scout]] that reads mail or Teams through an agent's own M365 tools. New items arrive as flights; what Tower may then do on its own is set in Policy.",
             );
             return;
         }
@@ -3121,10 +4138,13 @@ impl<'a> L<'a> {
         self.dot(x + d / 2.0, y + self.lh_of(Font::Strong) / 2.0, d, dot);
         let nx = x + d + self.u * 2.5;
         let nw = self.text_fit(nx, y, &src.name, Font::Strong, self.t.text, w * 0.5);
-        let kind = if src.kind == "jira" {
-            "Jira"
-        } else {
-            src.kind.as_str()
+        let kind = match src.kind.as_str() {
+            "jira" => "Jira",
+            "github" => "GitHub",
+            "gitlab" => "GitLab",
+            "mail" => "Mail scout",
+            "teams" => "Teams scout",
+            other => other,
         };
         let fg = self.t.info;
         let bg = self.t.tint(self.t.info);
@@ -3151,8 +4171,13 @@ impl<'a> L<'a> {
             })
             .unwrap_or_else(|| "held for you".into());
         let mut line = format!("→ {}", role);
+        let scout = matches!(src.kind.as_str(), "mail" | "teams");
         if src.auto_launch {
-            line.push_str(" · launches automatically");
+            line.push_str(if scout {
+                " · runs on its own while armed"
+            } else {
+                " · starts on its own while armed"
+            });
         }
         line.push_str(&format!(
             " · {} flight{} so far",
@@ -3161,11 +4186,858 @@ impl<'a> L<'a> {
         ));
         self.text_fit(nx, y, &line, Font::Small, self.t.faint, right - nx);
         y += self.lh_of(Font::Small) + self.u * 2.0;
+        if scout && !src.polling {
+            let (_, bh) = self.button_size("Run scout");
+            self.button(
+                nx,
+                y,
+                "Run scout",
+                true,
+                Hit::Button(Action::RunScout(src.name.clone())),
+            );
+            y += bh + self.u * 2.0;
+        }
         if let Some(err) = &src.error {
             let c = self.t.bad;
             y += self.banner(nx, y, right - nx, err, c) + self.u * 2.0;
         }
         y + pad - self.u * 2.0 - y0
+    }
+
+    // -- response clocks ----------------------------------------------------
+
+    fn tone_color(&self, tone: Tone) -> Color {
+        match tone {
+            Tone::Quiet => self.t.muted,
+            Tone::Calm => self.t.ok,
+            Tone::Half => self.t.warn,
+            Tone::Late => self.t.bad,
+        }
+    }
+
+    // -- policy -------------------------------------------------------------
+
+    /// Seconds Armed has left, if armed.
+    fn armed_left(&self) -> Option<u64> {
+        self.md
+            .snap
+            .armed_until
+            .filter(|until| *until > self.now)
+            .map(|until| until - self.now)
+    }
+
+    fn policy(&mut self, area: Rect) {
+        let area = self.list_area(area);
+        let md = self.md;
+        let rows = &md.snap.policy;
+        if rows.is_empty() {
+            self.empty_state(
+                area,
+                "No policy yet",
+                "This towerd predates [policy]: restart it to see what Tower may do on its own.",
+            );
+            return;
+        }
+        let pad = self.u * 4.0;
+        let row_h = self.lh_of(Font::Strong) + self.lh_of(Font::Small) + self.u * 5.0;
+        let intro = if self.armed_left().is_some() {
+            "Armed: actions set to auto run on their own until the timer ends; the rest still ask. Levels: off · draft (prepared, you do it) · confirm (one click in the Inbox) · auto."
+        } else {
+            "Disarmed: every action asks first, even those set to auto. Arm Tower when you want auto actions to run. Levels: off · draft (prepared, you do it) · confirm (one click in the Inbox) · auto."
+        };
+        let measure = self.push_clip(EMPTY);
+        let intro_h = self.para(area.x, 0.0, intro, Font::Small, self.t.muted, area.w, 4);
+        self.pop_clip(measure);
+        let card_h = row_h * rows.len() as f32 + pad * 2.0;
+        let content = intro_h + self.u * 4.0 + card_h;
+        let off = self.scroll_region(ScrollId::Policy, area, content, false, false);
+        let old = self.push_clip(area);
+        let mut y = area.y - off;
+        y += self.para(area.x, y, intro, Font::Small, self.t.muted, area.w, 4) + self.u * 4.0;
+        let card = Rect::new(area.x, y, area.w, card_h);
+        let radius = self.u * 2.4;
+        self.shadow(card, radius);
+        self.fill(card, self.t.card, radius);
+        let x = card.x + pad;
+        let right = card.right() - pad;
+        y += pad;
+        for row in rows.iter() {
+            // One chip per level; the current one is filled. Click to set.
+            let mut cx = right;
+            for level in ["auto", "confirm", "draft", "off"].iter() {
+                let color = match *level {
+                    "auto" => self.t.bad,
+                    "confirm" => self.t.info,
+                    "draft" => self.t.muted,
+                    _ => self.t.faint,
+                };
+                let cw =
+                    self.m.width(level, Font::Strong) + self.lh_of(Font::Strong) + self.u * 2.0;
+                cx -= cw;
+                self.pick_chip(
+                    cx,
+                    y - self.u,
+                    level,
+                    color,
+                    row.level == *level,
+                    Hit::Button(Action::SetPolicyLevel {
+                        action: row.action.clone(),
+                        level: level.to_string(),
+                    }),
+                );
+                cx -= self.u * 1.2;
+            }
+            let cw = right - cx;
+            let text_w = (right - x - cw - self.u * 4.0).max(0.0);
+            self.text_fit(x, y, &row.action, Font::Strong, self.t.text, text_w);
+            let sy = y + self.lh_of(Font::Strong) + self.u;
+            let help = if row.configured {
+                format!("{} · set here", action_help(&row.action))
+            } else {
+                action_help(&row.action).to_string()
+            };
+            self.text_fit(x, sy, &help, Font::Small, self.t.muted, text_w);
+            y += row_h;
+        }
+        self.pop_clip(old);
+        self.scrollbar(area, content, off);
+    }
+
+    // -- routines -----------------------------------------------------------
+
+    /// A card around `body`, which is laid out twice: once to measure it,
+    /// once to draw it. Returns the card's height.
+    fn boxed(
+        &mut self,
+        x: f32,
+        y: f32,
+        w: f32,
+        body: &dyn Fn(&mut Self, f32, f32, f32) -> f32,
+    ) -> f32 {
+        let pad = self.u * 4.0;
+        let measure = self.push_clip(EMPTY);
+        let inner = body(self, x + pad, 0.0, w - pad * 2.0);
+        self.pop_clip(measure);
+        let h = inner + pad * 2.0;
+        let r = Rect::new(x, y, w, h);
+        let radius = self.u * 2.4;
+        self.shadow(r, radius);
+        self.fill(r, self.t.card, radius);
+        body(self, x + pad, y + pad, w - pad * 2.0);
+        h
+    }
+
+    /// A card with a title and a line of explanation; returns its height.
+    fn note_card(&mut self, x: f32, y: f32, w: f32, title: &str, detail: &str) -> f32 {
+        self.boxed(x, y, w, &|l: &mut Self, x, y, w| {
+            l.text(x, y, title, Font::Strong, l.t.muted);
+            let th = l.lh_of(Font::Strong) + l.u;
+            th + l.para(x, y + th, detail, Font::Small, l.t.faint, w, 4)
+        })
+    }
+
+    /// A row of buttons from `x`; returns the button height.
+    fn buttons_left(&mut self, x: f32, y: f32, items: Vec<(String, bool, Hit)>) -> f32 {
+        let mut bx = x;
+        let mut bh = 0.0f32;
+        for (label, primary, hit) in items {
+            let r = self.button(bx, y, &label, primary, hit);
+            bx = r.right() + self.u * 2.0;
+            bh = bh.max(r.h);
+        }
+        bh
+    }
+
+    /// `Mon 08:30 · in 3h 12m`.
+    fn when_label(&self, t: u64) -> String {
+        format!(
+            "{} · in {}",
+            civil_label(&local_civil(t)),
+            duration(t.saturating_sub(self.now))
+        )
+    }
+
+    fn run_color(&self, r: RunResult) -> Color {
+        match r {
+            RunResult::Running => self.t.info,
+            RunResult::Landed => self.t.ok,
+            RunResult::Proposed => self.t.warn,
+            RunResult::Declined | RunResult::Failed => self.t.bad,
+            RunResult::Skipped => self.t.faint,
+        }
+    }
+
+    fn routines(&mut self, area: Rect) {
+        let area = self.list_area(area);
+        let measure = self.push_clip(EMPTY);
+        let content = self.routines_body(area.x, 0.0, area.w);
+        self.pop_clip(measure);
+        let off = self.scroll_region(ScrollId::Routines, area, content, false, false);
+        let old = self.push_clip(area);
+        self.routines_body(area.x, area.y - off, area.w);
+        self.pop_clip(old);
+        self.scrollbar(area, content, off);
+    }
+
+    fn routines_body(&mut self, x: f32, y0: f32, w: f32) -> f32 {
+        let md = self.md;
+        let gap = self.u * 3.0;
+        let mut y = y0;
+        y += self.section_label(x, y, "TOWER SCHEDULES");
+        if md.snap.schedules.is_empty() {
+            y += self.note_card(
+                x,
+                y,
+                w,
+                "No schedules yet",
+                "A schedule starts a flight at a time: a morning PR review, a nightly dependency audit. New schedule (key s) has templates. Saving one is your OK for it to run on time, without Armed.",
+            ) + gap;
+        }
+        for row in md.snap.schedules.iter() {
+            y += self.boxed(x, y, w, &|l: &mut Self, x, y, w| {
+                l.schedule_body(row, x, y, w)
+            }) + gap;
+        }
+        y += self.u * 3.0;
+        y += self.section_label(x, y, "THIS MACHINE · READ-ONLY");
+        if !md.snap.routines_note.is_empty() {
+            let c = self.t.warn;
+            y += self.banner(x, y, w, &md.snap.routines_note, c) + gap;
+        }
+        let mine: Vec<&RoutineRow> = md.snap.routines.iter().filter(|r| r.yours).collect();
+        let other: Vec<&RoutineRow> = md.snap.routines.iter().filter(|r| !r.yours).collect();
+        if mine.is_empty() && md.snap.routines_note.is_empty() {
+            y += self.note_card(
+                x,
+                y,
+                w,
+                "None of your own",
+                "No launchd agents of yours in ~/Library/LaunchAgents and no crontab lines. Tower only reads these; it never changes them.",
+            ) + gap;
+        }
+        for r in mine {
+            y += self.boxed(x, y, w, &|l: &mut Self, x, y, w| l.routine_body(r, x, y, w)) + gap;
+        }
+        if !other.is_empty() {
+            let label = if md.show_other_routines {
+                format!("Hide {} other jobs", other.len())
+            } else {
+                format!("Show {} other jobs (updaters, helpers)", other.len())
+            };
+            let (_, bh) = self.button_size(&label);
+            self.button(
+                x,
+                y,
+                &label,
+                false,
+                Hit::Button(Action::ToggleOtherRoutines),
+            );
+            y += bh + gap;
+            if md.show_other_routines {
+                for r in other {
+                    y += self.boxed(x, y, w, &|l: &mut Self, x, y, w| l.routine_body(r, x, y, w))
+                        + gap;
+                }
+            }
+        }
+        y - y0
+    }
+
+    /// One Tower schedule; returns its height.
+    fn schedule_body(&mut self, row: &ScheduleRow, x: f32, y0: f32, w: f32) -> f32 {
+        let md = self.md;
+        let spec = &row.spec;
+        let right = x + w;
+        let mut y = y0;
+        let (dot, state) = if row.error.is_some() {
+            (self.t.bad, "can't run".to_string())
+        } else if !spec.enabled {
+            (self.t.faint, "paused by you".to_string())
+        } else if row.paused_reason.is_some() {
+            (self.t.warn, "paused by Tower".to_string())
+        } else {
+            match row.next_fire_unix {
+                Some(t) => (self.t.ok, format!("next {}", self.when_label(t))),
+                None => (self.t.muted, "planning…".to_string()),
+            }
+        };
+        let sl = self.lh_of(Font::Strong);
+        let d = self.u * 1.6;
+        self.dot(x + d / 2.0, y + sl / 2.0, d, dot);
+        let nx = x + d + self.u * 2.5;
+        let state_w = self.m.width(&state, Font::Small);
+        let name_w = (right - nx - state_w - self.u * 4.0).max(0.0);
+        self.text_fit(nx, y, &spec.name, Font::Strong, self.t.text, name_w);
+        self.text_right(right, y, &state, Font::Small, dot);
+        y += sl + self.u;
+        let role = match spec.role.as_str() {
+            "auto" => "Auto".to_string(),
+            r => md
+                .snap
+                .role(r)
+                .map(|x| x.name.clone())
+                .unwrap_or_else(|| r.to_string()),
+        };
+        let place = match spec.place.as_str() {
+            "dir" => format!("in {}", spec.path.clone().unwrap_or_default()),
+            "worktree" => format!("worktree of {}", spec.path.clone().unwrap_or_default()),
+            _ => "new folder each run".to_string(),
+        };
+        let line = format!("{} · {} · {}", row.when_text, role, place);
+        self.text_fit(nx, y, &line, Font::Small, self.t.muted, right - nx);
+        y += self.lh_of(Font::Small) + self.u * 2.0;
+
+        // The latest runs, oldest first; a dot with a flight opens it.
+        let shown = row.recent.len().min(20);
+        if shown == 0 {
+            self.text(nx, y, "No runs yet", Font::Small, self.t.faint);
+            y += self.lh_of(Font::Small) + self.u * 2.0;
+        } else {
+            let dd = self.u * 2.2;
+            let step = dd + self.u * 1.4;
+            let marks = &row.recent[row.recent.len() - shown..];
+            for (i, m) in marks.iter().enumerate() {
+                let cx = nx + dd / 2.0 + i as f32 * step;
+                let cy = y + self.lh_of(Font::Small) / 2.0;
+                let c = self.run_color(m.result);
+                self.dot(cx, cy, dd, c);
+                if let Some(fid) = m.flight.as_ref().filter(|f| md.snap.flight(f).is_some()) {
+                    self.hit(
+                        Rect::new(cx - step / 2.0, cy - step / 2.0, step, step),
+                        Hit::Button(Action::OpenFlight {
+                            flight_id: fid.clone(),
+                        }),
+                    );
+                }
+            }
+            if let Some(last) = marks.last() {
+                let what = match last.result {
+                    RunResult::Running => "running",
+                    RunResult::Landed => "landed",
+                    RunResult::Proposed => "proposed",
+                    RunResult::Declined => "declined",
+                    RunResult::Failed => "failed",
+                    RunResult::Skipped => "skipped",
+                };
+                let mut text = format!("last {} ago: {}", age(self.now, last.at_unix), what);
+                if !last.note.is_empty() {
+                    text.push_str(&format!(" ({})", last.note));
+                }
+                let tx = nx + shown as f32 * step + self.u * 2.0;
+                self.text_fit(
+                    tx,
+                    y,
+                    &text,
+                    Font::Small,
+                    self.t.muted,
+                    (right - tx).max(0.0),
+                );
+            }
+            y += self.lh_of(Font::Small) + self.u * 2.0;
+        }
+        if let Some(why) = &row.paused_reason {
+            let c = self.t.warn;
+            y += self.banner(nx, y, right - nx, &format!("Paused: {}", why), c) + self.u * 2.0;
+        }
+        if let Some(err) = &row.error {
+            let c = self.t.bad;
+            y += self.banner(nx, y, right - nx, err, c) + self.u * 2.0;
+        }
+        let id = spec.id.clone();
+        let paused = !spec.enabled || row.paused_reason.is_some();
+        let delete = if md.confirm_delete.as_deref() == Some(id.as_str()) {
+            "Really delete?"
+        } else {
+            "Delete"
+        };
+        y += self.buttons_left(
+            nx,
+            y,
+            vec![
+                (
+                    "Run now".to_string(),
+                    true,
+                    Hit::Button(Action::RunSchedule(id.clone())),
+                ),
+                (
+                    if paused { "Resume" } else { "Pause" }.to_string(),
+                    false,
+                    Hit::Button(Action::SetScheduleEnabled {
+                        id: id.clone(),
+                        enabled: paused,
+                    }),
+                ),
+                (
+                    "Edit".to_string(),
+                    false,
+                    Hit::Button(Action::EditSchedule(id.clone())),
+                ),
+                (
+                    delete.to_string(),
+                    false,
+                    Hit::Button(Action::DeleteSchedule(id)),
+                ),
+            ],
+        );
+        y - y0
+    }
+
+    /// One launchd job or crontab line; returns its height.
+    fn routine_body(&mut self, r: &RoutineRow, x: f32, y0: f32, w: f32) -> f32 {
+        let right = x + w;
+        let mut y = y0;
+        let sl = self.lh_of(Font::Strong);
+        let src = if r.source == "cron" {
+            "cron"
+        } else {
+            "launchd"
+        };
+        let fg = self.t.info;
+        let bg = self.t.tint(self.t.info);
+        let chip = self.chip(x, y + (sl - self.chip_h()) / 2.0, src, fg, bg);
+        let (state, color) = if r.stalled {
+            ("looks stalled".to_string(), self.t.warn)
+        } else if r.pid.is_some() {
+            ("running".to_string(), self.t.info)
+        } else if r.disabled {
+            ("disabled".to_string(), self.t.faint)
+        } else if !r.loaded {
+            ("not loaded".to_string(), self.t.faint)
+        } else {
+            match r.last_exit {
+                Some(0) => ("last exit 0".to_string(), self.t.ok),
+                Some(c) => (format!("last exit {}", c), self.t.bad),
+                None => (String::new(), self.t.muted),
+            }
+        };
+        let state_w = self.m.width(&state, Font::Small);
+        let nx = chip.right() + self.u * 2.0;
+        let name_w = (right - nx - state_w - self.u * 4.0).max(0.0);
+        self.text_fit(nx, y, &r.label, Font::Strong, self.t.text, name_w);
+        self.text_right(right, y, &state, Font::Small, color);
+        y += sl + self.u;
+        let mut line = r.schedule_text.clone();
+        if let Some(t) = r.next_fire_unix {
+            line.push_str(&format!(" · next {}", self.when_label(t)));
+        }
+        if let Some(t) = r.last_activity_unix {
+            line.push_str(&format!(" · log written {} ago", age(self.now, t)));
+        }
+        self.text_fit(x, y, &line, Font::Small, self.t.muted, w);
+        y += self.lh_of(Font::Small) + self.u;
+        if !r.program.is_empty() && r.program != r.label {
+            self.text_fit(x, y, &r.program, Font::Small, self.t.faint, w);
+            y += self.lh_of(Font::Small) + self.u;
+        }
+        let mut items = vec![];
+        if let Some(p) = &r.file_path {
+            items.push((
+                "Open file".to_string(),
+                false,
+                Hit::Button(Action::EditFile { path: p.clone() }),
+            ));
+        }
+        if let Some(p) = &r.log_path {
+            items.push((
+                "Open log".to_string(),
+                false,
+                Hit::Button(Action::OpenPath { path: p.clone() }),
+            ));
+        }
+        if !items.is_empty() {
+            y += self.u + self.buttons_left(x, y + self.u, items);
+        }
+        y - y0
+    }
+
+    // -- activity -----------------------------------------------------------
+
+    fn activity(&mut self, area: Rect) {
+        let w = area.w.min(self.lh * 64.0);
+        let area = Rect::new(
+            area.x,
+            area.y + self.u * 4.0,
+            w,
+            (area.h - self.u * 4.0).max(0.0),
+        );
+        let measure = self.push_clip(EMPTY);
+        let content = self.activity_body(area.x, 0.0, area.w - self.u * 3.0);
+        self.pop_clip(measure);
+        let off = self.scroll_region(ScrollId::Activity, area, content, false, false);
+        let old = self.push_clip(area);
+        self.activity_body(area.x, area.y - off, area.w - self.u * 3.0);
+        self.pop_clip(old);
+        self.scrollbar(area, content, off);
+    }
+
+    /// The days the charts show, oldest first.
+    fn activity_days(&self) -> &'a [DayStats] {
+        let md = self.md;
+        let days = &md.snap.activity.days;
+        let n = md.activity_days.min(days.len());
+        &days[days.len() - n..]
+    }
+
+    fn activity_body(&mut self, x: f32, y0: f32, w: f32) -> f32 {
+        let md = self.md;
+        let days = self.activity_days();
+        let gap = self.u * 3.0;
+        let mut y = y0;
+        if days
+            .iter()
+            .all(|d| d.started.is_empty() && d.auto.is_empty() && d.asked == 0 && d.cost_usd == 0.0)
+        {
+            y += self.note_card(
+                x,
+                y,
+                w,
+                "Nothing yet",
+                "Once flights start (by you, a watch, a scout or a schedule), this shows what ran by itself, what asked you, how runs ended and what it cost.",
+            );
+            return y - y0;
+        }
+        let total = |f: &dyn Fn(&DayStats) -> f64| days.iter().map(|d| f(d)).collect::<Vec<f64>>();
+        let auto_all = total(&|d| d.auto.values().sum::<u32>() as f64);
+        let scheduled = total(&|d| count(&d.auto, "schedule.run"));
+        let landed = total(&|d| count(&d.outcomes, "landed") + count(&d.outcomes, "proposed"));
+        let asked = total(&|d| d.asked as f64);
+        let spent = total(&|d| d.cost_usd);
+        let gates = total(&|d| count(&d.outcomes, "gates_failed"));
+        let sum = |v: &[f64]| v.iter().sum::<f64>();
+        let tiles: Vec<(&str, String, &[f64], Color)> = vec![
+            (
+                "Ran by itself",
+                compact(sum(&auto_all)),
+                &auto_all[..],
+                self.t.accent,
+            ),
+            (
+                "Scheduled runs",
+                compact(sum(&scheduled)),
+                &scheduled[..],
+                self.t.ok,
+            ),
+            ("Landed", compact(sum(&landed)), &landed[..], self.t.ok),
+            ("Asked you", compact(sum(&asked)), &asked[..], self.t.info),
+            ("Spent", compact_money(sum(&spent)), &spent[..], self.t.warn),
+            (
+                "Gate failures",
+                compact(sum(&gates)),
+                &gates[..],
+                self.t.bad,
+            ),
+        ];
+        let min_tile = self.lh * 10.0;
+        let cols = (((w + gap) / (min_tile + gap)).floor() as usize)
+            .max(1)
+            .min(tiles.len());
+        let tw = (w - gap * (cols as f32 - 1.0)) / cols as f32;
+        let pad = self.u * 3.0;
+        let spark_h = (self.lh * 1.4).round();
+        let th = pad * 2.0 + self.lh_of(Font::Small) + self.lh_of(Font::Heading) + self.u + spark_h;
+        for (i, (label, value, series, color)) in tiles.iter().enumerate() {
+            let cx = x + (i % cols) as f32 * (tw + gap);
+            let cy = y + (i / cols) as f32 * (th + gap);
+            let r = Rect::new(cx, cy, tw, th);
+            let radius = self.u * 2.4;
+            self.shadow(r, radius);
+            self.fill(r, self.t.card, radius);
+            self.text(cx + pad, cy + pad, label, Font::Small, self.t.muted);
+            let vy = cy + pad + self.lh_of(Font::Small);
+            self.text(cx + pad, vy, value, Font::Heading, self.t.text);
+            let spark = Rect::new(
+                cx + pad,
+                vy + self.lh_of(Font::Heading) + self.u,
+                tw - pad * 2.0,
+                spark_h,
+            );
+            for b in spark_bars(spark, series, self.u * 0.5) {
+                self.fill(b, color.alpha(0.75), self.u * 0.3);
+            }
+        }
+        let rows = (tiles.len() + cols - 1) / cols;
+        y += rows as f32 * (th + gap);
+
+        // Flights started, by origin. Colours follow ORIGINS, so a series
+        // keeps its colour whichever others are present.
+        let origins: Vec<usize> = (0..ORIGINS.len())
+            .filter(|i| days.iter().any(|d| count(&d.started, ORIGINS[*i].0) > 0.0))
+            .collect();
+        let columns: Vec<Column> = days
+            .iter()
+            .map(|d| Column {
+                label: short_day(&d.day),
+                values: origins
+                    .iter()
+                    .map(|i| count(&d.started, ORIGINS[*i].0))
+                    .collect(),
+            })
+            .collect();
+        let legend: Vec<(String, Color)> = origins
+            .iter()
+            .map(|i| (ORIGINS[*i].1.to_string(), self.t.series(*i)))
+            .collect();
+        y += self.chart_card(
+            x,
+            y,
+            w,
+            "Flights started",
+            "by what started them",
+            &columns,
+            &legend,
+            false,
+        ) + gap;
+
+        // What ran by itself, by action: the busiest first.
+        let mut keys: Vec<(String, f64)> = Vec::new();
+        for d in days {
+            for (k, n) in d.auto.iter() {
+                match keys.iter_mut().find(|(kk, _)| kk == k) {
+                    Some(e) => e.1 += *n as f64,
+                    None => keys.push((k.clone(), *n as f64)),
+                }
+            }
+        }
+        keys.retain(|(_, n)| *n > 0.0);
+        keys.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        if !keys.is_empty() {
+            let columns: Vec<Column> = days
+                .iter()
+                .map(|d| Column {
+                    label: short_day(&d.day),
+                    values: keys.iter().map(|(k, _)| count(&d.auto, k)).collect(),
+                })
+                .collect();
+            let legend: Vec<(String, Color)> = keys
+                .iter()
+                .enumerate()
+                .map(|(i, (k, _))| (action_short(k).to_string(), self.t.series(i)))
+                .collect();
+            y += self.chart_card(
+                x,
+                y,
+                w,
+                "Ran by itself",
+                "actions Tower took without a click",
+                &columns,
+                &legend,
+                false,
+            ) + gap;
+        }
+
+        // How flights ended.
+        let ends: Vec<(&str, &str, Color)> = vec![
+            ("landed", "Landed", self.t.ok),
+            ("proposed", "Proposed", self.t.warn),
+            ("declined", "Declined", self.t.violet),
+            ("gates_failed", "Gate failed", self.t.bad),
+            ("escalated", "Escalated", self.t.info),
+        ];
+        let values: Vec<f64> = ends
+            .iter()
+            .map(|(k, _, _)| days.iter().map(|d| count(&d.outcomes, k)).sum())
+            .collect();
+        if values.iter().any(|v| *v > 0.0) {
+            y += self.boxed(x, y, w, &|l: &mut Self, x, y0, w| {
+                let mut y = y0;
+                l.text(x, y, "How runs ended", Font::Strong, l.t.text);
+                y += l.lh_of(Font::Strong) + l.u * 2.0;
+                let bar = Rect::new(x, y, w, l.u * 3.0);
+                l.fill(bar, l.t.border.alpha(0.4), l.u * 1.5);
+                for p in share_bar(bar, &values, l.u * 2.0) {
+                    l.fill(p.rect, ends[p.series].2, 0.0);
+                }
+                y += bar.h + l.u * 2.0;
+                let legend: Vec<(String, Color)> = ends
+                    .iter()
+                    .zip(values.iter())
+                    .filter(|(_, v)| **v > 0.0)
+                    .map(|((_, label, c), v)| (format!("{} {}", label, compact(*v)), *c))
+                    .collect();
+                y += l.legend(x, y, w, &legend);
+                y - y0
+            }) + gap;
+        }
+
+        // Spend per day.
+        if spent.iter().any(|v| *v > 0.0) {
+            let columns: Vec<Column> = days
+                .iter()
+                .map(|d| Column {
+                    label: short_day(&d.day),
+                    values: vec![d.cost_usd],
+                })
+                .collect();
+            let legend = vec![(
+                format!("{} in {} days", compact_money(sum(&spent)), days.len()),
+                self.t.warn,
+            )];
+            y += self.chart_card(
+                x,
+                y,
+                w,
+                "Spend",
+                "API-equivalent cost",
+                &columns,
+                &legend,
+                true,
+            ) + gap;
+        }
+
+        // The latest things that ran by themselves.
+        let recent = &md.snap.activity.recent;
+        if !recent.is_empty() {
+            y += self.boxed(x, y, w, &|l: &mut Self, x, y0, w| {
+                let mut y = y0;
+                l.text(x, y, "Ran by itself, latest", Font::Strong, l.t.text);
+                y += l.lh_of(Font::Strong) + l.u * 2.0;
+                let row_h = l.lh_of(Font::Small) + l.u * 1.5;
+                let when_w = l.m.width("00h ago", Font::Small) + l.u * 2.0;
+                for e in recent.iter().take(12) {
+                    let flight = e.flight.as_ref().and_then(|f| md.snap.flight(f));
+                    let what = format!(
+                        "{}{}{}",
+                        action_short(&e.action),
+                        e.target
+                            .as_ref()
+                            .map(|t| format!(" · {}", t))
+                            .unwrap_or_default(),
+                        flight.map(|f| format!(" · {}", f.key)).unwrap_or_default()
+                    );
+                    let hit = flight.map(|f| {
+                        Hit::Button(Action::OpenFlight {
+                            flight_id: f.id.clone(),
+                        })
+                    });
+                    let row = Rect::new(x - l.u, y - l.u * 0.5, w + l.u * 2.0, row_h);
+                    if let Some(h) = &hit {
+                        if l.hovered(h) {
+                            l.fill(row, l.t.card_hover, l.u);
+                        }
+                    }
+                    l.text(
+                        x,
+                        y,
+                        &format!("{} ago", age(l.now, e.at_unix)),
+                        Font::Small,
+                        l.t.faint,
+                    );
+                    let c = if e.outcome.starts_with("failed") {
+                        l.t.bad
+                    } else {
+                        l.t.text
+                    };
+                    l.text_fit(x + when_w, y, &what, Font::Small, c, w - when_w);
+                    if let Some(h) = hit {
+                        l.hit(row, h);
+                    }
+                    y += row_h;
+                }
+                y - y0
+            });
+        }
+        y - y0
+    }
+
+    /// Coloured legend entries, wrapping; returns the height.
+    fn legend(&mut self, x: f32, y: f32, w: f32, items: &[(String, Color)]) -> f32 {
+        let sh = self.lh_of(Font::Small);
+        let d = self.u * 1.6;
+        let mut cx = x;
+        let mut cy = y;
+        for (label, color) in items {
+            let iw = d + self.u * 1.5 + self.m.width(label, Font::Small) + self.u * 4.0;
+            if cx + iw > x + w && cx > x {
+                cx = x;
+                cy += sh + self.u;
+            }
+            self.fill(
+                Rect::new(cx, cy + (sh - d) / 2.0, d, d),
+                *color,
+                self.u * 0.4,
+            );
+            self.text(cx + d + self.u * 1.5, cy, label, Font::Small, self.t.muted);
+            cx += iw;
+        }
+        cy + sh - y
+    }
+
+    /// A stacked bar chart in a card; returns its height.
+    #[allow(clippy::too_many_arguments)]
+    fn chart_card(
+        &mut self,
+        x: f32,
+        y: f32,
+        w: f32,
+        title: &str,
+        subtitle: &str,
+        columns: &[Column],
+        legend: &[(String, Color)],
+        money: bool,
+    ) -> f32 {
+        self.boxed(x, y, w, &|l: &mut Self, x, y0, w| {
+            let mut y = y0;
+            let tw = l.text(x, y, title, Font::Strong, l.t.text);
+            let sx = x + tw + l.u * 2.0;
+            l.text_fit(
+                sx,
+                y + (l.lh_of(Font::Strong) - l.lh_of(Font::Small)),
+                subtitle,
+                Font::Small,
+                l.t.faint,
+                (x + w - sx).max(0.0),
+            );
+            y += l.lh_of(Font::Strong) + l.u * 1.5;
+            y += l.legend(x, y, w, legend) + l.u * 2.0;
+            let sh = l.lh_of(Font::Small);
+            let axis_w = l.m.width(if money { "$1.2k" } else { "1.2k" }, Font::Small) + l.u * 2.0;
+            let label_w = l.m.width("Oct 24", Font::Small) + l.u * 2.0;
+            let area = Rect::new(x, y + sh / 2.0, w, (l.lh * 7.0).round());
+            let spec = BarChartSpec {
+                columns,
+                series: legend.len().max(1),
+                gap: 0.3,
+                label_every: 0,
+                label_w,
+                axis_w,
+                label_h: sh + l.u,
+            };
+            let chart = bar_chart(area, &spec);
+            for t in &chart.ticks {
+                l.fill(
+                    Rect::new(chart.plot.x, t.y, chart.plot.w, 1.0),
+                    l.t.border.alpha(0.45),
+                    0.0,
+                );
+                let label = if money {
+                    compact_money(t.value)
+                } else {
+                    t.label.clone()
+                };
+                l.text_right(
+                    chart.plot.x - l.u,
+                    t.y - sh / 2.0,
+                    &label,
+                    Font::Small,
+                    l.t.faint,
+                );
+            }
+            for s in &chart.segments {
+                let c = legend.get(s.series).map(|x| x.1).unwrap_or(l.t.muted);
+                l.fill(s.rect, c, l.u * 0.3);
+            }
+            for lab in &chart.labels {
+                let lw = l.m.width(&lab.text, Font::Small);
+                l.text(
+                    lab.x_center - lw / 2.0,
+                    lab.y + l.u * 0.5,
+                    &lab.text,
+                    Font::Small,
+                    l.t.faint,
+                );
+            }
+            area.bottom() - y0
+        })
     }
 
     // -- toast --------------------------------------------------------------
@@ -3200,11 +5072,157 @@ impl<'a> L<'a> {
     }
 }
 
+/// How loudly a response clock should show.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Tone {
+    /// Not running (met, not started) or paused.
+    Quiet,
+    Calm,
+    Half,
+    Late,
+}
+
+/// A clock's state in words, and how loud it is. Wall-clock share of the
+/// time used, like towerd's Deadline items.
+fn sla_status(c: &SlaClock, now: u64) -> (String, Tone) {
+    if c.stopped {
+        return if c.breached {
+            ("breached".to_string(), Tone::Late)
+        } else {
+            ("not running".to_string(), Tone::Quiet)
+        };
+    }
+    if c.paused {
+        return ("paused".to_string(), Tone::Quiet);
+    }
+    if c.breached || (c.due_unix > 0 && now >= c.due_unix) {
+        return ("breached".to_string(), Tone::Late);
+    }
+    if c.due_unix == 0 {
+        return ("running".to_string(), Tone::Calm);
+    }
+    let left = c.due_unix - now;
+    let span = c.due_unix.saturating_sub(c.started_unix).max(1);
+    let used = now.saturating_sub(c.started_unix) as f64 / span as f64;
+    let tone = if used >= 0.8 {
+        Tone::Late
+    } else if used >= 0.5 {
+        Tone::Half
+    } else {
+        Tone::Calm
+    };
+    (format!("{} left", duration(left)), tone)
+}
+
+/// The running clock that breaches first (a breached one first of all).
+fn most_urgent(clocks: &[SlaClock]) -> Option<&SlaClock> {
+    clocks
+        .iter()
+        .filter(|c| !c.stopped && !c.paused && (c.breached || c.due_unix > 0))
+        .min_by_key(|c| if c.breached { 0 } else { c.due_unix })
+}
+
+/// `Ana → Bo · High · vpn, urgent`.
+fn tracker_line(i: &IssueInfo) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    match (i.reporter.is_empty(), i.assignee.is_empty()) {
+        (false, false) => parts.push(format!("{} → {}", i.reporter, i.assignee)),
+        (false, true) => parts.push(format!("from {}", i.reporter)),
+        (true, false) => parts.push(format!("assigned to {}", i.assignee)),
+        (true, true) => {}
+    }
+    if !i.priority.is_empty() {
+        parts.push(i.priority.clone());
+    }
+    if !i.labels.is_empty() {
+        parts.push(i.labels.join(", "));
+    }
+    parts.join(" · ")
+}
+
+/// What a `[policy]` action does, for the Policy view.
+fn action_help(action: &str) -> &'static str {
+    match action {
+        "intake.launch" => "Start an agent on a new issue from a watch",
+        "intake.triage" => "Ask the triage role which role a new issue needs",
+        "ack.post" => "Post the \"received\" note on a new issue",
+        "issue.comment" => "Comment on the issue when its flight lands",
+        "issue.transition" => "Move the issue to its done status with that comment",
+        "pr.draft" => "Push the branch and open a draft PR/MR after an auto-fix",
+        "land" => "Land a flight whose gates passed",
+        "handoff.release" => "Start the next role on a handoff an agent made",
+        "handoff.local" => {
+            "Hand an agent's subtask to a local model and give it the result (auto needs no Armed: nothing leaves your network)"
+        }
+        "scout.run" => "Run a scout that reads mail or Teams for new items",
+        "pane.message" => "Send a message Tower wrote into a running agent",
+        "schedule.run" => {
+            "Start a flight from a schedule (auto needs no Armed: saving it was your OK)"
+        }
+        _ => "",
+    }
+}
+
+/// What starts flights, in chart order, with the label shown.
+const ORIGINS: [(&str, &str); 6] = [
+    ("you", "You"),
+    ("schedule", "Schedule"),
+    ("intake", "Intake"),
+    ("autofix", "Auto-fix"),
+    ("scout", "Scout"),
+    ("handoff", "Handoff"),
+];
+
+fn count(map: &std::collections::BTreeMap<String, u32>, key: &str) -> f64 {
+    map.get(key).copied().unwrap_or(0) as f64
+}
+
+/// `2026-10-24` -> `Oct 24`.
+fn short_day(day: &str) -> String {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let mut parts = day.split('-').skip(1);
+    let month = parts.next().and_then(|m| m.parse::<usize>().ok());
+    let d = parts.next().and_then(|d| d.parse::<u32>().ok());
+    match (month, d) {
+        (Some(m), Some(d)) if (1..=12).contains(&m) => format!("{} {}", MONTHS[m - 1], d),
+        _ => day.to_string(),
+    }
+}
+
+/// A policy key as a short chart label.
+fn action_short(key: &str) -> &str {
+    match key {
+        "intake.launch" => "Launch",
+        "intake.triage" => "Triage",
+        "ack.post" => "Ack",
+        "issue.comment" => "Comment",
+        "issue.transition" => "Transition",
+        "pr.draft" => "Draft PR",
+        "land" => "Land",
+        "handoff.release" => "Release",
+        "scout.run" => "Scout",
+        "pane.message" => "Message",
+        "schedule.run" => "Schedule",
+        other => other,
+    }
+}
+
+/// `7h 52m`, `12m`, `40s`.
+fn duration(secs: u64) -> String {
+    match secs {
+        s if s >= 3600 => format!("{}h {:02}m", s / 3600, (s % 3600) / 60),
+        s if s >= 60 => format!("{}m", s / 60),
+        s => format!("{}s", s),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::forms::Sheet;
     use super::super::model::Model;
-    use super::super::proto::demo_snapshot;
+    use super::super::proto::{demo_snapshot, PolicyRow};
     use super::super::text::fake::FakeMeasure;
     use super::*;
 
@@ -3466,6 +5484,409 @@ mod tests {
             .cmds
             .iter()
             .any(|c| matches!(c, Cmd::Text { text, .. } if text.starts_with("Connecting"))));
+    }
+
+    fn texts(scene: &Scene) -> Vec<String> {
+        scene
+            .cmds
+            .iter()
+            .filter_map(|c| match c {
+                Cmd::Text { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn routines_view_lists_schedules_and_machine_jobs() {
+        let mut model = Model::new(demo_snapshot(1_000_000));
+        model.view = View::Routines;
+        let scene = scene_for(&model);
+        assert!(has(
+            &scene,
+            &Hit::Button(Action::RunSchedule("morning-prs".into()))
+        ));
+        assert!(has(
+            &scene,
+            &Hit::Button(Action::EditSchedule("morning-prs".into()))
+        ));
+        // Paused by Tower: the button resumes it.
+        assert!(has(
+            &scene,
+            &Hit::Button(Action::SetScheduleEnabled {
+                id: "deps-audit".into(),
+                enabled: true,
+            })
+        ));
+        let t = texts(&scene);
+        assert!(t.iter().any(|s| s.contains("sla-checker")));
+        assert!(t.iter().any(|s| s.contains("Paused: 3 failed runs")));
+        // Vendor jobs stay folded away until asked for.
+        assert!(!t.iter().any(|s| s.contains("com.vendor.updater")));
+        assert!(has(&scene, &Hit::Button(Action::ToggleOtherRoutines)));
+        model.show_other_routines = true;
+        let t = texts(&scene_for(&model));
+        assert!(t.iter().any(|s| s.contains("com.vendor.updater")));
+    }
+
+    #[test]
+    fn models_view_describes_models_and_edits_servers() {
+        let mut model = Model::new(demo_snapshot(1_000_000));
+        model.view = View::Models;
+        let scene = scene_for(&model);
+        let t = texts(&scene);
+        assert!(t.iter().any(|s| s == "Qwen 3.6 27B"));
+        assert!(t.iter().any(|s| s == "code edits"), "strengths are chips");
+        assert!(t.iter().any(|s| s == "local"));
+        assert!(has(
+            &scene,
+            &Hit::Button(Action::EditModel("localhost/qwen3.6:27b".into()))
+        ));
+        assert!(has(
+            &scene,
+            &Hit::Button(Action::EditEndpoint("localhost".into()))
+        ));
+        assert!(has(&scene, &Hit::Button(Action::NewEndpoint)));
+        assert!(has(&scene, &Hit::Button(Action::NewModel(None))));
+        // The demo has Claude connected: the button offers to disconnect.
+        assert!(has(&scene, &Hit::Button(Action::OpenConnect(false))));
+        model.snap.connected_clis.clear();
+        assert!(has(
+            &scene_for(&model),
+            &Hit::Button(Action::OpenConnect(true))
+        ));
+        model.sheet = Some(Sheet::Connect(true));
+        let t = texts(&scene_for(&model));
+        assert!(t.iter().any(|s| s == "Connect your agents"));
+        model.sheet = None;
+
+        // A served model nobody described yet can be added from its chip.
+        model.snap.models.clear();
+        let scene = scene_for(&model);
+        assert!(has(
+            &scene,
+            &Hit::Button(Action::NewModel(Some("localhost/qwen3.6:27b".into())))
+        ));
+    }
+
+    #[test]
+    fn roles_routing_and_policy_are_edited_in_place() {
+        let mut model = Model::new(demo_snapshot(1_000_000));
+        model.view = View::Roster;
+        let scene = scene_for(&model);
+        assert!(has(&scene, &Hit::Button(Action::NewRole)));
+        assert!(has(
+            &scene,
+            &Hit::Button(Action::EditRole("approach".into()))
+        ));
+        model.sheet = Some(Sheet::role(None));
+        let scene = scene_for(&model);
+        assert!(has(
+            &scene,
+            &Hit::Button(Action::SheetDriver("routed".into()))
+        ));
+        assert!(has(
+            &scene,
+            &Hit::Button(Action::SheetColor("#73daca".into()))
+        ));
+        assert!(has(
+            &scene,
+            &Hit::Button(Action::RoleAddModel("localhost/qwen3.6:27b".into()))
+        ));
+        model.sheet = None;
+
+        model.view = View::Models;
+        assert!(has(&scene_for(&model), &Hit::Button(Action::EditRouting)));
+        model.sheet = Some(Sheet::routing(&[], &[], &[]));
+        assert!(has(&scene_for(&model), &Hit::Field(FieldId::RouteHigh)));
+        model.sheet = None;
+
+        model.view = View::Policy;
+        model.snap.policy = vec![super::super::proto::PolicyRow {
+            action: "handoff.local".into(),
+            level: "auto".into(),
+            configured: false,
+        }];
+        let scene = scene_for(&model);
+        assert!(has(
+            &scene,
+            &Hit::Button(Action::SetPolicyLevel {
+                action: "handoff.local".into(),
+                level: "confirm".into()
+            })
+        ));
+        assert!(has(&scene, &Hit::Button(Action::OpenLocalOnly)));
+        model.sheet = Some(Sheet::local_only(&model.snap.local_only_paths.clone()));
+        assert!(texts(&scene_for(&model))
+            .iter()
+            .any(|s| s == "Local-only folders"));
+    }
+
+    #[test]
+    fn local_only_flights_wear_a_badge() {
+        let mut model = Model::new(demo_snapshot(1_000_000));
+        assert!(!texts(&scene_for(&model)).iter().any(|s| s == "local only"));
+        model.snap.flights[0].local_only = true;
+        assert!(texts(&scene_for(&model)).iter().any(|s| s == "local only"));
+        let id = model.snap.flights[0].id.clone();
+        model.drawer = Some(Drawer::Flight(id));
+        let n = texts(&scene_for(&model))
+            .iter()
+            .filter(|s| *s == "local only")
+            .count();
+        assert!(n >= 2, "card and drawer");
+        model.drawer = None;
+        model.sheet = Some(Sheet::new_flight(None, Place::NewFolder));
+        assert!(has(
+            &scene_for(&model),
+            &Hit::Button(Action::SheetFlag(SheetFlag::LocalOnly))
+        ));
+    }
+
+    #[test]
+    fn server_and_model_sheets_paint_their_pickers() {
+        let mut model = Model::new(demo_snapshot(1_000_000));
+        model.view = View::Models;
+        model.sheet = Some(Sheet::endpoint(None));
+        let scene = scene_for(&model);
+        assert!(has(&scene, &Hit::Button(Action::SheetKind("vllm".into()))));
+        assert!(has(&scene, &Hit::Button(Action::SheetLocal(Some(true)))));
+        assert!(has(&scene, &Hit::Field(FieldId::EpKeyEnv)));
+        assert!(!has(
+            &scene,
+            &Hit::Button(Action::DeleteEndpoint("localhost".into()))
+        ));
+        let ep = model.snap.endpoints[0].clone();
+        model.sheet = Some(Sheet::endpoint(Some(&ep)));
+        let scene = scene_for(&model);
+        assert!(has(
+            &scene,
+            &Hit::Button(Action::DeleteEndpoint(ep.name.clone()))
+        ));
+
+        let m = model.snap.models[0].clone();
+        model.sheet = Some(Sheet::model(Some(&m), None));
+        let scene = scene_for(&model);
+        assert!(has(
+            &scene,
+            &Hit::Button(Action::SheetEndpoint("localhost".into()))
+        ));
+        assert!(has(&scene, &Hit::Field(FieldId::ModelGoodFor)));
+        assert!(has(&scene, &Hit::Button(Action::DeleteModel(m.id.clone()))));
+        let t = texts(&scene);
+        assert!(t.iter().any(|s| s.starts_with("It serves:")));
+    }
+
+    #[test]
+    fn activity_view_draws_tiles_charts_and_the_latest() {
+        let mut model = Model::new(demo_snapshot(1_000_000));
+        model.view = View::Activity;
+        let scene = scene_for(&model);
+        let t = texts(&scene);
+        for want in &[
+            "Ran by itself",
+            "Flights started",
+            "How runs ended",
+            "Spend",
+        ] {
+            assert!(t.iter().any(|s| s == want), "{} is drawn", want);
+        }
+        // The latest automatic event (at the bottom) opens its flight.
+        model.scroll.insert(ScrollId::Activity, 1.0e6);
+        let bottom = scene_for(&model);
+        assert!(has(
+            &bottom,
+            &Hit::Button(Action::OpenFlight {
+                flight_id: "f-17".into()
+            })
+        ));
+        assert!(has(&scene, &Hit::Button(Action::ActivityDays(30))));
+        // An empty history explains itself instead of drawing empty charts.
+        model.snap.activity = Default::default();
+        let t = texts(&scene_for(&model));
+        assert!(t.iter().any(|s| s == "Nothing yet"));
+    }
+
+    #[test]
+    fn schedule_sheet_offers_templates_and_previews_the_time() {
+        let mut model = Model::new(demo_snapshot(1_000_000));
+        model.view = View::Routines;
+        model.sheet = Some(Sheet::schedule(None, None));
+        let scene = scene_for(&model);
+        assert!(has(&scene, &Hit::Button(Action::ScheduleTemplate(0))));
+        // The sheet scrolls; Save is at its bottom.
+        model.scroll.insert(ScrollId::Sheet, 1.0e6);
+        let bottom = scene_for(&model);
+        assert!(has(&bottom, &Hit::Button(Action::Submit { launch: false })));
+        assert!(has(
+            &bottom,
+            &Hit::Button(Action::SheetFlag(SheetFlag::LocalOnly))
+        ));
+        model.scroll.remove(&ScrollId::Sheet);
+        if let Some(Sheet::Schedule(f)) = &mut model.sheet {
+            f.apply_template(0);
+        }
+        let t = texts(&scene_for(&model));
+        assert!(t.iter().any(|s| s.starts_with("weekdays 08:30 · next")));
+    }
+
+    #[test]
+    fn days_and_actions_read_short() {
+        assert_eq!(short_day("2026-10-24"), "Oct 24");
+        assert_eq!(short_day("junk"), "junk");
+        assert_eq!(action_short("schedule.run"), "Schedule");
+    }
+
+    #[test]
+    fn policy_view_lists_levels_and_arms() {
+        let mut snap = demo_snapshot(1_000_000);
+        snap.config_dir = "/cfg".into();
+        snap.policy = vec![
+            PolicyRow {
+                action: "intake.launch".into(),
+                level: "auto".into(),
+                configured: true,
+            },
+            PolicyRow {
+                action: "land".into(),
+                level: "confirm".into(),
+                configured: false,
+            },
+        ];
+        let mut model = Model::new(snap);
+        model.view = View::Policy;
+        let scene = scene_for(&model);
+        assert!(has(&scene, &Hit::Button(Action::SetArmed(true))));
+        // Levels are chips you click; no file to edit.
+        assert!(has(
+            &scene,
+            &Hit::Button(Action::SetPolicyLevel {
+                action: "land".into(),
+                level: "off".into()
+            })
+        ));
+        let t = texts(&scene);
+        assert!(t.iter().any(|x| x == "intake.launch"));
+        assert!(t.iter().any(|x| x.ends_with("· set here")));
+        assert!(t.iter().any(|x| x.starts_with("Disarmed")));
+        assert!(
+            !t.iter().any(|x| x == "Armed"),
+            "no Armed badge while disarmed"
+        );
+
+        model.snap.armed_until = Some(1_000_000 + 2 * 3600 + 5 * 60);
+        let scene = scene_for(&model);
+        assert!(has(&scene, &Hit::Button(Action::SetArmed(false))));
+        let t = texts(&scene);
+        assert!(t.iter().any(|x| x == "Armed"), "rail shows Armed");
+        assert!(t.iter().any(|x| x == "2h 05m left"));
+
+        // An expired timestamp reads as disarmed.
+        model.snap.armed_until = Some(999_999);
+        let scene = scene_for(&model);
+        assert!(has(&scene, &Hit::Button(Action::SetArmed(true))));
+    }
+
+    fn clock(start: u64, due: u64) -> SlaClock {
+        SlaClock {
+            id: "9".into(),
+            name: "First response".into(),
+            source: "jsm".into(),
+            started_unix: start,
+            due_unix: due,
+            goal_secs: due - start,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn sla_status_reads_and_colours_by_time_used() {
+        let c = clock(0, 1000);
+        assert_eq!(sla_status(&c, 100), ("15m left".to_string(), Tone::Calm));
+        assert_eq!(sla_status(&c, 600).1, Tone::Half);
+        assert_eq!(sla_status(&c, 900).1, Tone::Late);
+        assert_eq!(sla_status(&c, 1000), ("breached".to_string(), Tone::Late));
+        let mut p = c.clone();
+        p.paused = true;
+        assert_eq!(sla_status(&p, 900), ("paused".to_string(), Tone::Quiet));
+        let mut done = c.clone();
+        done.stopped = true;
+        assert_eq!(sla_status(&done, 5000).1, Tone::Quiet);
+        done.breached = true;
+        assert_eq!(sla_status(&done, 5000).0, "breached");
+    }
+
+    #[test]
+    fn the_most_urgent_running_clock_wins() {
+        let soon = clock(0, 100);
+        let later = clock(0, 900);
+        let mut stopped = clock(0, 10);
+        stopped.stopped = true;
+        let list = vec![later.clone(), stopped, soon.clone()];
+        assert_eq!(most_urgent(&list), Some(&soon));
+        assert_eq!(most_urgent(&[]), None);
+    }
+
+    #[test]
+    fn tracker_line_skips_what_is_missing() {
+        let full = IssueInfo {
+            reporter: "Ana".into(),
+            assignee: "Bo".into(),
+            priority: "High".into(),
+            labels: vec!["vpn".into()],
+        };
+        assert_eq!(tracker_line(&full), "Ana → Bo · High · vpn");
+        assert_eq!(tracker_line(&IssueInfo::default()), "");
+        let only = IssueInfo {
+            reporter: "Ana".into(),
+            ..Default::default()
+        };
+        assert_eq!(tracker_line(&only), "from Ana");
+    }
+
+    #[test]
+    fn cards_show_the_countdown_instead_of_the_age() {
+        let mut snap = demo_snapshot(1_000_000);
+        let f = &mut snap.flights[0];
+        f.sla = vec![clock(1_000_000 - 100, 1_000_000 + 3500)];
+        f.issue = Some(IssueInfo {
+            reporter: "Ana".into(),
+            ..Default::default()
+        });
+        let id = f.id.clone();
+        let mut model = Model::new(snap);
+        let t = texts(&scene_for(&model));
+        assert!(t.iter().any(|x| x == "58m left"), "{t:?}");
+        model.drawer = Some(Drawer::Flight(id));
+        let t = texts(&scene_for(&model));
+        assert!(t.iter().any(|x| x == "TRACKER"));
+        assert!(t.iter().any(|x| x == "from Ana"));
+        assert!(t.iter().any(|x| x == "First response · 58m left"));
+    }
+
+    #[test]
+    fn scouts_get_a_run_button_until_they_run() {
+        let mut snap = demo_snapshot(1_000_000);
+        snap.sources[0].kind = "mail".into();
+        snap.sources[0].name = "Support".into();
+        snap.sources[0].polling = false;
+        let mut model = Model::new(snap);
+        model.view = View::Intake;
+        let run = Hit::Button(Action::RunScout("Support".into()));
+        assert!(has(&scene_for(&model), &run));
+        assert!(texts(&scene_for(&model)).iter().any(|t| t == "Mail scout"));
+        model.snap.sources[0].polling = true;
+        assert!(
+            !has(&scene_for(&model), &run),
+            "no second run while one is going"
+        );
+    }
+
+    #[test]
+    fn durations_read_naturally() {
+        assert_eq!(duration(40), "40s");
+        assert_eq!(duration(12 * 60 + 5), "12m");
+        assert_eq!(duration(7 * 3600 + 52 * 60), "7h 52m");
     }
 
     #[test]

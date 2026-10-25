@@ -154,6 +154,38 @@ pub async fn http_get(url: &str, timeout: Duration) -> Result<(u16, String, Dura
     Ok((status, body, started.elapsed()))
 }
 
+/// GET over reqwest (TLS, bearer key). Returns (status, body, latency).
+async fn https_get(
+    url: &str,
+    api_key: Option<&str>,
+    timeout: Duration,
+) -> Result<(u16, String, Duration), String> {
+    let client = reqwest::Client::builder()
+        .timeout(timeout)
+        .build()
+        .map_err(|e| e.to_string())?;
+    let mut req = client.get(url).header("Accept", "application/json");
+    if let Some(k) = api_key {
+        req = req.bearer_auth(k);
+    }
+    let started = Instant::now();
+    let mut resp = req.send().await.map_err(|e| e.to_string())?;
+    let status = resp.status().as_u16();
+    // Same 4 MiB cap as http_get: a model list is never that big.
+    let mut buf = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
+        if buf.len() + chunk.len() > 4 << 20 {
+            return Err("response too large".into());
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok((
+        status,
+        String::from_utf8_lossy(&buf).to_string(),
+        started.elapsed(),
+    ))
+}
+
 fn dechunk(body: &str) -> String {
     let mut out = String::new();
     let mut rest = body;
@@ -189,7 +221,7 @@ pub fn parse_models(kind: &str, body: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-pub async fn probe(ep: Endpoint) -> Endpoint {
+pub async fn probe(ep: Endpoint, api_key: Option<String>) -> Endpoint {
     let base = ep
         .base_url
         .trim_end_matches('/')
@@ -200,7 +232,15 @@ pub async fn probe(ep: Endpoint) -> Endpoint {
     } else {
         format!("{base}/v1/models")
     };
-    match http_get(&url, Duration::from_secs(3)).await {
+    let timeout = Duration::from_secs(3);
+    // Plain http on the LAN needs nothing more; a company server behind TLS
+    // or a key goes through reqwest.
+    let got = if url.starts_with("https://") || api_key.is_some() {
+        https_get(&url, api_key.as_deref(), timeout).await
+    } else {
+        http_get(&url, timeout).await
+    };
+    match got {
         Ok((200, body, latency)) => Endpoint {
             health: Health::Up,
             latency_ms: Some(latency.as_millis() as u32),
@@ -352,7 +392,8 @@ mod tests {
             health: Health::Unknown,
             latency_ms: None,
             models: vec![],
+            ..Default::default()
         };
-        assert_eq!(probe(ep).await.health, Health::Down);
+        assert_eq!(probe(ep, None).await.health, Health::Down);
     }
 }

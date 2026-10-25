@@ -76,10 +76,36 @@ pub struct AcpSpec {
     pub options: Vec<(String, String)>,
     /// Options set only when the agent offers them (effort, agent).
     pub optional: Vec<(String, String)>,
-    /// The `mcpServers` entry for the `tower` server; none for one-shot
-    /// sessions like triage.
-    pub mcp: Option<Value>,
+    /// `mcpServers` entries: the `tower` server and the role's own; none for
+    /// one-shot sessions like triage.
+    pub mcp: Vec<Value>,
     pub stderr_log: PathBuf,
+    /// The role declares `auth = "api_key"`: pick the agent's API-key sign-in
+    /// method from `authMethods` (and refuse if it has none) instead of
+    /// letting it fall back to a plan login. Otherwise Tower calls no
+    /// `authenticate` at all: the agent signs in its own way.
+    pub api_key_auth: bool,
+    /// The model must be set (local-only work): if the agent refuses it,
+    /// end the session before any prompt rather than run on its default.
+    pub model_required: bool,
+}
+
+/// The id of an API-key sign-in among an agent's `authMethods`.
+pub fn pick_api_key_method(methods: &Value) -> Option<String> {
+    methods.as_array()?.iter().find_map(|m| {
+        let id = m.get("id").and_then(Value::as_str)?;
+        let text = format!(
+            "{} {} {}",
+            id,
+            m.get("name").and_then(Value::as_str).unwrap_or(""),
+            m.get("description").and_then(Value::as_str).unwrap_or("")
+        )
+        .to_lowercase();
+        let api_key = ["api key", "api-key", "api_key", "apikey"]
+            .iter()
+            .any(|k| text.contains(k));
+        api_key.then(|| id.to_string())
+    })
 }
 
 /// `TOWER_DEBUG_ACP=1`: log JSON-RPC method names, ids and update kinds
@@ -106,6 +132,7 @@ fn trace(dir: &str, v: &Value) {
 
 enum Pending {
     Init,
+    Authenticate,
     NewSession,
     /// A `session/set_config_option` (or `session/set_model`) for this id.
     SetOption(String),
@@ -404,9 +431,31 @@ async fn run<F: Fn(AcpEvent)>(
                         if failed {
                             anyhow::bail!("initialize failed: {}", error_text(&msg));
                         }
+                        if spec.api_key_auth {
+                            let methods = msg.pointer("/result/authMethods").cloned().unwrap_or(Value::Null);
+                            let Some(method) = pick_api_key_method(&methods) else {
+                                anyhow::bail!(
+                                    "the role says auth = \"api_key\", but this agent offers no API-key sign-in"
+                                );
+                            };
+                            conn.request("authenticate", json!({"methodId": method}), Pending::Authenticate)
+                                .await?;
+                            continue;
+                        }
                         conn.request(
                             "session/new",
-                            json!({"cwd": spec.cwd.display().to_string(), "mcpServers": spec.mcp.iter().cloned().collect::<Vec<_>>()}),
+                            json!({"cwd": spec.cwd.display().to_string(), "mcpServers": spec.mcp.clone()}),
+                            Pending::NewSession,
+                        )
+                        .await?;
+                    }
+                    Some(Pending::Authenticate) => {
+                        if failed {
+                            anyhow::bail!("API-key sign-in failed: {}", error_text(&msg));
+                        }
+                        conn.request(
+                            "session/new",
+                            json!({"cwd": spec.cwd.display().to_string(), "mcpServers": spec.mcp.clone()}),
                             Pending::NewSession,
                         )
                         .await?;
@@ -443,6 +492,12 @@ async fn run<F: Fn(AcpEvent)>(
                         waiting_option = false;
                         if failed {
                             emit(AcpEvent::Error(format!("could not set {id}: {}", error_text(&msg))));
+                            if id == "model" && spec.model_required {
+                                emit(AcpEvent::Error(
+                                    "stopped before the first prompt: it would have run on the agent's own default model".into(),
+                                ));
+                                break;
+                            }
                         }
                     }
                     Some(Pending::Prompt) => {
@@ -533,6 +588,92 @@ async fn run<F: Fn(AcpEvent)>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn api_key_methods_are_found_by_id_name_or_description() {
+        let m = json!([
+            {"id": "chatgpt", "name": "Sign in with ChatGPT"},
+            {"id": "openai-api-key", "name": "Use OPENAI_API_KEY"}
+        ]);
+        assert_eq!(pick_api_key_method(&m).as_deref(), Some("openai-api-key"));
+        let m = json!([{"id": "k", "name": "Key", "description": "Uses your API key from the environment"}]);
+        assert_eq!(pick_api_key_method(&m).as_deref(), Some("k"));
+        assert_eq!(
+            pick_api_key_method(&json!([{"id": "oauth-personal", "name": "Log in with Google"}])),
+            None
+        );
+        assert_eq!(pick_api_key_method(&Value::Null), None);
+    }
+
+    /// A fake ACP agent offering `methods`; writes the chosen sign-in to `log`.
+    fn fake(dir: &std::path::Path, methods: &str, log: &std::path::Path) -> Vec<String> {
+        let script = dir.join("fake_auth.py");
+        std::fs::write(
+            &script,
+            format!(
+                r#"import json, sys
+for line in sys.stdin:
+    m = json.loads(line)
+    if "id" not in m or "method" not in m: continue
+    i, meth = m["id"], m["method"]
+    def out(x): sys.stdout.write(json.dumps(x) + "\n"); sys.stdout.flush()
+    if meth == "initialize": out({{"jsonrpc": "2.0", "id": i, "result": {{"protocolVersion": 1, "authMethods": {methods}}}}})
+    elif meth == "authenticate":
+        open({log:?}, "w").write(m["params"]["methodId"])
+        out({{"jsonrpc": "2.0", "id": i, "result": {{}}}})
+    elif meth == "session/new": out({{"jsonrpc": "2.0", "id": i, "result": {{"sessionId": "s"}}}})
+    elif meth == "session/prompt":
+        out({{"jsonrpc": "2.0", "method": "session/update", "params": {{"sessionId": "s", "update": {{"sessionUpdate": "agent_message_chunk", "content": {{"type": "text", "text": "ok"}}}}}}}})
+        out({{"jsonrpc": "2.0", "id": i, "result": {{"stopReason": "end_turn"}}}})
+    else: out({{"jsonrpc": "2.0", "id": i, "result": {{}}}})
+"#,
+                log = log.display().to_string()
+            ),
+        )
+        .unwrap();
+        vec!["python3".into(), "-I".into(), script.display().to_string()]
+    }
+
+    fn spec(argv: Vec<String>, dir: &std::path::Path, api_key_auth: bool) -> AcpSpec {
+        AcpSpec {
+            argv,
+            cwd: dir.to_path_buf(),
+            env: vec![],
+            model: None,
+            options: vec![],
+            optional: vec![],
+            mcp: vec![],
+            stderr_log: dir.join("stderr.log"),
+            api_key_auth,
+            model_required: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn api_key_roles_pick_the_api_key_sign_in_and_others_pick_none() {
+        let d = std::env::temp_dir().join(format!("tower-acp-auth-{}", crate::paths::random_u64()));
+        std::fs::create_dir_all(&d).unwrap();
+        let log = d.join("chosen");
+        let both = r#"[{"id": "chatgpt", "name": "Sign in with ChatGPT"}, {"id": "openai-api-key", "name": "API key"}]"#;
+        let t = std::time::Duration::from_secs(20);
+
+        let r = ask_once(spec(fake(&d, both, &log), &d, true), "hi".into(), t).await;
+        assert_eq!(r.unwrap().0, "ok");
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "openai-api-key");
+
+        // A plan-login role: Tower triggers no sign-in at all.
+        std::fs::remove_file(&log).unwrap();
+        let r = ask_once(spec(fake(&d, both, &log), &d, false), "hi".into(), t).await;
+        assert!(r.is_ok());
+        assert!(!log.exists(), "no authenticate call");
+
+        // api_key declared, but the agent only has a plan login: refused.
+        let plan_only = r#"[{"id": "oauth", "name": "Log in"}]"#;
+        let r = ask_once(spec(fake(&d, plan_only, &log), &d, true), "hi".into(), t).await;
+        assert!(r.unwrap_err().contains("no API-key sign-in"));
+        assert!(!log.exists());
+        let _ = std::fs::remove_dir_all(d);
+    }
 
     #[test]
     fn updates_map_to_events() {

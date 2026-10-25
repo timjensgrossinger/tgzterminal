@@ -24,6 +24,18 @@ pub struct Issue {
     pub project: String,
     /// GitHub/GitLab issue number.
     pub number: Option<u64>,
+    pub created_unix: u64,
+    /// Display name (Jira) or login (GitHub, GitLab).
+    pub reporter: String,
+    /// Comma-separated when there are several.
+    pub assignee: String,
+    pub priority: String,
+    pub labels: Vec<String>,
+    /// Jira Service Management SLAs.
+    pub sla: Vec<tower_proto::SlaClock>,
+    /// Jira: ids of the fields that held SLAs, found while the watch's SLA
+    /// fields are still unknown.
+    pub sla_fields: Vec<String>,
 }
 
 /// An issue's current text, status and comments.
@@ -33,6 +45,10 @@ pub struct Activity {
     pub description: String,
     pub status: String,
     pub comments: Vec<Comment>,
+    /// Who opened it, as comment authors are named.
+    pub reporter: String,
+    /// Jira Service Management SLAs, when the watch knows its SLA fields.
+    pub sla: Vec<tower_proto::SlaClock>,
 }
 
 #[derive(Clone, Debug, PartialEq, Default)]
@@ -61,6 +77,8 @@ fn id_of(v: &Value) -> String {
 /// `gh issue view --json title,body,state,comments`.
 pub fn parse_github_activity(v: &Value) -> Activity {
     Activity {
+        reporter: login(v, "/author/login"),
+        sla: vec![],
         summary: s(v, "title"),
         description: s(v, "body"),
         status: s(v, "state").to_lowercase(),
@@ -95,6 +113,8 @@ pub fn parse_github_activity(v: &Value) -> Activity {
 /// GitLab REST: the issue, and its notes (system notes dropped).
 pub fn parse_gitlab_activity(issue: &Value, notes: &Value) -> Activity {
     Activity {
+        reporter: login(issue, "/author/username"),
+        sla: vec![],
         summary: s(issue, "title"),
         description: s(issue, "description"),
         status: s(issue, "state"),
@@ -137,7 +157,7 @@ pub async fn activity_cli(w: &Watch, number: u64) -> Result<Activity, String> {
                 "-R",
                 &g.repo,
                 "--json",
-                "title,body,state,comments",
+                "title,body,state,comments,author",
             ]
             .iter()
             .map(|s| s.to_string())
@@ -195,6 +215,12 @@ pub struct GithubWatch {
     /// Extra `gh issue list --search` terms, e.g. `label:bug no:assignee`.
     #[serde(default)]
     pub search: Option<String>,
+    /// Only issues assigned to this login (`@me` for you).
+    #[serde(default)]
+    pub assignee: Option<String>,
+    /// Only issues with all of these labels.
+    #[serde(default)]
+    pub labels: Vec<String>,
     #[serde(default)]
     pub role: Option<String>,
     #[serde(default)]
@@ -215,6 +241,19 @@ pub struct GithubWatch {
     /// Pass relevant comments and changes on to the flight.
     #[serde(default = "yes")]
     pub follow: bool,
+    /// Work from this source is sensitive: local models only, triage
+    /// included (see `[privacy]`).
+    #[serde(default)]
+    pub local_only: bool,
+    /// Per-action overrides of `[policy.actions]` for this watch.
+    #[serde(default)]
+    pub policy: crate::policy::Overrides,
+    /// Tower's own response clock: answer within this many hours.
+    #[serde(default)]
+    pub respond_within_hours: Option<u64>,
+    /// Acknowledgement text for this watch (see `[ack]`).
+    #[serde(default)]
+    pub ack_template: Option<String>,
 }
 
 #[derive(Deserialize, Clone, Debug, PartialEq)]
@@ -228,6 +267,9 @@ pub struct GitlabWatch {
     /// Only issues with this label.
     #[serde(default)]
     pub label: Option<String>,
+    /// Only issues assigned to this username (`@me` for you).
+    #[serde(default)]
+    pub assignee: Option<String>,
     #[serde(default)]
     pub role: Option<String>,
     #[serde(default)]
@@ -247,6 +289,19 @@ pub struct GitlabWatch {
     /// Pass relevant comments and changes on to the flight.
     #[serde(default = "yes")]
     pub follow: bool,
+    /// Work from this source is sensitive: local models only, triage
+    /// included (see `[privacy]`).
+    #[serde(default)]
+    pub local_only: bool,
+    /// Per-action overrides of `[policy.actions]` for this watch.
+    #[serde(default)]
+    pub policy: crate::policy::Overrides,
+    /// Tower's own response clock: answer within this many hours.
+    #[serde(default)]
+    pub respond_within_hours: Option<u64>,
+    /// Acknowledgement text for this watch (see `[ack]`).
+    #[serde(default)]
+    pub ack_template: Option<String>,
 }
 
 /// Any intake watch.
@@ -309,6 +364,39 @@ impl Watch {
     pub fn follow(&self) -> bool {
         common!(self, w => w.follow)
     }
+    pub fn local_only(&self) -> bool {
+        common!(self, w => w.local_only)
+    }
+    pub fn respond_within_hours(&self) -> Option<u64> {
+        common!(self, w => w.respond_within_hours.filter(|h| *h > 0))
+    }
+    pub fn ack_template(&self) -> Option<&String> {
+        common!(self, w => w.ack_template.as_ref())
+    }
+    /// Comment visibility set on the watch; only Jira has internal comments.
+    pub fn ack_visibility(&self) -> Option<crate::responses::Visibility> {
+        match self {
+            Watch::Jira(j) => j.ack_visibility,
+            _ => None,
+        }
+    }
+    /// The watch's `policy = { … }` table as written.
+    pub fn own_policy(&self) -> &crate::policy::Overrides {
+        common!(self, w => &w.policy)
+    }
+    /// The watch's overrides with the deprecated knobs folded in:
+    /// `auto_launch` / `autofix` mean `intake.launch = "auto"` (and
+    /// `intake.triage = "auto"`), unless the table says otherwise.
+    pub fn policy(&self) -> crate::policy::Overrides {
+        use crate::policy::{Action, Level};
+        let mut out = self.own_policy().clone();
+        if self.auto_launch() || self.autofix() {
+            for a in [Action::IntakeLaunch, Action::IntakeTriage] {
+                out.entry(a.key().to_string()).or_insert(Level::Auto);
+            }
+        }
+        out
+    }
     /// What it polls, for the Intake view.
     pub fn query(&self) -> String {
         match self {
@@ -351,6 +439,37 @@ fn s(v: &Value, k: &str) -> String {
     v.get(k).and_then(Value::as_str).unwrap_or("").to_string()
 }
 
+fn login(v: &Value, pointer: &str) -> String {
+    v.pointer(pointer)
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string()
+}
+
+/// `[{login: a}, {login: b}]` -> `a, b`.
+fn names(list: Option<&Value>, key: &str) -> String {
+    list.and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.get(key).and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default()
+}
+
+/// Labels as GitHub (`[{name}]`) or GitLab (`["name"]`) lists them.
+fn label_names(list: Option<&Value>) -> Vec<String> {
+    list.and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().or_else(|| x.get("name").and_then(Value::as_str)))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// `gh issue list --json number,title,body,url,state`.
 pub fn parse_github(v: &Value, repo: &str) -> Vec<Issue> {
     v.as_array()
@@ -366,6 +485,11 @@ pub fn parse_github(v: &Value, repo: &str) -> Vec<Issue> {
                         url: s(i, "url"),
                         project: repo.to_string(),
                         number: Some(n),
+                        created_unix: ts(i, "createdAt"),
+                        reporter: login(i, "/author/login"),
+                        assignee: names(i.get("assignees"), "login"),
+                        labels: label_names(i.get("labels")),
+                        ..Default::default()
                     })
                 })
                 .collect()
@@ -388,6 +512,11 @@ pub fn parse_gitlab(v: &Value, project: &str) -> Vec<Issue> {
                         url: s(i, "web_url"),
                         project: project.to_string(),
                         number: Some(n),
+                        created_unix: ts(i, "created_at"),
+                        reporter: login(i, "/author/username"),
+                        assignee: names(i.get("assignees"), "username"),
+                        labels: label_names(i.get("labels")),
+                        ..Default::default()
                     })
                 })
                 .collect()
@@ -407,7 +536,7 @@ pub fn list_argv(w: &Watch) -> Option<Vec<String>> {
                 "--state",
                 "open",
                 "--json",
-                "number,title,body,url,state",
+                "number,title,body,url,state,author,assignees,labels,createdAt",
                 "-R",
             ]
             .iter()
@@ -417,6 +546,12 @@ pub fn list_argv(w: &Watch) -> Option<Vec<String>> {
             a.extend(["--limit".to_string(), g.max_results.to_string()]);
             if let Some(q) = g.search.as_ref().filter(|q| !q.trim().is_empty()) {
                 a.extend(["--search".to_string(), q.clone()]);
+            }
+            if let Some(who) = g.assignee.as_ref().filter(|x| !x.trim().is_empty()) {
+                a.extend(["--assignee".to_string(), who.clone()]);
+            }
+            for l in g.labels.iter().filter(|l| !l.trim().is_empty()) {
+                a.extend(["--label".to_string(), l.clone()]);
             }
             Some(a)
         }
@@ -429,6 +564,9 @@ pub fn list_argv(w: &Watch) -> Option<Vec<String>> {
             a.extend(["--per-page".to_string(), g.max_results.to_string()]);
             if let Some(l) = g.label.as_ref().filter(|l| !l.trim().is_empty()) {
                 a.extend(["--label".to_string(), l.clone()]);
+            }
+            if let Some(who) = g.assignee.as_ref().filter(|x| !x.trim().is_empty()) {
+                a.extend(["--assignee".to_string(), who.clone()]);
             }
             Some(a)
         }
@@ -551,6 +689,8 @@ mod tests {
             name: "bugs".into(),
             repo: "tim/tgz-terminal".into(),
             search: Some("label:bug".into()),
+            assignee: Some("@me".into()),
+            labels: vec!["bug".into(), "p1".into()],
             role: None,
             triage_role: None,
             auto_launch: true,
@@ -559,8 +699,28 @@ mod tests {
             interval_secs: 120,
             max_results: 5,
             comment_on_land: true,
+            local_only: false,
             follow: true,
+            policy: Default::default(),
+            respond_within_hours: Some(24),
+            ack_template: None,
         })
+    }
+
+    #[test]
+    fn deprecated_knobs_fold_into_the_watch_policy() {
+        use crate::policy::Level;
+        let w = gh();
+        let p = w.policy();
+        assert_eq!(p.get("intake.launch"), Some(&Level::Auto));
+        assert_eq!(p.get("intake.triage"), Some(&Level::Auto));
+        // An explicit table entry wins over the knob.
+        let Watch::Github(mut g) = w else {
+            unreachable!()
+        };
+        g.policy.insert("intake.launch".into(), Level::Confirm);
+        let p = Watch::Github(g).policy();
+        assert_eq!(p.get("intake.launch"), Some(&Level::Confirm));
     }
 
     #[test]
@@ -632,5 +792,43 @@ mod tests {
         assert_eq!(key_prefix("a/b c"), "B-C");
         assert_eq!(key_prefix("///"), "ISSUE");
         assert_eq!(gh().query(), "tim/tgz-terminal · label:bug");
+    }
+
+    #[test]
+    fn assignee_and_label_filters_reach_the_cli() {
+        let a = list_argv(&gh()).unwrap();
+        assert!(a.windows(2).any(|w| w[0] == "--assignee" && w[1] == "@me"));
+        let labels: Vec<_> = a
+            .windows(2)
+            .filter(|w| w[0] == "--label")
+            .map(|w| w[1].clone())
+            .collect();
+        assert_eq!(labels, vec!["bug".to_string(), "p1".to_string()]);
+        assert_eq!(gh().respond_within_hours(), Some(24));
+    }
+
+    #[test]
+    fn tracker_people_and_labels_are_read() {
+        let gh = parse_github(
+            &json!([{"number": 1, "title": "T", "author": {"login": "ana"},
+                "assignees": [{"login": "bo"}, {"login": "cy"}],
+                "labels": [{"name": "bug"}], "createdAt": "2026-10-19T09:30:00Z"}]),
+            "o/r",
+        );
+        assert_eq!(gh[0].reporter, "ana");
+        assert_eq!(gh[0].assignee, "bo, cy");
+        assert_eq!(gh[0].labels, vec!["bug".to_string()]);
+        assert_eq!(gh[0].created_unix, 1_792_402_200);
+        let gl = parse_gitlab(
+            &json!([{"iid": 2, "title": "T", "author": {"username": "dee"},
+                "assignees": [{"username": "eve"}], "labels": ["ops", "p2"],
+                "created_at": "2026-10-19T09:30:00Z"}]),
+            "g/p",
+        );
+        assert_eq!(
+            (gl[0].reporter.as_str(), gl[0].assignee.as_str()),
+            ("dee", "eve")
+        );
+        assert_eq!(gl[0].labels, vec!["ops".to_string(), "p2".to_string()]);
     }
 }

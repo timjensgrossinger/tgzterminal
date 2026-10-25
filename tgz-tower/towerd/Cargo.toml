@@ -15,8 +15,11 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 toml.workspace = true
+# Edits the config folder from the GUI without losing hand-written comments.
+toml_edit = "0.22"
 tower-proto.workspace = true
 tower-core.workspace = true
+jiff = "0.2"
 
 # HTTPS (Atlassian, hosted LLMs): rustls everywhere but Windows, which uses
 # the system's SChannel and so needs no C toolchain to build.

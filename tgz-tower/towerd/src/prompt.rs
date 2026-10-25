@@ -37,6 +37,10 @@ pub fn system(role: &RoleCfg, team: &[RoleCfg]) -> String {
            Write the packet so a smaller model can do it with nothing else: goal, context \
            (files), constraints and acceptance criteria. The result comes back to you later \
            as a message starting with [Tower]; you do not need to wait for it.\n\
+         - tower_models / tower_delegate / tower_await: local models inside the user's own \
+           network. When a subtask is well specified (name the files, say how to check it) \
+           hand it to one with tower_delegate instead of doing it yourself: it saves the user \
+           cloud tokens. Keep working, then tower_await the result and review the change.\n\
          - tower_return: when you were given a handoff packet, report the result to whoever sent it.\n\
          - tower_post: a short note to the team frequency. @role or @agent-id reaches that agent.\n\
          - tower_ask_human: a question for the human; the answer arrives as a [Tower] message.\n\

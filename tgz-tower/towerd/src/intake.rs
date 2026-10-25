@@ -6,8 +6,9 @@
 
 use super::*;
 use crate::issues::{self, Issue, Watch};
+use crate::policy::{Action, Decision};
 use crate::projects::{self, LandMode, Origin, Resolution};
-use crate::store::IssueRef;
+use crate::store::{IssueRef, PendingAction};
 use tower_core::work::{self as work, WorkKind};
 
 /// `Input::Worktree` launch marker: continue intake once the worktree exists.
@@ -100,10 +101,17 @@ impl Engine {
             };
             self.polling.insert(name.clone());
             self.changed();
+            let sla_fields = self
+                .st
+                .sources
+                .get(&name)
+                .and_then(|s| s.sla_fields.clone());
             let tx = self.tx.clone();
             tokio::spawn(async move {
                 let result = match (&w, token) {
-                    (Watch::Jira(j), Some(t)) => crate::jira::poll(j, &t).await,
+                    (Watch::Jira(j), Some(t)) => {
+                        crate::jira::poll(j, &t, sla_fields.as_deref()).await
+                    }
                     _ => issues::poll_cli(&w).await,
                 };
                 let _ = tx.send(Input::Polled {
@@ -138,9 +146,31 @@ impl Engine {
             let st = self.st.sources.entry(name.to_string()).or_default();
             st.error = None;
             st.last_poll = now;
+            // The first poll that returns issues reads every field once and
+            // finds the SLA fields by shape; later polls ask only for those.
+            if st.sla_fields.is_none() && !issues.is_empty() {
+                let mut ids: Vec<String> = issues
+                    .iter()
+                    .flat_map(|i| i.sla_fields.iter().cloned())
+                    .collect();
+                ids.sort();
+                ids.dedup();
+                st.sla_fields = Some(ids);
+            }
         }
         // Oldest first, so flight numbers follow the issues' order.
         for issue in issues.into_iter().rev() {
+            if let Some(fid) = self
+                .st
+                .flights
+                .iter()
+                .find(|f| f.key == issue.key && f.stage != Stage::Landed)
+                .map(|f| f.id.clone())
+            {
+                // Already a flight: refresh what the tracker says about it.
+                self.refresh_issue(&fid, &issue);
+                continue;
+            }
             let known = self
                 .st
                 .sources
@@ -160,6 +190,27 @@ impl Engine {
             self.intake_flight(&w, issue);
         }
         self.changed();
+    }
+
+    /// Tracker fields and clocks for a flight, from a poll.
+    fn refresh_issue(&mut self, fid: &str, issue: &Issue) {
+        let info = IssueInfo {
+            assignee: issue.assignee.clone(),
+            reporter: issue.reporter.clone(),
+            priority: issue.priority.clone(),
+            labels: issue.labels.clone(),
+        };
+        if let Some(f) = self.flight_mut(fid) {
+            if f.issue.as_ref() != Some(&info) {
+                f.issue = Some(info);
+            }
+        }
+        if issue.created_unix > 0 {
+            self.st
+                .issue_created
+                .insert(fid.to_string(), issue.created_unix);
+        }
+        self.set_clocks(fid, issue.sla.clone(), false);
     }
 
     fn intake_flight(&mut self, w: &Watch, issue: Issue) {
@@ -195,10 +246,11 @@ impl Engine {
                 self.default_workdir(w.workdir().cloned())
             },
             kind: w.autofix().then(|| guess.as_str().to_string()),
+            local_only: w.local_only(),
             ..Default::default()
         };
-        let fid = f.id.clone();
-        self.st.flights.push(f);
+        let origin = if w.autofix() { "autofix" } else { "intake" };
+        let fid = self.push_flight(f, origin);
         self.st
             .flight_source
             .insert(fid.clone(), w.name().to_string());
@@ -210,6 +262,7 @@ impl Engine {
             },
         );
         self.note(&fid, format!("Arrived from {label} watch \"{}\"", w.name()));
+        self.refresh_issue(&fid, &issue);
         if w.autofix() {
             self.st.autofix.insert(fid.clone());
             self.find_project(&fid);
@@ -218,22 +271,78 @@ impl Engine {
         }
     }
 
-    /// Pick a role for an intake flight and launch it if the watch says so.
+    /// Pick a role for an intake flight, and launch it if `[policy]` says so.
     fn intake_assign(&mut self, fid: &str) {
+        let Some(w) = self.watch_for(fid) else {
+            return;
+        };
+        let has_triage = w
+            .triage_role()
+            .and_then(|t| self.cfg.role(t))
+            .is_some_and(|r| matches!(r.driver, DriverKind::Llm | DriverKind::Acp));
+        let auto_triage = w.role().is_none() && w.autofix() && self.cfg.triage_role().is_some();
+        if !(has_triage || auto_triage) {
+            if let Some(r) = w.role().cloned() {
+                self.clear_to(fid, &r, false, None);
+                self.maybe_intake_launch(fid, &r);
+            }
+            return;
+        }
+        let key = self.flight(fid).map(|f| f.key.clone()).unwrap_or_default();
+        let overrides = w.policy();
+        match self.decide_action(
+            Action::IntakeTriage,
+            Some(&overrides),
+            false,
+            Some(fid),
+            Some(&key),
+        ) {
+            Decision::Run => self.run_intake_triage(fid, w.role().cloned()),
+            Decision::Ask => {
+                let title = self
+                    .flight(fid)
+                    .map(|f| f.title.clone())
+                    .unwrap_or_default();
+                self.ask_action(
+                    format!("Triage {key}?"),
+                    format!("Ask the triage role which role should take: {title}"),
+                    fid,
+                    PendingAction::Triage {
+                        flight: fid.to_string(),
+                        fallback: w.role().cloned(),
+                    },
+                );
+                // Meanwhile the watch's role holds it, without starting.
+                if let Some(r) = w.role().cloned() {
+                    self.clear_to(fid, &r, false, None);
+                }
+            }
+            Decision::Draft | Decision::Skip => {
+                if let Some(r) = w.role().cloned() {
+                    self.clear_to(fid, &r, false, None);
+                }
+            }
+        }
+    }
+
+    /// Run the watch's triage role (or the Auto one) on an intake flight.
+    pub(super) fn run_intake_triage(&mut self, fid: &str, fallback: Option<String>) {
         let Some(w) = self.watch_for(fid) else {
             return;
         };
         let Some(f) = self.flight(fid).cloned() else {
             return;
         };
-        let launch = w.auto_launch() || w.autofix();
+        // Whether it then starts is decided when triage answers
+        // (`clear_after_triage`), with the policy of that moment.
+        let launch = false;
         let triage = w
             .triage_role()
             .and_then(|t| self.cfg.role(t))
             .filter(|r| matches!(r.driver, DriverKind::Llm | DriverKind::Acp))
             .cloned();
-        match (triage, w.role().cloned()) {
-            (Some(role), fallback) => {
+        match triage {
+            Some(role) => {
                 let what = format!("Issue {}: {}", f.key, f.title);
                 let body = format!(
                     "--- issue (untrusted) ---\n{}",
@@ -241,12 +350,78 @@ impl Engine {
                 );
                 self.start_triage(fid, &role, what, body, launch, fallback);
             }
-            (None, Some(r)) => self.clear_to(fid, &r, launch, None),
-            // Auto-fix with no role: the Auto triage role picks one.
-            (None, None) if w.autofix() && self.cfg.triage_role().is_some() => {
-                self.start_auto_triage(fid, launch)
+            None => self.start_auto_triage(fid, launch),
+        }
+    }
+
+    /// A role for an intake flight came back from triage: clear it, then
+    /// let the policy decide whether it starts. Other flights keep the
+    /// launch choice their creator made.
+    pub(super) fn clear_after_triage(
+        &mut self,
+        fid: &str,
+        role_id: &str,
+        launch: bool,
+        why: Option<String>,
+    ) {
+        if self.st.flight_source.contains_key(fid) {
+            self.clear_to(fid, role_id, false, why);
+            self.maybe_intake_launch(fid, role_id);
+        } else {
+            self.clear_to(fid, role_id, launch, why);
+        }
+    }
+
+    /// Start `role` on a cleared intake flight if `intake.launch` says run.
+    pub(super) fn maybe_intake_launch(&mut self, fid: &str, role_id: &str) {
+        if !self.intake_launch_allowed(fid, role_id) {
+            return;
+        }
+        let res = self.launch_flight(fid, role_id);
+        self.audit_result(Action::IntakeLaunch, Some(fid), Some(role_id), &res);
+        if let Err(e) = res {
+            self.note(fid, format!("Launch failed: {e}"));
+        }
+    }
+
+    /// Decide `intake.launch` for starting `role` on an intake flight. On
+    /// "ask", queue a Run item; on "draft"/"skip", it stays cleared.
+    fn intake_launch_allowed(&mut self, fid: &str, role_id: &str) -> bool {
+        let overrides = self.overrides_for(fid);
+        let needs_terms = self
+            .cfg
+            .role(role_id)
+            .cloned()
+            .map(|r| {
+                let v = self.terms_for(&r, crate::compliance::Input::Initial);
+                self.terms_pending(v).is_some()
+            })
+            .unwrap_or(false);
+        let key = self.flight(fid).map(|f| f.key.clone()).unwrap_or_default();
+        match self.decide_action(
+            Action::IntakeLaunch,
+            overrides.as_ref(),
+            needs_terms,
+            Some(fid),
+            Some(&key),
+        ) {
+            Decision::Run => true,
+            Decision::Ask => {
+                let name = self.role_name(role_id);
+                self.ask_action(
+                    format!("Start {name} on {key}?"),
+                    self.flight(fid)
+                        .map(|f| f.title.clone())
+                        .unwrap_or_default(),
+                    fid,
+                    PendingAction::Launch {
+                        flight: fid.to_string(),
+                        role: role_id.to_string(),
+                    },
+                );
+                false
             }
-            (None, None) => {}
+            Decision::Draft | Decision::Skip => false,
         }
     }
 
@@ -313,9 +488,25 @@ impl Engine {
                         .map(|r| r.path.clone())
                         .collect();
                 }
-                match self.cfg.triage_role().cloned() {
-                    Some(t) if !choices.is_empty() => self.start_project_triage(fid, &t, choices),
-                    _ => self.ask_project(fid, choices, "No project matched it."),
+                // Triage is an agent run: the policy decides; otherwise you pick.
+                let triage = match self.cfg.triage_role().cloned() {
+                    Some(t) if !choices.is_empty() => {
+                        let overrides = w.policy();
+                        let key = f.key.clone();
+                        let run = self.decide_action(
+                            Action::IntakeTriage,
+                            Some(&overrides),
+                            false,
+                            Some(fid),
+                            Some(&key),
+                        ) == Decision::Run;
+                        run.then_some(t)
+                    }
+                    _ => None,
+                };
+                match triage {
+                    Some(t) => self.start_project_triage(fid, &t, choices),
+                    None => self.ask_project(fid, choices, "No project matched it."),
                 }
             }
         }
@@ -359,10 +550,12 @@ impl Engine {
             format!("Triage ({}) is looking for its project", triage.name),
         );
         let flight_id = fid.to_string();
-        self.ask_triage(triage, system, user, move |result| Input::ProjectPicked {
-            flight_id,
-            choices,
-            result,
+        self.ask_triage(fid, triage, system, user, move |result| {
+            Input::ProjectPicked {
+                flight_id,
+                choices,
+                result,
+            }
         });
     }
 
@@ -752,6 +945,28 @@ impl Engine {
         match self.cfg.autofix.land {
             LandMode::Branch => self.start_publish(fid, false),
             LandMode::Pr => {
+                let overrides = self.overrides_for(fid);
+                match self.decide_action(
+                    Action::PrDraft,
+                    overrides.as_ref(),
+                    false,
+                    Some(fid),
+                    Some(&f.key),
+                ) {
+                    Decision::Run => {
+                        self.note(
+                            fid,
+                            "Pushing and opening a draft PR on its own (pr.draft = auto, armed)",
+                        );
+                        self.start_publish(fid, true);
+                        return true;
+                    }
+                    Decision::Draft | Decision::Skip => {
+                        self.start_publish(fid, false);
+                        return true;
+                    }
+                    Decision::Ask => {}
+                }
                 let id = self.add_inbox(InboxItem {
                     kind: InboxKind::Clearance,
                     title: format!("Open a draft PR for {}?", f.key),

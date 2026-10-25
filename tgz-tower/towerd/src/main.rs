@@ -5,24 +5,39 @@
 //! tower status --socket <path>
 //! tower hook <event>    (run by Claude Code hooks; reads the payload on stdin)
 //! tower mcp             (stdio MCP server with the team tools)
+//! tower notify <json>   (run by Codex's `notify` at the end of a turn)
 //! ```
 //! `hook` and `mcp` find the daemon through TOWER_SOCK / TOWER_AGENT_ID,
 //! which the daemon sets when it launches an agent.
 
+mod audit;
 mod claude_trust;
+mod clock;
+mod compliance;
 mod config;
+mod config_write;
+mod connect;
 mod drivers;
 mod engine;
 mod gates;
+mod history;
 mod issues;
 mod jira;
+mod local_guard;
 mod mcp_http;
 mod paths;
+mod policy;
+mod privacy;
 mod projects;
 mod prompt;
+mod responses;
+mod routines;
 mod routing;
+mod schedule;
+mod scout;
 mod server;
 mod shim;
+mod sla;
 mod store;
 mod transport;
 mod usage;
@@ -60,7 +75,7 @@ fn auth(args: &[String]) -> anyhow::Result<()> {
 fn usage() -> ! {
     eprintln!(
         "usage: tower daemon [--socket <path>] [--config-dir <dir>] [--data-dir <dir>] [--demo]\n       \
-         tower status [--socket <path>]\n       tower auth jira <site>\n       tower hook <event>\n       tower mcp"
+         tower status [--socket <path>]\n       tower routines [--config-dir <dir>]\n       tower auth jira <site>\n       tower hook <event>\n       tower mcp\n       tower guard prompt|tool|dir [<folder> [<cli>]]"
     );
     std::process::exit(2);
 }
@@ -93,6 +108,8 @@ fn main() -> anyhow::Result<()> {
         // The shims stay synchronous and start fast.
         "hook" => return shim::hook(rest.first().map(String::as_str).unwrap_or("")),
         "mcp" => return shim::mcp(),
+        "notify" => return shim::notify(rest.last().map(String::as_str).unwrap_or("")),
+        "guard" => return local_guard::run(rest),
         _ => {}
     }
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -110,9 +127,74 @@ fn main() -> anyhow::Result<()> {
             rt.block_on(server::run(paths, rest.iter().any(|a| a == "--demo")))
         }
         "status" => status(rest),
+        "routines" => routines_cmd(rest),
         "auth" => auth(rest),
         _ => usage(),
     }
+}
+
+/// `tower routines`: Tower's schedules and this machine's launchd/cron
+/// jobs, read locally (no daemon needed).
+fn routines_cmd(args: &[String]) -> anyhow::Result<()> {
+    let paths = paths::Paths::new(
+        paths::default_socket(),
+        flag(args, "--config-dir").map(PathBuf::from),
+        None,
+    );
+    let tz = clock::local_tz();
+    let now = paths::now_unix();
+    let when = |t: Option<u64>| match t {
+        Some(t) => {
+            let c = clock::civil(t, &tz);
+            format!(
+                "next {} {} {:02}:{:02}",
+                clock::weekday_name(t, &tz),
+                clock::day_key(t, &tz),
+                c.hour,
+                c.minute
+            )
+        }
+        None => String::new(),
+    };
+    println!(
+        "Tower schedules ({}):",
+        paths.config.join(schedule::FILE).display()
+    );
+    match schedule::load(&paths.config) {
+        Ok(list) if list.is_empty() => println!("  none"),
+        Ok(list) => {
+            for s in list {
+                let (text, next) = match schedule::Timing::of(&s) {
+                    Ok(t) => (t.describe(), when(t.next(now, None, &tz))),
+                    Err(e) => (format!("can't read: {e}"), String::new()),
+                };
+                let off = if s.enabled { "" } else { " (paused)" };
+                println!("  {} [{}]{off}: {text}  {next}", s.name, s.id);
+            }
+        }
+        Err(e) => println!("  {e}"),
+    }
+    let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_default();
+    let found = routines::collect(&home, now);
+    println!("This machine:");
+    if !found.note.is_empty() {
+        println!("  {}", found.note);
+    }
+    for r in found.rows {
+        let exit = r
+            .last_exit
+            .map(|x| format!(" exit {x}"))
+            .unwrap_or_default();
+        let stalled = if r.stalled { " STALLED" } else { "" };
+        println!(
+            "  [{}] {}: {}{exit}{stalled}  {}",
+            r.source,
+            r.label,
+            r.schedule_text,
+            when(r.next_fire_unix)
+        );
+    }
+    Ok(())
 }
 
 /// `tower status`: one line about the running daemon.

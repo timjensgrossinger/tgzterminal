@@ -8,7 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 6;
 
 // ---------------------------------------------------------------------------
 // Model
@@ -144,6 +144,35 @@ pub struct Role {
     /// Something that will stop this role from working, e.g. a missing model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warning: Option<String>,
+    /// The program and its arguments, as the role file has them.
+    #[serde(default)]
+    pub command: Vec<String>,
+    /// `driver = "routed"`: the engine comes from `[routing]` by task size.
+    #[serde(default)]
+    pub routed: bool,
+    /// Tower made this role itself (the Local role); saving it writes a file.
+    #[serde(default)]
+    pub builtin: bool,
+}
+
+/// A role as the Roster edits it (`roles/<id>.toml`).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct RoleSpec {
+    /// The file name; empty: made from the name.
+    pub id: String,
+    pub name: String,
+    /// `#rrggbb`.
+    #[serde(default)]
+    pub color: String,
+    /// `pane`, `acp`, `llm` or `routed`.
+    pub driver: String,
+    #[serde(default)]
+    pub command: Vec<String>,
+    pub mission: String,
+    /// Models, cheapest first.
+    #[serde(default)]
+    pub ladder: Vec<String>,
+    pub max_concurrency: u32,
 }
 
 fn default_concurrency() -> u32 {
@@ -260,6 +289,25 @@ pub struct Agent {
     /// Thinking effort it was started with, when one was set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    /// A CLI you started in an ordinary pane that reached Tower through its
+    /// global MCP entry. Tower never types into its pane: it fetches results
+    /// with `tower_await`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub adopted: bool,
+}
+
+/// A CLI in an ordinary TGZTerminal pane, as its `tower mcp` server
+/// describes it.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct PaneAgentInfo {
+    /// `WEZTERM_PANE`.
+    pub pane_id: u64,
+    /// The CLI's process id (the MCP server's parent).
+    pub pid: u32,
+    /// `claude`, `codex`, … as the process is named.
+    pub vendor: String,
+    /// Where it works.
+    pub cwd: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -321,6 +369,14 @@ pub struct HandoffPacket {
     /// Agent or role id the result goes back to. Empty: back to you.
     pub return_to: String,
     pub state: HandoffState,
+    /// The model the receiver runs on, when the sender picked one
+    /// (`tower_delegate`); otherwise the role's first rung.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// The sender says the work is sensitive: local models only, and only
+    /// its status goes back to a cloud sender.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub local_only: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -426,6 +482,64 @@ pub struct Flight {
     /// Deliverables (documents, prototypes), absolute paths.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub artifacts: Vec<String>,
+    /// Response-time clocks of the issue it came from.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sla: Vec<SlaClock>,
+    /// Who and what the issue is about, from the tracker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issue: Option<IssueInfo>,
+    /// What started it: `you`, `auto:<policy action>`, `schedule:<id>` or
+    /// `handoff`. Unset on flights from before this was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_by: Option<String>,
+    /// When it landed (unix seconds).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub landed_unix: Option<u64>,
+    /// Sensitive work: only models inside your network may see it. Set on
+    /// the flight itself or worked out from its folder or source.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub local_only: bool,
+}
+
+/// One response-time clock: a Jira Service Management SLA, or a
+/// `respond_within_hours` clock Tower keeps for other trackers.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct SlaClock {
+    /// The tracker's SLA id, or `respond` for Tower's own clock.
+    pub id: String,
+    pub name: String,
+    /// `jsm` or `tower`.
+    pub source: String,
+    /// When the running cycle started (unix seconds); 0 when none runs.
+    #[serde(default)]
+    pub started_unix: u64,
+    /// When it breaches, wall-clock (the tracker already applied business
+    /// hours); 0 when no cycle runs.
+    #[serde(default)]
+    pub due_unix: u64,
+    /// The goal, in working time.
+    #[serde(default)]
+    pub goal_secs: u64,
+    #[serde(default)]
+    pub breached: bool,
+    #[serde(default)]
+    pub paused: bool,
+    /// No cycle is running: met, or not started.
+    #[serde(default)]
+    pub stopped: bool,
+}
+
+/// Tracker fields shown with a flight.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct IssueInfo {
+    #[serde(default)]
+    pub assignee: String,
+    #[serde(default)]
+    pub reporter: String,
+    #[serde(default)]
+    pub priority: String,
+    #[serde(default)]
+    pub labels: Vec<String>,
 }
 
 /// A routing decision: tier from the task text (and triage), then the first
@@ -473,6 +587,70 @@ pub struct EngineInfo {
     /// Arm observations, for the learned policy.
     #[serde(default)]
     pub trained: u32,
+    /// Where its model runs.
+    #[serde(default)]
+    pub locality: Locality,
+}
+
+/// A model server as the Models view edits it (`[[endpoint]]`).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct EndpointSpec {
+    pub name: String,
+    /// "ollama", "lmstudio", "llama.cpp", "vllm", "mlx", "openai-compatible".
+    pub kind: String,
+    pub base_url: String,
+    /// Unset: guessed from the URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_env: Option<String>,
+}
+
+/// A model as the Models view edits it (`[[model]]`).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct ModelSpec {
+    /// `<endpoint>/<model name on that server>`.
+    pub id: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub size: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<u32>,
+    #[serde(default)]
+    pub good_for: Vec<String>,
+    #[serde(default)]
+    pub notes: String,
+    pub max_concurrency: u32,
+}
+
+/// A model from `models.toml`'s `[[model]]` list: what agents may hand work
+/// to, and what they read to decide.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct ModelInfo {
+    /// `<endpoint>/<model>`, as ladders and `tower_delegate` name it.
+    pub id: String,
+    pub label: String,
+    /// The `models.toml` server it runs on.
+    pub endpoint: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub size: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<u32>,
+    #[serde(default)]
+    pub good_for: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub notes: String,
+    #[serde(default)]
+    pub locality: Locality,
+    /// Its server is up and serves it (or has not been probed yet).
+    pub available: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub why: Option<String>,
+    /// Live agents running on it now.
+    #[serde(default)]
+    pub busy: u32,
+    pub max_concurrency: u32,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -486,6 +664,8 @@ pub enum InboxKind {
     /// `ask_human` from an agent.
     Question,
     GateFailure,
+    /// A response-time clock is running out.
+    Deadline,
 }
 
 impl InboxKind {
@@ -495,6 +675,7 @@ impl InboxKind {
             InboxKind::Clearance => "Clearance",
             InboxKind::Question => "Question",
             InboxKind::GateFailure => "Gate failed",
+            InboxKind::Deadline => "Deadline",
         }
     }
 }
@@ -531,15 +712,16 @@ pub struct InboxItem {
     pub pane_id: Option<u64>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum Health {
     Up,
     Down,
+    #[default]
     Unknown,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
 pub struct Endpoint {
     pub id: String,
     pub name: String,
@@ -551,6 +733,14 @@ pub struct Endpoint {
     pub latency_ms: Option<u32>,
     #[serde(default)]
     pub models: Vec<String>,
+    /// Inside your own network (set, or guessed from the URL).
+    #[serde(default)]
+    pub local: bool,
+    /// `local` as written in `models.toml`; unset means guessed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_set: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_env: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -628,9 +818,285 @@ pub struct Snapshot {
     /// The `[routing]` engines, low tier first.
     #[serde(default)]
     pub engines: Vec<EngineInfo>,
+    /// `models.toml`'s `[[model]]` list.
+    #[serde(default)]
+    pub models: Vec<ModelInfo>,
+    /// CLIs whose user-wide config has Tower's MCP entry (`claude`, `codex`).
+    #[serde(default)]
+    pub connected_clis: Vec<String>,
+    /// Every `[routing.engines]` id, also those no tier uses yet.
+    #[serde(default)]
+    pub engine_ids: Vec<String>,
+    /// `[privacy] local_only_paths`.
+    #[serde(default)]
+    pub local_only_paths: Vec<String>,
     /// `off`, `shadow` or `live`.
     #[serde(default)]
     pub bandit_mode: String,
+    /// While set and in the future, actions at level `auto` run on their own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub armed_until: Option<u64>,
+    /// The effective level of every policy action.
+    #[serde(default)]
+    pub policy: Vec<PolicyRow>,
+    /// Tower's own schedules (`schedules.toml`).
+    #[serde(default)]
+    pub schedules: Vec<ScheduleRow>,
+    /// Other scheduled jobs on this machine (launchd, crontab), read-only.
+    #[serde(default)]
+    pub routines: Vec<RoutineRow>,
+    /// Why `routines` is empty or partial ("not available on Windows").
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub routines_note: String,
+    /// What ran by itself, per day.
+    #[serde(default)]
+    pub activity: ActivityStats,
+}
+
+// ---------------------------------------------------------------------------
+// Schedules, routines, activity
+// ---------------------------------------------------------------------------
+
+fn yes() -> bool {
+    true
+}
+
+fn three() -> u32 {
+    3
+}
+
+fn skip() -> String {
+    "skip".to_string()
+}
+
+/// A Tower schedule as written in `schedules.toml`: start a flight at a time.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct ScheduleSpec {
+    /// Slug; empty when creating one (towerd derives it from the name).
+    #[serde(default)]
+    pub id: String,
+    pub name: String,
+    #[serde(default = "yes")]
+    pub enabled: bool,
+    /// A 5-field cron expression or `@daily`-style macro, local time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cron: Option<String>,
+    /// An interval instead of `cron`: `30m`, `2h`, `1d`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub every: Option<String>,
+    /// A role id, or `auto` to let triage pick.
+    #[serde(default)]
+    pub role: String,
+    /// `low` / `medium` / `high`; unset = the router decides.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier: Option<String>,
+    /// Flight title; `{date}`, `{weekday}` and `{since}` are filled in.
+    #[serde(default)]
+    pub title: String,
+    /// The task for the agent; same placeholders as `title`.
+    #[serde(default)]
+    pub brief: String,
+    /// `new_folder`, `dir` or `worktree`.
+    #[serde(default, rename = "where")]
+    pub place: String,
+    /// The folder for `dir`, the repo for `worktree`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// `skip` (default): don't start while the last run's flight is open.
+    /// `run`: start anyway.
+    #[serde(default = "skip")]
+    pub overlap: String,
+    /// Run once at startup when a fire time passed while towerd was down.
+    #[serde(default)]
+    pub catch_up: bool,
+    /// Pause after this many failed runs in a row; 0 = never.
+    #[serde(default = "three")]
+    pub pause_after_failures: u32,
+    /// Overrides `schedule.run` in `[policy.actions]` for this schedule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<String>,
+    /// Its flights are sensitive: local models only.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub local_only: bool,
+}
+
+impl Default for ScheduleSpec {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: String::new(),
+            enabled: true,
+            cron: None,
+            every: None,
+            role: String::new(),
+            tier: None,
+            title: String::new(),
+            brief: String::new(),
+            place: String::new(),
+            path: None,
+            overlap: skip(),
+            catch_up: false,
+            pause_after_failures: 3,
+            policy: None,
+            local_only: false,
+        }
+    }
+}
+
+/// How one scheduled run went.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RunResult {
+    /// Its flight is still open.
+    #[default]
+    Running,
+    Landed,
+    Proposed,
+    Declined,
+    Failed,
+    /// Not started (still running, waiting in the Inbox, off).
+    Skipped,
+}
+
+impl RunResult {
+    pub fn is_failure(self) -> bool {
+        matches!(self, RunResult::Declined | RunResult::Failed)
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct RunMark {
+    pub at_unix: u64,
+    pub result: RunResult,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flight: Option<String>,
+    /// Why it was skipped or failed.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub note: String,
+}
+
+/// A schedule as the Tower view shows it.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct ScheduleRow {
+    pub spec: ScheduleSpec,
+    /// "weekdays 07:00", "every 30m".
+    #[serde(default)]
+    pub when_text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_fire_unix: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_fire_unix: Option<u64>,
+    /// Latest runs, oldest first.
+    #[serde(default)]
+    pub recent: Vec<RunMark>,
+    /// Set when Tower paused it (failures in a row, policy off).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused_reason: Option<String>,
+    /// A spec it could not use (bad cron, unknown role).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// A scheduled job Tower did not create: a launchd agent or a crontab line.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct RoutineRow {
+    /// `launchd` or `cron`.
+    pub source: String,
+    /// launchd label, or the crontab command.
+    pub label: String,
+    /// "every 15m", "weekdays 07:00", "at login", "keeps running".
+    #[serde(default)]
+    pub schedule_text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_fire_unix: Option<u64>,
+    /// Loaded into launchd (always true for crontab lines).
+    #[serde(default)]
+    pub loaded: bool,
+    #[serde(default)]
+    pub disabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_exit: Option<i32>,
+    /// When its log last changed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_activity_unix: Option<u64>,
+    /// An interval job whose log has not changed for 3 intervals.
+    #[serde(default)]
+    pub stalled: bool,
+    /// The program and its arguments, shortened.
+    #[serde(default)]
+    pub program: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_path: Option<String>,
+    /// The plist, for launchd.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_path: Option<String>,
+    /// The program lives under the home folder (not a vendor updater).
+    #[serde(default)]
+    pub yours: bool,
+}
+
+/// Counters for one local day.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct DayStats {
+    /// `2026-10-24`.
+    pub day: String,
+    /// Flights started, by origin: `you`, `intake`, `autofix`, `schedule`,
+    /// `handoff`.
+    #[serde(default)]
+    pub started: std::collections::BTreeMap<String, u32>,
+    /// Actions Tower ran without a click, by policy key.
+    #[serde(default)]
+    pub auto: std::collections::BTreeMap<String, u32>,
+    /// Questions Tower put in the Inbox instead.
+    #[serde(default)]
+    pub asked: u32,
+    /// How flights ended: `landed`, `proposed`, `declined`, `gates_failed`,
+    /// `escalated`.
+    #[serde(default)]
+    pub outcomes: std::collections::BTreeMap<String, u32>,
+    #[serde(default)]
+    pub cost_usd: f64,
+    #[serde(default)]
+    pub tokens: u64,
+}
+
+/// Something Tower did on its own.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct AutoEvent {
+    pub at_unix: u64,
+    /// Policy key: `ack.post`, `schedule.run`, ...
+    pub action: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flight: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    /// `started`, `done`, `posted`, `failed: ...`.
+    #[serde(default)]
+    pub outcome: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct ActivityStats {
+    /// Oldest first, at most 90, days with nothing included.
+    #[serde(default)]
+    pub days: Vec<DayStats>,
+    /// Newest first.
+    #[serde(default)]
+    pub recent: Vec<AutoEvent>,
+}
+
+/// One `[policy]` action and the level it runs at.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct PolicyRow {
+    /// `intake.launch`, `ack.post`, ...
+    pub action: String,
+    /// `off`, `draft`, `confirm` or `auto`.
+    pub level: String,
+    /// Set in `tower.toml` rather than the built-in default.
+    #[serde(default)]
+    pub configured: bool,
 }
 
 impl Snapshot {
@@ -695,6 +1161,9 @@ pub enum ClientMsg {
         /// `low` / `medium` / `high` to override the router; `None` = auto.
         #[serde(default)]
         tier: Option<String>,
+        /// Sensitive: only models inside your network may work on it.
+        #[serde(default)]
+        local_only: bool,
     },
     /// Launch an agent of a role on a flight, or on a new flight made from `task`.
     LaunchAgent {
@@ -747,6 +1216,86 @@ pub enum ClientMsg {
     ReloadConfig,
     /// Poll every intake watch now.
     PollSources,
+    /// Arm (for `[policy] armed_ttl_secs`) or disarm automatic actions.
+    SetArmed {
+        on: bool,
+    },
+    /// Start a run of a `[[scout]]` now.
+    RunScout {
+        name: String,
+    },
+    /// Create (empty `id`) or replace a schedule in `schedules.toml`.
+    SaveSchedule {
+        spec: ScheduleSpec,
+    },
+    /// Add or change a model server in `models.toml`; `old_name` renames.
+    SaveEndpoint {
+        spec: EndpointSpec,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        old_name: Option<String>,
+    },
+    DeleteEndpoint {
+        name: String,
+    },
+    /// Add or change a `[[model]]` in `models.toml`; `old_id` renames.
+    SaveModel {
+        spec: ModelSpec,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        old_id: Option<String>,
+    },
+    DeleteModel {
+        id: String,
+    },
+    /// Add or change a role file; `old_id` renames it.
+    SaveRole {
+        spec: RoleSpec,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        old_id: Option<String>,
+    },
+    DeleteRole {
+        id: String,
+    },
+    /// Which `[routing]` engines run a tier, in order of preference.
+    SetRouting {
+        tier: String,
+        engines: Vec<String>,
+    },
+    /// Set a `[policy.actions]` level; `None` goes back to the default.
+    SetPolicyLevel {
+        action: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        level: Option<String>,
+    },
+    /// `[privacy] local_only_paths`.
+    SetLocalOnlyPaths {
+        paths: Vec<String>,
+    },
+    /// Add (`on`) or remove Tower's MCP entry in the user-wide Claude Code
+    /// and Codex configs, so CLIs in ordinary panes can delegate.
+    ConnectAgents {
+        on: bool,
+    },
+    /// A team tool called by a CLI in an ordinary pane (not launched by
+    /// Tower). Only the delegation tools answer.
+    PaneTool {
+        agent: PaneAgentInfo,
+        name: String,
+        args: serde_json::Value,
+    },
+    DeleteSchedule {
+        id: String,
+    },
+    /// Pause or resume; resuming also clears a pause Tower made.
+    SetScheduleEnabled {
+        id: String,
+        enabled: bool,
+    },
+    /// Fire a schedule now, outside its timetable.
+    RunSchedule {
+        id: String,
+    },
+    /// Re-read launchd agents and the crontab now.
+    RefreshRoutines,
 
     // -- from the Tower view, about panes it spawned for the daemon ----------
     PaneSpawned {
@@ -796,6 +1345,10 @@ pub enum ServerMsg {
     ToolResult {
         ok: bool,
         text: String,
+    },
+    /// What a Claude Code hook should print (JSON hook output); empty: nothing.
+    HookReply {
+        output: String,
     },
 
     // -- to the Tower view: terminal work only the GUI can do ----------------
@@ -968,6 +1521,8 @@ pub fn demo_snapshot(now_unix: u64) -> Snapshot {
         ],
         return_to: "approach-1".into(),
         state: HandoffState::Returned,
+        model: None,
+        local_only: false,
     };
     let packet_docs = HandoffPacket {
         id: "h-33".into(),
@@ -979,6 +1534,8 @@ pub fn demo_snapshot(now_unix: u64) -> Snapshot {
         acceptance: vec!["cargo doc has no missing-docs warnings for the module".into()],
         return_to: "approach-1".into(),
         state: HandoffState::Draft,
+        model: None,
+        local_only: false,
     };
     let down = |from: &str, to: &str| LineageStep {
         from_role: from.into(),
@@ -1201,6 +1758,8 @@ pub fn demo_snapshot(now_unix: u64) -> Snapshot {
             health: Health::Up,
             latency_ms: Some(2),
             models: vec!["qwen3.6:27b".into()],
+            local: true,
+            ..Default::default()
         },
         Endpoint {
             id: "gpu-box".into(),
@@ -1210,6 +1769,8 @@ pub fn demo_snapshot(now_unix: u64) -> Snapshot {
             health: Health::Down,
             latency_ms: None,
             models: vec![],
+            local: true,
+            ..Default::default()
         },
     ];
 
@@ -1238,6 +1799,29 @@ pub fn demo_snapshot(now_unix: u64) -> Snapshot {
         flights_root: "~/Tower".into(),
         triage_role: "review".into(),
         bandit_mode: "shadow".into(),
+        armed_until: None,
+        policy: vec![],
+        connected_clis: vec!["claude".into()],
+        engine_ids: vec![
+            "qwen-local".into(),
+            "claude-sonnet".into(),
+            "claude-opus".into(),
+        ],
+        local_only_paths: vec!["~/src/payroll".into()],
+        models: vec![ModelInfo {
+            id: "localhost/qwen3.6:27b".into(),
+            label: "Qwen 3.6 27B".into(),
+            endpoint: "localhost".into(),
+            size: "27B".into(),
+            context: Some(131_072),
+            good_for: vec!["code edits".into(), "docs".into(), "tests".into()],
+            notes: "Strong on code; slow on very long files.".into(),
+            locality: Locality::Local,
+            available: true,
+            why: None,
+            busy: 0,
+            max_concurrency: 1,
+        }],
         engines: vec![
             EngineInfo {
                 id: "qwen-local".into(),
@@ -1246,6 +1830,7 @@ pub fn demo_snapshot(now_unix: u64) -> Snapshot {
                 model: "ollama/qwen3.6:27b".into(),
                 available: false,
                 why: Some("ollama pull qwen3.6:27b".into()),
+                locality: Locality::Local,
                 ..Default::default()
             },
             EngineInfo {
@@ -1279,7 +1864,169 @@ pub fn demo_snapshot(now_unix: u64) -> Snapshot {
             error: None,
             flights: 2,
         }],
+        schedules: demo_schedules(now_unix),
+        routines: demo_routines(now_unix),
+        routines_note: String::new(),
+        activity: demo_activity(now_unix),
     }
+}
+
+fn demo_schedules(now: u64) -> Vec<ScheduleRow> {
+    let h = |n: u64| now.saturating_sub(n * 3600);
+    let mark = |hours_ago: u64, result: RunResult| RunMark {
+        at_unix: h(hours_ago),
+        result,
+        flight: None,
+        note: String::new(),
+    };
+    vec![
+        ScheduleRow {
+            spec: ScheduleSpec {
+                id: "morning-prs".into(),
+                name: "Morning PR review".into(),
+                cron: Some("30 8 * * 1-5".into()),
+                role: "review".into(),
+                title: "PR review {date}".into(),
+                brief: "Review the open pull requests changed since {since}.".into(),
+                place: "dir".into(),
+                path: Some("~/src/acme".into()),
+                ..Default::default()
+            },
+            when_text: "weekdays 08:30".into(),
+            next_fire_unix: Some(now + 14 * 3600),
+            last_fire_unix: Some(h(10)),
+            recent: vec![
+                mark(106, RunResult::Landed),
+                mark(82, RunResult::Landed),
+                mark(58, RunResult::Proposed),
+                mark(34, RunResult::Landed),
+                mark(10, RunResult::Running),
+            ],
+            ..Default::default()
+        },
+        ScheduleRow {
+            spec: ScheduleSpec {
+                id: "deps-audit".into(),
+                name: "Nightly dependency audit".into(),
+                cron: Some("0 2 * * *".into()),
+                role: "auto".into(),
+                title: "Dependency audit {date}".into(),
+                brief: "Check for outdated or vulnerable dependencies.".into(),
+                place: "worktree".into(),
+                path: Some("~/src/acme".into()),
+                ..Default::default()
+            },
+            when_text: "daily 02:00".into(),
+            next_fire_unix: Some(now + 3 * 3600),
+            last_fire_unix: Some(h(21)),
+            recent: vec![
+                mark(69, RunResult::Failed),
+                mark(45, RunResult::Failed),
+                mark(21, RunResult::Failed),
+            ],
+            paused_reason: Some("3 failed runs in a row".into()),
+            ..Default::default()
+        },
+    ]
+}
+
+fn demo_routines(now: u64) -> Vec<RoutineRow> {
+    vec![
+        RoutineRow {
+            source: "launchd".into(),
+            label: "com.example.sla-checker".into(),
+            schedule_text: "every 15m".into(),
+            loaded: true,
+            last_exit: Some(0),
+            last_activity_unix: Some(now.saturating_sub(300)),
+            program: "~/sla-checker/venv/bin/python sla_checker.py".into(),
+            log_path: Some("~/Library/Logs/sla.log".into()),
+            file_path: Some("~/Library/LaunchAgents/com.example.sla-checker.plist".into()),
+            yours: true,
+            ..Default::default()
+        },
+        RoutineRow {
+            source: "cron".into(),
+            label: "~/scripts/briefing.sh".into(),
+            schedule_text: "weekdays 07:00".into(),
+            next_fire_unix: Some(now + 9 * 3600),
+            loaded: true,
+            program: "/bin/zsh ~/scripts/briefing.sh".into(),
+            yours: true,
+            ..Default::default()
+        },
+        RoutineRow {
+            source: "launchd".into(),
+            label: "com.vendor.updater".into(),
+            schedule_text: "at login".into(),
+            loaded: true,
+            last_exit: Some(1),
+            program: "/Library/Vendor/updater --check".into(),
+            ..Default::default()
+        },
+    ]
+}
+
+/// `YYYY-MM-DD` of a unix time, in UTC (demo data only).
+fn demo_day(unix: u64) -> String {
+    // Howard Hinnant's civil_from_days.
+    let z = (unix / 86_400) as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + if mo <= 2 { 1 } else { 0 };
+    format!("{:04}-{:02}-{:02}", y, mo, d)
+}
+
+fn demo_activity(now: u64) -> ActivityStats {
+    let mut days = Vec::new();
+    for i in (0..30u64).rev() {
+        // A deterministic wobble, quieter at weekends.
+        let w = (i * 7 + 3) % 5;
+        // +35 keeps the weekday and cannot underflow.
+        let weekend = matches!((now / 86_400 + 35 + 4 - i) % 7, 0 | 6);
+        let k = if weekend { 0 } else { 1 };
+        let mut d = DayStats {
+            day: demo_day(now.saturating_sub(i * 86_400)),
+            ..Default::default()
+        };
+        d.started.insert("you".into(), (2 + w as u32) * k);
+        d.started.insert("intake".into(), (w as u32 % 3) * k);
+        d.started.insert("autofix".into(), (w as u32 % 2) * k);
+        d.started.insert("schedule".into(), 1 + k);
+        d.auto.insert("ack.post".into(), (w as u32 % 3) * k);
+        d.auto.insert("schedule.run".into(), 1 + k);
+        d.auto.insert("intake.launch".into(), (w as u32 % 2) * k);
+        d.auto.insert("land".into(), (w as u32 / 2) * k);
+        d.asked = (w as u32 + 1) * k;
+        d.outcomes.insert("landed".into(), (1 + w as u32) * k);
+        d.outcomes.insert("proposed".into(), (w as u32 % 2) * k);
+        d.outcomes.insert("declined".into(), u32::from(w == 4) * k);
+        d.cost_usd = (0.4 + w as f64 * 0.35) * (k as f64 + 0.2);
+        d.tokens = 40_000 + w * 25_000;
+        days.push(d);
+    }
+    let recent = vec![
+        AutoEvent {
+            at_unix: now.saturating_sub(600),
+            action: "schedule.run".into(),
+            flight: Some("f-17".into()),
+            target: Some("morning-prs".into()),
+            outcome: "started".into(),
+        },
+        AutoEvent {
+            at_unix: now.saturating_sub(2400),
+            action: "ack.post".into(),
+            flight: None,
+            target: Some("PROJ-341".into()),
+            outcome: "posted".into(),
+        },
+    ];
+    ActivityStats { days, recent }
 }
 
 #[cfg(test)]

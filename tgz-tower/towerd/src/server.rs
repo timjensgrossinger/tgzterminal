@@ -26,6 +26,8 @@ struct Shared {
     tx: mpsc::UnboundedSender<Input>,
     snaps: watch::Receiver<Arc<Snapshot>>,
     master: Arc<String>,
+    /// For `tower mcp` in ordinary panes: only ever `Access::Pane`.
+    pane: Arc<String>,
     agents: AgentTokens,
 }
 
@@ -36,23 +38,27 @@ enum Access {
     Full,
     /// One agent's shims: hook events and tool calls for this agent only.
     Agent(String),
+    /// The `tower mcp` server of a CLI in an ordinary pane: the delegation
+    /// tools only. It shows the master token (it runs as you, like the
+    /// Tower view), but asks for no more than this.
+    Pane,
 }
 
 /// Write the master token and start the engine.
 fn start(paths: &Paths, demo: bool) -> anyhow::Result<Shared> {
     std::fs::create_dir_all(&paths.data)
         .with_context(|| format!("create {}", paths.data.display()))?;
-    let token = format!(
-        "{:016x}{:016x}",
-        crate::paths::random_u64(),
-        crate::paths::random_u64()
-    );
-    std::fs::write(paths.token(), &token)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(paths.token(), std::fs::Permissions::from_mode(0o600))?;
-    }
+    let fresh = || {
+        format!(
+            "{:016x}{:016x}",
+            crate::paths::random_u64(),
+            crate::paths::random_u64()
+        )
+    };
+    let token = fresh();
+    write_secret(&paths.token(), &token)?;
+    let pane = fresh();
+    write_secret(&paths.pane_token(), &pane)?;
     let agents = AgentTokens::default();
     let (tx, rx) = mpsc::unbounded_channel();
     let (engine, snaps) = Engine::new(paths.clone(), demo, tx.clone(), Arc::clone(&agents));
@@ -62,8 +68,26 @@ fn start(paths: &Paths, demo: bool) -> anyhow::Result<Shared> {
         tx,
         snaps,
         master: Arc::new(token),
+        pane: Arc::new(pane),
         agents,
     })
+}
+
+/// Write a token file only its owner can read, from the first byte on.
+fn write_secret(path: &std::path::Path, text: &str) -> anyhow::Result<()> {
+    let _ = std::fs::remove_file(path);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts
+        .open(path)
+        .with_context(|| format!("create {}", path.display()))?;
+    std::io::Write::write_all(&mut f, text.as_bytes())?;
+    Ok(())
 }
 
 fn spawn_conn<R, W>(r: R, w: W, shared: &Shared)
@@ -157,7 +181,15 @@ async fn send<W: AsyncWriteExt + Unpin>(w: &mut W, msg: &ServerMsg) -> anyhow::R
 /// Decide what a hello is allowed to do.
 fn authorize(token: &str, client: &str, shared: &Shared) -> Option<Access> {
     if token == shared.master.as_str() {
-        return Some(Access::Full);
+        return Some(if client == "pane" {
+            Access::Pane
+        } else {
+            Access::Full
+        });
+    }
+    // The pane token is good for nothing else, whatever the client says.
+    if token == shared.pane.as_str() {
+        return (client == "pane").then_some(Access::Pane);
     }
     if client == "hook" || client == "mcp" {
         let agents = shared.agents.read().ok()?;
@@ -182,6 +214,9 @@ fn scope(msg: ClientMsg, access: &Access) -> Result<ClientMsg, String> {
         }),
         (Access::Agent(_), ClientMsg::Ping) => Ok(ClientMsg::Ping),
         (Access::Agent(_), _) => Err("agents may only send hook events and tool calls".into()),
+        (Access::Pane, msg @ ClientMsg::PaneTool { .. }) => Ok(msg),
+        (Access::Pane, ClientMsg::Ping) => Ok(ClientMsg::Ping),
+        (Access::Pane, _) => Err("a pane agent may only call the delegation tools".into()),
     }
 }
 
@@ -325,6 +360,7 @@ mod tests {
             tx,
             snaps,
             master: Arc::new("master".into()),
+            pane: Arc::new("pane-tok".into()),
             agents,
         }
     }
@@ -368,5 +404,40 @@ mod tests {
             "no approving your own clearances"
         );
         assert!(scope(approve, &Access::Full).is_ok());
+    }
+
+    #[test]
+    fn pane_agents_get_the_delegation_tools_and_nothing_else() {
+        let s = shared();
+        assert_eq!(authorize("master", "pane", &s), Some(Access::Pane));
+        assert_eq!(authorize("pane-tok", "pane", &s), Some(Access::Pane));
+        assert_eq!(
+            authorize("pane-tok", "cli", &s),
+            None,
+            "never more than a pane"
+        );
+        assert_eq!(authorize("pane-tok", "gui", &s), None);
+        assert_eq!(authorize("nope", "pane", &s), None);
+        let call = ClientMsg::PaneTool {
+            agent: tower_proto::PaneAgentInfo::default(),
+            name: "tower_delegate".into(),
+            args: json!({}),
+        };
+        assert!(scope(call.clone(), &Access::Pane).is_ok());
+        assert!(
+            scope(call, &Access::Agent("ground-2".into())).is_err(),
+            "a Tower agent cannot pose as a pane"
+        );
+        for msg in [
+            ClientMsg::ConnectAgents { on: true },
+            ClientMsg::SetArmed { on: true },
+            ClientMsg::Tool {
+                agent_id: "approach-1".into(),
+                name: "tower_complete".into(),
+                args: json!({}),
+            },
+        ] {
+            assert!(scope(msg, &Access::Pane).is_err());
+        }
     }
 }

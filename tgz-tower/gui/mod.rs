@@ -12,11 +12,15 @@
 #[path = "../proto/src/lib.rs"]
 pub mod proto;
 
+mod chart;
 mod client;
 mod clip;
+#[path = "../core/src/cron.rs"]
+mod cron;
 mod fonts;
 mod forms;
 mod glue;
+mod guard;
 mod layout;
 mod model;
 mod pane;
@@ -25,3 +29,4 @@ mod text;
 mod theme;
 
 pub use glue::{is_tower_pane, on_emit_event, open, paint};
+pub use guard::launch_refusal;

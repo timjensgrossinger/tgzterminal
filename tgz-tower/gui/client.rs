@@ -292,6 +292,8 @@ async fn split_next_to(
     Ok(id)
 }
 
+pub(super) use imp::daemon_binary;
+
 mod imp {
     //! The connection itself. Platform specifics are three small functions
     //! (`endpoint`, `open`, `spawn_daemon`): a Unix socket next to the token
@@ -362,7 +364,7 @@ mod imp {
 
     /// Where the daemon binary is: `TGZ_TOWERD`, else the experiment's own
     /// target dir next to this checkout (debug first, it's what you iterate on).
-    fn daemon_binary() -> Option<PathBuf> {
+    pub(in super::super) fn daemon_binary() -> Option<PathBuf> {
         if let Ok(p) = std::env::var("TGZ_TOWERD") {
             return Some(PathBuf::from(p));
         }

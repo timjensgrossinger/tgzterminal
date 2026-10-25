@@ -1,7 +1,7 @@
 //! View model and reducers. Pure: inputs and server messages in, effects out.
 
 use super::clip::Rect;
-use super::forms::{Field, FieldId, Place, Sheet, AUTO_ROLE};
+use super::forms::{Field, FieldId, Place, Sheet, SheetFlag, AUTO_ROLE};
 use super::proto::{ClientMsg, HandoffPacket, ServerMsg, Snapshot, SnapshotOrigin, Stage};
 use std::collections::HashMap;
 
@@ -13,16 +13,22 @@ pub enum View {
     Frequencies,
     Models,
     Intake,
+    Policy,
+    Routines,
+    Activity,
 }
 
 impl View {
-    pub const ALL: [View; 6] = [
+    pub const ALL: [View; 9] = [
         View::Strips,
         View::Roster,
         View::Inbox,
         View::Frequencies,
         View::Models,
         View::Intake,
+        View::Policy,
+        View::Routines,
+        View::Activity,
     ];
 
     pub fn label(self) -> &'static str {
@@ -33,6 +39,9 @@ impl View {
             View::Frequencies => "Frequencies",
             View::Models => "Models",
             View::Intake => "Intake",
+            View::Policy => "Policy",
+            View::Routines => "Routines",
+            View::Activity => "Activity",
         }
     }
 
@@ -58,6 +67,9 @@ pub enum ScrollId {
     Frequencies,
     Models,
     Intake,
+    Policy,
+    Routines,
+    Activity,
     Sheet,
     Field(FieldId),
 }
@@ -115,6 +127,61 @@ pub enum Action {
     },
     Probe,
     PollSources,
+    /// Arm or disarm automatic actions.
+    SetArmed(bool),
+    /// Start a run of a scout now.
+    RunScout(String),
+    NewSchedule,
+    EditSchedule(String),
+    /// Fire a schedule now.
+    RunSchedule(String),
+    SetScheduleEnabled {
+        id: String,
+        enabled: bool,
+    },
+    /// Delete takes two clicks.
+    DeleteSchedule(String),
+    /// Schedule form: fill in one of `forms::TEMPLATES`.
+    ScheduleTemplate(usize),
+    NewEndpoint,
+    EditEndpoint(String),
+    /// Delete takes two clicks.
+    DeleteEndpoint(String),
+    /// Add a model; `Some(<endpoint>/<name>)` starts from a served one.
+    NewModel(Option<String>),
+    EditModel(String),
+    /// Delete takes two clicks.
+    DeleteModel(String),
+    /// Server form: its kind.
+    SheetKind(String),
+    /// Server form: local, cloud, or `None` = guess from the address.
+    SheetLocal(Option<bool>),
+    /// Model form: the server it runs on.
+    SheetEndpoint(String),
+    /// Ask before connecting (`true`) or disconnecting the CLIs.
+    OpenConnect(bool),
+    NewRole,
+    EditRole(String),
+    /// Delete takes two clicks.
+    DeleteRole(String),
+    /// Role form: how it runs.
+    SheetDriver(String),
+    /// Role form: its colour.
+    SheetColor(String),
+    /// Role form: append a model to the ladder.
+    RoleAddModel(String),
+    EditRouting,
+    OpenLocalOnly,
+    /// Policy view: set an action's level.
+    SetPolicyLevel {
+        action: String,
+        level: String,
+    },
+    SheetFlag(SheetFlag),
+    /// Show or hide vendor launchd jobs (updaters and the like).
+    ToggleOtherRoutines,
+    /// Activity: how many days the charts show.
+    ActivityDays(usize),
     Refresh,
     SheetRole(Option<String>),
     /// New flight / Launch: where the work happens.
@@ -286,7 +353,17 @@ pub fn empty_snapshot() -> Snapshot {
         flights_root: String::new(),
         triage_role: String::new(),
         engines: vec![],
+        models: vec![],
+        connected_clis: vec![],
+        engine_ids: vec![],
+        local_only_paths: vec![],
         bandit_mode: String::new(),
+        armed_until: None,
+        policy: vec![],
+        schedules: vec![],
+        routines: vec![],
+        routines_note: String::new(),
+        activity: Default::default(),
     }
 }
 
@@ -312,6 +389,12 @@ pub struct Model {
     pub preedit: Option<String>,
     /// The caret's cell in the pane, for placing the IME candidate window.
     pub caret_cell: Option<(usize, isize)>,
+    /// Activity: days shown (7, 30 or 90).
+    pub activity_days: usize,
+    /// Routines: vendor launchd jobs are listed too.
+    pub show_other_routines: bool,
+    /// A schedule whose Delete was clicked once.
+    pub confirm_delete: Option<String>,
 }
 
 impl Model {
@@ -333,6 +416,9 @@ impl Model {
             frame: Frame::default(),
             preedit: None,
             caret_cell: None,
+            activity_days: 14,
+            show_other_routines: false,
+            confirm_delete: None,
         }
     }
 
@@ -580,7 +666,7 @@ impl Model {
                 self.select_view(View::ALL[i]);
                 true
             }
-            Key::Char(c) if ('1'..='6').contains(&c) => {
+            Key::Char(c) if ('1'..='9').contains(&c) => {
                 self.select_view(View::ALL[c as usize - '1' as usize]);
                 true
             }
@@ -590,6 +676,10 @@ impl Model {
             }
             Key::Char('r') => {
                 self.activate(Hit::Button(Action::Refresh), now_ms, fx);
+                true
+            }
+            Key::Char('s') => {
+                self.activate(Hit::Button(Action::NewSchedule), now_ms, fx);
                 true
             }
             Key::Enter { .. }
@@ -609,6 +699,9 @@ impl Model {
                         View::Frequencies => Some(ScrollId::Frequencies),
                         View::Models => Some(ScrollId::Models),
                         View::Intake => Some(ScrollId::Intake),
+                        View::Policy => Some(ScrollId::Policy),
+                        View::Routines => Some(ScrollId::Routines),
+                        View::Activity => Some(ScrollId::Activity),
                         View::Strips => None,
                     }
                 };
@@ -684,7 +777,7 @@ impl Model {
                     Key::Down => f.buf.move_down(),
                     Key::Home => f.buf.move_home(),
                     Key::End => f.buf.move_end(),
-                    Key::Char(c) if !c.is_control() => f.buf.insert_char(c),
+                    Key::Char(c) if !c.is_control() => f.insert_char(c),
                     _ => return false,
                 }
             }
@@ -699,7 +792,13 @@ impl Model {
             Hit::Button(Action::SendCompose) | Hit::Button(Action::Submit { .. }) => {}
             Hit::Button(Action::SheetRole(_))
             | Hit::Button(Action::SheetPlace(_))
-            | Hit::Button(Action::SheetTier(_)) => {}
+            | Hit::Button(Action::SheetTier(_))
+            | Hit::Button(Action::SheetKind(_))
+            | Hit::Button(Action::SheetLocal(_))
+            | Hit::Button(Action::SheetEndpoint(_))
+            | Hit::Button(Action::SheetDriver(_))
+            | Hit::Button(Action::SheetColor(_))
+            | Hit::Button(Action::RoleAddModel(_)) => {}
             _ => self.focus = None,
         }
         match hit {
@@ -852,30 +951,256 @@ impl Model {
                     self.toast("Polling intake…", now_ms);
                 }
             }
+            Action::RunScout(name) => {
+                if self.send(ClientMsg::RunScout { name: name.clone() }, now_ms, fx) {
+                    self.toast(&format!("Starting scout {name}…"), now_ms);
+                }
+            }
+            Action::SetArmed(on) => {
+                if self.send(ClientMsg::SetArmed { on }, now_ms, fx) {
+                    self.toast(
+                        if on {
+                            "Armed: auto actions run on their own until the timer ends"
+                        } else {
+                            "Disarmed: Tower asks before everything"
+                        },
+                        now_ms,
+                    );
+                }
+            }
             Action::Probe => {
                 if self.send(ClientMsg::ProbeEndpoints, now_ms, fx) {
                     self.toast("Probing model servers…", now_ms);
                 }
             }
             Action::Refresh => {
+                if self.view == View::Routines {
+                    self.send(ClientMsg::RefreshRoutines, now_ms, fx);
+                }
                 self.send(ClientMsg::GetSnapshot, now_ms, fx);
+            }
+            Action::NewSchedule => {
+                let mut sheet = Sheet::schedule(None, self.workdir.as_deref());
+                if let Sheet::Schedule(f) = &mut sheet {
+                    f.place = self.default_place();
+                    f.role =
+                        Some(AUTO_ROLE.to_string()).filter(|_| !self.snap.triage_role.is_empty());
+                }
+                self.open_sheet(sheet);
+            }
+            Action::EditSchedule(id) => {
+                let spec = self
+                    .snap
+                    .schedules
+                    .iter()
+                    .find(|s| s.spec.id == id)
+                    .map(|s| s.spec.clone());
+                if let Some(spec) = spec {
+                    self.open_sheet(Sheet::schedule(Some(&spec), self.workdir.as_deref()));
+                }
+            }
+            Action::RunSchedule(id) => {
+                if self.send(ClientMsg::RunSchedule { id }, now_ms, fx) {
+                    self.toast("Starting a run now…", now_ms);
+                }
+            }
+            Action::SetScheduleEnabled { id, enabled } => {
+                if self.send(ClientMsg::SetScheduleEnabled { id, enabled }, now_ms, fx) {
+                    self.toast(if enabled { "Resumed" } else { "Paused" }, now_ms);
+                }
+            }
+            Action::DeleteSchedule(id) => {
+                if self.confirm_delete.as_deref() == Some(id.as_str()) {
+                    self.confirm_delete = None;
+                    if self.send(ClientMsg::DeleteSchedule { id }, now_ms, fx) {
+                        self.toast("Schedule deleted", now_ms);
+                    }
+                } else {
+                    self.confirm_delete = Some(id);
+                    self.toast("Click Delete again to remove the schedule", now_ms);
+                }
+            }
+            Action::ScheduleTemplate(i) => {
+                if let Some(Sheet::Schedule(f)) = &mut self.sheet {
+                    f.apply_template(i);
+                }
+            }
+            Action::SheetFlag(flag) => match &mut self.sheet {
+                Some(Sheet::Schedule(f)) => match flag {
+                    SheetFlag::Overlap => f.overlap_run = !f.overlap_run,
+                    SheetFlag::CatchUp => f.catch_up = !f.catch_up,
+                    SheetFlag::LocalOnly => f.local_only = !f.local_only,
+                },
+                Some(Sheet::NewFlight(f)) if flag == SheetFlag::LocalOnly => {
+                    f.local_only = !f.local_only
+                }
+                _ => {}
+            },
+            Action::NewEndpoint => self.open_sheet(Sheet::endpoint(None)),
+            Action::EditEndpoint(name) => {
+                let ep = self.snap.endpoints.iter().find(|e| e.name == name).cloned();
+                if let Some(ep) = ep {
+                    self.open_sheet(Sheet::endpoint(Some(&ep)));
+                }
+            }
+            Action::DeleteEndpoint(name) => {
+                let key = format!("endpoint:{}", name);
+                if self.confirm_delete.as_deref() == Some(key.as_str()) {
+                    self.confirm_delete = None;
+                    if self.send(ClientMsg::DeleteEndpoint { name }, now_ms, fx) {
+                        self.sheet = None;
+                        self.focus = None;
+                        self.toast("Model server removed", now_ms);
+                    }
+                } else {
+                    self.confirm_delete = Some(key);
+                    self.toast(
+                        "Click Delete again to remove the server and its models",
+                        now_ms,
+                    );
+                }
+            }
+            Action::NewModel(prefill) => {
+                let sheet = Sheet::model(None, prefill.as_deref());
+                self.open_sheet(sheet);
+            }
+            Action::EditModel(id) => {
+                let m = self.snap.models.iter().find(|m| m.id == id).cloned();
+                if let Some(m) = m {
+                    self.open_sheet(Sheet::model(Some(&m), None));
+                }
+            }
+            Action::DeleteModel(id) => {
+                let key = format!("model:{}", id);
+                if self.confirm_delete.as_deref() == Some(key.as_str()) {
+                    self.confirm_delete = None;
+                    if self.send(ClientMsg::DeleteModel { id }, now_ms, fx) {
+                        self.sheet = None;
+                        self.focus = None;
+                        self.toast("Model removed", now_ms);
+                    }
+                } else {
+                    self.confirm_delete = Some(key);
+                    self.toast("Click Delete again to remove the model", now_ms);
+                }
+            }
+            Action::SheetKind(kind) => {
+                if let Some(Sheet::Endpoint(f)) = &mut self.sheet {
+                    // A blank address follows the kind's usual one.
+                    let usual = |k: &str| {
+                        super::forms::ENDPOINT_KINDS
+                            .iter()
+                            .find(|(n, _)| *n == k)
+                            .map(|(_, u)| *u)
+                    };
+                    let was = f.url.text();
+                    if was.trim().is_empty() || usual(&f.kind) == Some(was.trim()) {
+                        if let Some(u) = usual(&kind) {
+                            f.url.buf.set_text(u);
+                        }
+                    }
+                    f.kind = kind;
+                }
+            }
+            Action::OpenConnect(on) => self.open_sheet(Sheet::Connect(on)),
+            Action::NewRole => self.open_sheet(Sheet::role(None)),
+            Action::EditRole(id) => {
+                let r = self.snap.role(&id).cloned();
+                if let Some(r) = r {
+                    self.open_sheet(Sheet::role(Some(&r)));
+                }
+            }
+            Action::DeleteRole(id) => {
+                let key = format!("role:{}", id);
+                if self.confirm_delete.as_deref() == Some(key.as_str()) {
+                    self.confirm_delete = None;
+                    if self.send(ClientMsg::DeleteRole { id }, now_ms, fx) {
+                        self.sheet = None;
+                        self.focus = None;
+                        self.toast("Role removed (its file is kept as .bak)", now_ms);
+                    }
+                } else {
+                    self.confirm_delete = Some(key);
+                    self.toast("Click Delete again to remove the role", now_ms);
+                }
+            }
+            Action::SheetDriver(d) => {
+                if let Some(Sheet::Role(f)) = &mut self.sheet {
+                    f.driver = d;
+                }
+            }
+            Action::SheetColor(c) => {
+                if let Some(Sheet::Role(f)) = &mut self.sheet {
+                    f.color = c;
+                }
+            }
+            Action::RoleAddModel(m) => {
+                if let Some(Sheet::Role(f)) = &mut self.sheet {
+                    f.add_model(&m);
+                }
+            }
+            Action::EditRouting => {
+                let tier = |t: &str| -> Vec<String> {
+                    self.snap
+                        .engines
+                        .iter()
+                        .filter(|e| e.tier == t)
+                        .map(|e| e.id.clone())
+                        .collect()
+                };
+                let sheet = Sheet::routing(&tier("low"), &tier("medium"), &tier("high"));
+                self.open_sheet(sheet);
+            }
+            Action::OpenLocalOnly => {
+                let sheet = Sheet::local_only(&self.snap.local_only_paths);
+                self.open_sheet(sheet);
+            }
+            Action::SetPolicyLevel { action, level } => {
+                let note = format!("{} set to {}", action, level);
+                if self.send(
+                    ClientMsg::SetPolicyLevel {
+                        action,
+                        level: Some(level),
+                    },
+                    now_ms,
+                    fx,
+                ) {
+                    self.toast(note, now_ms);
+                }
+            }
+            Action::SheetLocal(local) => {
+                if let Some(Sheet::Endpoint(f)) = &mut self.sheet {
+                    f.local = local;
+                }
+            }
+            Action::SheetEndpoint(name) => {
+                if let Some(Sheet::Model(f)) = &mut self.sheet {
+                    f.endpoint = Some(name);
+                }
+            }
+            Action::ToggleOtherRoutines => self.show_other_routines = !self.show_other_routines,
+            Action::ActivityDays(n) => {
+                self.activity_days = n;
+                self.scroll.remove(&ScrollId::Activity);
             }
             Action::SheetRole(role) => match &mut self.sheet {
                 Some(Sheet::NewFlight(f)) => f.role = role,
+                Some(Sheet::Schedule(f)) => f.role = role,
                 Some(Sheet::Packet(f)) => f.to_role = role,
                 _ => {}
             },
             Action::SheetPlace(place) => match &mut self.sheet {
                 Some(Sheet::NewFlight(f)) => f.place = place,
+                Some(Sheet::Schedule(f)) => f.place = place,
                 Some(Sheet::Launch(f)) if place != Place::Worktree => f.place = place,
                 _ => {}
             },
             Action::OpenPath { path } => fx.push(Effect::Open(path)),
-            Action::SheetTier(tier) => {
-                if let Some(Sheet::NewFlight(f)) = &mut self.sheet {
-                    f.tier = tier;
-                }
-            }
+            Action::SheetTier(tier) => match &mut self.sheet {
+                Some(Sheet::NewFlight(f)) => f.tier = tier,
+                Some(Sheet::Schedule(f)) => f.tier = tier,
+                _ => {}
+            },
             Action::CloseSheet => {
                 self.sheet = None;
                 self.focus = None;
@@ -898,6 +1223,23 @@ impl Model {
             self.toast(why, now_ms);
             return;
         }
+        // Routing saves one message per tier.
+        if let Sheet::Routing(f) = sheet {
+            let msgs: Vec<ClientMsg> = f
+                .tiers()
+                .into_iter()
+                .map(|(tier, engines)| ClientMsg::SetRouting { tier, engines })
+                .collect();
+            if self.live() {
+                fx.extend(msgs.into_iter().map(Effect::Send));
+                self.sheet = None;
+                self.focus = None;
+                self.toast("Routing saved", now_ms);
+            } else {
+                self.toast("towerd is not connected", now_ms);
+            }
+            return;
+        }
         let workdir = self.workdir.clone();
         let (msg, note) = match sheet {
             Sheet::NewFlight(f) => {
@@ -914,6 +1256,7 @@ impl Model {
                         auto_assign: auto,
                         launch,
                         tier: f.tier.clone(),
+                        local_only: f.local_only,
                     },
                     match (auto, launch) {
                         (true, true) => "Flight created; triage is picking who takes it",
@@ -955,6 +1298,60 @@ impl Model {
                     text: Some(f.text.text().trim().to_string()),
                 },
                 "Answer sent",
+            ),
+            Sheet::Schedule(f) => (
+                ClientMsg::SaveSchedule { spec: f.spec() },
+                if f.id.is_empty() {
+                    "Schedule created"
+                } else {
+                    "Schedule saved"
+                },
+            ),
+            Sheet::Endpoint(f) => (
+                ClientMsg::SaveEndpoint {
+                    spec: f.spec(),
+                    old_name: f.old_name.clone(),
+                },
+                if f.old_name.is_none() {
+                    "Model server added; probing it…"
+                } else {
+                    "Model server saved"
+                },
+            ),
+            Sheet::Routing(_) => return,
+            Sheet::Role(f) => (
+                ClientMsg::SaveRole {
+                    spec: f.spec(),
+                    old_id: f.old_id.clone(),
+                },
+                if f.old_id.is_none() {
+                    "Role saved"
+                } else {
+                    "Role updated"
+                },
+            ),
+            Sheet::LocalOnly(f) => (
+                ClientMsg::SetLocalOnlyPaths { paths: f.lines() },
+                "Local-only folders saved",
+            ),
+            Sheet::Connect(on) => (
+                ClientMsg::ConnectAgents { on: *on },
+                if *on {
+                    "Connecting your CLIs…"
+                } else {
+                    "Disconnecting your CLIs…"
+                },
+            ),
+            Sheet::Model(f) => (
+                ClientMsg::SaveModel {
+                    spec: f.spec(),
+                    old_id: f.old_id.clone(),
+                },
+                if f.old_id.is_none() {
+                    "Model added"
+                } else {
+                    "Model saved"
+                },
             ),
         };
         if self.send(msg, now_ms, fx) {
@@ -1155,6 +1552,62 @@ mod tests {
     }
 
     #[test]
+    fn routing_saves_every_tier_and_policy_chips_send_at_once() {
+        let mut m = model_with_hits(vec![]);
+        live(&mut m);
+        let mut fx = vec![];
+        m.action(Action::EditRouting, 0, &mut fx);
+        assert!(matches!(m.sheet, Some(Sheet::Routing(_))));
+        m.action(Action::Submit { launch: false }, 0, &mut fx);
+        let tiers: Vec<String> = sent(&fx)
+            .into_iter()
+            .filter_map(|msg| match msg {
+                ClientMsg::SetRouting { tier, .. } => Some(tier),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tiers, vec!["low", "medium", "high"]);
+        assert!(m.sheet.is_none());
+        let mut fx = vec![];
+        m.action(
+            Action::SetPolicyLevel {
+                action: "land".into(),
+                level: "auto".into(),
+            },
+            0,
+            &mut fx,
+        );
+        assert_eq!(
+            sent(&fx),
+            vec![ClientMsg::SetPolicyLevel {
+                action: "land".into(),
+                level: Some("auto".into())
+            }]
+        );
+    }
+
+    #[test]
+    fn sensitive_flights_and_schedules_are_sent_as_local_only() {
+        let mut m = model_with_hits(vec![]);
+        live(&mut m);
+        m.apply(Input::Key(Key::Char('n')), 0);
+        type_text(&mut m, "Export payroll");
+        let mut fx = vec![];
+        m.action(Action::SheetFlag(SheetFlag::LocalOnly), 0, &mut fx);
+        m.action(Action::Submit { launch: false }, 0, &mut fx);
+        match sent(&fx).as_slice() {
+            [ClientMsg::CreateFlight { local_only, .. }] => assert!(*local_only),
+            other => panic!("{:?}", other),
+        }
+        m.open_sheet(Sheet::schedule(None, None));
+        m.action(Action::SheetFlag(SheetFlag::LocalOnly), 0, &mut fx);
+        match &m.sheet {
+            Some(Sheet::Schedule(f)) => assert!(f.spec().local_only),
+            _ => panic!("schedule sheet"),
+        }
+    }
+
+    #[test]
     fn new_flight_form_types_and_submits() {
         let mut m = model_with_hits(vec![]);
         live(&mut m);
@@ -1188,6 +1641,7 @@ mod tests {
                 new_folder,
                 auto_assign,
                 tier,
+                ..
             }] => {
                 assert_eq!(tier, &None, "Auto by default");
                 assert_eq!(title, "Add v2 flag");
