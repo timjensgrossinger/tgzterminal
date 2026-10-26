@@ -15,6 +15,25 @@ const RUN: &str = "run";
 const NOT_NOW: &str = "not_now";
 const ACCEPT: &str = "accept";
 
+/// The text of a terms note as the user sees it: summary, the vendor's own
+/// words with their source, and what accepting means.
+fn terms_detail(terms: &TermsRef) -> String {
+    let mut detail = format!("{}\n\n", terms.summary);
+    if !terms.quote.is_empty() {
+        detail.push_str(&format!(
+            "\u{201c}{}\u{201d}\n{}\n\n",
+            terms.quote, terms.url
+        ));
+    }
+    detail.push_str(
+        "Tower never touches your login: it starts the vendor's own program and the \
+         program signs in itself. Accepting means you have read this and run it on \
+         your own account at your own risk. Asked again when Tower's terms notes change.",
+    );
+    detail.push_str(&format!(" (Notes as of {}.)", compliance::MATRIX_AS_OF));
+    detail
+}
+
 impl Engine {
     pub(super) fn armed(&self) -> bool {
         policy::is_armed(self.armed_until, now_unix())
@@ -156,6 +175,68 @@ impl Engine {
         }
     }
 
+    /// Every unaccepted note any configured role or `[routing]` engine would
+    /// hit on launch, one per note id, for the Setup view.
+    pub(super) fn terms_pending_notes(&self) -> Vec<tower_proto::TermsNote> {
+        let mut out: Vec<tower_proto::TermsNote> = Vec::new();
+        let mut push = |terms: &'static TermsRef, vendor: &str| {
+            if out.iter().any(|n| n.id == terms.id) {
+                return;
+            }
+            out.push(tower_proto::TermsNote {
+                id: terms.id.to_string(),
+                vendor: vendor.to_string(),
+                title: format!("{vendor}: vendor terms note"),
+                text: terms_detail(terms),
+            });
+        };
+        for role in &self.cfg.roles {
+            if role.routed {
+                continue;
+            }
+            if let Some(t) = self.terms_pending(self.terms_for(role, TermsInput::Initial)) {
+                push(t, compliance::vendor_of(role.driver, &role.command).label());
+            }
+        }
+        let routed: Vec<&RoleCfg> = self.cfg.roles.iter().filter(|r| r.routed).collect();
+        if let Some(base) = routed.first() {
+            for e in self.cfg.routing.engines.values() {
+                let role = base.on_engine(e);
+                if let Some(t) = self.terms_pending(self.terms_for(&role, TermsInput::Initial)) {
+                    push(t, compliance::vendor_of(role.driver, &role.command).label());
+                }
+            }
+        }
+        out
+    }
+
+    /// Accept a note from Setup: record it, drop its Inbox item, and run
+    /// whatever was waiting on it (a held launch).
+    pub(super) fn accept_terms(&mut self, note_id: &str) -> Res {
+        let terms = compliance::terms_by_id(note_id)
+            .ok_or_else(|| format!("No vendor-terms note {note_id:?}"))?;
+        let held: Vec<String> = self
+            .st
+            .pending_actions
+            .iter()
+            .filter_map(|(id, p)| match p {
+                PendingAction::Terms { terms: t, .. } if t == terms.id => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        if held.is_empty() {
+            return self.run_pending(PendingAction::Terms {
+                terms: terms.id.to_string(),
+                then: None,
+            });
+        }
+        let mut last = Ok("Accepted".to_string());
+        for id in held {
+            last = self.resolve_pending_action(&id, ACCEPT);
+        }
+        last
+    }
+
     /// Ask the user to accept `terms`; `then` runs once they do. One item
     /// per note: a second request just replaces what runs after it.
     pub(super) fn ask_terms(
@@ -178,19 +259,7 @@ impl Engine {
             self.changed();
             return;
         }
-        let mut detail = format!("{}\n\n", terms.summary);
-        if !terms.quote.is_empty() {
-            detail.push_str(&format!(
-                "\u{201c}{}\u{201d}\n{}\n\n",
-                terms.quote, terms.url
-            ));
-        }
-        detail.push_str(
-            "Tower never touches your login: it starts the vendor's own program and the \
-             program signs in itself. Accepting means you have read this and run it on \
-             your own account at your own risk. Asked again when Tower's terms notes change.",
-        );
-        detail.push_str(&format!(" (Notes as of {}.)", compliance::MATRIX_AS_OF));
+        let detail = terms_detail(terms);
         let id = self.add_inbox(InboxItem {
             kind: InboxKind::Clearance,
             title: format!("{vendor}: vendor terms note"),
@@ -473,10 +542,12 @@ impl Engine {
         );
     }
 
-    /// The effective level of every action, for the Policy view.
+    /// The effective level of every action, for the Policy view. The scout
+    /// row only while scouts are on.
     pub(super) fn policy_rows(&self) -> Vec<PolicyRow> {
         Action::ALL
             .iter()
+            .filter(|a| **a != Action::ScoutRun || self.cfg.extras.scouts)
             .map(|a| PolicyRow {
                 action: a.key().to_string(),
                 level: self.cfg.policy.level(*a, None).label().to_string(),

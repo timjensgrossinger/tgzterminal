@@ -5,48 +5,91 @@ use super::forms::{Field, FieldId, Place, Sheet, SheetFlag, AUTO_ROLE};
 use super::proto::{ClientMsg, HandoffPacket, ServerMsg, Snapshot, SnapshotOrigin, Stage};
 use std::collections::HashMap;
 
+/// The three views, plus Team while the frequencies extra is on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum View {
-    Strips,
-    Roster,
-    Inbox,
-    Frequencies,
-    Models,
-    Intake,
-    Policy,
-    Routines,
-    Activity,
+    /// Flights by stage, with what is waiting on you at the top.
+    Board,
+    /// Roles, models, routing, policy, sources, schedules, extras.
+    Setup,
+    /// What ran by itself; activity charts when that extra is on.
+    History,
+    /// The team frequency and flight threads (extras.frequencies).
+    Team,
 }
 
 impl View {
-    pub const ALL: [View; 9] = [
-        View::Strips,
-        View::Roster,
-        View::Inbox,
-        View::Frequencies,
-        View::Models,
-        View::Intake,
-        View::Policy,
-        View::Routines,
-        View::Activity,
+    pub const ALL: [View; 3] = [View::Board, View::Setup, View::History];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            View::Board => "Board",
+            View::Setup => "Setup",
+            View::History => "History",
+            View::Team => "Team",
+        }
+    }
+}
+
+/// A side feature behind `[extras]` in tower.toml, toggled in Setup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Extra {
+    Scouts,
+    MachineRoutines,
+    Activity,
+    Frequencies,
+}
+
+impl Extra {
+    pub const ALL: [Extra; 4] = [
+        Extra::Scouts,
+        Extra::MachineRoutines,
+        Extra::Activity,
+        Extra::Frequencies,
     ];
 
     pub fn label(self) -> &'static str {
         match self {
-            View::Strips => "Strips",
-            View::Roster => "Roster",
-            View::Inbox => "Inbox",
-            View::Frequencies => "Frequencies",
-            View::Models => "Models",
-            View::Intake => "Intake",
-            View::Policy => "Policy",
-            View::Routines => "Routines",
-            View::Activity => "Activity",
+            Extra::Scouts => "Scouts",
+            Extra::MachineRoutines => "This machine's jobs",
+            Extra::Activity => "Activity charts",
+            Extra::Frequencies => "Team frequency",
         }
     }
 
-    fn index(self) -> usize {
-        View::ALL.iter().position(|v| *v == self).unwrap_or(0)
+    pub fn help(self) -> &'static str {
+        match self {
+            Extra::Scouts => {
+                "Agents read mail or Teams with their own M365 tools and report what needs work ([[scout]] in sources.toml)."
+            }
+            Extra::MachineRoutines => {
+                "Your launchd agents and crontab, read-only, listed under Schedules."
+            }
+            Extra::Activity => {
+                "Tiles and charts in History: what ran by itself, how runs ended, what it cost. Counting never stops."
+            }
+            Extra::Frequencies => {
+                "A Team view: a chat channel plus one thread per flight; agents post with tower_post."
+            }
+        }
+    }
+
+    pub fn get(self, e: &super::proto::Extras) -> bool {
+        match self {
+            Extra::Scouts => e.scouts,
+            Extra::MachineRoutines => e.machine_routines,
+            Extra::Activity => e.activity,
+            Extra::Frequencies => e.frequencies,
+        }
+    }
+
+    pub fn set(self, e: &mut super::proto::Extras, on: bool) {
+        match self {
+            Extra::Scouts => e.scouts = on,
+            Extra::MachineRoutines => e.machine_routines = on,
+            Extra::Activity => e.activity = on,
+            Extra::Frequencies => e.frequencies = on,
+        }
     }
 }
 
@@ -62,14 +105,11 @@ pub enum ScrollId {
     BoardX,
     Column(Stage),
     Drawer,
-    Roster,
+    /// The "waiting on you" strip on the Board.
     Inbox,
     Frequencies,
-    Models,
-    Intake,
-    Policy,
-    Routines,
-    Activity,
+    Setup,
+    History,
     Sheet,
     Field(FieldId),
 }
@@ -182,6 +222,15 @@ pub enum Action {
     ToggleOtherRoutines,
     /// Activity: how many days the charts show.
     ActivityDays(usize),
+    /// Setup: accept a vendor-terms note (its matrix id).
+    AcceptTerms(String),
+    /// Setup: fold a terms note away for this session ("Not now"), or back.
+    DeferTerms {
+        id: String,
+        defer: bool,
+    },
+    /// Setup: switch a side feature on or off (writes `[extras]`).
+    ToggleExtra(Extra),
     Refresh,
     SheetRole(Option<String>),
     /// New flight / Launch: where the work happens.
@@ -364,6 +413,9 @@ pub fn empty_snapshot() -> Snapshot {
         routines: vec![],
         routines_note: String::new(),
         activity: Default::default(),
+        extras: Default::default(),
+        notices: vec![],
+        setup: Default::default(),
     }
 }
 
@@ -395,6 +447,8 @@ pub struct Model {
     pub show_other_routines: bool,
     /// A schedule whose Delete was clicked once.
     pub confirm_delete: Option<String>,
+    /// Terms notes folded away with "Not now" (this session only).
+    pub terms_deferred: Vec<String>,
 }
 
 impl Model {
@@ -402,7 +456,7 @@ impl Model {
         Self {
             snap,
             conn: Conn::Connecting,
-            view: View::Strips,
+            view: View::Board,
             drawer: None,
             sheet: None,
             focus: None,
@@ -416,10 +470,30 @@ impl Model {
             frame: Frame::default(),
             preedit: None,
             caret_cell: None,
-            activity_days: 14,
+            activity_days: 7,
             show_other_routines: false,
             confirm_delete: None,
+            terms_deferred: Vec::new(),
         }
+    }
+
+    /// The views in the rail: the three, plus Team while frequencies are on.
+    pub fn views(&self) -> Vec<View> {
+        let mut v = View::ALL.to_vec();
+        if self.snap.extras.frequencies {
+            v.push(View::Team);
+        }
+        v
+    }
+
+    /// Terms notes the user has not accepted and not folded away.
+    pub fn terms_due(&self) -> Vec<&super::proto::TermsNote> {
+        self.snap
+            .setup
+            .terms_pending
+            .iter()
+            .filter(|t| !self.terms_deferred.contains(&t.id))
+            .collect()
     }
 
     /// New work gets its own folder unless Tower was opened from a real
@@ -434,6 +508,11 @@ impl Model {
             Some(w) if Some(w.to_string()) == home => Place::NewFolder,
             Some(_) => Place::Here,
         }
+    }
+
+    /// "Auto" is worth offering: a triage role exists and can run.
+    pub fn auto_available(&self) -> bool {
+        !self.snap.triage_role.is_empty() && self.snap.setup.triage_usable
     }
 
     pub fn scroll_of(&self, id: ScrollId) -> f32 {
@@ -498,11 +577,14 @@ impl Model {
                 };
                 if gone {
                     self.drawer = None;
-                    if self.focus == Some(FieldId::Compose) && self.view != View::Frequencies {
+                    if self.focus == Some(FieldId::Compose) && self.view != View::Team {
                         self.focus = None;
                     }
                 }
                 self.snap = snapshot;
+                if self.view == View::Team && !self.snap.extras.frequencies {
+                    self.select_view(View::Board);
+                }
             }
             ServerMsg::Error { message } => self.toast(message, now_ms),
             ServerMsg::ToolResult { ok: false, text } => self.toast(text, now_ms),
@@ -654,21 +736,27 @@ impl Model {
                 _ => false,
             };
         }
+        let views = self.views();
+        let index = views.iter().position(|v| *v == self.view).unwrap_or(0);
         match key {
             Key::Escape => self.drawer.take().is_some(),
             Key::Tab => {
-                let i = (self.view.index() + 1) % View::ALL.len();
-                self.select_view(View::ALL[i]);
+                self.select_view(views[(index + 1) % views.len()]);
                 true
             }
             Key::BackTab => {
-                let i = (self.view.index() + View::ALL.len() - 1) % View::ALL.len();
-                self.select_view(View::ALL[i]);
+                self.select_view(views[(index + views.len() - 1) % views.len()]);
                 true
             }
-            Key::Char(c) if ('1'..='9').contains(&c) => {
-                self.select_view(View::ALL[c as usize - '1' as usize]);
-                true
+            // `1`..: a view; a digit past the last view does nothing.
+            Key::Char(c) if c.is_ascii_digit() && c != '0' => {
+                match views.get(c as usize - '1' as usize) {
+                    Some(v) => {
+                        self.select_view(*v);
+                        true
+                    }
+                    None => false,
+                }
             }
             Key::Char('n') => {
                 self.activate(Hit::Button(Action::NewFlight), now_ms, fx);
@@ -683,8 +771,7 @@ impl Model {
                 true
             }
             Key::Enter { .. }
-                if matches!(self.drawer, Some(Drawer::Agent(_)))
-                    || self.view == View::Frequencies =>
+                if matches!(self.drawer, Some(Drawer::Agent(_))) || self.view == View::Team =>
             {
                 self.focus = Some(FieldId::Compose);
                 true
@@ -694,15 +781,11 @@ impl Model {
                     Some(ScrollId::Drawer)
                 } else {
                     match self.view {
-                        View::Roster => Some(ScrollId::Roster),
-                        View::Inbox => Some(ScrollId::Inbox),
-                        View::Frequencies => Some(ScrollId::Frequencies),
-                        View::Models => Some(ScrollId::Models),
-                        View::Intake => Some(ScrollId::Intake),
-                        View::Policy => Some(ScrollId::Policy),
-                        View::Routines => Some(ScrollId::Routines),
-                        View::Activity => Some(ScrollId::Activity),
-                        View::Strips => None,
+                        // The strip; with nothing waiting there is no region.
+                        View::Board => Some(ScrollId::Inbox),
+                        View::Setup => Some(ScrollId::Setup),
+                        View::History => Some(ScrollId::History),
+                        View::Team => Some(ScrollId::Frequencies),
                     }
                 };
                 let region =
@@ -842,9 +925,8 @@ impl Model {
         match action {
             Action::NewFlight => {
                 let place = self.default_place();
-                // With a triage role around, the default is "let Tower decide".
-                let role =
-                    Some(AUTO_ROLE.to_string()).filter(|_| !self.snap.triage_role.is_empty());
+                // With a triage role that can run, the default is "let Tower decide".
+                let role = Some(AUTO_ROLE.to_string()).filter(|_| self.auto_available());
                 self.open_sheet(Sheet::new_flight(role, place))
             }
             Action::OpenLaunch { role_id } => {
@@ -974,7 +1056,7 @@ impl Model {
                 }
             }
             Action::Refresh => {
-                if self.view == View::Routines {
+                if self.view == View::Setup && self.snap.extras.machine_routines {
                     self.send(ClientMsg::RefreshRoutines, now_ms, fx);
                 }
                 self.send(ClientMsg::GetSnapshot, now_ms, fx);
@@ -983,10 +1065,40 @@ impl Model {
                 let mut sheet = Sheet::schedule(None, self.workdir.as_deref());
                 if let Sheet::Schedule(f) = &mut sheet {
                     f.place = self.default_place();
-                    f.role =
-                        Some(AUTO_ROLE.to_string()).filter(|_| !self.snap.triage_role.is_empty());
+                    f.role = Some(AUTO_ROLE.to_string()).filter(|_| self.auto_available());
                 }
                 self.open_sheet(sheet);
+            }
+            Action::AcceptTerms(note_id) => {
+                if self.send(ClientMsg::AcceptTerms { note_id }, now_ms, fx) {
+                    self.toast("Accepted", now_ms);
+                }
+            }
+            Action::DeferTerms { id, defer } => {
+                self.terms_deferred.retain(|t| *t != id);
+                if defer {
+                    self.terms_deferred.push(id);
+                }
+            }
+            Action::ToggleExtra(extra) => {
+                let mut extras = self.snap.extras;
+                let on = !extra.get(&extras);
+                extra.set(&mut extras, on);
+                if self.send(ClientMsg::SetExtras { extras }, now_ms, fx) {
+                    // Show the change at once; the daemon's snapshot confirms it.
+                    self.snap.extras = extras;
+                    if self.view == View::Team && !extras.frequencies {
+                        self.select_view(View::Board);
+                    }
+                    self.toast(
+                        format!(
+                            "{} {}",
+                            extra.label(),
+                            if extra.get(&extras) { "on" } else { "off" }
+                        ),
+                        now_ms,
+                    );
+                }
             }
             Action::EditSchedule(id) => {
                 let spec = self
@@ -1179,10 +1291,7 @@ impl Model {
                 }
             }
             Action::ToggleOtherRoutines => self.show_other_routines = !self.show_other_routines,
-            Action::ActivityDays(n) => {
-                self.activity_days = n;
-                self.scroll.remove(&ScrollId::Activity);
-            }
+            Action::ActivityDays(n) => self.activity_days = n,
             Action::SheetRole(role) => match &mut self.sheet {
                 Some(Sheet::NewFlight(f)) => f.role = role,
                 Some(Sheet::Schedule(f)) => f.role = role,
@@ -1371,7 +1480,7 @@ impl Model {
                 agent_id: id.clone(),
                 text,
             },
-            (_, View::Frequencies) => ClientMsg::Post {
+            (_, View::Team) => ClientMsg::Post {
                 frequency_id: self.freq.clone(),
                 text,
             },
@@ -1426,19 +1535,135 @@ mod tests {
             .collect()
     }
 
+    /// A button press, without needing its rectangle.
+    fn act(m: &mut Model, action: Action) -> Vec<Effect> {
+        let mut fx = Vec::new();
+        m.activate(Hit::Button(action), 0, &mut fx);
+        fx
+    }
+
     #[test]
     fn click_needs_press_and_release_on_the_same_target() {
         let a = Rect::new(0.0, 0.0, 10.0, 10.0);
         let b = Rect::new(20.0, 0.0, 10.0, 10.0);
         let mut m = model_with_hits(vec![
-            (a, Hit::Nav(View::Roster)),
-            (b, Hit::Nav(View::Inbox)),
+            (a, Hit::Nav(View::Setup)),
+            (b, Hit::Nav(View::History)),
         ]);
         m.apply(Input::Down { x: 5.0, y: 5.0 }, 0);
         m.apply(Input::Up { x: 25.0, y: 5.0 }, 0);
-        assert_eq!(m.view, View::Strips, "drag off a target cancels");
+        assert_eq!(m.view, View::Board, "drag off a target cancels");
         click(&mut m, 25.0, 5.0);
-        assert_eq!(m.view, View::Inbox);
+        assert_eq!(m.view, View::History);
+    }
+
+    #[test]
+    fn three_views_digits_beyond_are_ignored() {
+        let mut m = model_with_hits(vec![]);
+        for (key, view) in [('1', View::Board), ('2', View::Setup), ('3', View::History)].iter() {
+            m.apply(Input::Key(Key::Char(*key)), 0);
+            assert_eq!(m.view, *view);
+        }
+        for key in ['4', '7', '9', '0'].iter() {
+            let fx = m.apply(Input::Key(Key::Char(*key)), 0);
+            assert_eq!(m.view, View::History, "{} does nothing", key);
+            assert!(fx.is_empty(), "{} asks for no repaint", key);
+        }
+        m.apply(Input::Key(Key::Tab), 0);
+        assert_eq!(m.view, View::Board, "Tab wraps after the last view");
+        m.apply(Input::Key(Key::BackTab), 0);
+        assert_eq!(m.view, View::History);
+        // With the frequencies extra on, 4 is Team and Tab reaches it.
+        m.snap.extras.frequencies = true;
+        m.apply(Input::Key(Key::Char('4')), 0);
+        assert_eq!(m.view, View::Team);
+        m.apply(Input::Key(Key::Tab), 0);
+        assert_eq!(m.view, View::Board);
+    }
+
+    #[test]
+    fn team_view_falls_back_when_frequencies_turn_off() {
+        let mut m = model_with_hits(vec![]);
+        m.snap.extras.frequencies = true;
+        m.apply(Input::Key(Key::Char('4')), 0);
+        assert_eq!(m.view, View::Team);
+        let mut snap = m.snap.clone();
+        snap.extras.frequencies = false;
+        m.apply_server(ServerMsg::Snapshot { snapshot: snap }, 0);
+        assert_eq!(m.view, View::Board);
+    }
+
+    #[test]
+    fn accept_terms_sends_and_not_now_only_defers() {
+        let mut m = model_with_hits(vec![]);
+        live(&mut m);
+        let fx = act(
+            &mut m,
+            Action::DeferTerms {
+                id: "claude-agent-sdk".into(),
+                defer: true,
+            },
+        );
+        assert!(sent(&fx).is_empty(), "Not now tells the daemon nothing");
+        assert_eq!(m.terms_deferred, vec!["claude-agent-sdk".to_string()]);
+        act(
+            &mut m,
+            Action::DeferTerms {
+                id: "claude-agent-sdk".into(),
+                defer: false,
+            },
+        );
+        assert!(m.terms_deferred.is_empty());
+        let fx = act(&mut m, Action::AcceptTerms("claude-agent-sdk".into()));
+        assert_eq!(
+            sent(&fx),
+            vec![ClientMsg::AcceptTerms {
+                note_id: "claude-agent-sdk".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn toggle_extra_sends_the_whole_set_and_needs_a_live_daemon() {
+        let mut m = model_with_hits(vec![]);
+        let fx = act(&mut m, Action::ToggleExtra(Extra::Frequencies));
+        assert!(sent(&fx).is_empty());
+        assert!(!m.snap.extras.frequencies, "offline: nothing changes");
+        live(&mut m);
+        m.snap.extras.scouts = true;
+        let fx = act(&mut m, Action::ToggleExtra(Extra::Frequencies));
+        assert_eq!(
+            sent(&fx),
+            vec![ClientMsg::SetExtras {
+                extras: super::super::proto::Extras {
+                    scouts: true,
+                    frequencies: true,
+                    ..Default::default()
+                }
+            }]
+        );
+        assert!(m.snap.extras.frequencies, "shown at once");
+        m.view = View::Team;
+        act(&mut m, Action::ToggleExtra(Extra::Frequencies));
+        assert_eq!(m.view, View::Board, "Team goes with its extra");
+    }
+
+    #[test]
+    fn refresh_rereads_machine_jobs_only_when_shown() {
+        let mut m = model_with_hits(vec![]);
+        live(&mut m);
+        m.view = View::Setup;
+        let fx = m.apply(Input::Key(Key::Char('r')), 0);
+        assert_eq!(sent(&fx), vec![ClientMsg::GetSnapshot]);
+        m.snap.extras.machine_routines = true;
+        let fx = m.apply(Input::Key(Key::Char('r')), 0);
+        assert_eq!(
+            sent(&fx),
+            vec![ClientMsg::RefreshRoutines, ClientMsg::GetSnapshot]
+        );
+        m.view = View::Board;
+        let fx = m.apply(Input::Key(Key::Char('r')), 0);
+        assert_eq!(sent(&fx), vec![ClientMsg::GetSnapshot]);
     }
 
     #[test]
@@ -1617,7 +1842,7 @@ mod tests {
         assert_eq!(m.focus, Some(FieldId::Title));
         // Digits are text now, not view switches.
         type_text(&mut m, "Add v2 flag");
-        assert_eq!(m.view, View::Strips);
+        assert_eq!(m.view, View::Board);
         m.apply(Input::Key(Key::Tab), 0);
         assert_eq!(m.focus, Some(FieldId::Brief));
         m.apply(Input::Paste("line one\nline two".into()), 0);
@@ -1683,7 +1908,18 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+        // A triage role that cannot run (not installed, terms pending) is
+        // no Auto default either: the flight would only sit in Holding.
+        m.snap.setup.triage_usable = false;
+        m.apply(Input::Key(Key::Char('n')), 0);
+        match &m.sheet {
+            Some(Sheet::NewFlight(f)) => assert_eq!(f.role, None),
+            _ => panic!("no sheet"),
+        }
+        m.sheet = None;
+        m.focus = None;
         // Without a triage role there is no Auto default.
+        m.snap.setup.triage_usable = true;
         m.snap.triage_role.clear();
         m.apply(Input::Key(Key::Char('n')), 0);
         match &m.sheet {

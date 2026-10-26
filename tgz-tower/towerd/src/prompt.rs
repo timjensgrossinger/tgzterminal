@@ -17,7 +17,8 @@ pub fn access(deny: &[String]) -> String {
     )
 }
 
-pub fn system(role: &RoleCfg, team: &[RoleCfg]) -> String {
+/// `frequencies`: the Team frequency (`tower_post`) is on in this Tower.
+pub fn system(role: &RoleCfg, team: &[RoleCfg], frequencies: bool) -> String {
     let mut s = String::new();
     s.push_str(&format!(
         "You are {name}, an agent on a Tower team inside TGZTerminal.\n\n{mission}\n\n",
@@ -41,9 +42,15 @@ pub fn system(role: &RoleCfg, team: &[RoleCfg]) -> String {
            network. When a subtask is well specified (name the files, say how to check it) \
            hand it to one with tower_delegate instead of doing it yourself: it saves the user \
            cloud tokens. Keep working, then tower_await the result and review the change.\n\
-         - tower_return: when you were given a handoff packet, report the result to whoever sent it.\n\
-         - tower_post: a short note to the team frequency. @role or @agent-id reaches that agent.\n\
-         - tower_ask_human: a question for the human; the answer arrives as a [Tower] message.\n\
+         - tower_return: when you were given a handoff packet, report the result to whoever sent it.\n",
+    );
+    if frequencies {
+        s.push_str(
+            "- tower_post: a short note to the team frequency. @role or @agent-id reaches that agent.\n",
+        );
+    }
+    s.push_str(
+        "- tower_ask_human: a question for the human; the answer arrives as a [Tower] message.\n\
          - tower_decide: a decision the human should make (design, scope, trade-offs, anything \
            with consequences): 2-4 options and your recommendation. Do not make such decisions \
            silently; keep working on what does not depend on them.\n\
@@ -139,9 +146,16 @@ mod tests {
     fn system_prompt_names_role_team_and_tools() {
         let a = parse_role("approach", "a.toml".as_ref(), SEED_APPROACH).unwrap();
         let g = parse_role("ground", "g.toml".as_ref(), SEED_GROUND).unwrap();
-        let s = system(&a, &[a.clone(), g]);
+        let s = system(&a, &[a.clone(), g.clone()], true);
         assert!(s.contains("You are Approach"));
         assert!(s.contains("- ground (Ground):"));
+        assert!(s.contains("tower_post"));
+        let quiet = system(&a, &[a.clone(), g], false);
+        assert!(
+            !quiet.contains("tower_post"),
+            "the team frequency is not offered while it is off"
+        );
+        assert!(quiet.contains("tower_ask_human"));
         assert!(s.contains("mcp__tower__tower_complete"));
         assert!(s.contains("tower_decide") && s.contains("\"proposed\""));
         assert!(access(&[]).is_empty());

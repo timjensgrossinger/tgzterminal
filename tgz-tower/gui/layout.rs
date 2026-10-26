@@ -11,12 +11,12 @@ use super::forms::{
     caret_segment, civil_label, hex_rgb, local_civil, looks_local, segments, when_preview, Field,
     FieldId, Place, Sheet, SheetFlag, AUTO_ROLE, DRIVERS, ENDPOINT_KINDS, ROLE_COLORS, TEMPLATES,
 };
-use super::model::{Action, Conn, Drawer, Hit, Model, ScrollId, ScrollRegion, View};
+use super::model::{Action, Conn, Drawer, Extra, Hit, Model, ScrollId, ScrollRegion, View};
 use super::proto::{
     Agent, AgentStatus, ChatKind, DayStats, DriverKind, Flight, GateState, HandDirection,
     HandoffPacket, HandoffState, Health, InboxItem, InboxKind, IssueInfo, Locality, ModelInfo,
-    ModelRef, Role, RouteInfo, RoutineRow, RunResult, ScheduleRow, SlaClock, SnapshotOrigin, Stage,
-    TimelineBody, TimelineEntry,
+    ModelRef, NoticeLevel, Role, RouteInfo, RoutineRow, RunResult, ScheduleRow, SlaClock,
+    SnapshotOrigin, SourceStatus, Stage, TimelineBody, TimelineEntry,
 };
 use super::text::{age, ellipsize, usage_label, wrap, Font, Measure};
 use super::theme::{Color, Theme};
@@ -89,6 +89,23 @@ struct L<'a> {
 }
 
 const EMPTY: Rect = Rect::new(0.0, 0.0, 0.0, 0.0);
+
+/// The parts of Setup, top to bottom.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Section {
+    Notices,
+    Terms,
+    Roles,
+    Models,
+    Routing,
+    Connect,
+    Policy,
+    LocalOnly,
+    Schedules,
+    Sources,
+    Machine,
+    Extras,
+}
 
 impl<'a> L<'a> {
     // -- primitives ---------------------------------------------------------
@@ -591,26 +608,18 @@ impl<'a> L<'a> {
             (content.h - self.u * 4.0).max(0.0),
         );
         let md = self.md;
-        if md.snap.roles.is_empty()
-            && md.snap.flights.is_empty()
-            && md.view != View::Models
-            && md.view != View::Intake
-            && md.view != View::Policy
-            && md.view != View::Routines
-            && md.view != View::Activity
-        {
+        // Nothing to show until the first snapshot: a live daemon with no
+        // roles is a first run, and the Board explains what to do.
+        let offline = md.snap.now_unix == 0
+            || (!md.live() && md.snap.roles.is_empty() && md.snap.flights.is_empty());
+        if offline {
             self.offline_state(content);
         } else {
             match md.view {
-                View::Strips => self.board(content),
-                View::Roster => self.roster(content),
-                View::Inbox => self.inbox(content),
-                View::Frequencies => self.frequencies(content),
-                View::Models => self.models(content),
-                View::Intake => self.intake(content),
-                View::Policy => self.policy(content),
-                View::Routines => self.routines(content),
-                View::Activity => self.activity(content),
+                View::Board => self.board(content),
+                View::Setup => self.setup(content),
+                View::History => self.history(content),
+                View::Team => self.team(content),
             }
         }
         match &md.drawer {
@@ -639,13 +648,10 @@ impl<'a> L<'a> {
                 "Tower starts its daemon in the background.",
             ),
             Conn::Offline(why) => ("towerd is offline", why.as_str()),
-            Conn::Live { .. } => (
-                "No roles yet",
-                "Add role files to the roles folder of the Tower config directory.",
-            ),
+            Conn::Live { .. } => ("Waiting for towerd…", "The first snapshot is on its way."),
         };
         let detail = detail.to_string();
-        self.empty_state(area, title, &detail);
+        self.empty_state(area, title, &detail, None);
     }
 
     fn rail(&mut self, r: Rect) {
@@ -665,8 +671,17 @@ impl<'a> L<'a> {
         y += d + self.u * 6.0;
 
         let inbox = self.md.snap.inbox.len();
+        // Setup wants a look: a config error, or a terms note not yet accepted.
+        let attention = self
+            .md
+            .snap
+            .notices
+            .iter()
+            .any(|n| n.level == NoticeLevel::Error)
+            || !self.md.terms_due().is_empty();
         let item_h = (self.lh * 1.7).round();
-        for view in View::ALL.iter() {
+        let views = self.md.views();
+        for view in views.iter() {
             let row = Rect::new(r.x + self.u * 1.5, y, r.w - self.u * 3.0, item_h);
             let hit = Hit::Nav(*view);
             let active = self.md.view == *view;
@@ -685,7 +700,16 @@ impl<'a> L<'a> {
             let font = if active { Font::Strong } else { Font::Body };
             let ty = row.y + (item_h - self.lh_of(font)) / 2.0;
             self.text(row.x + self.u * 2.5, ty, view.label(), font, color);
-            if *view == View::Inbox && inbox > 0 {
+            if *view == View::Setup && attention {
+                let d = self.u * 1.6;
+                self.dot(
+                    row.right() - self.u * 3.0,
+                    row.y + item_h / 2.0,
+                    d,
+                    self.t.warn,
+                );
+            }
+            if *view == View::Board && inbox > 0 {
                 let label = inbox.to_string();
                 let cw = self.chip_w(&label);
                 let ch = self.chip_h();
@@ -734,7 +758,7 @@ impl<'a> L<'a> {
                 r.w - self.u * 3.0,
                 sh * 2.0 + self.u,
             );
-            let hit = Hit::Nav(View::Policy);
+            let hit = Hit::Nav(View::Setup);
             self.fill(row, self.t.tint(self.t.bad), self.u * 1.6);
             self.dot(
                 x + self.u,
@@ -784,65 +808,32 @@ impl<'a> L<'a> {
             .count();
         let needs = snap.inbox.len();
         let subtitle = match md.view {
-            View::Strips => format!(
+            View::Board => format!(
                 "{} flights · {} agents working · {} waiting on you",
                 snap.flights.len(),
                 airborne,
                 needs
             ),
-            View::Roster => format!(
-                "{} roles · {} live agents",
-                snap.roles.len(),
-                snap.agents.iter().filter(|a| a.status.is_live()).count()
-            ),
-            View::Inbox => {
-                if needs == 0 {
-                    "Nothing is waiting on you".to_string()
-                } else {
-                    format!("{} waiting on you", needs)
-                }
-            }
-            View::Frequencies => "Talk to the team · @role reaches its agents".to_string(),
-            View::Models => {
+            View::Setup => {
                 let up = snap
                     .endpoints
                     .iter()
                     .filter(|e| e.health == Health::Up)
                     .count();
-                format!("{} of {} model servers up", up, snap.endpoints.len())
+                let armed = match self.armed_left() {
+                    Some(left) => format!("Armed for {}", duration(left)),
+                    None => "Disarmed".to_string(),
+                };
+                format!(
+                    "{} of {} roles can run · {}/{} servers up · {}",
+                    snap.setup.roles_usable,
+                    snap.roles.len(),
+                    up,
+                    snap.endpoints.len(),
+                    armed
+                )
             }
-            View::Policy => match self.armed_left() {
-                Some(left) => format!(
-                    "Armed · auto actions run on their own for {}",
-                    duration(left)
-                ),
-                None => "Disarmed · Tower asks before everything".to_string(),
-            },
-            View::Routines => {
-                let next = snap
-                    .schedules
-                    .iter()
-                    .filter_map(|s| s.next_fire_unix.map(|t| (t, s.spec.name.as_str())))
-                    .min_by_key(|(t, _)| *t);
-                let others = snap.routines.iter().filter(|r| r.yours).count();
-                match next {
-                    Some((t, name)) => format!(
-                        "Next: {} in {} · {} other job{} here",
-                        name,
-                        duration(t.saturating_sub(self.now)),
-                        others,
-                        if others == 1 { "" } else { "s" }
-                    ),
-                    None => format!(
-                        "{} schedule{} · {} other job{} here",
-                        snap.schedules.len(),
-                        if snap.schedules.len() == 1 { "" } else { "s" },
-                        others,
-                        if others == 1 { "" } else { "s" }
-                    ),
-                }
-            }
-            View::Activity => {
+            View::History if snap.extras.activity => {
                 let days = self.activity_days();
                 let auto: u32 = days.iter().map(|d| d.auto.values().sum::<u32>()).sum();
                 let asked: u32 = days.iter().map(|d| d.asked).sum();
@@ -851,14 +842,8 @@ impl<'a> L<'a> {
                     md.activity_days, auto, asked
                 )
             }
-            View::Intake => {
-                let broken = snap.sources.iter().filter(|s| s.error.is_some()).count();
-                match (snap.sources.len(), broken) {
-                    (0, _) => "Where flights come from besides you".to_string(),
-                    (n, 0) => format!("{} watch{} polling", n, if n == 1 { "" } else { "es" }),
-                    (n, b) => format!("{} watches · {} with errors", n, b),
-                }
-            }
+            View::History => "What Tower did without a click".to_string(),
+            View::Team => "Talk to the team · @role reaches its agents".to_string(),
         };
         self.text(x, y, md.view.label(), Font::Heading, self.t.text);
         let hy = y + self.lh_of(Font::Heading);
@@ -875,7 +860,7 @@ impl<'a> L<'a> {
             Hit::Button(Action::OpenTerminal { cwd: None }),
         );
         let items = match md.view {
-            View::Strips => vec![
+            View::Board => vec![
                 terminal,
                 (
                     "New flight".to_string(),
@@ -883,73 +868,15 @@ impl<'a> L<'a> {
                     Hit::Button(Action::NewFlight),
                 ),
             ],
-            View::Roster => vec![
-                ("New role".to_string(), false, Hit::Button(Action::NewRole)),
-                (
-                    "New flight".to_string(),
-                    true,
-                    Hit::Button(Action::NewFlight),
-                ),
-            ],
-            View::Models => vec![
-                if snap.connected_clis.is_empty() {
-                    (
-                        "Connect agents".to_string(),
-                        false,
-                        Hit::Button(Action::OpenConnect(true)),
-                    )
-                } else {
-                    (
-                        format!("Connected: {}", snap.connected_clis.join(", ")),
-                        false,
-                        Hit::Button(Action::OpenConnect(false)),
-                    )
-                },
-                (
-                    "Add server".to_string(),
-                    false,
-                    Hit::Button(Action::NewEndpoint),
-                ),
-                (
-                    "Add model".to_string(),
-                    false,
-                    Hit::Button(Action::NewModel(None)),
-                ),
-                ("Probe".to_string(), true, Hit::Button(Action::Probe)),
-            ],
-            View::Intake if !cfg.is_empty() => vec![
-                (
-                    "Edit sources.toml".to_string(),
-                    false,
-                    Hit::Button(Action::EditFile {
-                        path: format!("{}/sources.toml", cfg),
-                    }),
-                ),
-                (
-                    "Poll now".to_string(),
-                    true,
-                    Hit::Button(Action::PollSources),
-                ),
-            ],
-            View::Routines => {
-                let mut v = vec![];
-                if !cfg.is_empty() {
-                    v.push((
-                        "Edit schedules.toml".to_string(),
-                        false,
-                        Hit::Button(Action::EditFile {
-                            path: format!("{}/schedules.toml", cfg),
-                        }),
-                    ));
-                }
-                v.push((
-                    "New schedule".to_string(),
-                    true,
-                    Hit::Button(Action::NewSchedule),
-                ));
-                v
+            View::Setup => {
+                let armed = self.armed_left().is_some();
+                vec![(
+                    if armed { "Disarm" } else { "Arm" }.to_string(),
+                    !armed,
+                    Hit::Button(Action::SetArmed(!armed)),
+                )]
             }
-            View::Activity => [7usize, 30, 90]
+            View::History if snap.extras.activity => [7usize, 30, 90]
                 .iter()
                 .map(|n| {
                     (
@@ -959,27 +886,10 @@ impl<'a> L<'a> {
                     )
                 })
                 .collect(),
-            View::Policy => {
-                let armed = self.armed_left().is_some();
-                let n = snap.local_only_paths.len();
-                let mut v = vec![(
-                    if n == 0 {
-                        "Local-only folders".to_string()
-                    } else {
-                        format!("Local-only folders ({})", n)
-                    },
-                    false,
-                    Hit::Button(Action::OpenLocalOnly),
-                )];
-                v.push((
-                    if armed { "Disarm" } else { "Arm" }.to_string(),
-                    !armed,
-                    Hit::Button(Action::SetArmed(!armed)),
-                ));
-                v
-            }
-            _ => vec![terminal],
+            View::History => vec![],
+            View::Team => vec![terminal],
         };
+        let _ = cfg;
         self.buttons_right(right, by, items);
         self.fill(
             Rect::new(r.x, r.bottom() - 1.0, r.w, 1.0),
@@ -991,24 +901,109 @@ impl<'a> L<'a> {
     // -- board --------------------------------------------------------------
 
     fn board(&mut self, area: Rect) {
-        if self.md.snap.flights.is_empty() {
+        let md = self.md;
+        let gap = self.u * 3.0;
+        let strip_w = area.w.min(self.lh * 60.0);
+        let mut y = area.y + self.u * 2.0;
+        // Callouts first: a config error, a terms note waiting for an OK.
+        let errors: Vec<String> = md
+            .snap
+            .notices
+            .iter()
+            .filter(|n| n.level == NoticeLevel::Error)
+            .map(|n| n.text.clone())
+            .collect();
+        for text in errors.iter().rev().take(3) {
+            let c = self.t.bad;
+            y += self.callout(
+                area.x,
+                y,
+                strip_w,
+                text,
+                c,
+                Some(("Open Setup".to_string(), Hit::Nav(View::Setup))),
+            ) + gap;
+        }
+        for t in md.terms_due() {
+            let text = format!(
+                "{}: needs your OK before {} agents start",
+                t.title, t.vendor
+            );
+            let c = self.t.warn;
+            y += self.callout(
+                area.x,
+                y,
+                strip_w,
+                &text,
+                c,
+                Some(("Review".to_string(), Hit::Nav(View::Setup))),
+            ) + gap;
+        }
+        // What is waiting on you, as a strip above the flights.
+        let items: Vec<&InboxItem> = md.snap.inbox.iter().rev().collect();
+        if !items.is_empty() {
+            y += self.section_label(area.x, y, &format!("WAITING ON YOU · {}", items.len()));
+            let measure = self.push_clip(EMPTY);
+            let heights: Vec<f32> = items
+                .iter()
+                .map(|i| self.inbox_row(i, area.x, 0.0, strip_w))
+                .collect();
+            self.pop_clip(measure);
+            let content = heights.iter().sum::<f32>() + gap * heights.len() as f32;
+            let first = heights[0] + gap;
+            let max_h = (area.h * 0.4).max(first.min(area.h * 0.6));
+            let vh = content.min(max_h).max(0.0);
+            let viewport = Rect::new(area.x, y, strip_w, vh);
+            let off = self.scroll_region(ScrollId::Inbox, viewport, content, false, false);
+            let old = self.push_clip(viewport);
+            let mut ry = viewport.y - off;
+            for (item, h) in items.iter().zip(heights.iter()) {
+                let r = Rect::new(area.x, ry, strip_w, *h);
+                let row_hit = item.flight_id.clone().map(Hit::InboxRow);
+                let hover = row_hit.as_ref().map(|h| self.hovered(h)).unwrap_or(false);
+                let radius = self.u * 2.4;
+                self.shadow(r, radius);
+                self.fill(
+                    r,
+                    if hover {
+                        self.t.card_hover
+                    } else {
+                        self.t.card
+                    },
+                    radius,
+                );
+                if let Some(h) = row_hit {
+                    self.hit(r, h);
+                }
+                self.inbox_row(item, area.x, ry, strip_w);
+                ry += h + gap;
+            }
+            self.pop_clip(old);
+            self.scrollbar(viewport, content, off);
+            y += vh + gap;
+        }
+        let used = y - area.y - self.u * 2.0;
+        let area = if used > 0.0 {
+            Rect::new(area.x, area.y + used, area.w, (area.h - used).max(0.0))
+        } else {
+            area
+        };
+        // Then the flights.
+        let first_run = md.snap.roles.is_empty()
+            || (md.snap.flights.is_empty() && md.snap.setup.roles_usable == 0);
+        if first_run {
+            self.first_run_state(area);
+            return;
+        }
+        if md.snap.flights.is_empty() {
             self.empty_state(
                 area,
                 "No flights yet",
                 "A flight is a piece of work. Create one, give it a role, and an agent takes off.",
-            );
-            let (w, _) = self.button_size("New flight");
-            let y = area.y + self.lh * 3.0 + self.lh_of(Font::Heading) + self.lh * 3.0;
-            self.button(
-                area.x + (area.w - w) / 2.0,
-                y,
-                "New flight",
-                true,
-                Hit::Button(Action::NewFlight),
+                Some(("New flight", Hit::Button(Action::NewFlight))),
             );
             return;
         }
-        let gap = self.u * 3.0;
         let n = Stage::ALL.len() as f32;
         let min_col = (self.lh * 11.0).round();
         let col_w = ((area.w - gap * (n - 1.0)) / n).max(min_col).floor();
@@ -1022,6 +1017,49 @@ impl<'a> L<'a> {
             self.column(Rect::new(x, area.y, col_w, area.h), *stage);
         }
         self.pop_clip(old);
+    }
+
+    /// A fresh setup: the one thing to do next, in order of what blocks the
+    /// first flight.
+    fn first_run_state(&mut self, area: Rect) {
+        let md = self.md;
+        let setup = &md.snap.setup;
+        if setup.installed_clis.is_empty() {
+            self.empty_state(
+                area,
+                "No agent CLI found",
+                "Tower runs the agent programs you already have: claude, codex, opencode, agy or gemini. Install one and Tower seeds a role for it.",
+                Some(("Open terminal", Hit::Button(Action::OpenTerminal { cwd: None }))),
+            );
+        } else if !md.terms_due().is_empty() {
+            self.empty_state(
+                area,
+                "One note before agents start",
+                "Setup shows the vendor's terms note for the agent you have. Accept it once and the first flight can take off.",
+                Some(("Review", Hit::Nav(View::Setup))),
+            );
+        } else if md.snap.roles.is_empty() {
+            self.empty_state(
+                area,
+                "No roles yet",
+                "A role is an agent with a mission. Tower seeds one for each installed CLI; add your own in Setup.",
+                Some(("New role", Hit::Button(Action::NewRole))),
+            );
+        } else {
+            let why = md
+                .snap
+                .roles
+                .iter()
+                .find_map(|r| r.warning.clone())
+                .unwrap_or_default();
+            let detail = format!("No role can run yet. {}", why);
+            self.empty_state(
+                area,
+                "Nothing can take off yet",
+                detail.trim(),
+                Some(("Open Setup", Hit::Nav(View::Setup))),
+            );
+        }
     }
 
     fn column(&mut self, r: Rect, stage: Stage) {
@@ -3203,17 +3241,12 @@ impl<'a> L<'a> {
 
     // -- roster -------------------------------------------------------------
 
-    fn roster(&mut self, area: Rect) {
-        let area = Rect::new(
-            area.x,
-            area.y + self.u * 4.0,
-            area.w,
-            (area.h - self.u * 4.0).max(0.0),
-        );
+    /// Role cards in a grid at (x0, y0); returns the height.
+    fn roles_body(&mut self, x0: f32, y0: f32, w: f32) -> f32 {
         let gap = self.u * 4.0;
         let min_w = self.lh * 17.0;
-        let cols = (((area.w + gap) / (min_w + gap)).floor() as usize).max(1);
-        let card_w = ((area.w - gap * (cols as f32 - 1.0)) / cols as f32).floor();
+        let cols = (((w + gap) / (min_w + gap)).floor() as usize).max(1);
+        let card_w = ((w - gap * (cols as f32 - 1.0)) / cols as f32).floor();
         let md = self.md;
         let roles: Vec<&Role> = md.snap.roles.iter().collect();
 
@@ -3228,15 +3261,12 @@ impl<'a> L<'a> {
         for chunk in heights.chunks(cols) {
             rows.push(chunk.iter().cloned().fold(0.0, f32::max));
         }
-        let content = rows.iter().sum::<f32>() + gap * rows.len().saturating_sub(1) as f32;
-        let off = self.scroll_region(ScrollId::Roster, area, content, false, false);
-        let old = self.push_clip(area);
-        let mut y = area.y - off;
+        let mut y = y0;
         for (row_idx, row_h) in rows.iter().enumerate() {
             for col in 0..cols {
                 let i = row_idx * cols + col;
                 if let Some(role) = roles.get(i) {
-                    let x = area.x + col as f32 * (card_w + gap);
+                    let x = x0 + col as f32 * (card_w + gap);
                     let radius = self.u * 2.4;
                     let r = Rect::new(x, y, card_w, *row_h);
                     self.shadow(r, radius);
@@ -3246,8 +3276,7 @@ impl<'a> L<'a> {
             }
             y += row_h + gap;
         }
-        self.pop_clip(old);
-        self.scrollbar(area, content, off);
+        (y - y0 - gap).max(0.0)
     }
 
     /// Draws a role card's contents at (x, y); returns its height.
@@ -3372,16 +3401,6 @@ impl<'a> L<'a> {
 
     // -- inbox --------------------------------------------------------------
 
-    fn list_area(&mut self, area: Rect) -> Rect {
-        let w = area.w.min(self.lh * 44.0);
-        Rect::new(
-            area.x,
-            area.y + self.u * 4.0,
-            w,
-            (area.h - self.u * 4.0).max(0.0),
-        )
-    }
-
     fn inbox_buttons(&self, item: &InboxItem) -> Vec<(String, bool, Hit)> {
         let mut out: Vec<(String, bool, Hit)> = Vec::new();
         if item.answerable {
@@ -3453,52 +3472,6 @@ impl<'a> L<'a> {
         out
     }
 
-    fn inbox(&mut self, area: Rect) {
-        let area = self.list_area(area);
-        let md = self.md;
-        let items: Vec<&InboxItem> = md.snap.inbox.iter().rev().collect();
-        if items.is_empty() {
-            self.empty_state(area, "All clear", "Permission requests, clearances, gate results and questions from agents land here.");
-            return;
-        }
-        let pad = self.u * 4.0;
-        let gap = self.u * 3.0;
-        let measure = self.push_clip(EMPTY);
-        let heights: Vec<f32> = items
-            .iter()
-            .map(|i| self.inbox_row(i, area.x, 0.0, area.w))
-            .collect();
-        self.pop_clip(measure);
-        let content = heights.iter().sum::<f32>() + gap * heights.len() as f32;
-        let off = self.scroll_region(ScrollId::Inbox, area, content, false, false);
-        let old = self.push_clip(area);
-        let mut y = area.y - off;
-        for (item, h) in items.iter().zip(heights.iter()) {
-            let r = Rect::new(area.x, y, area.w, *h);
-            let row_hit = item.flight_id.clone().map(Hit::InboxRow);
-            let hover = row_hit.as_ref().map(|h| self.hovered(h)).unwrap_or(false);
-            let radius = self.u * 2.4;
-            self.shadow(r, radius);
-            self.fill(
-                r,
-                if hover {
-                    self.t.card_hover
-                } else {
-                    self.t.card
-                },
-                radius,
-            );
-            if let Some(h) = row_hit {
-                self.hit(r, h);
-            }
-            self.inbox_row(item, area.x, y, area.w);
-            y += h + gap;
-        }
-        let _ = pad;
-        self.pop_clip(old);
-        self.scrollbar(area, content, off);
-    }
-
     /// Draw an inbox row's contents; returns its height.
     fn inbox_row(&mut self, item: &InboxItem, x0: f32, y0: f32, w: f32) -> f32 {
         let pad = self.u * 4.0;
@@ -3544,7 +3517,8 @@ impl<'a> L<'a> {
         y - y0
     }
 
-    fn empty_state(&mut self, area: Rect, title: &str, detail: &str) {
+    /// A centred title and explanation, with the one next step as a button.
+    fn empty_state(&mut self, area: Rect, title: &str, detail: &str, action: Option<(&str, Hit)>) {
         let y = area.y + self.lh * 3.0;
         let tw = self.m.width(title, Font::Heading);
         self.text(
@@ -3567,11 +3541,548 @@ impl<'a> L<'a> {
             );
             ly += self.lh_of(Font::Body);
         }
+        if let Some((label, hit)) = action {
+            let (bw, _) = self.button_size(label);
+            self.button(area.x + (area.w - bw) / 2.0, ly + self.lh, label, true, hit);
+        }
     }
 
-    // -- frequencies --------------------------------------------------------
+    /// A banner with one button at its right; returns its height.
+    fn callout(
+        &mut self,
+        x: f32,
+        y: f32,
+        w: f32,
+        text: &str,
+        color: Color,
+        action: Option<(String, Hit)>,
+    ) -> f32 {
+        let pad = self.u * 2.4;
+        let (bw, bh) = match &action {
+            Some((label, _)) => self.button_size(label),
+            None => (0.0, 0.0),
+        };
+        let reserve = if action.is_some() {
+            bw + self.u * 3.0
+        } else {
+            0.0
+        };
+        let tw = (w - pad * 2.0 - self.u - reserve).max(self.lh);
+        let measure = self.push_clip(EMPTY);
+        let th = self.para(0.0, 0.0, text, Font::Small, color, tw, 4);
+        self.pop_clip(measure);
+        let h = (th + pad * 2.0).max(bh + pad * 2.0);
+        let r = Rect::new(x, y, w, h);
+        self.fill(r, self.t.tint(color), self.u * 1.6);
+        let old = self.push_clip(r);
+        self.fill(Rect::new(x, y, self.u * 0.8, h), color, 0.0);
+        self.pop_clip(old);
+        let fg = self.t.readable(color);
+        self.para(
+            x + pad + self.u,
+            y + (h - th) / 2.0,
+            text,
+            Font::Small,
+            fg,
+            tw,
+            4,
+        );
+        if let Some((label, hit)) = action {
+            self.button(x + w - pad - bw, y + (h - bh) / 2.0, &label, false, hit);
+        }
+        h
+    }
 
-    fn frequencies(&mut self, area: Rect) {
+    /// A section of Setup: title, a line under it, buttons on the right.
+    /// Returns its height.
+    fn section_header(
+        &mut self,
+        x: f32,
+        y: f32,
+        w: f32,
+        title: &str,
+        sub: &str,
+        actions: Vec<(String, bool, Hit)>,
+    ) -> f32 {
+        let (_, bh) = self.button_size("x");
+        let th = self.lh_of(Font::Strong);
+        self.text_fit(x, y, title, Font::Strong, self.t.text, w * 0.5);
+        let mut h = th;
+        if !sub.is_empty() {
+            self.text_fit(x, y + th, sub, Font::Small, self.t.muted, w * 0.7);
+            h += self.lh_of(Font::Small);
+        }
+        if !actions.is_empty() {
+            self.buttons_right(x + w, y + (th - bh) / 2.0, actions);
+            h = h.max(bh);
+        }
+        h + self.u * 2.0
+    }
+
+    /// A note card with one button under the text; returns its height.
+    fn note_card_action(
+        &mut self,
+        x: f32,
+        y: f32,
+        w: f32,
+        title: &str,
+        detail: &str,
+        action: Option<(String, Hit)>,
+    ) -> f32 {
+        self.boxed(x, y, w, &|l: &mut Self, x, y, w| {
+            l.text(x, y, title, Font::Strong, l.t.muted);
+            let th = l.lh_of(Font::Strong) + l.u;
+            let mut h = th + l.para(x, y + th, detail, Font::Small, l.t.faint, w, 4);
+            if let Some((label, hit)) = &action {
+                h += l.u * 2.0;
+                let r = l.button(x, y + h, label, true, hit.clone());
+                h += r.h;
+            }
+            h
+        })
+    }
+
+    // -- setup --------------------------------------------------------------
+
+    /// Which sections Setup shows, top to bottom.
+    fn setup_sections(&self) -> Vec<Section> {
+        let md = self.md;
+        let mut v = Vec::new();
+        if !md.snap.notices.is_empty() {
+            v.push(Section::Notices);
+        }
+        if !md.snap.setup.terms_pending.is_empty() {
+            v.push(Section::Terms);
+        }
+        v.extend_from_slice(&[
+            Section::Roles,
+            Section::Models,
+            Section::Routing,
+            Section::Connect,
+            Section::Policy,
+            Section::LocalOnly,
+            Section::Schedules,
+            Section::Sources,
+        ]);
+        if md.snap.extras.machine_routines {
+            v.push(Section::Machine);
+        }
+        v.push(Section::Extras);
+        v
+    }
+
+    fn setup(&mut self, area: Rect) {
+        let w = area.w.min(self.lh * 64.0);
+        let area = Rect::new(
+            area.x,
+            area.y + self.u * 4.0,
+            w,
+            (area.h - self.u * 4.0).max(0.0),
+        );
+        let inner = area.w - self.u * 3.0;
+        let sections = self.setup_sections();
+        let measure = self.push_clip(EMPTY);
+        let heights: Vec<f32> = sections
+            .iter()
+            .map(|s| self.section(*s, area.x, 0.0, inner))
+            .collect();
+        self.pop_clip(measure);
+        let gap = self.u * 7.0;
+        let content = heights.iter().sum::<f32>() + gap * heights.len().saturating_sub(1) as f32;
+        let off = self.scroll_region(ScrollId::Setup, area, content, false, false);
+        let old = self.push_clip(area);
+        let mut y = area.y - off;
+        for (s, h) in sections.iter().zip(heights.iter()) {
+            // Only what is on screen is laid out a second time.
+            if y + h >= area.y && y <= area.bottom() {
+                self.section(*s, area.x, y, inner);
+            }
+            y += h + gap;
+        }
+        self.pop_clip(old);
+        self.scrollbar(area, content, off);
+    }
+
+    /// One Setup section at (x, y0); returns its height.
+    fn section(&mut self, s: Section, x: f32, y0: f32, w: f32) -> f32 {
+        let md = self.md;
+        let snap = &md.snap;
+        let gap = self.u * 3.0;
+        let cfg = snap.config_dir.clone();
+        let edit_file = |name: &str| {
+            Hit::Button(Action::EditFile {
+                path: format!("{}/{}", cfg, name),
+            })
+        };
+        let mut y = y0;
+        match s {
+            Section::Notices => {
+                y += self.section_header(x, y, w, "Notices", "", vec![]);
+                let n = snap.notices.len();
+                for notice in snap.notices.iter().rev().take(5) {
+                    let c = match notice.level {
+                        NoticeLevel::Error => self.t.bad,
+                        NoticeLevel::Warn => self.t.warn,
+                        NoticeLevel::Info => self.t.info,
+                    };
+                    y += self.banner(x, y, w, &notice.text, c) + gap;
+                }
+                if n > 5 {
+                    self.text(
+                        x,
+                        y,
+                        &format!("+{} older", n - 5),
+                        Font::Small,
+                        self.t.faint,
+                    );
+                    y += self.lh_of(Font::Small);
+                }
+            }
+            Section::Terms => {
+                y += self.section_header(
+                    x,
+                    y,
+                    w,
+                    "Before agents start",
+                    "A vendor-terms note for a program you have; accept it once",
+                    vec![],
+                );
+                for t in snap.setup.terms_pending.iter() {
+                    if md.terms_deferred.contains(&t.id) {
+                        let c = self.t.warn;
+                        y += self.callout(
+                            x,
+                            y,
+                            w,
+                            &format!("{}: not accepted yet", t.title),
+                            c,
+                            Some((
+                                "Review".to_string(),
+                                Hit::Button(Action::DeferTerms {
+                                    id: t.id.clone(),
+                                    defer: false,
+                                }),
+                            )),
+                        ) + gap;
+                        continue;
+                    }
+                    y += self.boxed(x, y, w, &|l: &mut Self, x, y0, w| {
+                        let mut y = y0;
+                        let tw = l.text(x, y, &t.title, Font::Strong, l.t.text);
+                        let cy = y + (l.lh_of(Font::Strong) - l.chip_h()) / 2.0;
+                        let fg = l.t.warn;
+                        let bg = l.t.tint(l.t.warn);
+                        l.chip(x + tw + l.u * 2.0, cy, &t.vendor, fg, bg);
+                        y += l.lh_of(Font::Strong) + l.u * 2.0;
+                        y += l.para(x, y, &t.text, Font::Small, l.t.muted, w, 60) + l.u * 3.0;
+                        y += l.buttons_left(
+                            x,
+                            y,
+                            vec![
+                                (
+                                    "Not now".to_string(),
+                                    false,
+                                    Hit::Button(Action::DeferTerms {
+                                        id: t.id.clone(),
+                                        defer: true,
+                                    }),
+                                ),
+                                (
+                                    "I accept".to_string(),
+                                    true,
+                                    Hit::Button(Action::AcceptTerms(t.id.clone())),
+                                ),
+                            ],
+                        );
+                        y - y0
+                    }) + gap;
+                }
+            }
+            Section::Roles => {
+                let n = snap.roles.len();
+                let sub = format!(
+                    "{} role{} · {} can run",
+                    n,
+                    if n == 1 { "" } else { "s" },
+                    snap.setup.roles_usable
+                );
+                y += self.section_header(
+                    x,
+                    y,
+                    w,
+                    "Roles",
+                    &sub,
+                    vec![("New role".to_string(), false, Hit::Button(Action::NewRole))],
+                );
+                if snap.roles.is_empty() {
+                    y += if snap.setup.installed_clis.is_empty() {
+                        self.note_card_action(
+                            x,
+                            y,
+                            w,
+                            "No agent CLI found",
+                            "Install claude, codex, opencode, agy or gemini; Tower seeds a role for each one it finds on PATH.",
+                            Some((
+                                "Open terminal".to_string(),
+                                Hit::Button(Action::OpenTerminal { cwd: None }),
+                            )),
+                        )
+                    } else {
+                        self.note_card_action(
+                            x,
+                            y,
+                            w,
+                            "No roles yet",
+                            "A role is an agent with a mission: a program, its models cheapest first, and what it does with a flight.",
+                            Some(("New role".to_string(), Hit::Button(Action::NewRole))),
+                        )
+                    };
+                } else {
+                    y += self.roles_body(x, y, w);
+                }
+            }
+            Section::Models => {
+                let eps = &snap.endpoints;
+                let up = eps.iter().filter(|e| e.health == Health::Up).count();
+                let sub = format!(
+                    "{} of {} servers up · models agents can hand work to",
+                    up,
+                    eps.len()
+                );
+                let mut actions = vec![(
+                    "Add server".to_string(),
+                    false,
+                    Hit::Button(Action::NewEndpoint),
+                )];
+                if !eps.is_empty() {
+                    actions.push((
+                        "Add model".to_string(),
+                        false,
+                        Hit::Button(Action::NewModel(None)),
+                    ));
+                    actions.push(("Probe".to_string(), false, Hit::Button(Action::Probe)));
+                }
+                y += self.section_header(x, y, w, "Models & servers", &sub, actions);
+                if eps.is_empty() && snap.models.is_empty() {
+                    y += self.note_card_action(
+                        x,
+                        y,
+                        w,
+                        "No model servers",
+                        "Ollama, LM Studio, llama.cpp, vLLM, MLX or any OpenAI-compatible host, on this Mac, the LAN or your company network. Then add the models on it that agents may hand work to.",
+                        Some(("Add server".to_string(), Hit::Button(Action::NewEndpoint))),
+                    );
+                } else {
+                    y += self.models_body(x, y, w);
+                }
+            }
+            Section::Routing => {
+                let mode = if snap.bandit_mode.is_empty() {
+                    "shadow"
+                } else {
+                    snap.bandit_mode.as_str()
+                };
+                let sub = format!(
+                    "learned policy: {} · click the card to change the tiers",
+                    mode
+                );
+                y += self.section_header(x, y, w, "Routing", &sub, vec![]);
+                if snap.engines.is_empty() {
+                    y += self.note_card_action(
+                        x,
+                        y,
+                        w,
+                        "No routing yet",
+                        "Roles with driver = \"routed\" run on the first available engine of the task's tier (low, medium, high).",
+                        Some((
+                            "Set up routing".to_string(),
+                            Hit::Button(Action::EditRouting),
+                        )),
+                    );
+                } else {
+                    y += self.routing_body(x, y, w);
+                }
+            }
+            Section::Connect => {
+                let action = if snap.connected_clis.is_empty() {
+                    (
+                        "Connect agents".to_string(),
+                        false,
+                        Hit::Button(Action::OpenConnect(true)),
+                    )
+                } else {
+                    (
+                        format!("Connected: {}", snap.connected_clis.join(", ")),
+                        false,
+                        Hit::Button(Action::OpenConnect(false)),
+                    )
+                };
+                y += self.section_header(x, y, w, "Your own sessions", "", vec![action]);
+                y += self.para(
+                    x,
+                    y,
+                    "A claude or codex you start yourself in any TGZTerminal pane gets Tower's delegation tools (tower_models, tower_delegate, tower_await) and the local-only guard. Tower never types into those panes.",
+                    Font::Small,
+                    self.t.muted,
+                    w,
+                    4,
+                );
+            }
+            Section::Policy => {
+                y += self.section_header(
+                    x,
+                    y,
+                    w,
+                    "Policy",
+                    "What Tower may do without a click",
+                    vec![],
+                );
+                y += self.policy_body(x, y, w);
+            }
+            Section::LocalOnly => {
+                let paths = &snap.local_only_paths;
+                y += self.section_header(
+                    x,
+                    y,
+                    w,
+                    "Local-only folders",
+                    "Work there never reaches a cloud model",
+                    vec![(
+                        "Edit folders".to_string(),
+                        false,
+                        Hit::Button(Action::OpenLocalOnly),
+                    )],
+                );
+                if paths.is_empty() {
+                    y += self.para(
+                        x,
+                        y,
+                        "None. Sensitive work can also be marked per flight, schedule, repo (.tower.toml) or intake source.",
+                        Font::Small,
+                        self.t.muted,
+                        w,
+                        3,
+                    );
+                }
+                for p in paths.iter().take(5) {
+                    self.text_fit(x, y, p, Font::Small, self.t.text, w);
+                    y += self.lh_of(Font::Small);
+                }
+                if paths.len() > 5 {
+                    self.text(
+                        x,
+                        y,
+                        &format!("+{} more", paths.len() - 5),
+                        Font::Small,
+                        self.t.faint,
+                    );
+                    y += self.lh_of(Font::Small);
+                }
+            }
+            Section::Schedules => {
+                let mut actions = vec![];
+                if !cfg.is_empty() {
+                    actions.push((
+                        "Edit schedules.toml".to_string(),
+                        false,
+                        edit_file("schedules.toml"),
+                    ));
+                }
+                actions.push((
+                    "New schedule".to_string(),
+                    true,
+                    Hit::Button(Action::NewSchedule),
+                ));
+                y += self.section_header(
+                    x,
+                    y,
+                    w,
+                    "Schedules",
+                    "Flights that start on a timer",
+                    actions,
+                );
+                y += self.schedules_body(x, y, w);
+            }
+            Section::Sources => {
+                let sources = self.visible_sources();
+                let broken = sources.iter().filter(|s| s.error.is_some()).count();
+                let sub = match (sources.len(), broken) {
+                    (0, _) => "Where flights come from besides you".to_string(),
+                    (n, 0) => format!("{} watch{} polling", n, if n == 1 { "" } else { "es" }),
+                    (n, b) => format!("{} watches · {} with errors", n, b),
+                };
+                let mut actions = vec![];
+                if !cfg.is_empty() {
+                    actions.push((
+                        "Edit sources.toml".to_string(),
+                        false,
+                        edit_file("sources.toml"),
+                    ));
+                }
+                if !sources.is_empty() {
+                    actions.push((
+                        "Poll now".to_string(),
+                        true,
+                        Hit::Button(Action::PollSources),
+                    ));
+                }
+                y += self.section_header(x, y, w, "Sources", &sub, actions);
+                if sources.is_empty() {
+                    let detail = if snap.extras.scouts {
+                        "Add a [[jira]], [[github]] or [[gitlab]] watch to sources.toml (Jira: store a token with `tower auth jira <site>`; GitHub/GitLab use your gh/glab login), or a [[scout]] that reads mail or Teams through an agent's own M365 tools."
+                    } else {
+                        "Add a [[jira]], [[github]] or [[gitlab]] watch to sources.toml (Jira: store a token with `tower auth jira <site>`; GitHub/GitLab use your gh/glab login). New items arrive as flights."
+                    };
+                    let action = if cfg.is_empty() {
+                        None
+                    } else {
+                        Some(("Edit sources.toml".to_string(), edit_file("sources.toml")))
+                    };
+                    y += self.note_card_action(x, y, w, "No intake yet", detail, action);
+                } else {
+                    y += self.sources_body(x, y, w);
+                }
+            }
+            Section::Machine => {
+                y += self.section_header(
+                    x,
+                    y,
+                    w,
+                    "This machine",
+                    "launchd agents and crontab, read-only",
+                    vec![("Re-read".to_string(), false, Hit::Button(Action::Refresh))],
+                );
+                y += self.machine_body(x, y, w);
+            }
+            Section::Extras => {
+                y += self.section_header(
+                    x,
+                    y,
+                    w,
+                    "Extras",
+                    "Side features, off until you want them ([extras] in tower.toml)",
+                    vec![],
+                );
+                for e in Extra::ALL.iter() {
+                    let on = e.get(&snap.extras);
+                    let label = format!("{}: {}", e.label(), if on { "on" } else { "off" });
+                    let color = if on { self.t.ok } else { self.t.muted };
+                    y += self.chip_row(
+                        x,
+                        y,
+                        w,
+                        vec![(label, on, color, Hit::Button(Action::ToggleExtra(*e)))],
+                    ) + self.u;
+                    y += self.para(x, y, e.help(), Font::Small, self.t.faint, w, 3) + gap;
+                }
+            }
+        }
+        y - y0
+    }
+
+    // -- team ---------------------------------------------------------------
+
+    fn team(&mut self, area: Rect) {
         let area = Rect::new(
             area.x,
             area.y + self.u * 4.0,
@@ -3604,6 +4115,7 @@ impl<'a> L<'a> {
                 area,
                 "Quiet",
                 "The team frequency appears once towerd is connected.",
+                None,
             );
             return;
         }
@@ -3724,141 +4236,33 @@ impl<'a> L<'a> {
 
     // -- models -------------------------------------------------------------
 
-    fn models(&mut self, area: Rect) {
-        let area = self.list_area(area);
+    /// Model cards and server cards at (x, y0); returns the height.
+    fn models_body(&mut self, x: f32, y0: f32, w: f32) -> f32 {
         let md = self.md;
         let eps = &md.snap.endpoints;
         let models = &md.snap.models;
         let pad = self.u * 4.0;
         let gap = self.u * 3.0;
-        let warnings: Vec<(String, String)> = md
-            .snap
-            .roles
-            .iter()
-            .filter_map(|r| r.warning.clone().map(|w| (r.name.clone(), w)))
-            .collect();
         let row_h = pad * 2.0
             + self.lh_of(Font::Strong)
             + self.lh_of(Font::Small)
             + self.u * 2.5
             + self.chip_h();
         let model_h = self.model_card_h();
-        let measure = self.push_clip(EMPTY);
-        let mut warn_h = 0.0;
-        for (name, w) in &warnings {
-            let text = format!("{}: {}", name, w);
-            let c = self.t.warn;
-            warn_h += self.banner(area.x, 0.0, area.w, &text, c) + gap;
-        }
-        self.pop_clip(measure);
-        let engines = &md.snap.engines;
-        let eng_row = self.lh_of(Font::Body).max(self.chip_h()) + self.u * 2.0;
-        let label_h = self.lh_of(Font::SmallStrong) + self.u;
-        let route_h = if engines.is_empty() {
-            0.0
-        } else {
-            label_h + pad + engines.len() as f32 * eng_row + pad + gap * 2.0
-        };
-        let models_h = if models.is_empty() {
-            0.0
-        } else {
-            label_h + models.len() as f32 * (model_h + gap) + gap
-        };
-        let eps_h = if eps.is_empty() {
-            0.0
-        } else {
-            label_h + eps.len() as f32 * (row_h + gap)
-        };
-        let content = warn_h + models_h + route_h + eps_h;
-        if eps.is_empty() && warnings.is_empty() && engines.is_empty() && models.is_empty() {
-            self.empty_state(
-                area,
-                "No model servers",
-                "Add server: Ollama, LM Studio, llama.cpp, vLLM, MLX or any OpenAI-compatible host, on this Mac, the LAN or your company network. Then add the models on it that agents may hand work to.",
-            );
-            return;
-        }
-        let off = self.scroll_region(ScrollId::Models, area, content, false, false);
-        let old = self.push_clip(area);
-        let mut y = area.y - off;
-        for (name, w) in &warnings {
-            let text = format!("{}: {}", name, w);
-            let c = self.t.warn;
-            y += self.banner(area.x, y, area.w, &text, c) + gap;
-        }
+        let mut y = y0;
         if !models.is_empty() {
-            y += self.section_label(area.x, y, "MODELS AGENTS CAN HAND WORK TO");
+            y += self.section_label(x, y, "MODELS AGENTS CAN HAND WORK TO");
             for m in models.iter() {
-                self.model_card(m, Rect::new(area.x, y, area.w, model_h));
+                self.model_card(m, Rect::new(x, y, w, model_h));
                 y += model_h + gap;
             }
             y += gap;
         }
-        if !engines.is_empty() {
-            let mode = if md.snap.bandit_mode.is_empty() {
-                "shadow"
-            } else {
-                md.snap.bandit_mode.as_str()
-            };
-            let label = format!(
-                "ROUTING  ·  learned policy: {}  ·  click to change the tiers",
-                mode
-            );
-            y += self.section_label(area.x, y, &label);
-            let card_h = pad * 2.0 + engines.len() as f32 * eng_row;
-            let r = Rect::new(area.x, y, area.w, card_h);
-            let radius = self.u * 2.4;
-            let hit = Hit::Button(Action::EditRouting);
-            let bg = if self.hovered(&hit) {
-                self.t.card_hover
-            } else {
-                self.t.card
-            };
-            self.shadow(r, radius);
-            self.fill(r, bg, radius);
-            self.hit(r, hit);
-            let x = r.x + pad;
-            let right = r.right() - pad;
-            let mut ry = r.y + pad;
-            let tier_w = self.chip_w("medium");
-            for e in engines.iter() {
-                let cy = ry + (eng_row - self.chip_h()) / 2.0;
-                let ty = ry + (eng_row - self.lh_of(Font::Body)) / 2.0;
-                let d = self.u * 1.6;
-                let dc = if e.available { self.t.ok } else { self.t.bad };
-                self.dot(x + d / 2.0, ry + eng_row / 2.0, d, dc);
-                self.tier_chip(x + d + self.u * 2.0, cy, &e.tier);
-                let nx = x + d + self.u * 4.0 + tier_w;
-                let nw = self.text(nx, ty, &e.id, Font::Strong, self.t.text);
-                let lc = self.locality_chip(nx + nw + self.u * 2.0, cy, e.locality);
-                let mut detail = format!("{} {}", e.driver.label(), e.model);
-                if !e.effort.is_empty() {
-                    detail.push_str(&format!(" · effort {}", e.effort));
-                }
-                let (status, sc) = match &e.why {
-                    Some(w) => (w.clone(), self.t.warn),
-                    None if e.trained > 0 => (format!("{} outcomes", e.trained), self.t.muted),
-                    None => ("ready".to_string(), self.t.muted),
-                };
-                let sw = self.text_right(right, ty, &status, Font::Small, sc);
-                let dx = lc.right() + self.u * 2.5;
-                self.text_fit(
-                    dx,
-                    ty,
-                    &detail,
-                    Font::Small,
-                    self.t.muted,
-                    right - sw - self.u * 3.0 - dx,
-                );
-                ry += eng_row;
-            }
-            y += card_h + gap * 2.0;
-        }
         if !eps.is_empty() {
-            y += self.section_label(area.x, y, "MODEL SERVERS");
+            y += self.section_label(x, y, "MODEL SERVERS");
         }
         for ep in eps.iter() {
-            let r = Rect::new(area.x, y, area.w, row_h);
+            let r = Rect::new(x, y, w, row_h);
             let radius = self.u * 2.4;
             let card_hit = Hit::Button(Action::EditEndpoint(ep.name.clone()));
             let bg = if self.hovered(&card_hit) {
@@ -3873,7 +4277,7 @@ impl<'a> L<'a> {
             let ty = r.y + pad;
             let (hc, hl) = match ep.health {
                 Health::Up => (self.t.ok, "up"),
-                Health::Down => (self.t.bad, "down"),
+                Health::Down => (self.t.faint, "not running"),
                 Health::Unknown => (self.t.faint, "not probed yet"),
             };
             let d = self.u * 1.6;
@@ -3943,8 +4347,73 @@ impl<'a> L<'a> {
             }
             y += row_h + gap;
         }
-        self.pop_clip(old);
-        self.scrollbar(area, content, off);
+        (y - y0 - gap).max(0.0)
+    }
+
+    /// The `[routing]` engines, one card; click to change the tiers.
+    /// Returns the height.
+    fn routing_body(&mut self, x: f32, y0: f32, w: f32) -> f32 {
+        let md = self.md;
+        let engines = &md.snap.engines;
+        let pad = self.u * 4.0;
+        let eng_row = self.lh_of(Font::Body).max(self.chip_h()) + self.u * 2.0;
+        let card_h = pad * 2.0 + engines.len() as f32 * eng_row;
+        let r = Rect::new(x, y0, w, card_h);
+        let radius = self.u * 2.4;
+        let hit = Hit::Button(Action::EditRouting);
+        let bg = if self.hovered(&hit) {
+            self.t.card_hover
+        } else {
+            self.t.card
+        };
+        self.shadow(r, radius);
+        self.fill(r, bg, radius);
+        self.hit(r, hit);
+        let x = r.x + pad;
+        let right = r.right() - pad;
+        let mut ry = r.y + pad;
+        let tier_w = self.chip_w("medium");
+        for e in engines.iter() {
+            let cy = ry + (eng_row - self.chip_h()) / 2.0;
+            let ty = ry + (eng_row - self.lh_of(Font::Body)) / 2.0;
+            let d = self.u * 1.6;
+            // Missing program: quiet, it is a fact about this machine, not
+            // a fault; anything else that blocks the engine is a warning.
+            let dc = if e.available {
+                self.t.ok
+            } else if e.missing {
+                self.t.faint
+            } else {
+                self.t.bad
+            };
+            self.dot(x + d / 2.0, ry + eng_row / 2.0, d, dc);
+            self.tier_chip(x + d + self.u * 2.0, cy, &e.tier);
+            let nx = x + d + self.u * 4.0 + tier_w;
+            let nw = self.text(nx, ty, &e.id, Font::Strong, self.t.text);
+            let lc = self.locality_chip(nx + nw + self.u * 2.0, cy, e.locality);
+            let mut detail = format!("{} {}", e.driver.label(), e.model);
+            if !e.effort.is_empty() {
+                detail.push_str(&format!(" · effort {}", e.effort));
+            }
+            let (status, sc) = match &e.why {
+                Some(w) if e.missing => (w.clone(), self.t.faint),
+                Some(w) => (w.clone(), self.t.warn),
+                None if e.trained > 0 => (format!("{} outcomes", e.trained), self.t.muted),
+                None => ("ready".to_string(), self.t.muted),
+            };
+            let sw = self.text_right(right, ty, &status, Font::Small, sc);
+            let dx = lc.right() + self.u * 2.5;
+            self.text_fit(
+                dx,
+                ty,
+                &detail,
+                Font::Small,
+                self.t.muted,
+                right - sw - self.u * 3.0 - dx,
+            );
+            ry += eng_row;
+        }
+        card_h
     }
 
     fn model_card_h(&self) -> f32 {
@@ -3976,13 +4445,25 @@ impl<'a> L<'a> {
         let right = r.right() - pad;
         let ty = r.y + pad;
         let d = self.u * 1.6;
-        let dc = if m.available { self.t.ok } else { self.t.bad };
+        let down = m
+            .why
+            .as_deref()
+            .map(|w| w.ends_with("is not reachable"))
+            .unwrap_or(false);
+        let dc = if m.available {
+            self.t.ok
+        } else if down {
+            self.t.faint
+        } else {
+            self.t.bad
+        };
         self.dot(x + d / 2.0, ty + self.lh_of(Font::Strong) / 2.0, d, dc);
         let nx = x + d + self.u * 2.5;
         let nw = self.text(nx, ty, &m.label, Font::Strong, self.t.text);
         let cy = ty + (self.lh_of(Font::Strong) - self.chip_h()) / 2.0;
         self.locality_chip(nx + nw + self.u * 2.0, cy, m.locality);
         let (status, sc) = match &m.why {
+            Some(_) if down => ("server not running".to_string(), self.t.faint),
             Some(w) => (w.clone(), self.t.warn),
             None => (
                 format!("{} of {} running", m.busy, m.max_concurrency),
@@ -4079,45 +4560,40 @@ impl<'a> L<'a> {
 
     // -- intake -------------------------------------------------------------
 
-    fn intake(&mut self, area: Rect) {
-        let area = self.list_area(area);
+    /// The intake watches Setup shows: scouts only while that extra is on.
+    fn visible_sources(&self) -> Vec<&'a SourceStatus> {
         let md = self.md;
-        let sources = &md.snap.sources;
-        if sources.is_empty() {
-            self.empty_state(
-                area,
-                "No intake yet",
-                "Add a [[jira]], [[github]] or [[gitlab]] watch to sources.toml (Jira: store a token with `tower auth jira <site>`; GitHub/GitLab use your gh/glab login), or a [[scout]] that reads mail or Teams through an agent's own M365 tools. New items arrive as flights; what Tower may then do on its own is set in Policy.",
-            );
-            return;
-        }
-        let pad = self.u * 4.0;
+        md.snap
+            .sources
+            .iter()
+            .filter(|s| md.snap.extras.scouts || !matches!(s.kind.as_str(), "mail" | "teams"))
+            .collect()
+    }
+
+    /// Source cards at (x, y0); returns the height.
+    fn sources_body(&mut self, x: f32, y0: f32, w: f32) -> f32 {
+        let sources = self.visible_sources();
         let gap = self.u * 3.0;
         let measure = self.push_clip(EMPTY);
         let heights: Vec<f32> = sources
             .iter()
-            .map(|s| self.source_card(s, area.x, 0.0, area.w))
+            .map(|s| self.source_card(s, x, 0.0, w))
             .collect();
         self.pop_clip(measure);
-        let content = heights.iter().sum::<f32>() + gap * heights.len() as f32;
-        let off = self.scroll_region(ScrollId::Intake, area, content, false, false);
-        let old = self.push_clip(area);
-        let mut y = area.y - off;
+        let mut y = y0;
         for (src, h) in sources.iter().zip(heights.iter()) {
-            let r = Rect::new(area.x, y, area.w, *h);
+            let r = Rect::new(x, y, w, *h);
             let radius = self.u * 2.4;
             self.shadow(r, radius);
             self.fill(r, self.t.card, radius);
-            self.source_card(src, area.x, y, area.w);
+            self.source_card(src, x, y, w);
             y += h + gap;
         }
-        let _ = pad;
-        self.pop_clip(old);
-        self.scrollbar(area, content, off);
+        (y - y0 - gap).max(0.0)
     }
 
     /// One intake watch; returns its height.
-    fn source_card(&mut self, src: &super::proto::SourceStatus, x0: f32, y0: f32, w: f32) -> f32 {
+    fn source_card(&mut self, src: &SourceStatus, x0: f32, y0: f32, w: f32) -> f32 {
         let pad = self.u * 4.0;
         let x = x0 + pad;
         let right = x0 + w - pad;
@@ -4226,17 +4702,18 @@ impl<'a> L<'a> {
             .map(|until| until - self.now)
     }
 
-    fn policy(&mut self, area: Rect) {
-        let area = self.list_area(area);
+    /// The policy rows (one chip per level) at (x0, y0); returns the height.
+    fn policy_body(&mut self, x0: f32, y0: f32, w: f32) -> f32 {
         let md = self.md;
         let rows = &md.snap.policy;
         if rows.is_empty() {
-            self.empty_state(
-                area,
+            return self.note_card(
+                x0,
+                y0,
+                w,
                 "No policy yet",
                 "This towerd predates [policy]: restart it to see what Tower may do on its own.",
             );
-            return;
         }
         let pad = self.u * 4.0;
         let row_h = self.lh_of(Font::Strong) + self.lh_of(Font::Small) + self.u * 5.0;
@@ -4245,16 +4722,10 @@ impl<'a> L<'a> {
         } else {
             "Disarmed: every action asks first, even those set to auto. Arm Tower when you want auto actions to run. Levels: off · draft (prepared, you do it) · confirm (one click in the Inbox) · auto."
         };
-        let measure = self.push_clip(EMPTY);
-        let intro_h = self.para(area.x, 0.0, intro, Font::Small, self.t.muted, area.w, 4);
-        self.pop_clip(measure);
         let card_h = row_h * rows.len() as f32 + pad * 2.0;
-        let content = intro_h + self.u * 4.0 + card_h;
-        let off = self.scroll_region(ScrollId::Policy, area, content, false, false);
-        let old = self.push_clip(area);
-        let mut y = area.y - off;
-        y += self.para(area.x, y, intro, Font::Small, self.t.muted, area.w, 4) + self.u * 4.0;
-        let card = Rect::new(area.x, y, area.w, card_h);
+        let mut y = y0;
+        y += self.para(x0, y, intro, Font::Small, self.t.muted, w, 4) + self.u * 4.0;
+        let card = Rect::new(x0, y, w, card_h);
         let radius = self.u * 2.4;
         self.shadow(card, radius);
         self.fill(card, self.t.card, radius);
@@ -4299,8 +4770,7 @@ impl<'a> L<'a> {
             self.text_fit(x, sy, &help, Font::Small, self.t.muted, text_w);
             y += row_h;
         }
-        self.pop_clip(old);
-        self.scrollbar(area, content, off);
+        y + pad - y0
     }
 
     // -- routines -----------------------------------------------------------
@@ -4367,23 +4837,11 @@ impl<'a> L<'a> {
         }
     }
 
-    fn routines(&mut self, area: Rect) {
-        let area = self.list_area(area);
-        let measure = self.push_clip(EMPTY);
-        let content = self.routines_body(area.x, 0.0, area.w);
-        self.pop_clip(measure);
-        let off = self.scroll_region(ScrollId::Routines, area, content, false, false);
-        let old = self.push_clip(area);
-        self.routines_body(area.x, area.y - off, area.w);
-        self.pop_clip(old);
-        self.scrollbar(area, content, off);
-    }
-
-    fn routines_body(&mut self, x: f32, y0: f32, w: f32) -> f32 {
+    /// Tower's schedules at (x, y0); returns the height.
+    fn schedules_body(&mut self, x: f32, y0: f32, w: f32) -> f32 {
         let md = self.md;
         let gap = self.u * 3.0;
         let mut y = y0;
-        y += self.section_label(x, y, "TOWER SCHEDULES");
         if md.snap.schedules.is_empty() {
             y += self.note_card(
                 x,
@@ -4398,8 +4856,15 @@ impl<'a> L<'a> {
                 l.schedule_body(row, x, y, w)
             }) + gap;
         }
-        y += self.u * 3.0;
-        y += self.section_label(x, y, "THIS MACHINE · READ-ONLY");
+        (y - y0 - gap).max(0.0)
+    }
+
+    /// This machine's launchd agents and crontab lines, read-only, at
+    /// (x, y0); returns the height.
+    fn machine_body(&mut self, x: f32, y0: f32, w: f32) -> f32 {
+        let md = self.md;
+        let gap = self.u * 3.0;
+        let mut y = y0;
         if !md.snap.routines_note.is_empty() {
             let c = self.t.warn;
             y += self.banner(x, y, w, &md.snap.routines_note, c) + gap;
@@ -4440,7 +4905,7 @@ impl<'a> L<'a> {
                 }
             }
         }
-        y - y0
+        (y - y0 - gap).max(0.0)
     }
 
     /// One Tower schedule; returns its height.
@@ -4652,7 +5117,7 @@ impl<'a> L<'a> {
 
     // -- activity -----------------------------------------------------------
 
-    fn activity(&mut self, area: Rect) {
+    fn history(&mut self, area: Rect) {
         let w = area.w.min(self.lh * 64.0);
         let area = Rect::new(
             area.x,
@@ -4660,14 +5125,30 @@ impl<'a> L<'a> {
             w,
             (area.h - self.u * 4.0).max(0.0),
         );
+        let inner = area.w - self.u * 3.0;
         let measure = self.push_clip(EMPTY);
-        let content = self.activity_body(area.x, 0.0, area.w - self.u * 3.0);
+        let content = self.history_body(area.x, 0.0, inner);
         self.pop_clip(measure);
-        let off = self.scroll_region(ScrollId::Activity, area, content, false, false);
+        let off = self.scroll_region(ScrollId::History, area, content, false, false);
         let old = self.push_clip(area);
-        self.activity_body(area.x, area.y - off, area.w - self.u * 3.0);
+        self.history_body(area.x, area.y - off, inner);
         self.pop_clip(old);
         self.scrollbar(area, content, off);
+    }
+
+    /// Charts while the activity extra is on, then what ran by itself.
+    fn history_body(&mut self, x: f32, y0: f32, w: f32) -> f32 {
+        let md = self.md;
+        let gap = self.u * 3.0;
+        let mut y = y0;
+        let limit = if md.snap.extras.activity {
+            y += self.activity_charts(x, y, w) + gap;
+            12
+        } else {
+            40
+        };
+        y += self.recent_body(x, y, w, limit);
+        y - y0
     }
 
     /// The days the charts show, oldest first.
@@ -4678,8 +5159,8 @@ impl<'a> L<'a> {
         &days[days.len() - n..]
     }
 
-    fn activity_body(&mut self, x: f32, y0: f32, w: f32) -> f32 {
-        let md = self.md;
+    /// Tiles and charts for the chosen days; returns the height.
+    fn activity_charts(&mut self, x: f32, y0: f32, w: f32) -> f32 {
         let days = self.activity_days();
         let gap = self.u * 3.0;
         let mut y = y0;
@@ -4692,7 +5173,7 @@ impl<'a> L<'a> {
                 y,
                 w,
                 "Nothing yet",
-                "Once flights start (by you, a watch, a scout or a schedule), this shows what ran by itself, what asked you, how runs ended and what it cost.",
+                "Once flights start (by you, a watch or a schedule), this shows what ran by itself, what asked you, how runs ended and what it cost.",
             );
             return y - y0;
         }
@@ -4883,17 +5364,33 @@ impl<'a> L<'a> {
                 true,
             ) + gap;
         }
+        (y - y0 - gap).max(0.0)
+    }
 
-        // The latest things that ran by themselves.
+    /// The latest things that ran by themselves (from the audit log);
+    /// returns the height.
+    fn recent_body(&mut self, x: f32, y0: f32, w: f32, limit: usize) -> f32 {
+        let md = self.md;
         let recent = &md.snap.activity.recent;
-        if !recent.is_empty() {
-            y += self.boxed(x, y, w, &|l: &mut Self, x, y0, w| {
+        {
+            self.boxed(x, y0, w, &|l: &mut Self, x, y0, w| {
                 let mut y = y0;
                 l.text(x, y, "Ran by itself, latest", Font::Strong, l.t.text);
                 y += l.lh_of(Font::Strong) + l.u * 2.0;
+                if recent.is_empty() {
+                    y += l.para(
+                        x,
+                        y,
+                        "Nothing ran by itself yet · What may run on its own is set in Setup → Policy.",
+                        Font::Small,
+                        l.t.faint,
+                        w,
+                        3,
+                    );
+                }
                 let row_h = l.lh_of(Font::Small) + l.u * 1.5;
                 let when_w = l.m.width("00h ago", Font::Small) + l.u * 2.0;
-                for e in recent.iter().take(12) {
+                for e in recent.iter().take(limit) {
                     let flight = e.flight.as_ref().and_then(|f| md.snap.flight(f));
                     let what = format!(
                         "{}{}{}",
@@ -4934,9 +5431,8 @@ impl<'a> L<'a> {
                     y += row_h;
                 }
                 y - y0
-            });
+            })
         }
-        y - y0
     }
 
     /// Coloured legend entries, wrapping; returns the height.
@@ -5222,7 +5718,7 @@ fn duration(secs: u64) -> String {
 mod tests {
     use super::super::forms::Sheet;
     use super::super::model::Model;
-    use super::super::proto::{demo_snapshot, PolicyRow};
+    use super::super::proto::{demo_snapshot, Notice, PolicyRow, TermsNote};
     use super::super::text::fake::FakeMeasure;
     use super::*;
 
@@ -5243,31 +5739,51 @@ mod tests {
         scene.hits.iter().any(|(_, h)| h == hit)
     }
 
+    /// Tall enough that every Setup section (and the whole inbox strip) is
+    /// on screen: hits are clipped, so a short pane hides the lower ones.
+    const TALL: Rect = Rect::new(0.0, 0.0, 1600.0, 20000.0);
+
+    fn scene_tall(model: &Model) -> Scene {
+        layout(model, &theme(), &mut FakeMeasure, TALL, 1_000_000)
+    }
+
+    fn with_extras(model: &mut Model, on: bool) {
+        model.snap.extras = super::super::proto::Extras {
+            scouts: on,
+            machine_routines: on,
+            activity: on,
+            frequencies: on,
+        };
+    }
+
     #[test]
     fn every_view_lays_out_inside_the_area() {
         let mut model = Model::new(demo_snapshot(1_000_000));
-        for view in View::ALL.iter() {
-            model.view = *view;
-            let scene = scene_for(&model);
-            assert!(!scene.cmds.is_empty(), "{:?} draws something", view);
-            for (r, h) in &scene.hits {
-                assert!(
-                    r.x >= AREA.x - 0.5
-                        && r.right() <= AREA.right() + 0.5
-                        && r.y >= AREA.y - 0.5
-                        && r.bottom() <= AREA.bottom() + 0.5,
-                    "{:?}: hit {:?} at {:?} leaves the pane",
-                    view,
-                    h,
-                    r
-                );
+        for on in [false, true].iter() {
+            with_extras(&mut model, *on);
+            for view in model.views() {
+                model.view = view;
+                let scene = scene_for(&model);
+                assert!(!scene.cmds.is_empty(), "{:?} draws something", view);
+                for (r, h) in &scene.hits {
+                    assert!(
+                        r.x >= AREA.x - 0.5
+                            && r.right() <= AREA.right() + 0.5
+                            && r.y >= AREA.y - 0.5
+                            && r.bottom() <= AREA.bottom() + 0.5,
+                        "{:?}: hit {:?} at {:?} leaves the pane",
+                        view,
+                        h,
+                        r
+                    );
+                }
             }
         }
     }
 
     #[test]
-    fn board_has_a_card_per_flight_and_nav_for_every_view() {
-        let model = Model::new(demo_snapshot(1_000_000));
+    fn board_has_a_card_per_flight_and_nav_for_each_view() {
+        let mut model = Model::new(demo_snapshot(1_000_000));
         let scene = scene_for(&model);
         for f in &model.snap.flights {
             assert!(
@@ -5279,6 +5795,65 @@ mod tests {
         for view in View::ALL.iter() {
             assert!(has(&scene, &Hit::Nav(*view)));
         }
+        assert_eq!(
+            scene
+                .hits
+                .iter()
+                .filter(|(_, h)| matches!(h, Hit::Nav(_)))
+                .count(),
+            3
+        );
+        assert!(!has(&scene, &Hit::Nav(View::Team)));
+        assert!(has(&scene, &Hit::Button(Action::NewFlight)));
+        model.snap.extras.frequencies = true;
+        assert!(has(&scene_for(&model), &Hit::Nav(View::Team)));
+    }
+
+    #[test]
+    fn board_draws_the_inbox_strip_above_the_columns() {
+        let mut model = Model::new(demo_snapshot(1_000_000));
+        let scene = scene_tall(&model);
+        let strip_y = scene
+            .hits
+            .iter()
+            .filter_map(|(r, h)| matches!(h, Hit::InboxRow(_)).then_some(r.y))
+            .fold(f32::MAX, f32::min);
+        let card_y = scene
+            .hits
+            .iter()
+            .filter_map(|(r, h)| matches!(h, Hit::Card(_)).then_some(r.y))
+            .fold(f32::MAX, f32::min);
+        assert!(strip_y < card_y, "the strip sits above the flights");
+        assert!(texts(&scene)
+            .iter()
+            .any(|t| t.starts_with("WAITING ON YOU · ")));
+        // Many items: the strip caps at 40% of the height and scrolls.
+        let item = model.snap.inbox[0].clone();
+        for i in 0..20 {
+            let mut it = item.clone();
+            it.id = format!("i-x{}", i);
+            model.snap.inbox.push(it);
+        }
+        let scene = scene_for(&model);
+        let strip = scene
+            .scrolls
+            .iter()
+            .find(|s| s.id == ScrollId::Inbox)
+            .expect("a strip region");
+        assert!(strip.viewport.h <= AREA.h * 0.4 + 0.5);
+        assert!(strip.max_offset() > 0.0);
+        // Nothing waiting: no strip at all.
+        model.snap.inbox.clear();
+        let scene = scene_for(&model);
+        assert!(!scene.scrolls.iter().any(|s| s.id == ScrollId::Inbox));
+        assert!(!texts(&scene)
+            .iter()
+            .any(|t| t.starts_with("WAITING ON YOU")));
+        // No flights: the strip still shows, and so does New flight.
+        model.snap.inbox.push(item);
+        model.snap.flights.clear();
+        let scene = scene_tall(&model);
+        assert!(scene.scrolls.iter().any(|s| s.id == ScrollId::Inbox));
         assert!(has(&scene, &Hit::Button(Action::NewFlight)));
     }
 
@@ -5422,9 +5997,8 @@ mod tests {
             answerable: true,
             ..Default::default()
         });
-        let mut model = Model::new(snap);
-        model.view = View::Inbox;
-        let scene = scene_for(&model);
+        let model = Model::new(snap);
+        let scene = scene_tall(&model);
         assert!(has(
             &scene,
             &Hit::Button(Action::Resolve {
@@ -5467,23 +6041,81 @@ mod tests {
         snap.inbox.clear();
         let mut model = Model::new(snap);
         let scene = scene_for(&model);
-        assert!(scene
-            .cmds
-            .iter()
-            .any(|c| matches!(c, Cmd::Text { text, .. } if text == "No flights yet")));
+        assert!(texts(&scene).iter().any(|t| t == "No flights yet"));
         assert!(has(&scene, &Hit::Button(Action::NewFlight)));
-        model.view = View::Inbox;
+
+        // A first run, step by step: no CLI, then a terms note, then no
+        // roles, then a role that cannot run.
+        model.conn = Conn::Live { pid: 1 };
+        model.snap.roles.clear();
+        model.snap.setup.roles_usable = 0;
+        model.snap.setup.installed_clis.clear();
         let scene = scene_for(&model);
-        assert!(scene
-            .cmds
+        assert!(texts(&scene).iter().any(|t| t == "No agent CLI found"));
+        assert!(has(
+            &scene,
+            &Hit::Button(Action::OpenTerminal { cwd: None })
+        ));
+        model.snap.setup.installed_clis = vec!["claude".into()];
+        model.snap.setup.terms_pending = vec![TermsNote {
+            id: "claude-agent-sdk".into(),
+            vendor: "Claude".into(),
+            title: "Claude: vendor terms note".into(),
+            text: "words".into(),
+        }];
+        let scene = scene_for(&model);
+        assert!(texts(&scene)
             .iter()
-            .any(|c| matches!(c, Cmd::Text { text, .. } if text == "All clear")));
+            .any(|t| t == "One note before agents start"));
+        assert!(has(&scene, &Hit::Nav(View::Setup)));
+        model.snap.setup.terms_pending.clear();
+        let scene = scene_for(&model);
+        assert!(texts(&scene).iter().any(|t| t == "No roles yet"));
+        assert!(has(&scene, &Hit::Button(Action::NewRole)));
+        let mut role = demo_snapshot(1_000_000).roles[0].clone();
+        role.warning = Some("opencode is not installed".into());
+        role.missing = true;
+        model.snap.roles = vec![role];
+        let scene = scene_for(&model);
+        assert!(texts(&scene)
+            .iter()
+            .any(|t| t == "Nothing can take off yet"));
+        assert!(texts(&scene)
+            .iter()
+            .any(|t| t.contains("opencode is not installed")));
+
+        // Setup's own empty states each offer one action.
+        let mut model = Model::new(demo_snapshot(1_000_000));
+        model.view = View::Setup;
+        model.snap.endpoints.clear();
+        model.snap.models.clear();
+        model.snap.sources.clear();
+        model.snap.config_dir = "/cfg".into();
+        let scene = scene_tall(&model);
+        let t = texts(&scene);
+        assert!(t.iter().any(|t| t == "No model servers"));
+        assert!(has(&scene, &Hit::Button(Action::NewEndpoint)));
+        assert!(
+            !has(&scene, &Hit::Button(Action::NewModel(None))),
+            "no server to add it to"
+        );
+        assert!(t.iter().any(|t| t == "No intake yet"));
+        assert!(has(
+            &scene,
+            &Hit::Button(Action::EditFile {
+                path: "/cfg/sources.toml".into()
+            })
+        ));
+        assert!(!has(&scene, &Hit::Button(Action::PollSources)));
+        model.snap.roles.clear();
+        model.snap.setup.roles_usable = 0;
+        let scene = scene_tall(&model);
+        assert!(texts(&scene).iter().any(|t| t == "No roles yet"));
+        assert!(has(&scene, &Hit::Button(Action::NewRole)));
+
         let model = Model::new(super::super::model::empty_snapshot());
         let scene = scene_for(&model);
-        assert!(scene
-            .cmds
-            .iter()
-            .any(|c| matches!(c, Cmd::Text { text, .. } if text.starts_with("Connecting"))));
+        assert!(texts(&scene).iter().any(|t| t.starts_with("Connecting")));
     }
 
     fn texts(scene: &Scene) -> Vec<String> {
@@ -5498,10 +6130,18 @@ mod tests {
     }
 
     #[test]
-    fn routines_view_lists_schedules_and_machine_jobs() {
+    fn setup_lists_schedules_and_machine_jobs_when_on() {
         let mut model = Model::new(demo_snapshot(1_000_000));
-        model.view = View::Routines;
-        let scene = scene_for(&model);
+        model.view = View::Setup;
+        // Machine jobs are an extra: hidden until switched on.
+        let t = texts(&scene_tall(&model));
+        assert!(!t.iter().any(|s| s.contains("sla-checker")));
+        assert!(!has(
+            &scene_tall(&model),
+            &Hit::Button(Action::ToggleOtherRoutines)
+        ));
+        model.snap.extras.machine_routines = true;
+        let scene = scene_tall(&model);
         assert!(has(
             &scene,
             &Hit::Button(Action::RunSchedule("morning-prs".into()))
@@ -5525,15 +6165,15 @@ mod tests {
         assert!(!t.iter().any(|s| s.contains("com.vendor.updater")));
         assert!(has(&scene, &Hit::Button(Action::ToggleOtherRoutines)));
         model.show_other_routines = true;
-        let t = texts(&scene_for(&model));
+        let t = texts(&scene_tall(&model));
         assert!(t.iter().any(|s| s.contains("com.vendor.updater")));
     }
 
     #[test]
     fn models_view_describes_models_and_edits_servers() {
         let mut model = Model::new(demo_snapshot(1_000_000));
-        model.view = View::Models;
-        let scene = scene_for(&model);
+        model.view = View::Setup;
+        let scene = scene_tall(&model);
         let t = texts(&scene);
         assert!(t.iter().any(|s| s == "Qwen 3.6 27B"));
         assert!(t.iter().any(|s| s == "code edits"), "strengths are chips");
@@ -5552,7 +6192,7 @@ mod tests {
         assert!(has(&scene, &Hit::Button(Action::OpenConnect(false))));
         model.snap.connected_clis.clear();
         assert!(has(
-            &scene_for(&model),
+            &scene_tall(&model),
             &Hit::Button(Action::OpenConnect(true))
         ));
         model.sheet = Some(Sheet::Connect(true));
@@ -5562,7 +6202,7 @@ mod tests {
 
         // A served model nobody described yet can be added from its chip.
         model.snap.models.clear();
-        let scene = scene_for(&model);
+        let scene = scene_tall(&model);
         assert!(has(
             &scene,
             &Hit::Button(Action::NewModel(Some("localhost/qwen3.6:27b".into())))
@@ -5572,8 +6212,8 @@ mod tests {
     #[test]
     fn roles_routing_and_policy_are_edited_in_place() {
         let mut model = Model::new(demo_snapshot(1_000_000));
-        model.view = View::Roster;
-        let scene = scene_for(&model);
+        model.view = View::Setup;
+        let scene = scene_tall(&model);
         assert!(has(&scene, &Hit::Button(Action::NewRole)));
         assert!(has(
             &scene,
@@ -5595,19 +6235,17 @@ mod tests {
         ));
         model.sheet = None;
 
-        model.view = View::Models;
-        assert!(has(&scene_for(&model), &Hit::Button(Action::EditRouting)));
+        assert!(has(&scene_tall(&model), &Hit::Button(Action::EditRouting)));
         model.sheet = Some(Sheet::routing(&[], &[], &[]));
         assert!(has(&scene_for(&model), &Hit::Field(FieldId::RouteHigh)));
         model.sheet = None;
 
-        model.view = View::Policy;
         model.snap.policy = vec![super::super::proto::PolicyRow {
             action: "handoff.local".into(),
             level: "auto".into(),
             configured: false,
         }];
-        let scene = scene_for(&model);
+        let scene = scene_tall(&model);
         assert!(has(
             &scene,
             &Hit::Button(Action::SetPolicyLevel {
@@ -5646,7 +6284,6 @@ mod tests {
     #[test]
     fn server_and_model_sheets_paint_their_pickers() {
         let mut model = Model::new(demo_snapshot(1_000_000));
-        model.view = View::Models;
         model.sheet = Some(Sheet::endpoint(None));
         let scene = scene_for(&model);
         assert!(has(&scene, &Hit::Button(Action::SheetKind("vllm".into()))));
@@ -5678,9 +6315,23 @@ mod tests {
     }
 
     #[test]
-    fn activity_view_draws_tiles_charts_and_the_latest() {
+    fn history_charts_follow_the_activity_extra() {
         let mut model = Model::new(demo_snapshot(1_000_000));
-        model.view = View::Activity;
+        model.view = View::History;
+        // Off (the default): only what ran by itself, no charts, no day buttons.
+        let scene = scene_for(&model);
+        let t = texts(&scene);
+        assert!(!t.iter().any(|s| s == "Flights started"));
+        assert!(!has(&scene, &Hit::Button(Action::ActivityDays(30))));
+        assert!(t.iter().any(|s| s == "Ran by itself, latest"));
+        assert!(has(
+            &scene,
+            &Hit::Button(Action::OpenFlight {
+                flight_id: "f-17".into()
+            })
+        ));
+        // On: tiles and charts above the list.
+        model.snap.extras.activity = true;
         let scene = scene_for(&model);
         let t = texts(&scene);
         for want in &[
@@ -5691,8 +6342,9 @@ mod tests {
         ] {
             assert!(t.iter().any(|s| s == want), "{} is drawn", want);
         }
+        assert!(has(&scene, &Hit::Button(Action::ActivityDays(30))));
         // The latest automatic event (at the bottom) opens its flight.
-        model.scroll.insert(ScrollId::Activity, 1.0e6);
+        model.scroll.insert(ScrollId::History, 1.0e6);
         let bottom = scene_for(&model);
         assert!(has(
             &bottom,
@@ -5700,17 +6352,19 @@ mod tests {
                 flight_id: "f-17".into()
             })
         ));
-        assert!(has(&scene, &Hit::Button(Action::ActivityDays(30))));
         // An empty history explains itself instead of drawing empty charts.
         model.snap.activity = Default::default();
+        model.scroll.remove(&ScrollId::History);
         let t = texts(&scene_for(&model));
         assert!(t.iter().any(|s| s == "Nothing yet"));
+        model.snap.extras.activity = false;
+        let t = texts(&scene_for(&model));
+        assert!(t.iter().any(|s| s.starts_with("Nothing ran by itself yet")));
     }
 
     #[test]
     fn schedule_sheet_offers_templates_and_previews_the_time() {
         let mut model = Model::new(demo_snapshot(1_000_000));
-        model.view = View::Routines;
         model.sheet = Some(Sheet::schedule(None, None));
         let scene = scene_for(&model);
         assert!(has(&scene, &Hit::Button(Action::ScheduleTemplate(0))));
@@ -5754,8 +6408,8 @@ mod tests {
             },
         ];
         let mut model = Model::new(snap);
-        model.view = View::Policy;
-        let scene = scene_for(&model);
+        model.view = View::Setup;
+        let scene = scene_tall(&model);
         assert!(has(&scene, &Hit::Button(Action::SetArmed(true))));
         // Levels are chips you click; no file to edit.
         assert!(has(
@@ -5775,7 +6429,7 @@ mod tests {
         );
 
         model.snap.armed_until = Some(1_000_000 + 2 * 3600 + 5 * 60);
-        let scene = scene_for(&model);
+        let scene = scene_tall(&model);
         assert!(has(&scene, &Hit::Button(Action::SetArmed(false))));
         let t = texts(&scene);
         assert!(t.iter().any(|x| x == "Armed"), "rail shows Armed");
@@ -5783,7 +6437,7 @@ mod tests {
 
         // An expired timestamp reads as disarmed.
         model.snap.armed_until = Some(999_999);
-        let scene = scene_for(&model);
+        let scene = scene_tall(&model);
         assert!(has(&scene, &Hit::Button(Action::SetArmed(true))));
     }
 
@@ -5871,13 +6525,17 @@ mod tests {
         snap.sources[0].name = "Support".into();
         snap.sources[0].polling = false;
         let mut model = Model::new(snap);
-        model.view = View::Intake;
+        model.view = View::Setup;
         let run = Hit::Button(Action::RunScout("Support".into()));
-        assert!(has(&scene_for(&model), &run));
-        assert!(texts(&scene_for(&model)).iter().any(|t| t == "Mail scout"));
+        // Scouts are an extra: off, the scout is not even listed.
+        assert!(!has(&scene_tall(&model), &run));
+        assert!(!texts(&scene_tall(&model)).iter().any(|t| t == "Mail scout"));
+        model.snap.extras.scouts = true;
+        assert!(has(&scene_tall(&model), &run));
+        assert!(texts(&scene_tall(&model)).iter().any(|t| t == "Mail scout"));
         model.snap.sources[0].polling = true;
         assert!(
-            !has(&scene_for(&model), &run),
+            !has(&scene_tall(&model), &run),
             "no second run while one is going"
         );
     }
@@ -5895,8 +6553,8 @@ mod tests {
         snap.config_dir = "/cfg".into();
         snap.sources[0].error = Some("HTTP 401: not authorized".into());
         let mut model = Model::new(snap);
-        model.view = View::Intake;
-        let scene = scene_for(&model);
+        model.view = View::Setup;
+        let scene = scene_tall(&model);
         assert!(has(&scene, &Hit::Button(Action::PollSources)));
         assert!(has(
             &scene,
@@ -5915,11 +6573,223 @@ mod tests {
         assert!(texts.iter().any(|t| t == "Team backlog"));
         assert!(texts.iter().any(|t| t.contains("not authorized")));
         model.snap.sources.clear();
-        let scene = scene_for(&model);
+        let scene = scene_tall(&model);
         assert!(scene
             .cmds
             .iter()
             .any(|c| matches!(c, Cmd::Text { text, .. } if text == "No intake yet")));
+    }
+
+    #[test]
+    fn setup_has_every_section_and_opens_each_sheet() {
+        let mut snap = demo_snapshot(1_000_000);
+        snap.config_dir = "/cfg".into();
+        let mut model = Model::new(snap);
+        model.view = View::Setup;
+        with_extras(&mut model, true);
+        let scene = scene_tall(&model);
+        let t = texts(&scene);
+        for title in &[
+            "Roles",
+            "Models & servers",
+            "Routing",
+            "Your own sessions",
+            "Policy",
+            "Local-only folders",
+            "Schedules",
+            "Sources",
+            "This machine",
+            "Extras",
+        ] {
+            assert!(t.iter().any(|s| s == title), "{} section", title);
+        }
+        for hit in &[
+            Hit::Button(Action::NewRole),
+            Hit::Button(Action::EditRole("approach".into())),
+            Hit::Button(Action::NewEndpoint),
+            Hit::Button(Action::NewModel(None)),
+            Hit::Button(Action::Probe),
+            Hit::Button(Action::EditEndpoint("localhost".into())),
+            Hit::Button(Action::EditRouting),
+            Hit::Button(Action::OpenConnect(false)),
+            Hit::Button(Action::OpenLocalOnly),
+            Hit::Button(Action::NewSchedule),
+            Hit::Button(Action::RunSchedule("morning-prs".into())),
+            Hit::Button(Action::EditFile {
+                path: "/cfg/sources.toml".into(),
+            }),
+            Hit::Button(Action::EditFile {
+                path: "/cfg/schedules.toml".into(),
+            }),
+            Hit::Button(Action::PollSources),
+            Hit::Button(Action::Refresh),
+            Hit::Button(Action::SetArmed(true)),
+        ] {
+            assert!(has(&scene, hit), "{:?}", hit);
+        }
+        for e in Extra::ALL.iter() {
+            assert!(
+                has(&scene, &Hit::Button(Action::ToggleExtra(*e))),
+                "{:?}",
+                e
+            );
+        }
+        // Setup is one vertical scroll region.
+        assert!(scene.scrolls.iter().any(|s| s.id == ScrollId::Setup));
+    }
+
+    #[test]
+    fn extras_off_hide_scouts_machine_jobs_and_team() {
+        let mut snap = demo_snapshot(1_000_000);
+        snap.sources[0].kind = "mail".into();
+        snap.sources[0].name = "Support".into();
+        let mut model = Model::new(snap);
+        model.view = View::Setup;
+        let scene = scene_tall(&model);
+        let t = texts(&scene);
+        assert!(!t.iter().any(|s| s == "Mail scout"));
+        assert!(!has(
+            &scene,
+            &Hit::Button(Action::RunScout("Support".into()))
+        ));
+        assert!(
+            !t.iter().any(|s| s == "scout.run"),
+            "no policy row for scouts"
+        );
+        assert!(!t.iter().any(|s| s == "This machine"));
+        assert!(!has(&scene, &Hit::Button(Action::ToggleOtherRoutines)));
+        assert!(!has(&scene, &Hit::Nav(View::Team)));
+        with_extras(&mut model, true);
+        model.snap.policy.push(PolicyRow {
+            action: "scout.run".into(),
+            level: "off".into(),
+            configured: false,
+        });
+        let scene = scene_tall(&model);
+        let t = texts(&scene);
+        assert!(t.iter().any(|s| s == "Mail scout"));
+        assert!(t.iter().any(|s| s == "scout.run"));
+        assert!(t.iter().any(|s| s == "This machine"));
+        assert!(has(&scene, &Hit::Nav(View::Team)));
+    }
+
+    #[test]
+    fn terms_card_accepts_defers_and_shows_on_the_board() {
+        let mut snap = demo_snapshot(1_000_000);
+        snap.setup.terms_pending = vec![TermsNote {
+            id: "claude-agent-sdk".into(),
+            vendor: "Claude".into(),
+            title: "Claude: vendor terms note".into(),
+            text: "Unless previously approved, Anthropic does not allow …".into(),
+        }];
+        let mut model = Model::new(snap);
+        // The Board points at Setup.
+        let scene = scene_for(&model);
+        assert!(texts(&scene)
+            .iter()
+            .any(|t| t.contains("needs your OK before Claude agents start")));
+        assert!(has(&scene, &Hit::Nav(View::Setup)));
+        // Setup has the card with the verbatim text and both buttons.
+        model.view = View::Setup;
+        let scene = scene_tall(&model);
+        let t = texts(&scene);
+        assert!(t.iter().any(|s| s == "Before agents start"));
+        assert!(t.iter().any(|s| s.contains("Unless previously approved")));
+        assert!(has(
+            &scene,
+            &Hit::Button(Action::AcceptTerms("claude-agent-sdk".into()))
+        ));
+        assert!(has(
+            &scene,
+            &Hit::Button(Action::DeferTerms {
+                id: "claude-agent-sdk".into(),
+                defer: true
+            })
+        ));
+        // Not now: folded to one line with Review; the Board stops nagging.
+        model.terms_deferred.push("claude-agent-sdk".into());
+        let scene = scene_tall(&model);
+        assert!(!has(
+            &scene,
+            &Hit::Button(Action::AcceptTerms("claude-agent-sdk".into()))
+        ));
+        assert!(has(
+            &scene,
+            &Hit::Button(Action::DeferTerms {
+                id: "claude-agent-sdk".into(),
+                defer: false
+            })
+        ));
+        assert!(texts(&scene)
+            .iter()
+            .any(|s| s.ends_with("not accepted yet")));
+        model.view = View::Board;
+        assert!(!texts(&scene_for(&model))
+            .iter()
+            .any(|t| t.contains("needs your OK")));
+    }
+
+    #[test]
+    fn notices_show_in_setup_and_errors_on_the_board() {
+        let mut snap = demo_snapshot(1_000_000);
+        snap.notices = vec![
+            Notice {
+                level: NoticeLevel::Error,
+                text: "Config: tower.toml: expected a table".into(),
+                at_unix: 999_000,
+            },
+            Notice {
+                level: NoticeLevel::Info,
+                text: "Armed: actions set to auto run on their own".into(),
+                at_unix: 999_500,
+            },
+        ];
+        let mut model = Model::new(snap);
+        let scene = scene_for(&model);
+        let t = texts(&scene);
+        assert!(t.iter().any(|s| s.starts_with("Config: tower.toml")));
+        assert!(
+            !t.iter().any(|s| s.starts_with("Armed: actions")),
+            "info stays in Setup"
+        );
+        assert!(has(&scene, &Hit::Nav(View::Setup)));
+        model.view = View::Setup;
+        let t = texts(&scene_tall(&model));
+        assert!(t.iter().any(|s| s == "Notices"));
+        assert!(t.iter().any(|s| s.starts_with("Config: tower.toml")));
+        assert!(t.iter().any(|s| s.starts_with("Armed: actions")));
+    }
+
+    #[test]
+    fn missing_programs_read_as_not_installed() {
+        let mut model = Model::new(demo_snapshot(1_000_000));
+        model.view = View::Setup;
+        let e = &mut model.snap.engines[0];
+        e.available = false;
+        e.missing = true;
+        e.why = Some("npx is not installed (needs Node.js)".into());
+        let scene = scene_tall(&model);
+        let faint = theme().faint;
+        assert!(
+            scene.cmds.iter().any(|c| matches!(
+                c,
+                Cmd::Text { text, color, .. }
+                    if text == "npx is not installed (needs Node.js)" && *color == faint
+            )),
+            "a missing program is a fact, not a warning"
+        );
+        // A blocked engine whose program is there stays a warning.
+        let e = &mut model.snap.engines[0];
+        e.missing = false;
+        e.why = Some("$K is not set".into());
+        let scene = scene_tall(&model);
+        assert!(scene.cmds.iter().any(|c| matches!(
+            c,
+            Cmd::Text { text, color, .. } if text == "$K is not set" && *color == theme().warn
+        )));
+        // Role warnings live on the role cards now, not as a wall of banners.
+        let t = texts(&scene);
+        assert!(!t.iter().any(|s| s.starts_with("Ground: ")));
     }
 
     #[test]
@@ -5935,11 +6805,11 @@ mod tests {
                 .collect()
         };
         let mut m = Model::new(demo_snapshot(1_000_000));
-        m.view = View::Models;
-        let t = texts(&scene_for(&m));
-        assert!(t.iter().any(|t| t.contains("ROUTING")), "{:?}", t);
+        m.view = View::Setup;
+        let t = texts(&scene_tall(&m));
+        assert!(t.iter().any(|t| t == "Routing"), "{:?}", t);
         assert!(t.iter().any(|t| t == "ollama pull qwen3.6:27b"));
-        m.view = View::Strips;
+        m.view = View::Board;
         m.drawer = Some(Drawer::Flight("f-13".into()));
         if let Some(f) = m.snap.flights.iter_mut().find(|f| f.id == "f-13") {
             f.kind = Some("design".into());

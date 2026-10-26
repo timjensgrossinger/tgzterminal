@@ -196,6 +196,10 @@ pub struct Engine {
     demo: Option<Snapshot>,
     /// `[routing]` engines and whether each can run now.
     engines: Vec<EngineInfo>,
+    /// Agent CLIs found on PATH, refreshed with `engines`.
+    installed_clis: Vec<String>,
+    /// Config errors and notices for the Setup view (not persisted).
+    notices: std::collections::VecDeque<tower_proto::Notice>,
     /// Is a program installed? (Replaced in tests.)
     on_path: fn(&str) -> bool,
     /// A projects scan is running.
@@ -242,7 +246,7 @@ impl Engine {
         // Roles for the vendor CLIs installed here; tests must not depend on
         // what this machine has installed.
         if !cfg!(test) {
-            if let Err(err) = config::seed_vendor_roles(&paths.config, config::on_path) {
+            if let Err(err) = config::seed_vendor_roles(&paths.config, &config::on_path) {
                 eprintln!("tower: could not seed vendor roles: {err}");
             }
         }
@@ -315,6 +319,8 @@ impl Engine {
             last_probe: None,
             demo: demo.then(|| demo_snapshot(now_unix())),
             engines: vec![],
+            installed_clis: vec![],
+            notices: Default::default(),
             on_path: config::on_path,
             scanning: false,
             scan_enabled: true,
@@ -418,7 +424,38 @@ impl Engine {
             .collect()
     }
 
+    /// The role's program is not installed.
+    fn role_missing(&self, role: &RoleCfg) -> bool {
+        config::role_missing(role, &self.on_path).is_some()
+    }
+
+    /// Roles that can run now: program installed, nothing else in the way.
+    fn usable_roles(&self) -> Vec<&RoleCfg> {
+        self.cfg
+            .roles
+            .iter()
+            .filter(|r| self.role_warning(r).is_none())
+            .collect()
+    }
+
+    /// The triage role, only when it can actually run and no vendor-terms
+    /// note stands in its way; `None` means "Auto" is not worth offering.
+    fn usable_triage_role(&self) -> Option<&RoleCfg> {
+        let role = self.cfg.triage_role()?;
+        if self.role_warning(role).is_some() {
+            return None;
+        }
+        let verdict = self.terms_for(role, crate::compliance::Input::Initial);
+        if self.terms_pending(verdict).is_some() {
+            return None;
+        }
+        Some(role)
+    }
+
     fn role_warning(&self, role: &RoleCfg) -> Option<String> {
+        if let Some(why) = config::role_missing(role, &self.on_path) {
+            return Some(why);
+        }
         if let Some(why) = role
             .ladder
             .iter()
@@ -492,7 +529,7 @@ impl Engine {
                 .cfg
                 .roles
                 .iter()
-                .map(|r| r.to_proto(self.role_warning(r)))
+                .map(|r| r.to_proto(self.role_warning(r), self.role_missing(r)))
                 .collect(),
             agents,
             flights,
@@ -502,10 +539,17 @@ impl Engine {
             config_dir: self.paths.config.display().to_string(),
             flights_root: self.cfg.workspace.flights_root.clone(),
             triage_role: self
-                .cfg
-                .triage_role()
+                .usable_triage_role()
                 .map(|r| r.id.clone())
                 .unwrap_or_default(),
+            extras: self.cfg.extras.to_proto(),
+            notices: self.notices.iter().cloned().collect(),
+            setup: tower_proto::SetupInfo {
+                installed_clis: self.installed_clis.clone(),
+                roles_usable: self.usable_roles().len(),
+                terms_pending: self.terms_pending_notes(),
+                triage_usable: self.usable_triage_role().is_some(),
+            },
             engines: self.engines.clone(),
             models: self.model_infos(),
             connected_clis: self.connected_clis.clone(),
@@ -786,13 +830,27 @@ impl Engine {
         self.cfg_fp = config::fingerprint(&self.paths.config);
         self.cfg = config::load(&self.paths.config);
         let now = now_unix();
+        // A file that parses again clears its earlier error.
+        self.notices.retain(|n| {
+            !(n.level == tower_proto::NoticeLevel::Error && n.text.starts_with("Config: "))
+        });
         let errors = self.cfg.errors.clone();
         for e in errors {
-            self.post_system(&format!("Config: {e}"), now);
+            let text = format!("Config: {e}");
+            self.notice(tower_proto::NoticeLevel::Error, &text);
+            self.post_system(&text, now);
         }
         let notices = self.cfg.notices.clone();
         for n in notices {
-            self.post_system(&format!("Config: {n}"), now);
+            let text = format!("Config: {n}");
+            self.notice(tower_proto::NoticeLevel::Warn, &text);
+            self.post_system(&text, now);
+        }
+        if !self.cfg.scouts.is_empty() && !self.cfg.extras.scouts {
+            self.notice(
+                tower_proto::NoticeLevel::Warn,
+                "sources.toml has [[scout]] entries, but scouts are off: enable them in Setup → Extras",
+            );
         }
         // Keep probe results for endpoints that still exist.
         // Keep what the last probe found for a server that is still there
@@ -825,6 +883,25 @@ impl Engine {
     fn refresh_engines(&mut self) {
         self.engines =
             routing::engine_infos(&self.cfg, &self.endpoints, &self.st.bandit, &self.on_path);
+        self.installed_clis = config::KNOWN_CLIS
+            .iter()
+            .copied()
+            .filter(|c| (self.on_path)(c))
+            .map(str::to_string)
+            .collect();
+    }
+
+    /// Add a notice for Setup (newest last, one per text, at most 20).
+    fn notice(&mut self, level: tower_proto::NoticeLevel, text: &str) {
+        self.notices.retain(|n| n.text != text);
+        self.notices.push_back(tower_proto::Notice {
+            level,
+            text: text.to_string(),
+            at_unix: now_unix(),
+        });
+        while self.notices.len() > 20 {
+            self.notices.pop_front();
+        }
     }
 
     fn probe(&mut self) {
@@ -881,7 +958,7 @@ impl Engine {
                 launch,
                 tier,
                 local_only,
-            } => ack(self.create_flight(
+            } => match self.create_flight(
                 title,
                 brief,
                 role_id,
@@ -893,7 +970,13 @@ impl Engine {
                 tier,
                 local_only,
                 "you",
-            )),
+            ) {
+                Ok(id) => {
+                    let key = self.flight(&id).map(|f| f.key.clone()).unwrap_or_default();
+                    ServerMsg::Created { id, key }
+                }
+                Err(message) => ServerMsg::Error { message },
+            },
             ClientMsg::LaunchAgent {
                 role_id,
                 flight_id,
@@ -920,9 +1003,16 @@ impl Engine {
                 ack(r)
             }
             ClientMsg::Post { frequency_id, text } => {
+                if !self.cfg.extras.frequencies {
+                    return Some(ServerMsg::Error {
+                        message: "The Team frequency is off: enable it in Setup → Extras".into(),
+                    });
+                }
                 self.post(&frequency_id, "you", &text);
                 ServerMsg::Ack
             }
+            ClientMsg::AcceptTerms { note_id } => ack(self.accept_terms(&note_id)),
+            ClientMsg::SetExtras { extras } => ack(self.set_extras(extras)),
             ClientMsg::ResolveInbox {
                 item_id,
                 approve,
@@ -976,7 +1066,14 @@ impl Engine {
                 self.set_armed(on);
                 ServerMsg::Ack
             }
-            ClientMsg::RunScout { name } => ack(self.run_scout(&name, true)),
+            ClientMsg::RunScout { name } => {
+                if !self.cfg.extras.scouts {
+                    return Some(ServerMsg::Error {
+                        message: "Scouts are off: enable them in Setup → Extras".into(),
+                    });
+                }
+                ack(self.run_scout(&name, true))
+            }
             ClientMsg::SaveSchedule { spec } => ack(self.save_schedule(spec)),
             ClientMsg::SaveEndpoint { spec, old_name } => {
                 ack(self.save_endpoint(spec, old_name.as_deref()))
@@ -998,8 +1095,10 @@ impl Engine {
             }
             ClientMsg::RunSchedule { id } => ack(self.fire_schedule(&id, true)),
             ClientMsg::RefreshRoutines => {
-                self.last_routines = None;
-                self.refresh_routines();
+                if self.cfg.extras.machine_routines {
+                    self.last_routines = None;
+                    self.refresh_routines();
+                }
                 ServerMsg::Ack
             }
             ClientMsg::ReloadConfig => {
@@ -1153,11 +1252,33 @@ impl Engine {
         } else {
             self.note(&id, "Created");
         }
-        let auto = auto_assign && role_id.is_none();
-        if auto && self.cfg.triage_role().is_none() {
-            self.note(&id, "No triage role is set up: pick a role for it");
+        let mut auto = auto_assign && role_id.is_none();
+        let mut role_id = role_id;
+        if auto && self.usable_triage_role().is_none() {
+            // No triage that can run: with exactly one usable role there is
+            // nothing to pick, so take it; otherwise the flight waits.
+            let usable: Vec<String> = self.usable_roles().iter().map(|r| r.id.clone()).collect();
+            if let [only] = usable.as_slice() {
+                let name = self.role_name(only);
+                if let Some(f) = self.flight_mut(&id) {
+                    f.role_id = Some(only.clone());
+                    f.stage = Stage::Cleared;
+                }
+                self.note(
+                    &id,
+                    format!("No triage role can run: assigned {name} (the only role that can)"),
+                );
+                role_id = Some(only.clone());
+            } else if self.cfg.triage_role().is_some() {
+                self.note(
+                    &id,
+                    "The triage role cannot run yet (see Setup): pick a role for it",
+                );
+            } else {
+                self.note(&id, "No triage role is set up: pick a role for it");
+            }
+            auto = false;
         }
-        let auto = auto && self.cfg.triage_role().is_some();
         let launch_role = if auto {
             // Triage runs once the workdir exists (after a worktree, if any).
             Some(AUTO.to_string())
@@ -1418,7 +1539,7 @@ impl Engine {
         } else {
             sensitive
         };
-        let system = prompt::system(&role, &self.cfg.roles)
+        let system = prompt::system(&role, &self.cfg.roles, self.cfg.extras.frequencies)
             + &prompt::access(&self.cfg.access.deny_hosts)
             + &crate::privacy::prompt(&sensitive);
         let agent_token = format!(
@@ -2520,6 +2641,9 @@ impl Engine {
             "tower_delegate" => self.tool_delegate(&a, &fid, args),
             "tower_await" => self.tool_await(&a, args),
             "tower_post" => {
+                if !self.cfg.extras.frequencies {
+                    return Err("The team frequency is off in this Tower. Use tower_ask_human for the human, tower_handoff for another role.".into());
+                }
                 let text = s("text");
                 if text.is_empty() {
                     return Err("text is empty".into());
@@ -2564,6 +2688,9 @@ impl Engine {
                     return Err("give a question and at least two options".into());
                 }
                 self.ask_decision(&a, &fid, q, options, s("recommendation"), s("context"))
+            }
+            "tower_intake_submit" if !self.cfg.extras.scouts => {
+                Err("Scouts are off in this Tower.".into())
             }
             "tower_intake_submit" => self.intake_submit(&fid, args),
             "tower_complete" if self.st.scout_flights.contains_key(&fid) => {
@@ -2663,7 +2790,9 @@ impl Engine {
         core::validate_packet(&packet).map_err(|e| e.to_string())?;
 
         let direction = match self.cfg.role(from_role) {
-            Some(from) => core::hand_direction(&from.to_proto(None), &target.to_proto(None)),
+            Some(from) => {
+                core::hand_direction(&from.to_proto(None, false), &target.to_proto(None, false))
+            }
             None => HandDirection::Down,
         };
         let n = self
@@ -2739,7 +2868,7 @@ impl Engine {
                 Some(&target.id),
             ) == crate::policy::Decision::Run
         };
-        let mut target_rule = target.to_proto(None);
+        let mut target_rule = target.to_proto(None, false);
         target_rule.auto_release = false;
         let release = core::advance_handoff(
             &packet,
@@ -3035,6 +3164,8 @@ impl Engine {
     // Frequencies
     // ------------------------------------------------------------------
 
+    /// Tower's own note to the team frequency; also kept as an Info notice
+    /// so it is seen while the Team view is off.
     fn post_system(&mut self, text: &str, now: u64) {
         if let Some(f) = self.st.frequencies.iter_mut().find(|f| f.id == TEAM) {
             f.messages.push(FreqMessage {
@@ -3043,6 +3174,9 @@ impl Engine {
                 at_unix: now,
             });
             f.last_message = Some(format!("tower: {}", shorten(text, 120)));
+        }
+        if !self.notices.iter().any(|n| n.text == text) {
+            self.notice(tower_proto::NoticeLevel::Info, text);
         }
         self.changed();
     }
@@ -3870,6 +4004,19 @@ impl Engine {
             let _ = tx.send(make(Err(why)));
             return;
         }
+        // The same vendor-terms gate every launch has: triage is a run of
+        // the vendor's program too.
+        let verdict = self.terms_for(triage, crate::compliance::Input::Initial);
+        if self.terms_pending(verdict).is_some() {
+            let vendor = crate::compliance::vendor_of(triage.driver, &triage.command).label();
+            let why = format!(
+                "Triage ({}) needs the {vendor} vendor-terms note accepted in Setup first",
+                triage.name
+            );
+            self.note(flight_id, why.clone());
+            let _ = tx.send(make(Err(why)));
+            return;
+        }
         let model = triage.ladder.first().cloned().unwrap_or_default();
         match triage.driver {
             DriverKind::Acp => {
@@ -4126,10 +4273,15 @@ mod tests {
         let d = std::env::temp_dir().join(format!("tower-engine-{}", crate::paths::random_u64()));
         std::fs::create_dir_all(&d).unwrap();
         let paths = Paths::new(d.join("towerd.sock"), Some(d.join("cfg")), None);
+        // The role set these tests were written against (a first run now
+        // seeds only roles whose program is installed).
+        config::seed(&d.join("cfg")).unwrap();
+        config::seed_test_roles(&d.join("cfg")).unwrap();
         let (tx, rx) = mpsc::unbounded_channel();
         let (mut e, _snap) = Engine::new(paths, false, tx, AgentTokens::default());
-        // Only Claude is "installed": routing tests must not depend on the host.
-        e.on_path = |p| p == "claude";
+        // Only Claude (and Node's npx, for its ACP adapter) is "installed":
+        // routing tests must not depend on the host.
+        e.on_path = |p| p == "claude" || p == "npx";
         e.refresh_engines();
         e.scan_enabled = false;
         // Never touch the real ~/.claude.json from tests.
@@ -4470,6 +4622,19 @@ mod tests {
         argv.windows(2).any(|w| w[0] == k && w[1] == v)
     }
 
+    /// The routing table these tests were written against: Sonnet and Opus
+    /// as `claude` panes, Haiku over an adapter that is not installed here.
+    fn pane_routing(e: &mut Engine) {
+        e.on_path = |p| p == "claude";
+        for id in ["claude-sonnet", "claude-opus"] {
+            let eng = e.cfg.routing.engines.get_mut(id).unwrap();
+            eng.driver = DriverKind::Pane;
+            eng.command = vec!["claude".into()];
+            eng.acp_options.clear();
+        }
+        e.refresh_engines();
+    }
+
     fn new_flight(
         e: &mut Engine,
         dir: &std::path::Path,
@@ -4492,13 +4657,14 @@ mod tests {
                 local_only: false,
             },
         );
-        assert_eq!(r, ServerMsg::Ack, "{r:?}");
+        assert!(matches!(r, ServerMsg::Created { .. }), "{r:?}");
         e.st.flights.last().unwrap().id.clone()
     }
 
     #[tokio::test]
     async fn routed_roles_run_on_the_tiers_first_available_engine() {
         let (mut e, _rx, dir) = engine();
+        pane_routing(&mut e);
         let mut gui_rx = gui(&mut e);
         // Low tier: qwen (opencode) and haiku (npx) are not installed here,
         // so it climbs to the medium tier's Sonnet, keeping the low effort.
@@ -4543,6 +4709,7 @@ mod tests {
     #[tokio::test]
     async fn your_tier_wins_and_escalation_climbs_tiers() {
         let (mut e, _rx, dir) = engine();
+        pane_routing(&mut e);
         let mut gui_rx = gui(&mut e);
         let fid = new_flight(&mut e, &dir, "fix a typo", "crew", Some("medium"));
         let (_, argv) = spawned_argv(&mut gui_rx);
@@ -4655,7 +4822,7 @@ mod tests {
         );
         match r {
             ServerMsg::Error { message } => {
-                assert!(message.contains("claude is not installed"), "{message}")
+                assert!(message.contains("is not installed"), "{message}")
             }
             other => panic!("{other:?}"),
         }
@@ -5016,7 +5183,13 @@ mod tests {
                 local_only: false,
             },
         );
-        assert_eq!(r, ServerMsg::Ack);
+        assert_eq!(
+            r,
+            ServerMsg::Created {
+                id: "f-1".into(),
+                key: "TWR-1".into()
+            }
+        );
         let f = e.st.flights[0].clone();
         let wd = PathBuf::from(f.workdir.unwrap());
         assert_eq!(wd, dir.join("flights").join("TWR-1-weather-widget"));
@@ -5153,7 +5326,10 @@ for line in sys.stdin:
             .unwrap();
         tri.command = fake;
         tri.acp_options.clear();
+        // The fake agent is a script, not a program on PATH.
+        e.on_path = |_| true;
         assert_eq!(e.snapshot().triage_role, "ground-claude");
+        assert!(e.snapshot().setup.triage_usable);
         ask(
             &mut e,
             ClientMsg::CreateFlight {
@@ -6170,6 +6346,7 @@ for line in sys.stdin:
     #[tokio::test]
     async fn flight_threads_reach_the_flight_agent() {
         let (mut e, _rx, dir) = engine();
+        e.cfg.extras.frequencies = true;
         let mut gui_rx = gui(&mut e);
         ask(
             &mut e,
@@ -6500,6 +6677,7 @@ for line in sys.stdin:
     #[tokio::test]
     async fn a_scout_run_reports_items_that_become_flights() {
         let (mut e, _rx, dir) = engine();
+        e.cfg.extras.scouts = true;
         e.cfg.workspace.flights_root = dir.join("flights").display().to_string();
         e.cfg.scouts = vec![scout_cfg("target_role = \"approach\"")];
         let mut gui_rx = gui(&mut e);
@@ -6597,6 +6775,7 @@ for line in sys.stdin:
     #[tokio::test]
     async fn only_scouts_may_submit_intake() {
         let (mut e, _rx, dir) = engine();
+        e.cfg.extras.scouts = true;
         let (lead, _fid) = lead_on_flight(&mut e, &dir);
         let r = tool(
             &mut e,
@@ -6613,6 +6792,7 @@ for line in sys.stdin:
     #[tokio::test]
     async fn scheduled_scouts_follow_the_policy() {
         let (mut e, _rx, _dir) = engine();
+        e.cfg.extras.scouts = true;
         e.cfg.scouts = vec![scout_cfg("")];
         // Default: scout.run = off.
         e.handle(Input::Tick);
@@ -6798,6 +6978,286 @@ for line in sys.stdin:
     }
 
     #[tokio::test]
+    async fn setup_lists_pending_terms_and_accepting_from_setup_clears_them() {
+        let (mut e, _rx, _dir) = engine();
+        e.st.terms_acks.clear();
+        let setup = e.snapshot().setup;
+        let ids: Vec<&str> = setup.terms_pending.iter().map(|t| t.id.as_str()).collect();
+        assert!(ids.contains(&"claude-agent-sdk"), "{ids:?}");
+        assert!(ids.contains(&"opencode-provider-login"), "{ids:?}");
+        assert_eq!(
+            ids.iter().filter(|i| **i == "claude-agent-sdk").count(),
+            1,
+            "one card per note, not per role"
+        );
+        let sdk = setup
+            .terms_pending
+            .iter()
+            .find(|t| t.id == "claude-agent-sdk")
+            .unwrap();
+        assert_eq!(sdk.vendor, "Claude");
+        assert!(sdk.text.contains(crate::compliance::CLAUDE_SDK.quote));
+        assert!(sdk.text.contains("Tower never touches your login"));
+        // The triage role runs Claude over ACP: not usable until accepted.
+        assert!(!setup.triage_usable);
+        assert_eq!(e.snapshot().triage_role, "");
+
+        assert_eq!(
+            ask(
+                &mut e,
+                ClientMsg::AcceptTerms {
+                    note_id: "claude-agent-sdk".into()
+                }
+            ),
+            ServerMsg::Ack
+        );
+        assert_eq!(
+            e.st.terms_acks.get("claude-agent-sdk"),
+            Some(&crate::compliance::MATRIX_VERSION)
+        );
+        let setup = e.snapshot().setup;
+        assert!(!setup
+            .terms_pending
+            .iter()
+            .any(|t| t.id == "claude-agent-sdk"));
+        assert!(setup.triage_usable);
+        assert_eq!(e.snapshot().triage_role, "ground-claude");
+        assert!(matches!(
+            ask(
+                &mut e,
+                ClientMsg::AcceptTerms {
+                    note_id: "no-such-note".into()
+                }
+            ),
+            ServerMsg::Error { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn accepting_in_setup_releases_a_launch_the_note_held() {
+        let (mut e, _rx, dir) = engine();
+        e.st.terms_acks.clear();
+        let ground = e.cfg.roles.iter_mut().find(|r| r.id == "ground").unwrap();
+        ground.command = vec!["cat".into()];
+        let r = e.client(ClientMsg::LaunchAgent {
+            role_id: "ground".into(),
+            flight_id: None,
+            task: Some("x".into()),
+            workdir: Some(dir.display().to_string()),
+            new_folder: false,
+        });
+        assert!(matches!(&r, Some(ServerMsg::Error { .. })), "{r:?}");
+        assert!(e.acp.is_empty());
+        assert!(e
+            .st
+            .inbox
+            .iter()
+            .any(|i| i.title.contains("vendor terms note")));
+        ask(
+            &mut e,
+            ClientMsg::AcceptTerms {
+                note_id: crate::compliance::UNKNOWN_VENDOR.id.into(),
+            },
+        );
+        assert!(
+            !e.st
+                .inbox
+                .iter()
+                .any(|i| i.title.contains("vendor terms note")),
+            "the Inbox item goes with it"
+        );
+        assert!(e.st.pending_actions.is_empty());
+        assert_eq!(e.acp.len(), 1, "accepting runs the launch it held");
+    }
+
+    #[tokio::test]
+    async fn triage_over_acp_waits_for_the_terms_note() {
+        let (mut e, mut rx, dir) = engine();
+        e.st.terms_acks.clear();
+        let fake = fake_acp_agent(&dir, r#"{"role": "ground", "why": "x"}"#);
+        let tri = e
+            .cfg
+            .roles
+            .iter_mut()
+            .find(|r| r.id == "ground-claude")
+            .unwrap();
+        // Still Claude: the adapter is what the vendor check sees.
+        tri.command = vec!["npx".into(), "-y".into(), fake[2].clone()];
+        tri.command[2] = "@agentclientprotocol/claude-agent-acp".into();
+        e.on_path = |_| true;
+        ask(
+            &mut e,
+            ClientMsg::CreateFlight {
+                title: "Rename a variable".into(),
+                brief: String::new(),
+                role_id: None,
+                workdir: Some(dir.display().to_string()),
+                worktree: false,
+                new_folder: false,
+                auto_assign: true,
+                launch: false,
+                tier: None,
+                local_only: false,
+            },
+        );
+        let f = e.st.flights[0].clone();
+        assert_eq!(f.stage, Stage::Holding);
+        assert!(
+            f.timeline.iter().any(|t| matches!(&t.body,
+                TimelineBody::System { text } if text.contains("cannot run yet"))),
+            "{:?}",
+            f.timeline
+        );
+        // Asked directly, triage refuses too (belt and braces).
+        let tri = e.cfg.role("ground-claude").unwrap().clone();
+        e.ask_triage(&f.id, &tri, "s".into(), "u".into(), |result| match result {
+            Err(e) => Input::Triaged {
+                flight_id: "f-1".into(),
+                launch: false,
+                fallback: None,
+                result: Err(e),
+            },
+            Ok(_) => panic!("triage must not run before the note is accepted"),
+        });
+        match next_input(&mut rx).await {
+            Input::Triaged { result, .. } => {
+                let err = result.err().unwrap_or_default();
+                assert!(err.contains("vendor-terms note accepted in Setup"), "{err}");
+            }
+            _ => panic!("not a Triaged input"),
+        }
+        assert!(e.acp.is_empty(), "no adapter was started");
+    }
+
+    #[tokio::test]
+    async fn auto_with_one_usable_role_assigns_it() {
+        let (mut e, _rx, dir) = engine();
+        // Only the pane Claude role exists and only `claude` is installed.
+        e.cfg.roles.retain(|r| r.id == "approach");
+        e.cfg.triage.role = None;
+        e.on_path = |p| p == "claude";
+        assert!(e.cfg.triage_role().is_none());
+        assert_eq!(e.snapshot().setup.roles_usable, 1);
+        ask(
+            &mut e,
+            ClientMsg::CreateFlight {
+                title: "Rename a variable".into(),
+                brief: String::new(),
+                role_id: None,
+                workdir: Some(dir.display().to_string()),
+                worktree: false,
+                new_folder: false,
+                auto_assign: true,
+                launch: false,
+                tier: None,
+                local_only: false,
+            },
+        );
+        let f = e.st.flights[0].clone();
+        assert_eq!(f.role_id.as_deref(), Some("approach"));
+        assert_eq!(f.stage, Stage::Cleared);
+        assert!(f.timeline.iter().any(|t| matches!(&t.body,
+            TimelineBody::System { text } if text.contains("the only role that can"))));
+    }
+
+    #[test]
+    fn setup_info_lists_installed_clis_and_usable_roles() {
+        let (e, _rx, _dir) = engine();
+        let snap = e.snapshot();
+        assert_eq!(snap.setup.installed_clis, vec!["claude".to_string()]);
+        let ground = snap.roles.iter().find(|r| r.id == "ground").unwrap();
+        assert!(ground.missing);
+        assert_eq!(ground.warning.as_deref(), Some("opencode is not installed"));
+        let approach = snap.roles.iter().find(|r| r.id == "approach").unwrap();
+        assert!(!approach.missing && approach.warning.is_none());
+        let usable = snap
+            .roles
+            .iter()
+            .filter(|r| !r.missing && r.warning.is_none())
+            .count();
+        assert_eq!(snap.setup.roles_usable, usable);
+        assert!(usable >= 2, "approach and crew at least");
+        assert!(
+            snap.engines.iter().all(|i| !i.missing),
+            "npx is on the test PATH"
+        );
+    }
+
+    #[tokio::test]
+    async fn extras_are_off_by_default_and_setup_writes_them_to_tower_toml() {
+        let (mut e, _rx, dir) = engine();
+        let snap = e.snapshot();
+        assert_eq!(snap.extras, tower_proto::Extras::default());
+        assert!(matches!(
+            ask(
+                &mut e,
+                ClientMsg::Post {
+                    frequency_id: TEAM.into(),
+                    text: "hi".into()
+                }
+            ),
+            ServerMsg::Error { .. }
+        ));
+        assert!(matches!(
+            ask(
+                &mut e,
+                ClientMsg::RunScout {
+                    name: "Support".into()
+                }
+            ),
+            ServerMsg::Error { .. }
+        ));
+        let extras = tower_proto::Extras {
+            frequencies: true,
+            ..Default::default()
+        };
+        assert_eq!(ask(&mut e, ClientMsg::SetExtras { extras }), ServerMsg::Ack);
+        let toml = std::fs::read_to_string(dir.join("cfg/tower.toml")).unwrap();
+        assert!(toml.contains("frequencies = true"), "{toml}");
+        assert!(toml.contains("# Side features"), "comments are kept");
+        assert!(e.cfg.extras.frequencies && !e.cfg.extras.scouts);
+        assert!(e.snapshot().extras.frequencies);
+        assert_eq!(
+            ask(
+                &mut e,
+                ClientMsg::Post {
+                    frequency_id: TEAM.into(),
+                    text: "hi".into()
+                }
+            ),
+            ServerMsg::Ack
+        );
+    }
+
+    #[tokio::test]
+    async fn notices_carry_config_errors_and_tower_notes_outside_the_team_chat() {
+        let (mut e, _rx, dir) = engine();
+        std::fs::write(dir.join("cfg/tower.toml"), "[routing\n").unwrap();
+        e.reload();
+        let snap = e.snapshot();
+        let err = snap
+            .notices
+            .iter()
+            .find(|n| n.level == tower_proto::NoticeLevel::Error)
+            .expect("a config error notice");
+        assert!(err.text.starts_with("Config: tower.toml"), "{}", err.text);
+        // Fixed: the error goes away on the next reload.
+        config::seed(&dir.join("cfg")).unwrap();
+        std::fs::remove_file(dir.join("cfg/tower.toml")).unwrap();
+        config::seed(&dir.join("cfg")).unwrap();
+        e.reload();
+        assert!(e
+            .snapshot()
+            .notices
+            .iter()
+            .all(|n| n.level != tower_proto::NoticeLevel::Error));
+        e.set_armed(true);
+        let snap = e.snapshot();
+        assert!(snap.notices.iter().any(|n| n.text.starts_with("Armed:")));
+        assert!(snap.notices.len() <= 20);
+    }
+
+    #[tokio::test]
     async fn a_claude_pane_needs_no_terms_note() {
         let (mut e, _rx, dir) = engine();
         e.st.terms_acks.clear();
@@ -6818,7 +7278,12 @@ for line in sys.stdin:
 
     #[test]
     fn snapshot_lists_every_policy_action() {
-        let (e, _rx, _dir) = engine();
+        let (mut e, _rx, _dir) = engine();
+        // Scouts off (the default): their action is not a row.
+        let rows = e.snapshot().policy;
+        assert_eq!(rows.len(), crate::policy::Action::ALL.len() - 1);
+        assert!(rows.iter().all(|r| r.action != "scout.run"));
+        e.cfg.extras.scouts = true;
         let rows = e.snapshot().policy;
         assert_eq!(rows.len(), crate::policy::Action::ALL.len());
         let launch = rows.iter().find(|r| r.action == "intake.launch").unwrap();
@@ -6948,6 +7413,7 @@ for line in sys.stdin:
     #[tokio::test]
     async fn mentions_reach_live_agents_only() {
         let (mut e, _rx, dir) = engine();
+        e.cfg.extras.frequencies = true;
         let mut gui_rx = gui(&mut e);
         ask(
             &mut e,

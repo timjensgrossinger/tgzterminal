@@ -203,6 +203,9 @@ always allowed.
 - **The vendor still matters.** ACP is only the transport; the terms of the
   agent behind it still apply. `claude-agent-acp` is built on the Agent SDK,
   so the SDK note above applies to it.
+  Tower shows that note in Setup before any flight (and the Board points at
+  it); a launch before acceptance is refused, and triage over the same
+  adapter waits too.
 
 ## Questions to put to the vendors
 

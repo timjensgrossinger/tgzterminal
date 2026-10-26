@@ -137,6 +137,9 @@ impl Engine {
     }
 
     pub(super) fn routines_due(&mut self) {
+        if !self.cfg.extras.machine_routines {
+            return;
+        }
         if self
             .last_routines
             .map(|t| t.elapsed() > ROUTINES_EVERY)

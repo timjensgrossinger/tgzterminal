@@ -387,11 +387,11 @@ pub fn hex_rgb(s: &str) -> Option<[u8; 3]> {
 pub const DRIVERS: [(&str, &str); 4] = [
     (
         "pane",
-        "An interactive CLI in a terminal pane next to Tower",
+        "Attach to my own session: the real CLI in a pane next to Tower",
     ),
     (
         "acp",
-        "An Agent Client Protocol agent Tower talks to directly",
+        "An Agent Client Protocol agent Tower talks to directly (default)",
     ),
     ("llm", "One model call, no tools (triage)"),
     (

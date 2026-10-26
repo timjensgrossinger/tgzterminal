@@ -97,8 +97,12 @@ impl Engine {
         res.map(|_| fid)
     }
 
-    /// Scheduled scout runs: only what `scout.run` allows (off by default).
+    /// Scheduled scout runs: only what `scout.run` allows (off by default),
+    /// and only while the scouts extra is on.
     pub(super) fn scouts_due(&mut self) {
+        if !self.cfg.extras.scouts {
+            return;
+        }
         let now = now_unix();
         let due: Vec<ScoutCfg> = self
             .cfg

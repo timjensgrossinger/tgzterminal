@@ -12,6 +12,7 @@
 
 mod audit;
 mod claude_trust;
+mod cli;
 mod clock;
 mod compliance;
 mod config;
@@ -75,7 +76,8 @@ fn auth(args: &[String]) -> anyhow::Result<()> {
 fn usage() -> ! {
     eprintln!(
         "usage: tower daemon [--socket <path>] [--config-dir <dir>] [--data-dir <dir>] [--demo]\n       \
-         tower status [--socket <path>]\n       tower routines [--config-dir <dir>]\n       tower auth jira <site>\n       tower hook <event>\n       tower mcp\n       tower guard prompt|tool|dir [<folder> [<cli>]]"
+         tower status [--socket <path>]\n       tower flight new|list|show …\n       tower inbox list|answer …\n       tower routines [--config-dir <dir>]\n       tower auth jira <site>\n       tower hook <event>\n       tower mcp\n       tower guard prompt|tool|dir [<folder> [<cli>]]\n\n{}",
+        cli::USAGE
     );
     std::process::exit(2);
 }
@@ -127,6 +129,8 @@ fn main() -> anyhow::Result<()> {
             rt.block_on(server::run(paths, rest.iter().any(|a| a == "--demo")))
         }
         "status" => status(rest),
+        "flight" => cli::flight(rest),
+        "inbox" => cli::inbox(rest),
         "routines" => routines_cmd(rest),
         "auth" => auth(rest),
         _ => usage(),
@@ -199,7 +203,6 @@ fn routines_cmd(args: &[String]) -> anyhow::Result<()> {
 
 /// `tower status`: one line about the running daemon.
 fn status(args: &[String]) -> anyhow::Result<()> {
-    use tower_proto::ServerMsg;
     let socket = socket_arg(args)?;
     let paths = paths::Paths::new(
         socket.clone(),
@@ -208,38 +211,33 @@ fn status(args: &[String]) -> anyhow::Result<()> {
     );
     let token = std::fs::read_to_string(paths.token())
         .with_context(|| format!("read {}", paths.token().display()))?;
-    let (mut r, _w) = transport::hello(&socket, &token, "cli", std::time::Duration::from_secs(5))
+    let snapshot = transport::snapshot(&socket, &token, std::time::Duration::from_secs(5))
         .with_context(|| format!("connect {}", socket.display()))?;
-    loop {
-        match transport::read_msg(&mut r)? {
-            ServerMsg::Snapshot { snapshot } => {
-                let live = snapshot
-                    .agents
-                    .iter()
-                    .filter(|a| a.status.is_live())
-                    .count();
-                println!(
-                    "{} roles · {} live agents · {} flights · {} in inbox ({:?})",
-                    snapshot.roles.len(),
-                    live,
-                    snapshot.flights.len(),
-                    snapshot.inbox.len(),
-                    snapshot.origin
-                );
-                for r in &snapshot.roles {
-                    if let Some(w) = &r.warning {
-                        println!("  {}: {w}", r.name);
-                    }
-                }
-                for s in &snapshot.sources {
-                    if let Some(e) = &s.error {
-                        println!("  intake {}: {e}", s.name);
-                    }
-                }
-                return Ok(());
-            }
-            ServerMsg::Error { message } => bail!("towerd: {message}"),
-            _ => {}
+    let live = snapshot
+        .agents
+        .iter()
+        .filter(|a| a.status.is_live())
+        .count();
+    println!(
+        "{} roles · {} live agents · {} flights · {} in inbox ({:?})",
+        snapshot.roles.len(),
+        live,
+        snapshot.flights.len(),
+        snapshot.inbox.len(),
+        snapshot.origin
+    );
+    for r in &snapshot.roles {
+        if let Some(w) = &r.warning {
+            println!("  {}: {w}", r.name);
         }
     }
+    for t in &snapshot.setup.terms_pending {
+        println!("  terms: {} (accept it in Setup)", t.title);
+    }
+    for s in &snapshot.sources {
+        if let Some(e) = &s.error {
+            println!("  intake {}: {e}", s.name);
+        }
+    }
+    Ok(())
 }

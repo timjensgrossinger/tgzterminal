@@ -33,6 +33,7 @@ pub fn engine_infos(
             let Some(e) = cfg.routing.engines.get(id) else {
                 continue;
             };
+            let missing = config::command_missing(e.driver, &e.command, on_path).is_some();
             let why = config::engine_blocked(e, endpoints, on_path, &has_env);
             out.push(EngineInfo {
                 id: id.clone(),
@@ -44,6 +45,7 @@ pub fn engine_infos(
                 why,
                 trained: bandit.arms.get(&arm(t, id)).map(|a| a.n).unwrap_or(0),
                 locality: cfg.engine_model(e).locality,
+                missing,
             });
         }
     }
@@ -215,25 +217,26 @@ mod tests {
         let d = std::env::temp_dir().join(format!("tower-route-{}", crate::paths::random_u64()));
         config::seed(&d).unwrap();
         let cfg = config::load(&d);
-        let infos = engine_infos(&cfg, &[], &Bandit::default(), &|p| p == "claude");
+        // Without Node.js the adapter cannot start: every engine is missing.
+        let none = engine_infos(&cfg, &[], &Bandit::default(), &|p| p == "claude");
+        assert!(none.iter().all(|i| !i.available && i.missing));
+        let infos = engine_infos(&cfg, &[], &Bandit::default(), &|p| p == "npx");
         let ids: Vec<_> = infos
             .iter()
-            .map(|i| (i.tier.as_str(), i.id.as_str(), i.available))
+            .map(|i| (i.tier.as_str(), i.id.as_str(), i.available, i.missing))
             .collect();
         assert_eq!(
             ids,
             vec![
-                ("low", "qwen-local", false),
-                ("low", "claude-haiku", false),
-                ("medium", "claude-sonnet", true),
-                ("medium", "opencode-kimi", false),
-                ("high", "claude-opus", true),
+                ("low", "claude-haiku", true, false),
+                ("medium", "claude-sonnet", true, false),
+                ("high", "claude-opus", true, false),
             ]
         );
         let r = tower_core::router::classify("fix a typo");
         assert_eq!(
             pick(&infos, r.tier, r.floor),
-            Some((Tier::Medium, "claude-sonnet".into()))
+            Some((Tier::Low, "claude-haiku".into()))
         );
         assert_eq!(effort(None, &r, &cfg).as_deref(), Some("low"));
         assert_eq!(effort(Some("max"), &r, &cfg).as_deref(), Some("max"));

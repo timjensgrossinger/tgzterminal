@@ -396,6 +396,16 @@ impl Engine {
         Ok(action.to_string())
     }
 
+    /// `[extras]` in tower.toml, from the Setup view.
+    pub(super) fn set_extras(&mut self, extras: tower_proto::Extras) -> Res {
+        config_write::edit(&self.tower_file(), |d| {
+            config_write::set_extras(d, extras);
+            Ok(())
+        })?;
+        self.reload();
+        Ok("Extras saved".into())
+    }
+
     pub(super) fn set_local_only_paths(&mut self, paths: Vec<String>) -> Res {
         let mut clean: Vec<String> = vec![];
         for p in paths.iter().map(|p| p.trim()).filter(|p| !p.is_empty()) {

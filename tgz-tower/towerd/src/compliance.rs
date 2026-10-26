@@ -196,8 +196,7 @@ pub static UNKNOWN_VENDOR: TermsRef = TermsRef {
     url: "",
 };
 
-/// Every grey zone, for the tests' uniqueness check and their harness.
-#[cfg(test)]
+/// Every grey zone: the tests' uniqueness check, and `terms_by_id`.
 pub static ALL: [&TermsRef; 8] = [
     &CLAUDE_TOWER_INPUT,
     &CLAUDE_HEADLESS,
@@ -208,6 +207,26 @@ pub static ALL: [&TermsRef; 8] = [
     &OPENCODE_PROVIDER,
     &UNKNOWN_VENDOR,
 ];
+
+/// The note with this id, if the matrix has one.
+pub fn terms_by_id(id: &str) -> Option<&'static TermsRef> {
+    ALL.iter().copied().find(|t| t.id == id)
+}
+
+/// Programs that only start another program: looked through when deciding
+/// what a command runs.
+pub const LAUNCHERS: [&str; 4] = ["npx", "bunx", "pnpx", "env"];
+
+/// The launcher a command starts with (`npx`, `bunx`, `env`), if any.
+pub fn launcher_of(command: &[String]) -> Option<&str> {
+    let first = command.first()?;
+    let name = program_name(first);
+    LAUNCHERS
+        .iter()
+        .copied()
+        .find(|l| *l == name)
+        .filter(|_| command.len() > 1)
+}
 
 /// Which vendor a role or engine command runs. Launchers (`npx -y`, `env`,
 /// `bunx`) are looked through, and a package name counts like a program:

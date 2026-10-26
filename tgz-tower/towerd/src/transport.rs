@@ -5,7 +5,7 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::time::Duration;
-use tower_proto::{decode_line, encode_line, ClientMsg, ServerMsg, PROTOCOL_VERSION};
+use tower_proto::{decode_line, encode_line, ClientMsg, ServerMsg, Snapshot, PROTOCOL_VERSION};
 
 pub type Reader = BufReader<Box<dyn Read + Send>>;
 pub type Writer = Box<dyn Write + Send>;
@@ -59,6 +59,49 @@ pub fn read_msg(r: &mut Reader) -> anyhow::Result<ServerMsg> {
         anyhow::bail!("towerd closed the connection");
     }
     Ok(decode_line::<ServerMsg>(&line)?)
+}
+
+/// A "cli" client's request: hello, send `msg`, and return its reply. The
+/// daemon pushes a Snapshot to a cli client right after hello and on every
+/// change, so those are skipped until the actual reply arrives.
+pub fn call(
+    sock: &Path,
+    token: &str,
+    msg: &ClientMsg,
+    timeout: Duration,
+) -> anyhow::Result<ServerMsg> {
+    let (mut r, mut w) = hello(sock, token, "cli", timeout)?;
+    w.write_all(encode_line(msg)?.as_bytes())?;
+    loop {
+        match read_msg(&mut r)? {
+            ServerMsg::Snapshot { .. } => continue,
+            other => return Ok(other),
+        }
+    }
+}
+
+/// The daemon's current snapshot, as a "cli" client sees it. The push that
+/// follows hello is the last *published* one and can predate a change made
+/// a moment ago (publishing happens on the engine's tick), so this asks for
+/// a fresh one and returns that.
+pub fn snapshot(sock: &Path, token: &str, timeout: Duration) -> anyhow::Result<Snapshot> {
+    let (mut r, mut w) = hello(sock, token, "cli", timeout)?;
+    // The welcome push.
+    loop {
+        match read_msg(&mut r)? {
+            ServerMsg::Snapshot { .. } => break,
+            ServerMsg::Error { message } => anyhow::bail!("towerd: {message}"),
+            _ => continue,
+        }
+    }
+    w.write_all(encode_line(&ClientMsg::GetSnapshot)?.as_bytes())?;
+    loop {
+        match read_msg(&mut r)? {
+            ServerMsg::Snapshot { snapshot } => return Ok(snapshot),
+            ServerMsg::Error { message } => anyhow::bail!("towerd: {message}"),
+            _ => continue,
+        }
+    }
 }
 
 /// Hello, one request, one reply.

@@ -300,6 +300,18 @@ pub fn set_policy_level(
     Ok(())
 }
 
+/// `[extras]`: the four feature switches, comments kept.
+pub fn set_extras(doc: &mut DocumentMut, extras: tower_proto::Extras) {
+    if !doc.contains_key("extras") {
+        doc.insert("extras", Item::Table(Table::new()));
+    }
+    let t = &mut doc["extras"];
+    t["scouts"] = value(extras.scouts);
+    t["machine_routines"] = value(extras.machine_routines);
+    t["activity"] = value(extras.activity);
+    t["frequencies"] = value(extras.frequencies);
+}
+
 /// `[privacy] local_only_paths`.
 pub fn set_local_only_paths(doc: &mut DocumentMut, paths: &[String]) -> Result<(), String> {
     let privacy = table_mut(doc, "privacy")?;

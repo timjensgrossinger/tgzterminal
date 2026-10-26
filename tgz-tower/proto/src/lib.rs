@@ -8,7 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 7;
 
 // ---------------------------------------------------------------------------
 // Model
@@ -153,6 +153,9 @@ pub struct Role {
     /// Tower made this role itself (the Local role); saving it writes a file.
     #[serde(default)]
     pub builtin: bool,
+    /// The program this role launches is not installed (not on PATH).
+    #[serde(default)]
+    pub missing: bool,
 }
 
 /// A role as the Roster edits it (`roles/<id>.toml`).
@@ -590,6 +593,9 @@ pub struct EngineInfo {
     /// Where its model runs.
     #[serde(default)]
     pub locality: Locality,
+    /// The program is not installed (not on PATH); `why` says so.
+    #[serde(default)]
+    pub missing: bool,
 }
 
 /// A model server as the Models view edits it (`[[endpoint]]`).
@@ -851,6 +857,80 @@ pub struct Snapshot {
     /// What ran by itself, per day.
     #[serde(default)]
     pub activity: ActivityStats,
+    /// Which side features are on (`[extras]` in tower.toml).
+    #[serde(default)]
+    pub extras: Extras,
+    /// Config errors and notices for the Setup view, newest last.
+    #[serde(default)]
+    pub notices: Vec<Notice>,
+    /// What a first run needs: installed CLIs, usable roles, pending terms.
+    #[serde(default)]
+    pub setup: SetupInfo,
+}
+
+/// Side features behind `[extras]` in tower.toml. All off by default.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct Extras {
+    /// Mail/Teams scouts (`[[scout]]`, `tower_intake_submit`, `scout.run`).
+    #[serde(default)]
+    pub scouts: bool,
+    /// The read-only launchd/crontab reader in Setup.
+    #[serde(default)]
+    pub machine_routines: bool,
+    /// Activity tiles and charts in History (counting never stops).
+    #[serde(default)]
+    pub activity: bool,
+    /// The Team frequency and flight threads (`tower_post`, the Team view).
+    #[serde(default)]
+    pub frequencies: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum NoticeLevel {
+    #[default]
+    Info,
+    Warn,
+    Error,
+}
+
+/// A config error or notice; shown in Setup (errors also on the Board).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct Notice {
+    #[serde(default)]
+    pub level: NoticeLevel,
+    pub text: String,
+    #[serde(default)]
+    pub at_unix: u64,
+}
+
+/// A vendor-terms note that has to be accepted before that vendor's agents start.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct TermsNote {
+    /// The matrix note id, e.g. `claude-agent-sdk`.
+    pub id: String,
+    /// The vendor's display name.
+    pub vendor: String,
+    pub title: String,
+    /// The note's text, verbatim from the matrix.
+    pub text: String,
+}
+
+/// What the first run still needs, so the GUI can offer one next step.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct SetupInfo {
+    /// Agent CLIs found on PATH (`claude`, `codex`, `opencode`, `agy`, `gemini`).
+    #[serde(default)]
+    pub installed_clis: Vec<String>,
+    /// Roles whose program is installed and that have no warning.
+    #[serde(default)]
+    pub roles_usable: usize,
+    /// Terms notes not yet accepted for any configured role or engine.
+    #[serde(default)]
+    pub terms_pending: Vec<TermsNote>,
+    /// The triage role can actually run, so "Auto" is worth offering.
+    #[serde(default)]
+    pub triage_usable: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1197,6 +1277,14 @@ pub enum ClientMsg {
         #[serde(default)]
         text: Option<String>,
     },
+    /// Accept a vendor-terms note from Setup (master token only).
+    AcceptTerms {
+        note_id: String,
+    },
+    /// Write `[extras]` to tower.toml (master token only).
+    SetExtras {
+        extras: Extras,
+    },
     ReleaseHandoff {
         flight_id: String,
         handoff_id: String,
@@ -1342,6 +1430,11 @@ pub enum ServerMsg {
     },
     Pong,
     Ack,
+    /// Reply to `CreateFlight`: the new flight's id and key (`TWR-7`).
+    Created {
+        id: String,
+        key: String,
+    },
     ToolResult {
         ok: bool,
         text: String,
@@ -1786,6 +1879,7 @@ pub fn demo_snapshot(now_unix: u64) -> Snapshot {
         }],
     }];
 
+    let roles_len = roles.len();
     Snapshot {
         origin: SnapshotOrigin::Demo,
         now_unix,
@@ -1868,6 +1962,14 @@ pub fn demo_snapshot(now_unix: u64) -> Snapshot {
         routines: demo_routines(now_unix),
         routines_note: String::new(),
         activity: demo_activity(now_unix),
+        extras: Extras::default(),
+        notices: Vec::new(),
+        setup: SetupInfo {
+            installed_clis: vec!["claude".into(), "opencode".into()],
+            roles_usable: roles_len,
+            terms_pending: Vec::new(),
+            triage_usable: true,
+        },
     }
 }
 
