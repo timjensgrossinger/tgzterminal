@@ -262,12 +262,20 @@ fn shim_prefix() -> Vec<String> {
 }
 
 fn base_env(paths: &Paths, role: &RoleCfg, agent_id: &str, token: &str) -> Vec<(String, String)> {
-    vec![
+    let mut env = vec![
         ("TOWER_AGENT_ID".into(), agent_id.into()),
         ("TOWER_SOCK".into(), paths.socket.display().to_string()),
         ("TOWER_ROLE".into(), role.name.clone()),
         ("TOWER_AGENT_TOKEN".into(), token.into()),
-    ]
+    ];
+    // The pane is opened by the GUI, whose PATH is launchd's when it was
+    // started from the Dock; towerd's PATH (see `envpath`) is the one that
+    // finds `claude`, `npx` and `node`. A Tower tab in a remote domain gets
+    // this machine's PATH too, which is the known limit.
+    if let Some(path) = std::env::var_os("PATH") {
+        env.push(("PATH".into(), path.to_string_lossy().to_string()));
+    }
+    env
 }
 
 /// `OPENCODE_CONFIG_CONTENT`: merged over the user's config, adds only the
@@ -599,6 +607,54 @@ mod tests {
         std::fs::create_dir_all(&user).unwrap();
         let _ = launch(&["agy"], None);
         assert!(!user.join(".agents").exists());
+    }
+
+    #[test]
+    fn a_pane_gets_the_daemons_path_and_a_role_server_may_override_it() {
+        let path = std::env::var("PATH").unwrap_or_default();
+        let (l, _) = launch(&["claude"], None);
+        let got: Vec<&str> = l
+            .env
+            .iter()
+            .filter(|(k, _)| k == "PATH")
+            .map(|(_, v)| v.as_str())
+            .collect();
+        assert_eq!(got, vec![path.as_str()], "the daemon's PATH, once");
+        // Codex takes role servers' variables in its environment; a PATH
+        // there comes later and so wins where the pane is started.
+        let d = std::env::temp_dir().join(format!("tower-pathmcp-{}", crate::paths::random_u64()));
+        let paths = Paths::new(d.join("towerd.sock"), Some(d.join("cfg")), None);
+        let mut role = vendor_role(&["codex"]);
+        role.mcp.insert(
+            "tool".into(),
+            crate::config::McpServerCfg {
+                command: "tool-mcp".into(),
+                args: vec![],
+                env: [("PATH".to_string(), "/custom/bin".to_string())].into(),
+            },
+        );
+        let l = prepare(
+            &paths,
+            &role,
+            "a-2",
+            "s",
+            None,
+            "T",
+            "sys",
+            "b",
+            "tok",
+            &[],
+            &[],
+            None,
+        )
+        .unwrap();
+        let last = l
+            .env
+            .iter()
+            .rev()
+            .find(|(k, _)| k == "PATH")
+            .map(|(_, v)| v.as_str());
+        assert_eq!(last, Some("/custom/bin"));
     }
 
     #[test]

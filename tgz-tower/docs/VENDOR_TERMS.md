@@ -6,7 +6,7 @@ what those rules say, how Tower reads them, and what Tower does as a result.
 The code that acts on it is `towerd/src/compliance.rs`.
 
 **This is not legal advice.** It is a reading of public text, as of
-**2026-10-21** (`MATRIX_AS_OF`). The vendors changed their positions several
+**2026-10-27** (`MATRIX_AS_OF`). The vendors changed their positions several
 times in 2026. Tower's notes carry a version (`MATRIX_VERSION`), and an
 acceptance you gave for an older version is asked for again.
 
@@ -65,7 +65,7 @@ The **input** column in the tables below means:
 |---|---|---|
 | Interactive `claude` in a pane, Initial/Human input | **Allowed** | |
 | Interactive pane, Tower-generated input typed in | Grey | `claude-tower-input` |
-| Headless `claude -p` | Grey | `claude-headless` |
+| Headless `claude -p` | **Allowed** | |
 | ACP via `claude-agent-acp` (Agent SDK) | Grey | `claude-agent-sdk` |
 
 What the sources say:
@@ -87,12 +87,43 @@ What the sources say:
   [Agent SDK overview](https://code.claude.com/docs/en/agent-sdk/overview).
 - **Limits:** "Advertised usage limits for Pro and Max plans assume ordinary,
   individual usage of Claude Code and the Agent SDK." — Legal and compliance.
+  Anthropic defines this nowhere; the limits themselves (five-hour window,
+  weekly cap, Max/Team monthly API credits) are the practical definition, and
+  Claude Code itself ships routines, `/loop`, agent teams and workflows that
+  "spawn dozens of agents" to plan subscribers. What the sentence reserves
+  the right to act on is the bot-farm shape: pooled or shared accounts,
+  round-the-clock loops with nobody behind them, tokens lifted into other
+  products. One person's own routines and parallel flights are the usage
+  the plan is priced for. Tower's markers of "individual" are the rules at
+  the top of this page, not a flight count.
+- **Redistributing a build:** "preinstalling or running Claude Code in your
+  products or services (e.g. in hosted sandboxes or other agent
+  infrastructure) requires agreeing to our Commercial Terms of Service" plus
+  three conditions: the binary is not modified, no authentication method is
+  removed or restricted, and each end user authenticates and is billed under
+  their own credentials — Legal and compliance. Tower meets all three by
+  construction (see the rules above); whoever ships a build that bundles or
+  launches Claude Code accepts the Commercial Terms as the distributor. The
+  same page allows saying in plain text that a product runs Claude Code, but
+  not "Claude Code" or "Anthropic" in a product, feature or company name or
+  logo.
+
+The automated-access clause has an exception for what Anthropic "otherwise
+explicitly permit[s]", and the support article names `claude -p` as covered
+by a plan. That is the permission, so headless runs are allowed, whatever the
+prompt's origin: a `-p` call is scripted by definition. (Until matrix
+version 2 Tower rated it grey; the Oct 7 2026 wording settled it.) Today no
+Tower driver runs `claude -p` itself — the `llm` driver is an HTTP endpoint —
+so the row is there for a future headless driver and for a role whose
+`command` is a user-written `-p` wrapper. Note the
+billing side: on Max and Team, `-p` and the SDK draw on the plan's monthly
+API credits, which "can't be used in Claude Code or the Claude apps", so
+headless and interactive usage come out of different pools.
 
 Anthropic publishes no text on programmatically typing into a running
-session. The support article explicitly allows `claude -p` on a plan, and
-typing into a session you started is less automated than that. Tower still
-treats it as a grey zone, because the automated-access clause is the only
-text that covers it.
+session. Typing into a session you started is less automated than `-p`, but
+the automated-access clause is the only text that covers it, so Tower still
+treats it as a grey zone.
 
 For Tower-generated messages, Tower uses Claude's own mechanisms before
 typing anything into the pane:

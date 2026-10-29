@@ -88,10 +88,12 @@ impl Engine {
             Decision::Draft => "drafted",
             Decision::Skip => "skipped",
         };
+        let via = self.hands_free_via(action, flight);
         let mut e = Entry::new(action, level, decision, outcome);
         e.armed = armed;
         e.flight = flight;
         e.target = target;
+        e.via = via;
         self.log_audit(&e);
         self.count_decision(action, level, decision, flight, target);
         if level == policy::Level::Auto && decision == Decision::Ask {
@@ -105,11 +107,34 @@ impl Engine {
             if let Some(fid) = flight {
                 self.note(
                     fid,
-                    format!("{} is set to auto, but {why}: asking", action.key()),
+                    format!(
+                        "{} is set to auto{}, but {why}: asking",
+                        action.key(),
+                        if via.is_some() { " (hands-free)" } else { "" }
+                    ),
                 );
             }
         }
         decision
+    }
+
+    /// `Some("hands_free")` when a hands-free flight is what raised this
+    /// action's level.
+    fn hands_free_via(&self, action: Action, flight: Option<&str>) -> Option<&'static str> {
+        let fid = flight?;
+        if !self.flight(fid).is_some_and(|f| f.hands_free) || !policy::HANDS_FREE.contains(&action)
+        {
+            return None;
+        }
+        // Only when hands-free is what changed the level: from `confirm`.
+        let watch = self
+            .st
+            .flight_source
+            .get(fid)
+            .and_then(|name| self.watch(name))
+            .map(|w| w.policy());
+        (self.cfg.policy.level(action, watch.as_ref()) == policy::Level::Confirm)
+            .then_some("hands_free")
     }
 
     /// Record how an action that ran (or was clicked) turned out.
@@ -129,6 +154,7 @@ impl Engine {
         e.armed = self.armed();
         e.flight = flight;
         e.target = target;
+        e.via = self.hands_free_via(action, flight);
         self.log_audit(&e);
     }
 
@@ -141,10 +167,22 @@ impl Engine {
         }
     }
 
-    /// The overrides of the watch a flight came from.
+    /// The overrides for a flight: the watch it came from, and for a
+    /// hands-free flight what would ask raised to `auto` (still Armed-only;
+    /// landing untouched).
     pub(super) fn overrides_for(&self, flight_id: &str) -> Option<Overrides> {
-        let name = self.st.flight_source.get(flight_id)?;
-        self.watch(name).map(|w| w.policy())
+        let watch = self
+            .st
+            .flight_source
+            .get(flight_id)
+            .and_then(|name| self.watch(name))
+            .map(|w| w.policy());
+        if !self.flight(flight_id).is_some_and(|f| f.hands_free) {
+            return watch;
+        }
+        let mut o = watch.unwrap_or_default();
+        policy::raise_for_hands_free(&self.cfg.policy, &mut o);
+        Some(o)
     }
 
     /// The vendor-terms verdict for running `role` with `input`.
@@ -337,6 +375,23 @@ impl Engine {
 
     /// The user answered a Run / accept item.
     pub(super) fn resolve_pending_action(&mut self, item_id: &str, opt: &str) -> Res {
+        // A fan-out's question stays until it gets an answer that fits.
+        if let Some(PendingAction::FanoutFailed { id }) = self.st.pending_actions.get(item_id) {
+            let id = id.clone();
+            if let Err(e) = self.fanout_answer(&id, opt) {
+                let open = self.fanout(&id).is_some_and(|f| {
+                    matches!(f.status, FanoutStatus::Paused | FanoutStatus::Partial)
+                });
+                if open {
+                    return Err(e);
+                }
+                // The fan-out moved on (cancelled, retried elsewhere): drop it.
+                self.st.pending_actions.remove(item_id);
+                self.st.inbox.retain(|i| i.id != item_id);
+                self.changed();
+                return Ok("That fan-out has moved on".into());
+            }
+        }
         let pending = self
             .st
             .pending_actions
@@ -344,8 +399,20 @@ impl Engine {
             .ok_or("That item is gone")?;
         self.st.inbox.retain(|i| i.id != item_id);
         self.changed();
+        // Its own answers: retry, continue, stop (and gates, dismiss).
+        if let PendingAction::FanoutFailed { id } = &pending {
+            let id = id.clone();
+            let res = self.resolve_fanout_failure(&id, opt);
+            let flight = self.fanout(&id).map(|f| f.flight_id.clone());
+            self.audit_result(Action::HandoffFanout, flight.as_deref(), Some(&id), &res);
+            return res;
+        }
         let yes = opt == RUN || opt == ACCEPT || opt == "approve";
         if !yes {
+            // The agent that planned a fan-out is waiting: tell it.
+            if let PendingAction::Fanout { id } = &pending {
+                self.cancel_fanout(id, "the human said not now");
+            }
             return Ok("Left for later".into());
         }
         self.run_pending(pending)
@@ -418,6 +485,29 @@ impl Engine {
                 self.run_intake_triage(&flight, fallback);
                 Ok("Triage started".into())
             }
+            PendingAction::Fanout { id } => {
+                let Some(f) = self.fanout(&id).cloned() else {
+                    return Ok("That fan-out is gone".into());
+                };
+                if f.status != FanoutStatus::Waiting {
+                    return Ok("That fan-out has moved on".into());
+                }
+                self.set_fanout_status(&id, FanoutStatus::Running);
+                self.advance_fanout(&id);
+                let res = Ok(format!("Fan-out {id} started"));
+                self.audit_result(Action::HandoffFanout, Some(&f.flight_id), Some(&id), &res);
+                // The planner hears it is on its way.
+                if !f.return_to.starts_with(fanouts::TOWER_RETURN) {
+                    let _ = self.deliver(
+                        &f.return_to,
+                        format!(
+                            "[Tower] Your fan-out {id} was cleared and has started; the combined result arrives as a [Tower] message."
+                        ),
+                    );
+                }
+                res
+            }
+            PendingAction::FanoutFailed { id } => self.resolve_fanout_failure(&id, "approve"),
         }
     }
 

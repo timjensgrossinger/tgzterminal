@@ -10,7 +10,7 @@
 //! kind = "mail"                       # or "teams"
 //! role = "scout"                      # the role that reads (any vendor)
 //! prompt = "Unread mail in the Support folder since {since}."
-//! target_role = "approach"            # items are cleared to this role
+//! target_role = "task-claude"         # items are cleared to this role
 //! internal_domains = ["example.com"]  # other senders count as customers
 //! respond_within_hours = 24           # mail from customers; default 24
 //! interval_secs = 1800                # only when scout.run = "auto" and armed

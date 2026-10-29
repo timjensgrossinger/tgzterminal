@@ -119,7 +119,7 @@ pub fn tool_schemas() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "to_role": s("Role id from tower_roster, e.g. \"ground\"."),
+                    "to_role": s("Role id from tower_roster, e.g. \"sub-opencode\"."),
                     "goal": s("One or two sentences: what to achieve."),
                     "context": list("Files, functions or facts the receiver needs."),
                     "constraints": list("What not to touch or change."),
@@ -148,6 +148,37 @@ pub fn tool_schemas() -> Value {
                     "local_only": {"type": "boolean", "description": "The subtask touches sensitive data (credentials, customer or personal data, anything marked confidential). Then only local models work on it and you get back only whether it is done, not its details. Do not read those files yourself."}
                 },
                 "required": ["goal", "acceptance"]
+            }
+        },
+        {
+            "name": "tower_fanout",
+            "description": "Split your task into parts that other agents do at the same time, and get one combined result. Use it when the work has independent pieces (one per file or module); give each part a self-contained brief, the files it owns, and which parts it waits for. Parts that wait on others run in a later wave; two parts never write the same file at once. Returns a fan-out id (x-N) at once: keep working or end your turn, the combined result arrives as a [Tower] message, or call tower_await with that id. Review the combined changes before tower_complete.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "subtasks": {
+                        "type": "array",
+                        "description": "The parts, 2 or more.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": s("Short id, e.g. \"s1\"; depends_on refers to it."),
+                                "title": s("What this part achieves, in a few words."),
+                                "brief": s("Everything the agent doing it needs: files, functions, the interface it shares with other parts, how to check it."),
+                                "tier": {"type": "string", "enum": ["low", "medium", "high"], "description": "How hard the part is; picks the model for a routed role."},
+                                "depends_on": list("Ids of parts that must be done first."),
+                                "target_files": list("Files this part owns (relative paths)."),
+                                "acceptance": list("How the part can tell it is done."),
+                                "read_only": {"type": "boolean", "description": "The part only investigates and changes nothing."},
+                                "role": s("A role id for this part; default: to_role.")
+                            },
+                            "required": ["title", "brief"]
+                        }
+                    },
+                    "to_role": s("Role id the parts run on (default: the role Tower picks for Auto work, which chooses its model by each part's tier)."),
+                    "max_agents": {"type": "integer", "description": "Parts at once, at most [fanout] max_agents (default 4)."}
+                },
+                "required": ["subtasks"]
             }
         },
         {

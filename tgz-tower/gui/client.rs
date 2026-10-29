@@ -422,7 +422,8 @@ mod imp {
             return Ok(s);
         }
         spawn_daemon(sock)?;
-        let deadline = Instant::now() + Duration::from_secs(4);
+        // The daemon asks the login shell for its PATH first (up to 1.5 s).
+        let deadline = Instant::now() + Duration::from_secs(8);
         loop {
             std::thread::sleep(Duration::from_millis(100));
             if let Ok(s) = open(sock) {

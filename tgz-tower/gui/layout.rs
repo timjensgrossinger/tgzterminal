@@ -13,10 +13,10 @@ use super::forms::{
 };
 use super::model::{Action, Conn, Drawer, Extra, Hit, Model, ScrollId, ScrollRegion, View};
 use super::proto::{
-    Agent, AgentStatus, ChatKind, DayStats, DriverKind, Flight, GateState, HandDirection,
-    HandoffPacket, HandoffState, Health, InboxItem, InboxKind, IssueInfo, Locality, ModelInfo,
-    ModelRef, NoticeLevel, Role, RouteInfo, RoutineRow, RunResult, ScheduleRow, SlaClock,
-    SnapshotOrigin, SourceStatus, Stage, TimelineBody, TimelineEntry,
+    Agent, AgentStatus, ChatKind, DayStats, DriverKind, Fanout, FanoutStatus, Flight, GateState,
+    HandDirection, HandoffPacket, HandoffState, Health, InboxItem, InboxKind, IssueInfo, Locality,
+    ModelInfo, ModelRef, NoticeLevel, Role, RouteInfo, RoutineRow, RunResult, ScheduleRow,
+    SlaClock, SnapshotOrigin, SourceStatus, Stage, TaskState, TimelineBody, TimelineEntry,
 };
 use super::text::{age, ellipsize, usage_label, wrap, Font, Measure};
 use super::theme::{Color, Theme};
@@ -1243,6 +1243,10 @@ impl<'a> L<'a> {
             let c = self.local_only_chip(cx, y);
             cx = c.right() + self.u * 1.5;
         }
+        if f.hands_free && cx + self.chip_w("hands-free") + self.u * 10.0 < right {
+            let c = self.hands_free_chip(cx, y);
+            cx = c.right() + self.u * 1.5;
+        }
         if let Some(model) = &f.model {
             if cx + self.u * 10.0 < right {
                 let old = self.push_clip(Rect::new(r.x, r.y, right - r.x, r.h));
@@ -1415,6 +1419,10 @@ impl<'a> L<'a> {
             let c = self.local_only_chip(cx, y);
             cx = c.right() + self.u * 1.5;
         }
+        if f.hands_free {
+            let c = self.hands_free_chip(cx, y);
+            cx = c.right() + self.u * 1.5;
+        }
         if let Some(model) = &f.model {
             let c = self.model_chip(cx, y, model);
             cx = c.right() + self.u * 1.5;
@@ -1470,7 +1478,11 @@ impl<'a> L<'a> {
             }
             None => {}
         }
-        let can_hand_down = f.stage != Stage::Landed && md.snap.roles.len() > 1;
+        // A swarm flight has no agent of its own to hand work down from:
+        // Tower splits it.
+        let can_hand_down = f.stage != Stage::Landed
+            && md.snap.roles.len() > 1
+            && !role.is_some_and(|r| r.swarm);
         if can_hand_down {
             items.push((
                 "Hand down".into(),
@@ -1664,6 +1676,34 @@ impl<'a> L<'a> {
             y += self.route_summary(route, x, y, w);
             y += self.u * 4.0;
         }
+        if let Some(x_) = md.snap.fanout_of_flight(&f.id).cloned() {
+            y += self.section_label(x, y, "FAN-OUT");
+            y += self.fanout_summary(&x_, x, y, w);
+            y += self.u * 4.0;
+        }
+        if let Some(gid) = &f.group_id {
+            if let Some(owner) = md.snap.fanout(gid).cloned() {
+                y += self.section_label(x, y, "PART OF");
+                let part = owner
+                    .task_of_flight(&f.id)
+                    .map(|t| t.id.clone())
+                    .unwrap_or_default();
+                let parent_key = md
+                    .snap
+                    .flight(&owner.flight_id)
+                    .map(|p| p.key.clone())
+                    .unwrap_or_default();
+                let line = format!("Part {part} of fan-out {} on {parent_key}", owner.id);
+                let hit = Hit::Button(Action::OpenFlight {
+                    flight_id: owner.flight_id.clone(),
+                });
+                let (bw, bh) = self.button_size("Open");
+                self.button(x + w - bw, y, "Open", false, hit);
+                let ty = y + (bh - self.lh_of(Font::Body)) / 2.0;
+                self.text_fit(x, ty, &line, Font::Body, self.t.text, w - bw - self.u * 2.0);
+                y += bh + self.u * 4.0;
+            }
+        }
         if !f.brief.trim().is_empty() && f.brief.trim() != f.title.trim() {
             y += self.section_label(x, y, "BRIEF");
             y += self.para(x, y, &f.brief, Font::Body, self.t.text, w, 14);
@@ -1708,6 +1748,82 @@ impl<'a> L<'a> {
         for entry in f.timeline.iter().rev() {
             y = self.timeline_entry(f, entry, x, y, w);
             y += self.u * 3.0;
+        }
+        y - y0
+    }
+
+    /// A fan-out: its status line, then one row per part (state, the child
+    /// flight to open, and why it failed); returns the height.
+    fn fanout_summary(&mut self, x_: &Fanout, x: f32, y0: f32, w: f32) -> f32 {
+        let md = self.md;
+        let mut y = y0;
+        let by = match x_.planned_by.as_str() {
+            "agent" => "planned by the lead agent".to_string(),
+            "heuristic" => "split by files (heuristics)".to_string(),
+            p => format!(
+                "planned by {}",
+                md.snap
+                    .role(p.strip_prefix("triage:").unwrap_or(p))
+                    .map(|r| r.name.clone())
+                    .unwrap_or_else(|| p.to_string())
+            ),
+        };
+        let worker = md
+            .snap
+            .role(&x_.worker_role)
+            .map(|r| r.name.clone())
+            .unwrap_or_else(|| x_.worker_role.clone());
+        let head = format!(
+            "{} · {} · wave {} of {} · {} · on {worker}",
+            x_.id,
+            x_.status.label(),
+            (x_.wave as usize + 1).min(x_.waves.len().max(1)),
+            x_.waves.len(),
+            by
+        );
+        let c = match x_.status {
+            FanoutStatus::Done => self.t.ok,
+            FanoutStatus::Partial | FanoutStatus::Paused => self.t.warn,
+            FanoutStatus::Cancelled => self.t.faint,
+            _ => self.t.info,
+        };
+        y += self.para(x, y, &head, Font::Small, c, w, 2) + self.u;
+        if !x_.analysis.trim().is_empty() {
+            y += self.para(x, y, x_.analysis.trim(), Font::Small, self.t.faint, w, 2) + self.u;
+        }
+        for t in &x_.subtasks {
+            let (mark, mc) = match t.state {
+                TaskState::Returned => ("✓", self.t.ok),
+                TaskState::Failed => ("✕", self.t.bad),
+                TaskState::Skipped => ("–", self.t.faint),
+                TaskState::Running => ("•", self.t.warn),
+                TaskState::Queued => ("◦", self.t.muted),
+                TaskState::Pending => ("·", self.t.faint),
+            };
+            let (bw, bh) = self.button_size("Open");
+            if let Some(child) = &t.flight_id {
+                let hit = Hit::Button(Action::OpenFlight {
+                    flight_id: child.clone(),
+                });
+                self.button(x + w - bw, y, "Open", false, hit);
+            }
+            let ty = y + (bh - self.lh_of(Font::Body)) / 2.0;
+            let mw = self.text(x, ty, mark, Font::Strong, mc);
+            let key = t
+                .flight_id
+                .as_deref()
+                .and_then(|c| md.snap.flight(c))
+                .map(|c| format!("{} ", c.key))
+                .unwrap_or_default();
+            let line = format!("{key}{} · {}", t.title, t.state.label());
+            let tx = x + mw + self.u * 2.0;
+            self.text_fit(tx, ty, &line, Font::Body, self.t.text, x + w - bw - self.u * 2.0 - tx);
+            y += bh;
+            if let Some(why) = t.reason.as_deref().filter(|_| t.state.is_done() && t.state != TaskState::Returned) {
+                self.text_fit(tx, y, why, Font::Small, self.t.muted, w - (tx - x));
+                y += self.lh_of(Font::Small);
+            }
+            y += self.u;
         }
         y - y0
     }
@@ -2331,7 +2447,7 @@ impl<'a> L<'a> {
         let mut cy = y;
         let mut items: Vec<(String, Option<String>, Color)> = Vec::new();
         if allow_none {
-            if !md.snap.triage_role.is_empty() {
+            if md.auto_available() {
                 items.push(("Auto".into(), Some(AUTO_ROLE.to_string()), self.t.accent));
             }
             if nobody {
@@ -2446,18 +2562,46 @@ impl<'a> L<'a> {
                 y += self.labeled(x, y, "ASSIGN TO");
                 y += self.role_picker(x, y, w, f.role.as_deref(), true, true, None);
                 if f.role.as_deref() == Some(AUTO_ROLE) {
-                    let who = md
-                        .snap
-                        .role(&md.snap.triage_role)
-                        .map(|r| r.name.clone())
-                        .unwrap_or_else(|| md.snap.triage_role.clone());
-                    let hint = format!(
-                        "{} reads the task and picks the cheapest role that can do it well.",
-                        who
-                    );
+                    let name_of = |id: &str| {
+                        md.snap
+                            .role(id)
+                            .map(|r| r.name.clone())
+                            .unwrap_or_else(|| id.to_string())
+                    };
+                    let fallback = &md.snap.setup.auto_heuristic_role;
+                    let triage_ok = md.snap.setup.triage_usable && !md.snap.triage_role.is_empty();
+                    let hint = if f.heuristic || !triage_ok {
+                        if fallback.is_empty() {
+                            "No role can take it on heuristics alone; pick one.".to_string()
+                        } else {
+                            format!(
+                                "No model call: the router rates the task and {} takes it.",
+                                name_of(fallback)
+                            )
+                        }
+                    } else {
+                        format!(
+                            "{} reads the task and picks the cheapest role that can do it well.",
+                            name_of(&md.snap.triage_role)
+                        )
+                    };
                     y += self.u;
                     self.text_fit(x, y, &hint, Font::Small, self.t.faint, w);
-                    y += self.lh_of(Font::Small);
+                    y += self.lh_of(Font::Small) + self.u;
+                    if triage_ok && !fallback.is_empty() {
+                        let accent = self.t.accent;
+                        y += self.chip_row(
+                            x,
+                            y,
+                            w,
+                            vec![(
+                                "Heuristics only".to_string(),
+                                f.heuristic,
+                                accent,
+                                Hit::Button(Action::SheetFlag(SheetFlag::Heuristic)),
+                            )],
+                        );
+                    }
                 }
                 y += gap;
                 if let Some(warn) = f
@@ -2469,11 +2613,21 @@ impl<'a> L<'a> {
                     let c = self.t.warn;
                     y += self.banner(x, y, w, &warn, c) + gap;
                 }
+                if f
+                    .role
+                    .as_deref()
+                    .and_then(|r| md.snap.role(r))
+                    .is_some_and(|r| r.swarm)
+                {
+                    let hint = "Tower splits the task (the triage model plans it, or one part per file it names) and runs the parts in parallel, then checks the combined result.";
+                    y += self.para(x, y, hint, Font::Small, self.t.faint, w, 3) + gap;
+                }
                 y += self.labeled(x, y, "HOW HARD");
                 y += self.tier_picker(x, y, w, f.tier.as_deref()) + gap;
                 y += self.labeled(x, y, "WHERE");
                 y += self.place_picker(x, y, w, f.place, true) + gap;
-                y += self.local_only_toggle(x, y, w, f.local_only) + gap + self.u * 2.0;
+                y += self.local_only_toggle(x, y, w, f.local_only) + gap;
+                y += self.hands_free_toggle(x, y, w, f.hands_free) + gap + self.u * 2.0;
                 let launch = f.role.is_some();
                 let mut items: Vec<(String, bool, Hit)> =
                     vec![("Cancel".into(), false, Hit::Button(Action::CloseSheet))];
@@ -2503,8 +2657,8 @@ impl<'a> L<'a> {
                 self.text(x, y, &title, Font::Heading, self.t.text);
                 y += self.lh_of(Font::Heading) + self.u * 2.0;
                 if let Some(role) = md.snap.role(&f.role_id) {
-                    let first = role.mission.lines().next().unwrap_or("").to_string();
-                    y += self.para(x, y, &first, Font::Body, self.t.muted, w, 3) + gap;
+                    let summary = role.summary.clone();
+                    y += self.para(x, y, &summary, Font::Body, self.t.muted, w, 3) + gap;
                     if let Some(warn) = role.warning.clone() {
                         let c = self.t.warn;
                         y += self.banner(x, y, w, &warn, c) + gap;
@@ -2711,6 +2865,11 @@ impl<'a> L<'a> {
                         "Sensitive: local models only",
                         f.local_only,
                         SheetFlag::LocalOnly,
+                    ),
+                    (
+                        "Hands-free while armed",
+                        f.hands_free,
+                        SheetFlag::HandsFree,
                     ),
                 ];
                 let mut cy = y;
@@ -2921,7 +3080,16 @@ impl<'a> L<'a> {
                         "The command and its arguments, e.g. claude, codex, opencode acp.",
                     ) + gap;
                 }
-                y += self.labeled(x, y, "MISSION");
+                y += self.labeled(x, y, "SUMMARY, FOR YOU");
+                self.field(Rect::new(x, y, w, h), FieldId::RoleSummary, &f.summary, 1);
+                y += h + self.u;
+                y += self.hint(
+                    x,
+                    y,
+                    w,
+                    "One line on the role card: what it does and who runs it. Empty: made from the mission.",
+                ) + gap;
+                y += self.labeled(x, y, "MISSION, FOR THE AGENT");
                 let h5 = self.field_height(5);
                 self.field(Rect::new(x, y, w, h5), FieldId::RoleMission, &f.mission, 5);
                 y += h5 + gap;
@@ -3298,8 +3466,13 @@ impl<'a> L<'a> {
             self.t.text,
             inner * 0.5,
         );
-        let driver = format!("{} · {}", role.driver.label(), role.program);
-        let driver = ellipsize(self.m, &driver, Font::SmallStrong, inner * 0.45);
+        // The chip is the driver word alone; the program and its arguments
+        // are for Edit role, not for a card.
+        let driver = if role.routed {
+            "routed".to_string()
+        } else {
+            role.driver.label().to_string()
+        };
         let dw = self.chip_w(&driver);
         let fg = self.t.muted;
         let bg = self.t.tint(self.t.muted);
@@ -3309,7 +3482,12 @@ impl<'a> L<'a> {
             let wc = self.t.warn;
             y += self.banner(x, y, inner, warn, wc) + self.u * 2.0;
         }
-        y += self.para(x, y, &role.mission, Font::Body, self.t.muted, inner, 4);
+        // What it does, for people; the mission (what the agent is told) is
+        // in Edit role.
+        y += self.para(x, y, &role.summary, Font::Body, self.t.muted, inner, 3);
+        y += self.u;
+        let how = how_it_runs(role);
+        y += self.para(x, y, &how, Font::Small, self.t.faint, inner, 2);
         y += self.u * 3.0;
 
         y += self.section_label(x, y, "LADDER");
@@ -3717,7 +3895,18 @@ impl<'a> L<'a> {
         let mut y = y0;
         match s {
             Section::Notices => {
-                y += self.section_header(x, y, w, "Notices", "", vec![]);
+                y += self.section_header(
+                    x,
+                    y,
+                    w,
+                    "Notices",
+                    "",
+                    vec![(
+                        "Restart towerd".into(),
+                        false,
+                        Hit::Button(Action::RestartDaemon),
+                    )],
+                );
                 let n = snap.notices.len();
                 for notice in snap.notices.iter().rev().take(5) {
                     let c = match notice.level {
@@ -4521,6 +4710,38 @@ impl<'a> L<'a> {
         let fg = self.t.readable(c);
         let bg = self.t.tint(c);
         self.dot_chip(x, y, "local only", c, fg, bg)
+    }
+
+    fn hands_free_chip(&mut self, x: f32, y: f32) -> Rect {
+        let c = self.t.accent;
+        let fg = self.t.readable(c);
+        let bg = self.t.tint(c);
+        self.dot_chip(x, y, "hands-free", c, fg, bg)
+    }
+
+    /// The "hands-free" toggle of the New flight form; returns its height.
+    fn hands_free_toggle(&mut self, x: f32, y: f32, w: f32, on: bool) -> f32 {
+        let accent = self.t.accent;
+        let h = self.chip_row(
+            x,
+            y,
+            w,
+            vec![(
+                "Hands-free while armed".to_string(),
+                on,
+                accent,
+                Hit::Button(Action::SheetFlag(SheetFlag::HandsFree)),
+            )],
+        );
+        let armed = self.md.snap.armed_until.is_some();
+        let hint = match (on, armed) {
+            (true, true) => "No Inbox stops until landing: handoffs, fan-outs and messages run on their own.",
+            (true, false) => "Not armed: Tower still asks until you arm it.",
+            (false, _) => "Let it run without stopping for clearances (landing still asks).",
+        };
+        let hy = y + h + self.u;
+        self.text_fit(x, hy, hint, Font::Small, self.t.faint, w);
+        hy + self.lh_of(Font::Small) - y
     }
 
     /// The "sensitive" toggle of the New flight form; returns its height.
@@ -5618,6 +5839,44 @@ fn most_urgent(clocks: &[SlaClock]) -> Option<&SlaClock> {
         .min_by_key(|c| if c.breached { 0 } else { c.due_unix })
 }
 
+/// How a role runs, in plain words for its card: the program and where it
+/// shows up, never the raw command line.
+pub fn how_it_runs(role: &Role) -> String {
+    let program = role.command.first().map(String::as_str).unwrap_or("");
+    let is_claude_acp = program == "npx" && role.command.iter().any(|a| a.contains("claude-agent"));
+    if role.routed {
+        return "Tower picks the program and model by task size".into();
+    }
+    match role.driver {
+        DriverKind::Pane => match program {
+            "claude" => "Claude Code in a terminal pane".into(),
+            "codex" => "Codex in a terminal pane".into(),
+            "opencode" => "OpenCode in a terminal pane".into(),
+            "agy" => "Antigravity in a terminal pane".into(),
+            "gemini" => "Gemini CLI in a terminal pane".into(),
+            "" => "A terminal pane".into(),
+            other => format!("{other} in a terminal pane"),
+        },
+        DriverKind::Acp if is_claude_acp => "Claude via ACP, chat in the drawer".into(),
+        DriverKind::Acp => match program {
+            "opencode" => "OpenCode via ACP, chat in the drawer".into(),
+            "" => "An ACP agent, chat in the drawer".into(),
+            other => format!("{other} via ACP, chat in the drawer"),
+        },
+        DriverKind::Llm => {
+            let local = role
+                .ladder
+                .iter()
+                .all(|m| m.locality == Locality::Local);
+            if local && !role.ladder.is_empty() {
+                "Local LLM, no tools".into()
+            } else {
+                "LLM over an API, no tools".into()
+            }
+        }
+    }
+}
+
 /// `Ana → Bo · High · vpn, urgent`.
 fn tracker_line(i: &IssueInfo) -> String {
     let mut parts: Vec<String> = Vec::new();
@@ -5647,6 +5906,9 @@ fn action_help(action: &str) -> &'static str {
         "pr.draft" => "Push the branch and open a draft PR/MR after an auto-fix",
         "land" => "Land a flight whose gates passed",
         "handoff.release" => "Start the next role on a handoff an agent made",
+        "handoff.fanout" => {
+            "Split a task into parts that run in parallel, wave by wave (asked once per plan)"
+        }
         "handoff.local" => {
             "Hand an agent's subtask to a local model and give it the result (auto needs no Armed: nothing leaves your network)"
         }
@@ -5660,13 +5922,14 @@ fn action_help(action: &str) -> &'static str {
 }
 
 /// What starts flights, in chart order, with the label shown.
-const ORIGINS: [(&str, &str); 6] = [
+const ORIGINS: [(&str, &str); 7] = [
     ("you", "You"),
     ("schedule", "Schedule"),
     ("intake", "Intake"),
     ("autofix", "Auto-fix"),
     ("scout", "Scout"),
     ("handoff", "Handoff"),
+    ("fanout", "Fan-out"),
 ];
 
 fn count(map: &std::collections::BTreeMap<String, u32>, key: &str) -> f64 {
@@ -5698,6 +5961,7 @@ fn action_short(key: &str) -> &str {
         "pr.draft" => "Draft PR",
         "land" => "Land",
         "handoff.release" => "Release",
+        "handoff.fanout" => "Fan-out",
         "scout.run" => "Scout",
         "pane.message" => "Message",
         "schedule.run" => "Schedule",
@@ -5721,6 +5985,45 @@ mod tests {
     use super::super::proto::{demo_snapshot, Notice, PolicyRow, TermsNote};
     use super::super::text::fake::FakeMeasure;
     use super::*;
+
+    #[test]
+    fn how_it_runs_says_program_and_place_not_argv() {
+        let role = |driver: DriverKind, command: &[&str], routed: bool| Role {
+            driver,
+            command: command.iter().map(|s| s.to_string()).collect(),
+            routed,
+            ..Default::default()
+        };
+        assert_eq!(
+            how_it_runs(&role(DriverKind::Pane, &["claude"], false)),
+            "Claude Code in a terminal pane"
+        );
+        assert_eq!(
+            how_it_runs(&role(
+                DriverKind::Acp,
+                &["npx", "-y", "@agentclientprotocol/claude-agent-acp"],
+                false
+            )),
+            "Claude via ACP, chat in the drawer"
+        );
+        assert_eq!(
+            how_it_runs(&role(DriverKind::Acp, &["opencode", "acp"], false)),
+            "OpenCode via ACP, chat in the drawer"
+        );
+        assert_eq!(
+            how_it_runs(&role(DriverKind::Pane, &[], true)),
+            "Tower picks the program and model by task size"
+        );
+        let mut llm = role(DriverKind::Llm, &[], false);
+        llm.ladder = vec![ModelRef::local("qwen", "localhost")];
+        assert_eq!(how_it_runs(&llm), "Local LLM, no tools");
+        llm.ladder = vec![ModelRef {
+            id: "gpt".into(),
+            ..Default::default()
+        }];
+        assert_eq!(how_it_runs(&llm), "LLM over an API, no tools");
+        assert!(!how_it_runs(&role(DriverKind::Pane, &["mytool", "--flag"], false)).contains("--flag"));
+    }
 
     fn theme() -> Theme {
         Theme::from_palette(
@@ -6278,6 +6581,119 @@ mod tests {
         assert!(has(
             &scene_for(&model),
             &Hit::Button(Action::SheetFlag(SheetFlag::LocalOnly))
+        ));
+    }
+
+    #[test]
+    fn a_swarm_flight_offers_no_hand_down() {
+        let mut model = Model::new(demo_snapshot(1_000_000));
+        model.drawer = Some(Drawer::Flight("f-13".into()));
+        let hand_down = Hit::Button(Action::OpenPacket {
+            flight_id: "f-13".into(),
+        });
+        assert!(has(&scene_for(&model), &hand_down));
+        // The same flight on a swarm role: Tower splits it, nothing to hand down.
+        if let Some(r) = model.snap.roles.iter_mut().find(|r| r.id == "ground") {
+            r.swarm = true;
+        }
+        assert!(!has(&scene_for(&model), &hand_down));
+    }
+
+    #[test]
+    fn a_schedule_can_run_its_flights_hands_free() {
+        let mut model = Model::new(demo_snapshot(1_000_000));
+        model.sheet = Some(Sheet::schedule(None, None));
+        assert!(has(
+            &scene_for(&model),
+            &Hit::Button(Action::SheetFlag(SheetFlag::HandsFree))
+        ));
+        if let Some(Sheet::Schedule(f)) = &mut model.sheet {
+            f.hands_free = true;
+        }
+        match &model.sheet {
+            Some(Sheet::Schedule(f)) => assert!(f.spec().hands_free, "saved with the schedule"),
+            _ => panic!("no schedule sheet"),
+        }
+        // Editing a saved one keeps it.
+        let spec = super::super::proto::ScheduleSpec {
+            name: "n".into(),
+            hands_free: true,
+            ..Default::default()
+        };
+        match Sheet::schedule(Some(&spec), None) {
+            Sheet::Schedule(f) => assert!(f.hands_free),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn hands_free_flights_wear_a_badge_and_new_flight_offers_it() {
+        let mut model = Model::new(demo_snapshot(1_000_000));
+        assert!(!texts(&scene_for(&model)).iter().any(|s| s == "hands-free"));
+        model.snap.flights[0].hands_free = true;
+        assert!(texts(&scene_for(&model)).iter().any(|s| s == "hands-free"));
+        model.sheet = Some(Sheet::new_flight(None, Place::NewFolder));
+        let scene = scene_for(&model);
+        assert!(has(&scene, &Hit::Button(Action::SheetFlag(SheetFlag::HandsFree))));
+        assert!(texts(&scene).iter().any(|s| s.contains("landing still asks")));
+    }
+
+    #[test]
+    fn a_fanout_shows_its_parts_in_the_flight_drawer_and_on_each_part() {
+        use super::super::proto::{Fanout, FanoutTask};
+        let mut model = Model::new(demo_snapshot(1_000_000));
+        let parent = model.snap.flights[0].clone();
+        let child = model.snap.flights[1].clone();
+        model.snap.fanouts = vec![Fanout {
+            id: "x-1".into(),
+            flight_id: parent.id.clone(),
+            worker_role: "ground".into(),
+            planned_by: "heuristic".into(),
+            status: FanoutStatus::Running,
+            waves: vec![vec!["s1".into(), "s2".into()]],
+            subtasks: vec![
+                FanoutTask {
+                    id: "s1".into(),
+                    title: "Parser".into(),
+                    state: TaskState::Running,
+                    flight_id: Some(child.id.clone()),
+                    ..Default::default()
+                },
+                FanoutTask {
+                    id: "s2".into(),
+                    title: "Lexer".into(),
+                    state: TaskState::Failed,
+                    reason: Some("its agent exited".into()),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        }];
+        model.drawer = Some(Drawer::Flight(parent.id.clone()));
+        let scene = scene_for(&model);
+        let t = texts(&scene);
+        assert!(t.iter().any(|s| s == "FAN-OUT"), "{t:?}");
+        assert!(t.iter().any(|s| s.contains("split by files")), "{t:?}");
+        assert!(t.iter().any(|s| s.contains("Parser · running")), "{t:?}");
+        assert!(t.iter().any(|s| s.contains("its agent exited")), "{t:?}");
+        assert!(has(
+            &scene,
+            &Hit::Button(Action::OpenFlight {
+                flight_id: child.id.clone()
+            })
+        ));
+        // The part links back to its fan-out's flight.
+        if let Some(c) = model.snap.flights.iter_mut().find(|f| f.id == child.id) {
+            c.group_id = Some("x-1".into());
+        }
+        model.drawer = Some(Drawer::Flight(child.id.clone()));
+        let scene = scene_for(&model);
+        assert!(texts(&scene).iter().any(|s| s.starts_with("Part s1 of fan-out x-1")));
+        assert!(has(
+            &scene,
+            &Hit::Button(Action::OpenFlight {
+                flight_id: parent.id.clone()
+            })
         ));
     }
 

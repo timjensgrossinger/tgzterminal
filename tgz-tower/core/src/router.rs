@@ -428,21 +428,29 @@ fn file_refs(text: &str) -> usize {
 
 /// Distinct work files named in a task (`src/auth.rs`, `cli.py`).
 pub fn count_task_files(task: &str) -> usize {
-    let lower = task.to_lowercase();
+    task_files(task).len()
+}
+
+/// The work files named in a task, as spelled, in order of first mention;
+/// a file named twice in different case counts once.
+pub fn task_files(task: &str) -> Vec<String> {
     let mut seen = std::collections::BTreeSet::new();
-    for run in lower.split(|c: char| !(is_word(c) || matches!(c, '.' | '/' | '-'))) {
+    let mut out = Vec::new();
+    for run in task.split(|c: char| !(is_word(c) || matches!(c, '.' | '/' | '-'))) {
         let tok = run.trim_end_matches(|c: char| !is_word(c));
         if tok.ends_with('/') {
             continue;
         }
         if let Some((stem, ext)) = tok.rsplit_once('.') {
             let name = stem.rsplit('/').next().unwrap_or(stem);
-            if !name.is_empty() && WORK_EXTS.contains(&ext) {
-                seen.insert(tok.to_string());
+            if !name.is_empty() && WORK_EXTS.contains(&ext.to_lowercase().as_str()) {
+                if seen.insert(tok.to_lowercase()) {
+                    out.push(tok.to_string());
+                }
             }
         }
     }
-    seen.len()
+    out
 }
 
 fn sys_file_refs(text: &str) -> usize {

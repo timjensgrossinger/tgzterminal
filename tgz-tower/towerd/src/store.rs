@@ -11,6 +11,9 @@ pub struct Counters {
     pub agent: u32,
     pub inbox: u32,
     pub handoff: u32,
+    /// Added later: older state files have no such field.
+    #[serde(default)]
+    pub fanout: u32,
 }
 
 #[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
@@ -135,6 +138,9 @@ pub struct Persisted {
     /// `daily` was rebuilt from the flights and the audit log once.
     #[serde(default)]
     pub history_backfilled: bool,
+    /// Fan-outs, open ones and the most recent finished ones.
+    #[serde(default)]
+    pub fanouts: Vec<tower_proto::Fanout>,
 }
 
 /// What Tower remembers about a schedule between runs.
@@ -202,6 +208,12 @@ pub enum PendingAction {
         #[serde(default)]
         then: Option<Box<PendingAction>>,
     },
+    /// Start a planned fan-out (asked because `handoff.fanout` is not
+    /// automatic).
+    Fanout { id: String },
+    /// A fan-out wave ended with failed parts: retry, continue or stop
+    /// (and, for Tower's own split, run the gates anyway).
+    FanoutFailed { id: String },
 }
 
 #[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
@@ -291,5 +303,40 @@ mod tests {
         std::fs::write(&p, "{not json").unwrap();
         assert_eq!(load(&p), Persisted::default());
         assert!(d.join("state.json.bad").exists());
+    }
+
+    #[test]
+    fn a_state_file_from_before_fanouts_still_loads() {
+        let d =
+            std::env::temp_dir().join(format!("tower-store-old-{}", crate::paths::random_u64()));
+        std::fs::create_dir_all(&d).unwrap();
+        let p = d.join("state.json");
+        // The shape a protocol-7 towerd wrote: no fanouts, no counters.fanout.
+        std::fs::write(
+            &p,
+            r#"{"flights":[{"id":"f-1","key":"TWR-1","title":"x","stage":"cleared","lineage":[],"created_unix":1,"updated_unix":1,"gates":[],"timeline":[],"failures":0,"usage":{"input_tokens":0,"output_tokens":0}}],"agents":[],"inbox":[],"frequencies":[],"counters":{"flight":1,"agent":0,"inbox":0,"handoff":0}}"#,
+        )
+        .unwrap();
+        let s = load(&p);
+        assert!(!d.join("state.json.bad").exists(), "it was readable");
+        assert_eq!(s.flights.len(), 1);
+        assert_eq!(s.flights[0].group_id, None);
+        assert_eq!(s.counters.fanout, 0);
+        assert!(s.fanouts.is_empty());
+        // And a fan-out survives a round trip.
+        let mut s = s;
+        s.fanouts.push(tower_proto::Fanout {
+            id: "x-1".into(),
+            flight_id: "f-1".into(),
+            worker_role: "auto".into(),
+            ..Default::default()
+        });
+        s.pending_actions.insert(
+            "i-1".into(),
+            PendingAction::FanoutFailed { id: "x-1".into() },
+        );
+        save(&p, &s).unwrap();
+        assert_eq!(load(&p), s);
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

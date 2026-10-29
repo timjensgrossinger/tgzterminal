@@ -148,6 +148,8 @@ pub enum Action {
     StopAgent {
         agent_id: String,
     },
+    /// Save state and start towerd afresh (new build, current PATH).
+    RestartDaemon,
     FocusPane {
         pane_id: u64,
     },
@@ -402,6 +404,7 @@ pub fn empty_snapshot() -> Snapshot {
         flights_root: String::new(),
         triage_role: String::new(),
         engines: vec![],
+        fanouts: vec![],
         models: vec![],
         connected_clis: vec![],
         engine_ids: vec![],
@@ -511,8 +514,11 @@ impl Model {
     }
 
     /// "Auto" is worth offering: a triage role exists and can run.
+    /// "Auto" is worth offering when triage can run, or when heuristics
+    /// have a role to fall back to.
     pub fn auto_available(&self) -> bool {
-        !self.snap.triage_role.is_empty() && self.snap.setup.triage_usable
+        (!self.snap.triage_role.is_empty() && self.snap.setup.triage_usable)
+            || !self.snap.setup.auto_heuristic_role.is_empty()
     }
 
     pub fn scroll_of(&self, id: ScrollId) -> f32 {
@@ -1006,6 +1012,28 @@ impl Model {
             Action::StopAgent { agent_id } => {
                 self.send(ClientMsg::StopAgent { agent_id }, now_ms, fx);
             }
+            Action::RestartDaemon => {
+                if self.confirm_delete.as_deref() == Some("restart-daemon") {
+                    self.confirm_delete = None;
+                    if self.send(ClientMsg::RestartDaemon, now_ms, fx) {
+                        self.toast("Restarting towerd…", now_ms);
+                    }
+                } else {
+                    self.confirm_delete = Some("restart-daemon".into());
+                    let acp = self
+                        .snap
+                        .agents
+                        .iter()
+                        .filter(|a| a.status.is_live() && a.driver == super::proto::DriverKind::Acp)
+                        .count();
+                    self.toast(
+                        format!(
+                            "Click again to restart towerd (stops {acp} ACP agent(s); pane agents keep running)"
+                        ),
+                        now_ms,
+                    );
+                }
+            }
             Action::FocusPane { pane_id } => fx.push(Effect::FocusPane(pane_id)),
             Action::OpenAgent { agent_id } => {
                 self.drawer = Some(Drawer::Agent(agent_id));
@@ -1142,9 +1170,17 @@ impl Model {
                     SheetFlag::Overlap => f.overlap_run = !f.overlap_run,
                     SheetFlag::CatchUp => f.catch_up = !f.catch_up,
                     SheetFlag::LocalOnly => f.local_only = !f.local_only,
+                    SheetFlag::HandsFree => f.hands_free = !f.hands_free,
+                    SheetFlag::Heuristic => {}
                 },
                 Some(Sheet::NewFlight(f)) if flag == SheetFlag::LocalOnly => {
                     f.local_only = !f.local_only
+                }
+                Some(Sheet::NewFlight(f)) if flag == SheetFlag::Heuristic => {
+                    f.heuristic = !f.heuristic
+                }
+                Some(Sheet::NewFlight(f)) if flag == SheetFlag::HandsFree => {
+                    f.hands_free = !f.hands_free
                 }
                 _ => {}
             },
@@ -1363,15 +1399,23 @@ impl Model {
                         worktree: f.place == Place::Worktree,
                         new_folder: f.place == Place::NewFolder,
                         auto_assign: auto,
+                        auto_mode: if auto && f.heuristic {
+                            super::proto::AutoMode::Heuristic
+                        } else {
+                            super::proto::AutoMode::Off
+                        },
                         launch,
                         tier: f.tier.clone(),
                         local_only: f.local_only,
+                        hands_free: f.hands_free,
                     },
-                    match (auto, launch) {
-                        (true, true) => "Flight created; triage is picking who takes it",
-                        (true, false) => "Flight created; triage is picking a role",
-                        (false, true) => "Flight created, agent taking off",
-                        (false, false) => "Flight created",
+                    match (auto, auto && f.heuristic, launch) {
+                        (true, true, true) => "Flight created; heuristics picked who takes it",
+                        (true, true, false) => "Flight created; heuristics picked a role",
+                        (true, false, true) => "Flight created; triage is picking who takes it",
+                        (true, false, false) => "Flight created; triage is picking a role",
+                        (false, _, true) => "Flight created, agent taking off",
+                        (false, _, false) => "Flight created",
                     },
                 )
             }
@@ -1925,6 +1969,57 @@ mod tests {
         match &m.sheet {
             Some(Sheet::NewFlight(f)) => assert_eq!(f.role, None),
             _ => panic!("no sheet"),
+        }
+        m.sheet = None;
+        m.focus = None;
+        // ...unless heuristics have a role to fall back to.
+        m.snap.setup.auto_heuristic_role = "auto".into();
+        assert!(m.auto_available());
+        m.apply(Input::Key(Key::Char('n')), 0);
+        match &m.sheet {
+            Some(Sheet::NewFlight(f)) => assert_eq!(f.role.as_deref(), Some(AUTO_ROLE)),
+            _ => panic!("no sheet"),
+        }
+    }
+
+    #[test]
+    fn the_hands_free_toggle_works_on_new_flight_and_schedule_sheets() {
+        let mut m = model_with_hits(vec![]);
+        let mut fx = Vec::new();
+        m.sheet = Some(Sheet::new_flight(None, Place::NewFolder));
+        m.action(Action::SheetFlag(SheetFlag::HandsFree), 0, &mut fx);
+        assert!(matches!(&m.sheet, Some(Sheet::NewFlight(f)) if f.hands_free));
+        m.sheet = Some(Sheet::schedule(None, None));
+        m.action(Action::SheetFlag(SheetFlag::HandsFree), 0, &mut fx);
+        assert!(matches!(&m.sheet, Some(Sheet::Schedule(f)) if f.hands_free));
+        m.action(Action::SheetFlag(SheetFlag::HandsFree), 0, &mut fx);
+        assert!(matches!(&m.sheet, Some(Sheet::Schedule(f)) if !f.hands_free));
+    }
+
+    #[test]
+    fn heuristics_only_is_sent_as_its_own_auto_mode() {
+        let mut m = model_with_hits(vec![]);
+        live(&mut m);
+        m.snap.setup.auto_heuristic_role = "auto".into();
+        m.apply(Input::Key(Key::Char('n')), 0);
+        let mut fx = Vec::new();
+        m.action(Action::SheetFlag(SheetFlag::Heuristic), 0, &mut fx);
+        match &m.sheet {
+            Some(Sheet::NewFlight(f)) => assert!(f.heuristic),
+            _ => panic!("no sheet"),
+        }
+        type_text(&mut m, "Fix the flaky test");
+        let fx = m.apply(Input::Key(Key::Enter { ctrl: false }), 0);
+        match sent(&fx).as_slice() {
+            [ClientMsg::CreateFlight {
+                auto_assign,
+                auto_mode,
+                ..
+            }] => {
+                assert!(*auto_assign);
+                assert_eq!(*auto_mode, super::super::proto::AutoMode::Heuristic);
+            }
+            other => panic!("{other:?}"),
         }
     }
 

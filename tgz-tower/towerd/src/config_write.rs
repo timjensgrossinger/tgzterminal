@@ -242,6 +242,11 @@ pub fn set_role(doc: &mut DocumentMut, spec: &RoleSpec) {
     } else {
         t["command"] = value(spec.command.iter().map(String::as_str).collect::<Array>());
     }
+    if spec.summary.trim().is_empty() {
+        t.remove("summary");
+    } else {
+        t["summary"] = value(spec.summary.trim());
+    }
     t["mission"] = multiline(spec.mission.trim());
     if spec.ladder.is_empty() {
         t.remove("ladder");
@@ -253,7 +258,7 @@ pub fn set_role(doc: &mut DocumentMut, spec: &RoleSpec) {
 
 /// A string written as a `"""` block, as people write missions by hand;
 /// a plain string when the text would not survive that.
-fn multiline(text: &str) -> Item {
+pub(crate) fn multiline(text: &str) -> Item {
     if !text.contains("\"\"\"") && !text.ends_with('"') {
         let block = format!("v = \"\"\"\n{}\n\"\"\"\n", text.replace('\\', "\\\\"));
         if let Ok(d) = block.parse::<DocumentMut>() {
@@ -448,6 +453,7 @@ mod tests {
             color: "#bb9af7".into(),
             driver: "acp".into(),
             command: vec!["opencode".into(), "acp".into()],
+            summary: "Reviews diffs.".into(),
             mission: "Review the diff.\nNever edit code; say \"LGTM\".".into(),
             ladder: vec!["localhost/qwen3.6:27b".into()],
             max_concurrency: 2,

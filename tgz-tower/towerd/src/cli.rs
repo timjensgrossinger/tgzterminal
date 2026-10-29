@@ -16,9 +16,9 @@ const EXIT_USAGE: i32 = 2;
 const EXIT_CONNECT: i32 = 3;
 
 pub const USAGE: &str = "\
-tower flight new --title <t> [--brief <b> | --brief-file <f> | --brief -] [--role <id>]
+tower flight new --title <t> [--brief <b> | --brief-file <f> | --brief -] [--role <id> | --heuristic | --fanout]
                  [--tier low|medium|high] [--here | --new-folder | --worktree] [--workdir <dir>]
-                 [--local-only] [--no-launch] [--json]
+                 [--local-only] [--hands-free] [--no-launch] [--json]
 tower flight list [--all] [--json]
 tower flight show <key|id> [--json]
 tower inbox list [--json]
@@ -133,8 +133,11 @@ const VALUE_FLAGS: [&str; 8] = [
     "--socket",
     "--data-dir",
 ];
-const BOOL_FLAGS: [&str; 6] = [
+const BOOL_FLAGS: [&str; 9] = [
     "--here",
+    "--fanout",
+    "--heuristic",
+    "--hands-free",
     "--new-folder",
     "--worktree",
     "--local-only",
@@ -200,11 +203,32 @@ pub fn parse_new(
                 .to_string(),
         )
     };
-    let role_id = flag(args, "--role").filter(|r| !r.trim().is_empty());
+    let fanout = has(args, "--fanout");
+    if fanout && (flag(args, "--role").is_some() || has(args, "--heuristic")) {
+        return Err(
+            "--fanout picks the swarm role itself: give it without --role or --heuristic".into(),
+        );
+    }
+    // `--fanout`: the seeded swarm role ("Split & run").
+    let role_id = if fanout {
+        Some("swarm".to_string())
+    } else {
+        flag(args, "--role").filter(|r| !r.trim().is_empty())
+    };
+    let heuristic = has(args, "--heuristic");
+    if heuristic && role_id.is_some() {
+        return Err("give --role or --heuristic, not both".into());
+    }
     Ok(ClientMsg::CreateFlight {
         title,
         brief,
         auto_assign: role_id.is_none(),
+        // No role: Auto. `--heuristic` skips the triage call.
+        auto_mode: if heuristic {
+            tower_proto::AutoMode::Heuristic
+        } else {
+            tower_proto::AutoMode::Off
+        },
         role_id,
         workdir,
         worktree,
@@ -212,6 +236,7 @@ pub fn parse_new(
         launch: !has(args, "--no-launch"),
         tier,
         local_only: has(args, "--local-only"),
+        hands_free: has(args, "--hands-free"),
     })
 }
 
@@ -321,6 +346,41 @@ fn find_flight<'a>(snap: &'a Snapshot, what: &str) -> Option<&'a Flight> {
         .find(|f| f.id == what || f.key.eq_ignore_ascii_case(what))
 }
 
+/// A fan-out as `tower flight show` prints it: a status line, then one
+/// line per part.
+fn fanout_text(snap: &Snapshot, x: &tower_proto::Fanout) -> String {
+    let mut out = format!(
+        "  fan-out  {} · {} · wave {}/{} · {} parts on {}\n",
+        x.id,
+        x.status.label(),
+        (x.wave as usize + 1).min(x.waves.len().max(1)),
+        x.waves.len(),
+        x.subtasks.len(),
+        x.worker_role
+    );
+    for t in &x.subtasks {
+        let key = t
+            .flight_id
+            .as_deref()
+            .and_then(|c| snap.flight(c))
+            .map(|c| c.key.clone())
+            .unwrap_or_else(|| "-".into());
+        let why = t
+            .reason
+            .as_deref()
+            .map(|r| format!(" ({r})"))
+            .unwrap_or_default();
+        out.push_str(&format!(
+            "           {:<4} {:<9} {:<10} {}{why}\n",
+            t.id,
+            t.state.label(),
+            key,
+            t.title
+        ));
+    }
+    out
+}
+
 fn flight_show(args: &[String]) -> anyhow::Result<()> {
     let Some(what) = args.first().filter(|a| !a.starts_with("--")) else {
         usage("flight show needs a key or id")
@@ -354,6 +414,20 @@ fn flight_show(args: &[String]) -> anyhow::Result<()> {
     }
     if f.local_only {
         println!("  local-only: cloud models never see this work");
+    }
+    if f.hands_free {
+        println!("  hands-free: while armed, nothing stops in the Inbox until landing");
+    }
+    if let Some(x) = snap.fanout_of_flight(&f.id) {
+        print!("{}", fanout_text(&snap, x));
+    }
+    if let Some(gid) = &f.group_id {
+        let part = snap
+            .fanout(gid)
+            .and_then(|x| x.task_of_flight(&f.id))
+            .map(|t| t.id.clone())
+            .unwrap_or_default();
+        println!("  part     {part} of fan-out {gid}");
     }
     println!(
         "  usage    {} in · {} out{}",
@@ -576,9 +650,11 @@ mod tests {
                 worktree: false,
                 new_folder: false,
                 auto_assign: false,
+                auto_mode: tower_proto::AutoMode::Off,
                 launch: false,
                 tier: Some("high".into()),
                 local_only: true,
+                hands_free: false,
             }
         );
         // No role: Auto. New folder: no workdir. Brief from a file or stdin.
@@ -611,9 +687,78 @@ mod tests {
             "--title T --brief a --brief-file f",
             "--title T --bogus",
             "--title",
+            "--title T --role auto --heuristic",
         ] {
             assert!(parse_new(&args(bad), cwd, &read).is_err(), "{bad}");
         }
+        // Heuristics only: Auto without the triage call.
+        let m = parse_new(&args("--title T --heuristic"), cwd, &read).unwrap();
+        assert!(matches!(
+            &m,
+            ClientMsg::CreateFlight {
+                auto_assign: true,
+                auto_mode: tower_proto::AutoMode::Heuristic,
+                role_id: None,
+                ..
+            }
+        ));
+        let m = parse_new(&args("--title T --hands-free"), cwd, &read).unwrap();
+        assert!(matches!(
+            &m,
+            ClientMsg::CreateFlight {
+                hands_free: true,
+                ..
+            }
+        ));
+        // `--fanout`: the swarm role splits it.
+        let m = parse_new(&args("--title T --fanout"), cwd, &read).unwrap();
+        assert!(matches!(
+            &m,
+            ClientMsg::CreateFlight { role_id: Some(r), auto_assign: false, .. } if r == "swarm"
+        ));
+        assert!(parse_new(&args("--title T --fanout --role auto"), cwd, &read).is_err());
+        assert!(parse_new(&args("--title T --fanout --heuristic"), cwd, &read).is_err());
+    }
+
+    #[test]
+    fn a_fanout_prints_one_line_per_part() {
+        let mut snap = tower_proto::demo_snapshot(1_000_000);
+        let child = snap.flights[1].clone();
+        let x = tower_proto::Fanout {
+            id: "x-2".into(),
+            flight_id: snap.flights[0].id.clone(),
+            worker_role: "auto".into(),
+            status: tower_proto::FanoutStatus::Partial,
+            waves: vec![vec!["s1".into(), "s2".into()]],
+            subtasks: vec![
+                tower_proto::FanoutTask {
+                    id: "s1".into(),
+                    title: "Parser".into(),
+                    state: tower_proto::TaskState::Returned,
+                    flight_id: Some(child.id.clone()),
+                    ..Default::default()
+                },
+                tower_proto::FanoutTask {
+                    id: "s2".into(),
+                    title: "Lexer".into(),
+                    state: tower_proto::TaskState::Failed,
+                    reason: Some("timed out".into()),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        snap.fanouts.push(x.clone());
+        let text = fanout_text(&snap, &x);
+        assert!(
+            text.contains("x-2 · finished with failures · wave 1/1 · 2 parts on auto"),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("s1   returned  {}", child.key)),
+            "{text}"
+        );
+        assert!(text.contains("Lexer (timed out)"), "{text}");
     }
 
     #[test]

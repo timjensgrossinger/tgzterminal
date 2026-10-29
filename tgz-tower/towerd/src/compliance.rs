@@ -14,8 +14,8 @@ use tower_proto::DriverKind;
 
 /// Bump whenever a verdict or a quote changes: every acceptance given for an
 /// older version is asked for again.
-pub const MATRIX_VERSION: u32 = 1;
-pub const MATRIX_AS_OF: &str = "2026-10-21";
+pub const MATRIX_VERSION: u32 = 2;
+pub const MATRIX_AS_OF: &str = "2026-10-27";
 
 /// Whose terms apply.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -130,16 +130,6 @@ pub static CLAUDE_TOWER_INPUT: TermsRef = TermsRef {
     url: "https://www.anthropic.com/legal/consumer-terms",
 };
 
-pub static CLAUDE_HEADLESS: TermsRef = TermsRef {
-    id: "claude-headless",
-    summary: "Headless `claude -p` on your plan, started by Tower. Anthropic support says it \
-              draws from your subscription; the Consumer Terms still ban automated access \
-              unless explicitly permitted.",
-    quote: "You can still use the Claude Agent SDK, claude -p, and third-party apps with your \
-            subscription limits.",
-    url: "https://support.claude.com/en/articles/15036540",
-};
-
 pub static CLAUDE_SDK: TermsRef = TermsRef {
     id: "claude-agent-sdk",
     summary: "An Agent SDK based adapter (claude-agent-acp) on your plan. Anthropic asks \
@@ -197,9 +187,8 @@ pub static UNKNOWN_VENDOR: TermsRef = TermsRef {
 };
 
 /// Every grey zone: the tests' uniqueness check, and `terms_by_id`.
-pub static ALL: [&TermsRef; 8] = [
+pub static ALL: [&TermsRef; 7] = [
     &CLAUDE_TOWER_INPUT,
-    &CLAUDE_HEADLESS,
     &CLAUDE_SDK,
     &AGY_THIRD_PARTY,
     &GEMINI_OAUTH,
@@ -281,7 +270,12 @@ pub fn verdict(vendor: Vendor, auth: Auth, mode: Mode, input: Input) -> Verdict 
         // unmodified Claude Code binary with their own Claude subscription".
         (Vendor::Claude, Mode::Pane) if !tower_driven => Allowed,
         (Vendor::Claude, Mode::Pane) => Warn(&CLAUDE_TOWER_INPUT),
-        (Vendor::Claude, Mode::Headless) => Warn(&CLAUDE_HEADLESS),
+        // The Consumer Terms ban automated access "except ... where we
+        // otherwise explicitly permit it"; Anthropic's support article
+        // (15036540, Oct 7 2026 update) names `claude -p` as covered by a
+        // plan, which is that permission. The prompt's origin does not
+        // matter: a `-p` run is a scripted call by definition.
+        (Vendor::Claude, Mode::Headless) => Allowed,
         (Vendor::Claude, Mode::Acp) => Warn(&CLAUDE_SDK),
         (Vendor::Antigravity, _) => Warn(&AGY_THIRD_PARTY),
         (Vendor::Gemini, _) => Warn(&GEMINI_OAUTH),
@@ -435,16 +429,17 @@ mod tests {
     }
 
     #[test]
-    fn claude_headless_and_acp_on_a_plan_are_grey() {
-        assert_eq!(
-            verdict(
-                Vendor::Claude,
-                Auth::Subscription,
-                Mode::Headless,
-                Input::Initial
-            ),
-            Verdict::Warn(&CLAUDE_HEADLESS)
-        );
+    fn claude_headless_on_a_plan_is_allowed_for_every_input() {
+        for input in [Input::Initial, Input::Human, Input::Tower] {
+            assert_eq!(
+                verdict(Vendor::Claude, Auth::Subscription, Mode::Headless, input),
+                Verdict::Allowed
+            );
+        }
+    }
+
+    #[test]
+    fn claude_acp_on_a_plan_is_grey() {
         assert_eq!(
             verdict(Vendor::Claude, Auth::Subscription, Mode::Acp, Input::Human),
             Verdict::Warn(&CLAUDE_SDK)
@@ -512,7 +507,7 @@ mod tests {
 
     #[test]
     fn acceptance_is_per_matrix_version() {
-        let warn = Verdict::Warn(&CLAUDE_HEADLESS);
+        let warn = Verdict::Warn(&CLAUDE_SDK);
         assert!(warn.needs_ack(None));
         assert!(warn.needs_ack(Some(MATRIX_VERSION - 1)));
         assert!(!warn.needs_ack(Some(MATRIX_VERSION)));

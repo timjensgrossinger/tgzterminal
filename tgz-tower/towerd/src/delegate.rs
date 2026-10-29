@@ -253,12 +253,13 @@ impl Engine {
         self.handoff(fid, &a.role_id, &a.id, packet, false)
     }
 
-    /// Put a released-but-waiting local handoff in line for its model.
-    pub(super) fn queue_local(&mut self, child_id: &str, packet_id: &str, model: &str) {
+    /// Put a released-but-waiting handoff in line: a local one for its
+    /// model, a fan-out part for a free slot. `why` is what it waits for.
+    pub(super) fn queue_local(&mut self, child_id: &str, packet_id: &str, why: &str) {
         let entry = (child_id.to_string(), packet_id.to_string());
         if !self.st.local_queue.contains(&entry) {
             self.st.local_queue.push(entry);
-            self.note(child_id, format!("Queued: waiting for {model} to be free"));
+            self.note(child_id, format!("Queued: {why}"));
             self.set_stage(child_id, Stage::Holding);
         }
     }
@@ -296,6 +297,10 @@ impl Engine {
             .to_string();
         if id.is_empty() {
             return Err("handoff_id is missing".into());
+        }
+        // A fan-out's id: how its parts are doing, or the combined result.
+        if id.starts_with("x-") {
+            return self.fanout_status(a, &id);
         }
         let child = self
             .st
@@ -369,7 +374,7 @@ impl Engine {
 
     /// What a returned child flight reported, with its check, for
     /// `tower_await`.
-    fn result_text(&self, child: &Flight) -> String {
+    pub(super) fn result_text(&self, child: &Flight) -> String {
         let mut summary = None;
         let mut checks = None;
         for e in &child.timeline {
@@ -522,6 +527,17 @@ impl Engine {
             "Stopped: it ended its turn without tower_return after every reminder",
         );
         self.set_stage(&fid, Stage::NeedsYou);
+        // A fan-out part: the barrier hears it, not the lead one by one.
+        if self.flight(&fid).is_some_and(|f| f.group_id.is_some()) {
+            self.fanout_child_done(
+                &fid,
+                false,
+                Some("stopped without a result: it never called tower_return".into()),
+            );
+            let _ = self.stop_agent(agent_id);
+            self.changed();
+            return;
+        }
         let _ = self.stop_agent(agent_id);
         if let Some(p) = self.child_packet(&fid) {
             if let Some(parent) = self.flight(&fid).and_then(|f| f.parent_id.clone()) {

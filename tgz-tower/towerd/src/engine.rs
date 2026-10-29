@@ -24,6 +24,8 @@ mod acks;
 mod activity;
 #[path = "delegate.rs"]
 mod delegate;
+#[path = "fanouts.rs"]
+mod fanouts;
 #[path = "followup.rs"]
 mod followup;
 #[path = "guard.rs"]
@@ -40,6 +42,8 @@ mod scouts;
 mod sensitive;
 #[path = "settings.rs"]
 mod settings;
+#[path = "swarm.rs"]
+mod swarm;
 
 /// A triage answer: role, how hard the task is, and why.
 #[derive(Debug, Clone, Default)]
@@ -48,6 +52,17 @@ pub struct Triage {
     pub tier: Option<core::router::Tier>,
     pub why: String,
     pub usage: Usage,
+}
+
+/// Why "Auto" picked its fallback role.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum AutoWhy {
+    /// `[triage] fallback_role`.
+    Configured,
+    /// The routed role: it picks its model by the router's tier.
+    Routed,
+    /// No other role can run.
+    Only,
 }
 
 /// Per-agent token -> agent id, shared with the server's auth check.
@@ -85,6 +100,16 @@ pub enum Input {
         launch: Option<String>,
     },
     Tick,
+    /// `RestartDaemon`, a moment after it was acknowledged: save and exit.
+    Shutdown,
+    /// A swarm role's planner answered with its split (or failed).
+    Planned {
+        flight_id: String,
+        role_id: String,
+        worker: String,
+        planned_by: String,
+        result: Result<(String, Usage), String>,
+    },
     /// An LLM agent's reply.
     Llm {
         agent_id: String,
@@ -168,6 +193,12 @@ pub struct Engine {
     stop_after_turn: HashSet<String>,
     /// Persisted local checks were re-run after a restart.
     checks_resumed: bool,
+    /// Fan-outs whose barrier is being walked right now (re-entry guard).
+    fanouts_advancing: HashSet<String>,
+    /// Parts that were running before a restart were looked at.
+    fanouts_resumed: bool,
+    /// Swarm flights whose split the planner is working on now.
+    swarm_planning: HashSet<String>,
     /// Agent id -> how often it was reminded to call tower_return.
     reminded: HashMap<String, u8>,
     /// The CLI connection was refreshed after start.
@@ -243,9 +274,24 @@ impl Engine {
         if let Err(err) = config::seed(&paths.config) {
             eprintln!("tower: could not seed {}: {err}", paths.config.display());
         }
+        // Roles an earlier seed named differently move to their current ids
+        // before seeding, or the new seeds would sit next to the old files.
+        // Tests build their own role sets and must not be renamed under.
+        let migrated = if cfg!(test) || demo {
+            crate::role_migrate::Report::default()
+        } else {
+            crate::role_migrate::run(&paths.config)
+        };
+        for (old, new) in &migrated.renamed {
+            eprintln!("tower: role {old} is now {new}");
+        }
+        for s in migrated.skipped.iter().chain(&migrated.errors) {
+            eprintln!("tower: role migration: {s}");
+        }
         // Roles for the vendor CLIs installed here; tests must not depend on
-        // what this machine has installed.
-        if !cfg!(test) {
+        // what this machine has installed, and a demo run must not seed next
+        // to files the migration above left alone.
+        if !cfg!(test) && !demo {
             if let Err(err) = config::seed_vendor_roles(&paths.config, &config::on_path) {
                 eprintln!("tower: could not seed vendor roles: {err}");
             }
@@ -258,6 +304,7 @@ impl Engine {
             eprintln!("tower: config: {n}");
         }
         let mut st = store::load(&paths.state());
+        let state_renamed = crate::role_migrate::rewrite_state(&mut st, &cfg);
         // ACP agents are child processes of a previous daemon: gone now.
         // Pane agents may still be alive; the Tower view reports live panes.
         for a in st.agents.iter_mut() {
@@ -297,6 +344,9 @@ impl Engine {
             last_msg: HashMap::new(),
             stop_after_turn: HashSet::new(),
             checks_resumed: false,
+            fanouts_advancing: HashSet::new(),
+            fanouts_resumed: false,
+            swarm_planning: HashSet::new(),
             reminded: HashMap::new(),
             connection_refreshed: false,
             last_pane_check: None,
@@ -339,10 +389,70 @@ impl Engine {
             last_routines: None,
         };
         e.refresh_engines();
+        e.startup_notices(&migrated, state_renamed);
         e.history_startup();
         e.schedules_rearm(true);
         e.publish();
         (e, snap_rx)
+    }
+
+    /// What startup changed, for Setup: the PATH fix and the role rename.
+    fn startup_notices(&mut self, migrated: &crate::role_migrate::Report, state_renamed: bool) {
+        use tower_proto::NoticeLevel;
+        if let Some(report) = crate::envpath::report() {
+            let added: Vec<String> = report
+                .added
+                .iter()
+                .map(|p| match std::env::var_os("HOME") {
+                    Some(h) if !h.is_empty() => match p.strip_prefix(&h) {
+                        Ok(rest) => format!("~/{}", rest.display()),
+                        Err(_) => p.display().to_string(),
+                    },
+                    _ => p.display().to_string(),
+                })
+                .collect();
+            match &report.source {
+                crate::envpath::Source::LoginShell if !added.is_empty() => self.notice(
+                    NoticeLevel::Info,
+                    &format!(
+                        "PATH: added {} from your login shell, so agent CLIs installed there are found",
+                        added.join(", ")
+                    ),
+                ),
+                crate::envpath::Source::FallbackOnly(why) => self.notice(
+                    NoticeLevel::Warn,
+                    &format!(
+                        "PATH: could not ask your login shell ({why}); searched the usual install folders{}",
+                        if added.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" and added {}", added.join(", "))
+                        }
+                    ),
+                ),
+                _ => {}
+            }
+        }
+        if !migrated.renamed.is_empty() {
+            let list: Vec<String> = migrated
+                .renamed
+                .iter()
+                .map(|(o, n)| format!("{o} → {n}"))
+                .collect();
+            self.notice(
+                NoticeLevel::Info,
+                &format!(
+                    "Roles renamed to say what they do: {}. Old ids still work for running agents.",
+                    list.join(", ")
+                ),
+            );
+        }
+        for s in migrated.skipped.iter().chain(&migrated.errors) {
+            self.notice(NoticeLevel::Warn, &format!("Role migration: {s}"));
+        }
+        if state_renamed {
+            self.changed();
+        }
     }
 
     pub async fn run(mut self, mut rx: mpsc::UnboundedReceiver<Input>) {
@@ -452,6 +562,107 @@ impl Engine {
         Some(role)
     }
 
+    /// May work that must stay inside your network go to `target`? A routed
+    /// role counts when some `[routing]` engine runs a local model (launch
+    /// then picks only those).
+    fn target_stays_local_ok(&self, target: &RoleCfg, stays_local: bool) -> Result<(), String> {
+        if !stays_local {
+            return Ok(());
+        }
+        if !target.routed && !target.all_local() {
+            return Err(format!(
+                "{} runs outside your network, but this work must stay local; hand it to a local model (tower_delegate) instead",
+                target.name
+            ));
+        }
+        if target.routed && !self.engines.iter().any(|e| e.locality == Locality::Local) {
+            return Err(format!(
+                "{} is routed, and no [routing] engine runs a local model; this work must stay local",
+                target.name
+            ));
+        }
+        Ok(())
+    }
+
+    /// Roles "Auto" may give a flight: not a tool-less `llm` role, able to
+    /// run now (program installed, no warning, terms accepted), and inside
+    /// your network when the work must stay there.
+    fn auto_candidates(&self, local_only: bool) -> Vec<&RoleCfg> {
+        self.cfg
+            .roles
+            .iter()
+            .filter(|r| r.driver != DriverKind::Llm)
+            .filter(|r| self.role_warning(r).is_none())
+            .filter(|r| {
+                self.terms_pending(self.terms_for(r, crate::compliance::Input::Initial))
+                    .is_none()
+            })
+            .filter(|r| self.target_stays_local_ok(r, local_only).is_ok())
+            .collect()
+    }
+
+    /// Where "Auto" sends a flight without a triage answer, and why:
+    /// `[triage] fallback_role` when it can take it, else the routed role
+    /// (it picks its model by the router's tier), else the only role that
+    /// can run at all.
+    fn auto_fallback(&self, local_only: bool) -> Option<(String, AutoWhy)> {
+        // Never the swarm role: it needs this very fallback for its parts.
+        let c: Vec<&RoleCfg> = self
+            .auto_candidates(local_only)
+            .into_iter()
+            .filter(|r| r.swarm.is_none())
+            .collect();
+        if let Some(id) = self
+            .cfg
+            .triage
+            .fallback_role
+            .as_deref()
+            .and_then(|id| self.cfg.resolve_role(id))
+            .map(|r| r.id.clone())
+        {
+            if c.iter().any(|r| r.id == id) {
+                return Some((id, AutoWhy::Configured));
+            }
+        }
+        if let Some(r) = c.iter().find(|r| r.routed) {
+            return Some((r.id.clone(), AutoWhy::Routed));
+        }
+        match c.as_slice() {
+            [only] => Some((only.id.clone(), AutoWhy::Only)),
+            _ => None,
+        }
+    }
+
+    /// Assign a flight by the router's tier alone, no model call. `prefix`
+    /// says why triage was not asked. `false` when no role fits.
+    fn auto_heuristic(&mut self, flight_id: &str, prefix: &str) -> bool {
+        let local_only = self.local_only_reason(flight_id).is_some();
+        let Some((role_id, why)) = self.auto_fallback(local_only) else {
+            return false;
+        };
+        let name = self.role_name(&role_id);
+        let tier = self
+            .flight(flight_id)
+            .and_then(|f| f.route.as_ref())
+            .map(|r| r.tier.clone())
+            .unwrap_or_else(|| "medium".into());
+        let text = match why {
+            AutoWhy::Only => format!("{prefix}: assigned {name} (the only role that can)"),
+            AutoWhy::Routed => format!(
+                "{prefix}: a {tier} task, assigned {name}, which picks its model by task size"
+            ),
+            AutoWhy::Configured => {
+                format!("{prefix}: a {tier} task, assigned {name} ([triage] fallback_role)")
+            }
+        };
+        if let Some(f) = self.flight_mut(flight_id) {
+            f.role_id = Some(role_id);
+            f.stage = Stage::Cleared;
+        }
+        self.note(flight_id, text);
+        true
+    }
+
     fn role_warning(&self, role: &RoleCfg) -> Option<String> {
         if let Some(why) = config::role_missing(role, &self.on_path) {
             return Some(why);
@@ -549,8 +760,13 @@ impl Engine {
                 roles_usable: self.usable_roles().len(),
                 terms_pending: self.terms_pending_notes(),
                 triage_usable: self.usable_triage_role().is_some(),
+                auto_heuristic_role: self
+                    .auto_fallback(false)
+                    .map(|(id, _)| id)
+                    .unwrap_or_default(),
             },
             engines: self.engines.clone(),
+            fanouts: self.st.fanouts.clone(),
             models: self.model_infos(),
             connected_clis: self.connected_clis.clone(),
             engine_ids: self.cfg.routing.engines.keys().cloned().collect(),
@@ -725,7 +941,7 @@ impl Engine {
 
     fn role_name(&self, role_id: &str) -> String {
         self.cfg
-            .role(role_id)
+            .resolve_role(role_id)
             .map(|r| r.name.clone())
             .unwrap_or_else(|| role_id.to_string())
     }
@@ -758,7 +974,20 @@ impl Engine {
                 launch,
             } => self.on_worktree(&flight_id, result, launch),
             Input::Tick => self.tick(),
+            Input::Shutdown => {
+                self.save();
+                let _ = std::fs::remove_file(&self.paths.socket);
+                let _ = std::fs::remove_file(self.paths.token());
+                std::process::exit(0);
+            }
             Input::Llm { agent_id, result } => self.on_llm(&agent_id, result),
+            Input::Planned {
+                flight_id,
+                role_id,
+                worker,
+                planned_by,
+                result,
+            } => self.on_planned(&flight_id, &role_id, &worker, &planned_by, result),
             Input::Polled { watch, result } => self.on_polled(&watch, result),
             Input::Triaged {
                 flight_id,
@@ -804,6 +1033,11 @@ impl Engine {
         self.refresh_connection();
         self.check_adopted_panes();
         self.drain_local_queue();
+        if !self.fanouts_resumed {
+            self.fanouts_resumed = true;
+            self.resume_fanouts();
+        }
+        self.fanout_tick();
         if self.last_cfg_check.elapsed() > Duration::from_secs(2) {
             self.last_cfg_check = Instant::now();
             let fp = config::fingerprint(&self.paths.config);
@@ -955,9 +1189,11 @@ impl Engine {
                 worktree,
                 new_folder,
                 auto_assign,
+                auto_mode,
                 launch,
                 tier,
                 local_only,
+                hands_free,
             } => match self.create_flight(
                 title,
                 brief,
@@ -965,10 +1201,11 @@ impl Engine {
                 workdir,
                 worktree,
                 new_folder,
-                auto_assign,
+                auto_mode.effective(auto_assign),
                 launch,
                 tier,
                 local_only,
+                hands_free,
                 "you",
             ) {
                 Ok(id) => {
@@ -985,6 +1222,19 @@ impl Engine {
                 new_folder,
             } => ack(self.launch_request(&role_id, flight_id, task, workdir, new_folder)),
             ClientMsg::StopAgent { agent_id } => ack(self.stop_agent(&agent_id)),
+            ClientMsg::RestartDaemon => {
+                // Answer first, then leave the way SIGTERM does, from the
+                // engine task so nothing handled in between is lost; the GUI
+                // reconnects and starts a fresh daemon with its own PATH and
+                // build. ACP agents are this process's children and stop with
+                // it; pane agents keep running and re-attach by their tokens.
+                let tx = self.tx.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    let _ = tx.send(Input::Shutdown);
+                });
+                ServerMsg::Ack
+            }
             ClientMsg::SendMessage { agent_id, text } => {
                 // You are talking to it: its turns are not "forgot to report".
                 self.reminded.remove(&agent_id);
@@ -1210,10 +1460,11 @@ impl Engine {
         workdir: Option<String>,
         worktree: bool,
         new_folder: bool,
-        auto_assign: bool,
+        auto_mode: AutoMode,
         launch: bool,
         tier: Option<String>,
         local_only: bool,
+        hands_free: bool,
         started_by: &str,
     ) -> Res {
         let tier = match tier.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
@@ -1227,15 +1478,32 @@ impl Engine {
         } else {
             shorten(title.trim(), 100)
         };
-        if let Some(r) = &role_id {
-            if self.cfg.role(r).is_none() {
-                return Err(format!("Unknown role {r}"));
-            }
-        }
+        let role_id = match role_id {
+            Some(r) => Some(
+                self.cfg
+                    .resolve_role(&r)
+                    .map(|x| x.id.clone())
+                    .ok_or_else(|| format!("Unknown role {r}"))?,
+            ),
+            None => None,
+        };
         let workdir = self.default_workdir(workdir);
         let id = self.new_flight(title, brief, workdir.clone(), started_by);
         if local_only {
             self.mark_local_only(&id, "marked when it was created");
+        }
+        if hands_free {
+            if let Some(f) = self.flight_mut(&id) {
+                f.hands_free = true;
+            }
+            self.note(
+                &id,
+                if self.armed() {
+                    "Hands-free: while Tower is armed, handoffs, fan-outs and messages run without asking; landing still asks"
+                } else {
+                    "Hands-free takes effect while Tower is armed; until then Tower asks"
+                },
+            );
         }
         if new_folder {
             self.give_own_folder(&id)?;
@@ -1252,23 +1520,32 @@ impl Engine {
         } else {
             self.note(&id, "Created");
         }
-        let mut auto = auto_assign && role_id.is_none();
+        let mode = if role_id.is_some() {
+            AutoMode::Off
+        } else {
+            auto_mode
+        };
+        let mut auto = mode == AutoMode::Triage;
         let mut role_id = role_id;
-        if auto && self.usable_triage_role().is_none() {
-            // No triage that can run: with exactly one usable role there is
-            // nothing to pick, so take it; otherwise the flight waits.
-            let usable: Vec<String> = self.usable_roles().iter().map(|r| r.id.clone()).collect();
-            if let [only] = usable.as_slice() {
-                let name = self.role_name(only);
-                if let Some(f) = self.flight_mut(&id) {
-                    f.role_id = Some(only.clone());
-                    f.stage = Stage::Cleared;
-                }
-                self.note(
-                    &id,
-                    format!("No triage role can run: assigned {name} (the only role that can)"),
-                );
-                role_id = Some(only.clone());
+        // No model call: heuristics only, or no triage that can run. The
+        // router's tier (already on the flight) picks the fallback role;
+        // with none, the flight waits for you.
+        let heuristic_why = match mode {
+            AutoMode::Heuristic => Some("Auto (heuristics only)"),
+            AutoMode::Triage if self.usable_triage_role().is_none() => {
+                Some(if self.cfg.triage_role().is_some() {
+                    "The triage role cannot run yet (see Setup), so Auto used heuristics"
+                } else {
+                    "No triage role can run, so Auto used heuristics"
+                })
+            }
+            _ => None,
+        };
+        if let Some(prefix) = heuristic_why {
+            if self.auto_heuristic(&id, prefix) {
+                role_id = self.flight(&id).and_then(|f| f.role_id.clone());
+            } else if mode == AutoMode::Heuristic {
+                self.note(&id, "Auto (heuristics only): no role can take it; pick one");
             } else if self.cfg.triage_role().is_some() {
                 self.note(
                     &id,
@@ -1460,11 +1737,30 @@ impl Engine {
 
     /// Start a role's lead agent on a flight.
     fn launch_flight(&mut self, flight_id: &str, role_id: &str) -> Res {
+        // The current id, whatever the caller (CLI, an older GUI) called it.
+        let role_id = self
+            .cfg
+            .resolve_role(role_id)
+            .map(|r| r.id.clone())
+            .ok_or_else(|| format!("Unknown role {role_id}"))?;
+        let role_id = role_id.as_str();
         let flight = self.flight(flight_id).cloned().ok_or("Unknown flight")?;
         if let Some(a) = flight.agent_id.as_deref().and_then(|a| self.agent(a)) {
             if a.status.is_live() {
                 return Err(format!("{} is already flying {}", a.id, flight.key));
             }
+        }
+        // A swarm role has no agent: Tower splits the task and runs the parts.
+        if let Some(role) = self
+            .cfg
+            .role(role_id)
+            .filter(|r| r.swarm.is_some())
+            .cloned()
+        {
+            if flight.group_id.is_some() {
+                return Err(format!("{} cannot take a part of another split", role.name));
+            }
+            return self.start_swarm(flight_id, &role);
         }
         let brief = prompt::flight_brief(&flight);
         let agent = self.launch(role_id, flight_id, brief, 0)?;
@@ -1481,7 +1777,7 @@ impl Engine {
     fn launch(&mut self, role_id: &str, flight_id: &str, first: String, rung: usize) -> Res {
         let mut role = self
             .cfg
-            .role(role_id)
+            .resolve_role(role_id)
             .cloned()
             .ok_or_else(|| format!("Unknown role {role_id}"))?;
         let live = self.role_load(&role.id);
@@ -1928,6 +2224,14 @@ impl Engine {
             if let Some((true, Stage::InFlight)) = lead {
                 self.set_stage(&fid, Stage::Cleared);
             }
+            // A fan-out part whose agent is gone before it returned failed.
+            let open_part = self.flight(&fid).is_some_and(|f| f.group_id.is_some())
+                && self
+                    .child_packet(&fid)
+                    .is_some_and(|p| p.state == HandoffState::Accepted);
+            if open_part {
+                self.fanout_child_done(&fid, false, Some(format!("its agent {why}")));
+            }
         }
         self.changed();
     }
@@ -1953,6 +2257,20 @@ impl Engine {
                 "deleted before it landed",
             );
         }
+        // A deleted part fails its fan-out's part; a deleted flight with a
+        // split under way cancels it.
+        self.fanout_child_done(flight_id, false, Some("its flight was deleted".into()));
+        let owned: Vec<String> = self
+            .st
+            .fanouts
+            .iter()
+            .filter(|x| x.flight_id == flight_id && x.status.is_open())
+            .map(|x| x.id.clone())
+            .collect();
+        for id in owned {
+            self.cancel_fanout(&id, "its flight was deleted");
+        }
+        self.st.local_queue.retain(|(c, _)| c != flight_id);
         self.st.flight_schedule.remove(flight_id);
         self.st.flights.retain(|f| f.id != flight_id);
         self.st
@@ -2639,6 +2957,7 @@ impl Engine {
             "tower_return" => self.tool_return(&a, &fid, &s("summary")),
             "tower_models" => self.tool_models(),
             "tower_delegate" => self.tool_delegate(&a, &fid, args),
+            "tower_fanout" => self.tool_fanout(&a, &fid, args),
             "tower_await" => self.tool_await(&a, args),
             "tower_post" => {
                 if !self.cfg.extras.frequencies {
@@ -2748,36 +3067,49 @@ impl Engine {
         from_flight: &str,
         from_role: &str,
         return_to: &str,
-        mut packet: HandoffPacket,
+        packet: HandoffPacket,
         by_human: bool,
     ) -> Res {
-        let target = self.cfg.role(&packet.to_role).cloned().ok_or_else(|| {
-            let ids: Vec<_> = self.cfg.roles.iter().map(|r| r.id.clone()).collect();
-            format!(
-                "Unknown role {:?}; roles are: {}",
-                packet.to_role,
-                ids.join(", ")
-            )
-        })?;
+        let (child_id, packet, target) =
+            self.make_child(from_flight, from_role, return_to, packet, "handoff")?;
+        let key = self
+            .flight(&child_id)
+            .map(|f| f.key.clone())
+            .unwrap_or_default();
+        self.release_or_ask(from_flight, &child_id, &packet, &target, &key, by_human)
+    }
+
+    /// A child flight for `packet`, handed down from `from_flight`: the
+    /// target resolved (old ids too), the local-only rule checked, the
+    /// packet numbered and validated, the lineage extended. The packet
+    /// stays a draft; the caller releases it.
+    fn make_child(
+        &mut self,
+        from_flight: &str,
+        from_role: &str,
+        return_to: &str,
+        mut packet: HandoffPacket,
+        started_by: &str,
+    ) -> Result<(String, HandoffPacket, RoleCfg), String> {
+        let target = self
+            .cfg
+            .resolve_role(&packet.to_role)
+            .cloned()
+            .ok_or_else(|| {
+                let ids: Vec<_> = self.cfg.roles.iter().map(|r| r.id.clone()).collect();
+                format!(
+                    "Unknown role {:?}; roles are: {}",
+                    packet.to_role,
+                    ids.join(", ")
+                )
+            })?;
+        // An agent started before a rename may still use the old id.
+        packet.to_role = target.id.clone();
         let parent = self.flight(from_flight).cloned().ok_or("Flight is gone")?;
         // Sensitive work only goes to a role that stays inside your network
         // (a routed role is limited to local engines at launch).
         let stays_local = packet.local_only || self.local_only_reason(from_flight).is_some();
-        if stays_local && !target.routed && !target.all_local() {
-            return Err(format!(
-                "{} runs outside your network, but this work must stay local; hand it to a local model (tower_delegate) instead",
-                target.name
-            ));
-        }
-        if stays_local
-            && target.routed
-            && !self.engines.iter().any(|e| e.locality == Locality::Local)
-        {
-            return Err(format!(
-                "{} is routed, and no [routing] engine runs a local model; this work must stay local",
-                target.name
-            ));
-        }
+        self.target_stays_local_ok(&target, stays_local)?;
         self.st.counters.handoff += 1;
         packet.id = format!("h-{}", self.st.counters.handoff);
         packet.from_role = if from_role.is_empty() {
@@ -2827,6 +3159,8 @@ impl Engine {
             parent_id: Some(parent.id.clone()),
             // An explicit mark; a parent's or folder's rule is found anew.
             local_only: packet.local_only,
+            // A hands-free flight's children run the same way.
+            hands_free: parent.hands_free,
             timeline: vec![TimelineEntry {
                 at_unix: now,
                 body: TimelineBody::Handoff {
@@ -2835,14 +3169,28 @@ impl Engine {
             }],
             ..Default::default()
         };
-        let child_id = self.push_flight(child, "handoff");
+        let child_id = self.push_flight(child, started_by);
         self.timeline(
             from_flight,
             TimelineBody::Handoff {
                 packet: packet.clone(),
             },
         );
+        Ok((child_id, packet, target))
+    }
 
+    /// A one-off handoff's child: release it now if the policy allows,
+    /// else ask in the Inbox.
+    fn release_or_ask(
+        &mut self,
+        from_flight: &str,
+        child_id: &str,
+        packet: &HandoffPacket,
+        target: &RoleCfg,
+        key: &str,
+        by_human: bool,
+    ) -> Res {
+        let child_id = child_id.to_string();
         // `auto_release` (deprecated) and `handoff.release = "auto"` both
         // only release on their own while armed: the policy decides, and the
         // core rule sees the result as the clearance. A role that only runs
@@ -3007,9 +3355,16 @@ impl Engine {
                         .map(|r| r.max_concurrency)
                         .unwrap_or(1)
             {
-                self.queue_local(child_id, packet_id, &m);
+                self.queue_local(child_id, packet_id, &format!("waiting for {m} to be free"));
+                self.fanout_part_state(child_id, TaskState::Queued, None);
                 return Ok(delegate::QUEUED.to_string());
             }
+        }
+        // A fan-out part waits for a free slot instead of failing.
+        if let Some(why) = self.fanout_wait(child_id, &packet) {
+            self.queue_local(child_id, packet_id, &why);
+            self.fanout_part_state(child_id, TaskState::Queued, None);
+            return Ok(delegate::QUEUED.to_string());
         }
         self.st.local_queue.retain(|(c, _)| c != child_id);
         self.set_packet_state(packet_id, HandoffState::Released);
@@ -3032,6 +3387,20 @@ impl Engine {
                     child_id,
                     format!("Released to {} ({agent})", self.role_name(&packet.to_role)),
                 );
+                self.fanout_part_state(child_id, TaskState::Running, None);
+                // A part that starts later (from the queue) starts its clock now.
+                if let Some(gid) = child.group_id.as_deref() {
+                    let now = now_unix();
+                    if let Some(f) = self.st.fanouts.iter_mut().find(|x| x.id == gid) {
+                        if let Some(t) = f
+                            .subtasks
+                            .iter_mut()
+                            .find(|t| t.flight_id.as_deref() == Some(child_id))
+                        {
+                            t.started_unix = Some(now);
+                        }
+                    }
+                }
                 Ok(agent)
             }
             Err(e) => {
@@ -3042,6 +3411,13 @@ impl Engine {
                 if let Some(parent) = child.parent_id.as_deref() {
                     self.note(parent, format!("Handoff {packet_id} could not start: {e}"));
                 }
+                // A fan-out part that cannot start is a failed part; the
+                // barrier moves on the next tick.
+                self.fanout_part_state(
+                    child_id,
+                    TaskState::Failed,
+                    Some(format!("could not start: {e}")),
+                );
                 Err(e)
             }
         }
@@ -3085,6 +3461,10 @@ impl Engine {
                     .into(),
             ),
         };
+        // A fan-out part: the result waits at the barrier for the others.
+        if child.group_id.is_some() {
+            return self.fanout_return(a, child_id, &packet, summary);
+        }
         self.set_packet_state(&packet.id, HandoffState::Returned);
         self.timeline(
             child_id,
@@ -3341,6 +3721,34 @@ impl Engine {
             self.note(flight_id, format!("Gate failed: {failed}"));
             let per = self.cfg.gates.failures_per_rung.max(1);
             let suggest = f.failures + 1 >= per;
+            // Hands-free and armed, with an agent to fix it: the output goes
+            // straight to the agent and you are asked only once the failures
+            // reach `failures_per_rung` (escalating costs money).
+            let lead_live = f
+                .agent_id
+                .as_deref()
+                .and_then(|a| self.agent(a))
+                .is_some_and(|a| a.status.is_live());
+            if f.hands_free && self.armed() && lead_live && !suggest {
+                if let Some(fm) = self.flight_mut(flight_id) {
+                    fm.stage = Stage::InFlight;
+                }
+                self.note(
+                    flight_id,
+                    format!(
+                        "Hands-free: the output went to the agent to fix ({} of {per} failures)",
+                        f.failures + 1
+                    ),
+                );
+                if let Some(lead) = f.agent_id.clone() {
+                    self.deliver_tower(
+                        &lead,
+                        format!("[Tower] Gate `{failed}` failed on {}. Output (tail):\n```\n{out}\n```\nFix it, then call tower_complete again.", f.key),
+                        "the gate failure",
+                    );
+                }
+                return;
+            }
             let mut options = vec![InboxOption {
                 id: "retry".into(),
                 label: "Run again".into(),
@@ -3495,7 +3903,11 @@ impl Engine {
     fn escalate_now(&mut self, flight_id: &str) -> Res {
         let f = self.flight(flight_id).cloned().ok_or("Unknown flight")?;
         let role_id = f.role_id.clone().ok_or("The flight has no role yet")?;
-        let role = self.cfg.role(&role_id).cloned().ok_or("Unknown role")?;
+        let role = self
+            .cfg
+            .resolve_role(&role_id)
+            .cloned()
+            .ok_or("Unknown role")?;
         let lead = f.agent_id.clone();
         let rung = lead
             .as_deref()
@@ -3861,10 +4273,11 @@ impl Engine {
     /// Start polls that are due (or all of them with `force`).
     /// Assign a flight to a role, and launch if asked.
     fn clear_to(&mut self, flight_id: &str, role_id: &str, launch: bool, why: Option<String>) {
-        if self.cfg.role(role_id).is_none() {
+        let Some(role_id) = self.cfg.resolve_role(role_id).map(|r| r.id.clone()) else {
             self.note(flight_id, format!("Unknown role {role_id}; left holding"));
             return;
-        }
+        };
+        let role_id = role_id.as_str();
         let name = self.role_name(role_id);
         if let Some(f) = self.flight_mut(flight_id) {
             f.role_id = Some(role_id.to_string());
@@ -3881,7 +4294,9 @@ impl Engine {
         }
     }
 
-    /// Triage a manual "Auto" flight with the configured triage role.
+    /// Triage a manual "Auto" flight with the configured triage role. With
+    /// no answer, or an answer naming a role that cannot run, it goes to the
+    /// fallback (`auto_fallback`) instead of waiting.
     fn start_auto_triage(&mut self, flight_id: &str, launch: bool) {
         let Some(role) = self.cfg.triage_role().cloned() else {
             return;
@@ -3895,7 +4310,9 @@ impl Engine {
         } else {
             shorten(f.brief.trim(), 6000)
         };
-        self.start_triage(flight_id, &role, what, body, launch, None);
+        let local_only = self.local_only_reason(flight_id).is_some();
+        let fallback = self.auto_fallback(local_only).map(|(id, _)| id);
+        self.start_triage(flight_id, &role, what, body, launch, fallback);
     }
 
     /// Ask `triage` (an llm or acp role, no tools) which role should take a
@@ -3909,12 +4326,18 @@ impl Engine {
         launch: bool,
         fallback: Option<String>,
     ) {
+        // Only roles that can take the flight now: a pick that cannot run
+        // would only bounce to the fallback.
+        let local_only = self.local_only_reason(flight_id).is_some();
         let roles: Vec<String> = self
-            .cfg
-            .roles
-            .iter()
-            .filter(|r| r.driver != DriverKind::Llm)
+            .auto_candidates(local_only)
+            .into_iter()
             .map(|r| {
+                let about = if r.summary.trim().is_empty() {
+                    r.mission.trim().lines().next().unwrap_or("").trim()
+                } else {
+                    r.summary.trim()
+                };
                 format!(
                     "- {}{}: {}",
                     r.id,
@@ -3923,7 +4346,7 @@ impl Engine {
                     } else {
                         ""
                     },
-                    r.mission.trim().lines().next().unwrap_or("").trim()
+                    about
                 )
             })
             .collect();
@@ -4094,19 +4517,26 @@ impl Engine {
                         self.route_flight(flight_id, Some((t, "triage")));
                     }
                 }
-                let valid = role.filter(|r| {
-                    self.cfg
-                        .role(r)
-                        .map(|c| c.driver != DriverKind::Llm)
-                        .unwrap_or(false)
-                });
+                // The answer must name a role that can take the flight now.
+                let local_only = self.local_only_reason(flight_id).is_some();
+                let candidates: Vec<String> = self
+                    .auto_candidates(local_only)
+                    .iter()
+                    .map(|r| r.id.clone())
+                    .collect();
+                let named = role.clone();
+                let valid = role
+                    .and_then(|r| self.cfg.resolve_role(&r).map(|c| c.id.clone()))
+                    .filter(|r| candidates.contains(r));
                 match valid {
                     Some(r) => self.clear_after_triage(flight_id, &r, launch, Some(why)),
                     None => {
-                        let why = if why.is_empty() {
-                            "no answer".to_string()
-                        } else {
-                            why
+                        let why = match named {
+                            Some(n) if !n.trim().is_empty() => {
+                                format!("it named {n}, which cannot take it now")
+                            }
+                            _ if why.is_empty() => "no answer".to_string(),
+                            _ => why,
                         };
                         self.note(flight_id, format!("Triage found no fitting role: {why}"));
                         if let Some(r) = fallback {
@@ -4652,9 +5082,11 @@ mod tests {
                 worktree: false,
                 new_folder: false,
                 auto_assign: false,
+                auto_mode: AutoMode::Off,
                 launch: true,
                 tier: tier.map(str::to_string),
                 local_only: false,
+                hands_free: false,
             },
         );
         assert!(matches!(r, ServerMsg::Created { .. }), "{r:?}");
@@ -4796,9 +5228,11 @@ mod tests {
                 worktree: false,
                 new_folder: false,
                 auto_assign: false,
+                auto_mode: AutoMode::Off,
                 launch: false,
                 tier: Some("enormous".into()),
                 local_only: false,
+                hands_free: false,
             },
         );
         assert!(matches!(r, ServerMsg::Error { .. }));
@@ -5178,9 +5612,11 @@ mod tests {
                 worktree: false,
                 new_folder: true,
                 auto_assign: false,
+                auto_mode: AutoMode::Off,
                 launch: false,
                 tier: None,
                 local_only: false,
+                hands_free: false,
             },
         );
         assert_eq!(
@@ -5340,9 +5776,11 @@ for line in sys.stdin:
                 worktree: false,
                 new_folder: false,
                 auto_assign: true,
+                auto_mode: AutoMode::Off,
                 launch: false,
                 tier: None,
                 local_only: false,
+                hands_free: false,
             },
         );
         let fid = e.st.flights[0].id.clone();
@@ -5376,33 +5814,1048 @@ for line in sys.stdin:
         assert!(f.timeline.iter().any(|t| matches!(&t.body, TimelineBody::System { text } if text.contains("small mechanical change"))));
     }
 
+    /// A "New flight" with Auto and nothing else set.
+    fn auto_flight(
+        dir: &std::path::Path,
+        title: &str,
+        mode: AutoMode,
+        local_only: bool,
+    ) -> ClientMsg {
+        ClientMsg::CreateFlight {
+            title: title.into(),
+            brief: String::new(),
+            role_id: None,
+            workdir: Some(dir.display().to_string()),
+            worktree: false,
+            new_folder: false,
+            auto_assign: true,
+            auto_mode: mode,
+            launch: false,
+            tier: None,
+            local_only,
+            hands_free: false,
+        }
+    }
+
+    fn has_note(f: &Flight, part: &str) -> bool {
+        f.timeline
+            .iter()
+            .any(|t| matches!(&t.body, TimelineBody::System { text } if text.contains(part)))
+    }
+
     #[tokio::test]
-    async fn auto_without_a_triage_role_says_so() {
+    async fn auto_without_a_triage_role_routes_by_heuristics_or_says_so() {
         let (mut e, _rx, dir) = engine();
         e.cfg
             .roles
             .retain(|r| !matches!(r.driver, DriverKind::Llm) && r.id != "ground-claude");
         assert_eq!(e.snapshot().triage_role, "");
+        assert_eq!(e.snapshot().setup.auto_heuristic_role, "crew");
+        // The routed role takes it: it picks its model by the router's tier.
         ask(
             &mut e,
-            ClientMsg::CreateFlight {
-                title: "x".into(),
-                brief: String::new(),
-                role_id: None,
-                workdir: Some(dir.display().to_string()),
-                worktree: false,
-                new_folder: false,
-                auto_assign: true,
-                launch: true,
+            auto_flight(&dir, "Rename a variable", AutoMode::Off, false),
+        );
+        let f = e.st.flights[0].clone();
+        assert_eq!(f.role_id.as_deref(), Some("crew"));
+        assert_eq!(f.stage, Stage::Cleared);
+        assert!(has_note(&f, "used heuristics"), "{:?}", f.timeline);
+        // With no routed role and several that could, nobody is guessed.
+        e.cfg.roles.retain(|r| !r.routed);
+        assert_eq!(e.snapshot().setup.auto_heuristic_role, "");
+        ask(&mut e, auto_flight(&dir, "x", AutoMode::Off, false));
+        let f = e.st.flights[1].clone();
+        assert_eq!(f.stage, Stage::Holding);
+        assert!(has_note(&f, "No triage role"), "{:?}", f.timeline);
+    }
+
+    #[tokio::test]
+    async fn heuristics_only_never_asks_triage_and_honours_the_fallback_role() {
+        let (mut e, mut rx, dir) = engine();
+        // A triage role that could run is there, and is still not asked.
+        assert!(e.snapshot().setup.triage_usable);
+        ask(
+            &mut e,
+            auto_flight(&dir, "Fix a typo", AutoMode::Heuristic, false),
+        );
+        let f = e.st.flights[0].clone();
+        assert_eq!(f.role_id.as_deref(), Some("crew"));
+        assert!(has_note(&f, "Auto (heuristics only)"), "{:?}", f.timeline);
+        assert!(!has_note(&f, "is choosing a role"), "{:?}", f.timeline);
+        assert!(e.acp.is_empty(), "no triage session was started");
+        while let Ok(i) = rx.try_recv() {
+            assert!(!matches!(i, Input::Triaged { .. }), "triage was asked");
+        }
+        // `[triage] fallback_role` wins over the routed role when it can run.
+        e.cfg.triage.fallback_role = Some("approach".into());
+        ask(
+            &mut e,
+            auto_flight(&dir, "Fix a typo", AutoMode::Heuristic, false),
+        );
+        let f = e.st.flights[1].clone();
+        assert_eq!(f.role_id.as_deref(), Some("approach"));
+        assert!(has_note(&f, "fallback_role"), "{:?}", f.timeline);
+        // A fallback that cannot run (opencode is not installed) is skipped.
+        e.cfg.triage.fallback_role = Some("ground".into());
+        ask(
+            &mut e,
+            auto_flight(&dir, "Fix a typo", AutoMode::Heuristic, false),
+        );
+        assert_eq!(e.st.flights[2].role_id.as_deref(), Some("crew"));
+        // An old id names the renamed role.
+        e.cfg.aliases.insert("lead".into(), "approach".into());
+        e.cfg.triage.fallback_role = Some("lead".into());
+        ask(
+            &mut e,
+            auto_flight(&dir, "Fix a typo", AutoMode::Heuristic, false),
+        );
+        assert_eq!(e.st.flights[3].role_id.as_deref(), Some("approach"));
+    }
+
+    #[tokio::test]
+    async fn a_triage_pick_that_cannot_run_goes_to_the_fallback() {
+        let (mut e, _rx, dir) = engine();
+        let id = match ask(
+            &mut e,
+            auto_flight(&dir, "Rename it", AutoMode::Heuristic, false),
+        ) {
+            ServerMsg::Created { id, .. } => id,
+            other => panic!("{other:?}"),
+        };
+        // Start over as if triage had been asked, then answer with a role
+        // whose program is not installed.
+        if let Some(f) = e.flight_mut(&id) {
+            f.role_id = None;
+            f.stage = Stage::Holding;
+        }
+        e.handle(Input::Triaged {
+            flight_id: id.clone(),
+            launch: false,
+            fallback: e.auto_fallback(false).map(|(r, _)| r),
+            result: Ok(Triage {
+                role: Some("ground".into()),
                 tier: None,
-                local_only: false,
+                why: "small change".into(),
+                usage: Usage::default(),
+            }),
+        });
+        let f = e.flight(&id).unwrap().clone();
+        assert_eq!(f.role_id.as_deref(), Some("crew"));
+        assert!(
+            has_note(&f, "it named ground, which cannot take it now"),
+            "{:?}",
+            f.timeline
+        );
+        // The candidates offered to triage are the roles that can run.
+        let offered: Vec<&str> = e
+            .auto_candidates(false)
+            .iter()
+            .map(|r| r.id.as_str())
+            .collect();
+        assert!(
+            offered.contains(&"approach") && offered.contains(&"crew"),
+            "{offered:?}"
+        );
+        assert!(
+            !offered.contains(&"ground"),
+            "opencode is not installed: {offered:?}"
+        );
+        assert!(
+            !offered.contains(&"triage"),
+            "llm roles do no work: {offered:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_only_work_never_gets_a_cloud_role_from_auto() {
+        let (mut e, _rx, dir) = engine();
+        // Every role that can run here is a cloud one, and no engine is local.
+        assert!(e.auto_candidates(true).is_empty());
+        assert!(e.auto_fallback(true).is_none());
+        ask(
+            &mut e,
+            auto_flight(&dir, "Look at payroll", AutoMode::Heuristic, true),
+        );
+        let f = e.st.flights[0].clone();
+        assert_eq!(f.role_id, None);
+        assert_eq!(f.stage, Stage::Holding);
+        assert!(has_note(&f, "no role can take it"), "{:?}", f.timeline);
+    }
+
+    // -- fan-out -------------------------------------------------------------
+
+    /// A lead agent (busy, so messages to it queue) on a fresh flight, and
+    /// Ground runnable as a stand-in ACP program.
+    fn fanout_setup(e: &mut Engine, dir: &std::path::Path) -> (String, String) {
+        e.on_path = |_| true;
+        let ground = e.cfg.roles.iter_mut().find(|r| r.id == "ground").unwrap();
+        ground.command = vec!["cat".into()];
+        ground.max_concurrency = 4;
+        let fid = e.new_flight(
+            "Big change".into(),
+            String::new(),
+            Some(dir.display().to_string()),
+            "you",
+        );
+        e.st.agents.push(Agent {
+            id: "lead-1".into(),
+            role_id: "approach".into(),
+            status: AgentStatus::Working,
+            driver: DriverKind::Acp,
+            flight_id: Some(fid.clone()),
+            ..Default::default()
+        });
+        if let Some(f) = e.flight_mut(&fid) {
+            f.role_id = Some("approach".into());
+            f.agent_id = Some("lead-1".into());
+            f.stage = Stage::InFlight;
+        }
+        (fid, "lead-1".to_string())
+    }
+
+    /// Two independent parts and one that needs both.
+    fn diamond() -> Value {
+        json!({
+            "analysis": "two modules, then the glue",
+            "to_role": "ground",
+            "subtasks": [
+                {"id": "s1", "title": "Parser", "brief": "Write the parser", "target_files": ["src/parse.rs"]},
+                {"id": "s2", "title": "Lexer", "brief": "Write the lexer", "target_files": ["src/lex.rs"]},
+                {"id": "s3", "title": "Glue", "brief": "Wire both into main", "depends_on": ["s1", "s2"], "target_files": ["src/main.rs"]}
+            ]
+        })
+    }
+
+    fn part_child(e: &Engine, task: &str) -> Flight {
+        let f = &e.st.fanouts[0];
+        let fid = f
+            .task(task)
+            .and_then(|t| t.flight_id.clone())
+            .expect("started");
+        e.flight(&fid).unwrap().clone()
+    }
+
+    fn part_state(e: &Engine, task: &str) -> TaskState {
+        e.st.fanouts[0].task(task).unwrap().state
+    }
+
+    fn arm_fanout(e: &mut Engine) {
+        e.cfg
+            .policy
+            .actions
+            .insert("handoff.fanout".into(), crate::policy::Level::Auto);
+        e.set_armed(true);
+    }
+
+    fn stop_all(e: &mut Engine) {
+        let live: Vec<String> = e.acp.keys().cloned().collect();
+        for a in live {
+            let _ = e.stop_agent(&a);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_fanout_asks_once_runs_wave_by_wave_and_answers_once() {
+        let (mut e, _rx, dir) = engine();
+        let (fid, lead) = fanout_setup(&mut e, &dir);
+        // Disarmed: one question for the whole plan, nothing started yet.
+        let (ok, text) = call_tool(&mut e, &lead, "tower_fanout", diamond());
+        assert!(ok, "{text}");
+        assert!(text.contains("waiting for the human's clearance"), "{text}");
+        assert_eq!(e.st.fanouts[0].status, FanoutStatus::Waiting);
+        assert!(!e.st.flights.iter().any(|f| f.group_id.is_some()));
+        let item =
+            e.st.inbox
+                .iter()
+                .find(|i| i.title.starts_with("Fan out 3 parts"))
+                .expect("one clearance item")
+                .clone();
+        assert!(
+            item.detail.contains("Wave 1: Parser · Lexer"),
+            "{}",
+            item.detail
+        );
+        assert!(item.detail.contains("Wave 2: Glue"), "{}", item.detail);
+        ask(
+            &mut e,
+            ClientMsg::ResolveInbox {
+                item_id: item.id,
+                approve: true,
+                option_id: Some("run".into()),
+                text: None,
             },
         );
-        let f = &e.st.flights[0];
-        assert_eq!(f.stage, Stage::Holding);
-        assert!(f.timeline.iter().any(
-            |t| matches!(&t.body, TimelineBody::System { text } if text.contains("No triage role"))
+        // Wave 1: both independent parts run at once, as children of the flight.
+        assert_eq!(e.st.fanouts[0].status, FanoutStatus::Running);
+        assert_eq!(part_state(&e, "s1"), TaskState::Running);
+        assert_eq!(part_state(&e, "s2"), TaskState::Running);
+        assert_eq!(part_state(&e, "s3"), TaskState::Pending);
+        let c1 = part_child(&e, "s1");
+        assert_eq!(c1.parent_id.as_deref(), Some(fid.as_str()));
+        assert_eq!(c1.group_id.as_deref(), Some("x-1"));
+        assert_eq!(c1.key, "TWR-1.1");
+        assert_eq!(c1.started_by.as_deref(), Some("fanout"));
+        let brief = c1.brief.clone();
+        assert!(brief.contains("Files you own: src/parse.rs"), "{brief}");
+        assert!(brief.contains("same folder right now"), "{brief}");
+        // No Inbox item per part.
+        assert!(!e
+            .st
+            .inbox
+            .iter()
+            .any(|i| i.title.starts_with("Release handoff")));
+
+        // s1 returns: s3 still waits for s2.
+        let a1 = c1.agent_id.clone().unwrap();
+        let (ok, text) = call_tool(
+            &mut e,
+            &a1,
+            "tower_return",
+            json!({"summary": "Parser done"}),
+        );
+        assert!(ok && text.contains("fan-out x-1"), "{text}");
+        assert_eq!(part_state(&e, "s1"), TaskState::Returned);
+        assert_eq!(part_state(&e, "s3"), TaskState::Pending);
+        // The lead only heard that its plan was cleared: no result per part.
+        let q = e.st.queues.get(&lead).cloned().unwrap_or_default();
+        assert_eq!(q.len(), 1, "{q:?}");
+        assert!(q[0].contains("was cleared and has started"), "{q:?}");
+        let (_, status) = call_tool(&mut e, &lead, "tower_await", json!({"handoff_id": "x-1"}));
+        assert!(
+            status.starts_with("status: running") && status.contains("s1 returned"),
+            "{status}"
+        );
+
+        // s2 returns: wave 2 starts.
+        let a2 = part_child(&e, "s2").agent_id.unwrap();
+        call_tool(
+            &mut e,
+            &a2,
+            "tower_return",
+            json!({"summary": "Lexer done"}),
+        );
+        assert_eq!(e.st.fanouts[0].wave, 1);
+        assert_eq!(part_state(&e, "s3"), TaskState::Running);
+
+        // s3 returns: one combined result for the lead, and the timeline.
+        let a3 = part_child(&e, "s3").agent_id.unwrap();
+        call_tool(&mut e, &a3, "tower_return", json!({"summary": "Glued"}));
+        assert_eq!(e.st.fanouts[0].status, FanoutStatus::Done);
+        send_pending_message(&mut e, &lead, "Result of fan-out x-1");
+        let q = &e.st.queues[&lead];
+        assert_eq!(q.len(), 2, "the clearance note and exactly one result");
+        assert!(q[1].contains("3 of 3 parts returned"), "{}", q[1]);
+        assert!(
+            q[1].contains("Parser done") && q[1].contains("Glued"),
+            "{}",
+            q[1]
+        );
+        let parent = e.flight(&fid).unwrap();
+        assert!(parent.timeline.iter().any(|t| matches!(&t.body,
+            TimelineBody::Message { from, text } if from == "tower" && text.contains("Fan-out x-1"))));
+        let (_, status) = call_tool(&mut e, &lead, "tower_await", json!({"handoff_id": "x-1"}));
+        assert!(status.starts_with("status: returned"), "{status}");
+        // Somebody else's fan-out is not theirs to await.
+        let (ok, _) = call_tool(&mut e, &a1, "tower_await", json!({"handoff_id": "x-1"}));
+        assert!(!ok);
+        stop_all(&mut e);
+    }
+
+    #[tokio::test]
+    async fn parts_wait_for_a_slot_and_start_when_one_frees() {
+        let (mut e, _rx, dir) = engine();
+        let (_fid, lead) = fanout_setup(&mut e, &dir);
+        arm_fanout(&mut e);
+        let mut plan = diamond();
+        plan["max_agents"] = json!(1);
+        let (ok, text) = call_tool(&mut e, &lead, "tower_fanout", plan);
+        assert!(ok && text.contains("1 running, 1 queued"), "{text}");
+        assert_eq!(part_state(&e, "s1"), TaskState::Running);
+        assert_eq!(part_state(&e, "s2"), TaskState::Queued);
+        let c2 = part_child(&e, "s2");
+        assert!(e.st.local_queue.iter().any(|(c, _)| c == &c2.id));
+        assert!(
+            has_note(&c2, "Queued: waiting for a free slot"),
+            "{:?}",
+            c2.timeline
+        );
+        // Still full: the queue keeps it.
+        e.drain_local_queue();
+        assert_eq!(part_state(&e, "s2"), TaskState::Queued);
+        let a1 = part_child(&e, "s1").agent_id.unwrap();
+        call_tool(&mut e, &a1, "tower_return", json!({"summary": "ok"}));
+        e.drain_local_queue();
+        assert_eq!(part_state(&e, "s2"), TaskState::Running);
+        stop_all(&mut e);
+    }
+
+    #[tokio::test]
+    async fn a_failed_part_skips_what_needs_it_and_the_lead_hears_once() {
+        let (mut e, _rx, dir) = engine();
+        let (_fid, lead) = fanout_setup(&mut e, &dir);
+        arm_fanout(&mut e);
+        call_tool(&mut e, &lead, "tower_fanout", diamond());
+        // s1's agent dies before returning.
+        let a1 = part_child(&e, "s1").agent_id.unwrap();
+        e.mark_offline(&a1, "exited");
+        assert_eq!(part_state(&e, "s1"), TaskState::Failed);
+        let a2 = part_child(&e, "s2").agent_id.unwrap();
+        call_tool(
+            &mut e,
+            &a2,
+            "tower_return",
+            json!({"summary": "Lexer done"}),
+        );
+        // An agent's own fan-out goes on: s3 needs s1, so it is skipped.
+        assert_eq!(part_state(&e, "s3"), TaskState::Skipped);
+        assert_eq!(e.st.fanouts[0].status, FanoutStatus::Partial);
+        send_pending_message(&mut e, &lead, "1 of 3 parts returned, 1 failed, 1 skipped");
+        let q = &e.st.queues[&lead][0];
+        assert!(q.contains("its agent exited"), "{q}");
+        assert!(q.contains("were not redone"), "{q}");
+        stop_all(&mut e);
+    }
+
+    #[tokio::test]
+    async fn on_failure_ask_pauses_and_retry_runs_the_part_again() {
+        let (mut e, _rx, dir) = engine();
+        let (_fid, lead) = fanout_setup(&mut e, &dir);
+        arm_fanout(&mut e);
+        e.cfg.fanout.on_failure = "ask".into();
+        call_tool(&mut e, &lead, "tower_fanout", diamond());
+        let a1 = part_child(&e, "s1").agent_id.unwrap();
+        e.mark_offline(&a1, "exited");
+        let a2 = part_child(&e, "s2").agent_id.unwrap();
+        call_tool(&mut e, &a2, "tower_return", json!({"summary": "ok"}));
+        assert_eq!(e.st.fanouts[0].status, FanoutStatus::Paused);
+        let item =
+            e.st.inbox
+                .iter()
+                .find(|i| i.title.contains("Fan-out x-1: 1 part failed"))
+                .expect("asked")
+                .clone();
+        let ids: Vec<&str> = item.options.iter().map(|o| o.id.as_str()).collect();
+        assert_eq!(ids, vec!["retry", "continue", "stop"]);
+        ask(
+            &mut e,
+            ClientMsg::ResolveInbox {
+                item_id: item.id,
+                approve: true,
+                option_id: Some("retry".into()),
+                text: None,
+            },
+        );
+        assert_eq!(e.st.fanouts[0].status, FanoutStatus::Running);
+        assert_eq!(part_state(&e, "s1"), TaskState::Running, "started again");
+        assert_eq!(e.st.fanouts[0].task("s1").unwrap().retries, 1);
+        assert_eq!(part_state(&e, "s3"), TaskState::Pending);
+        // Fails again: no retry left, only go on or stop.
+        let a1 = part_child(&e, "s1").agent_id.unwrap();
+        e.mark_offline(&a1, "exited");
+        let item =
+            e.st.inbox
+                .iter()
+                .find(|i| i.title.contains("part failed"))
+                .unwrap()
+                .clone();
+        assert!(!item.options.iter().any(|o| o.id == "retry"));
+        ask(
+            &mut e,
+            ClientMsg::ResolveInbox {
+                item_id: item.id,
+                approve: true,
+                option_id: Some("stop".into()),
+                text: None,
+            },
+        );
+        assert_eq!(part_state(&e, "s3"), TaskState::Skipped);
+        assert_eq!(e.st.fanouts[0].status, FanoutStatus::Partial);
+        stop_all(&mut e);
+    }
+
+    #[tokio::test]
+    async fn plans_that_cannot_run_are_refused_before_anything_starts() {
+        let (mut e, _rx, dir) = engine();
+        let (fid, lead) = fanout_setup(&mut e, &dir);
+        arm_fanout(&mut e);
+        let refused = |e: &mut Engine, plan: Value| {
+            let (ok, text) = call_tool(e, "lead-1", "tower_fanout", plan);
+            assert!(!ok, "{text}");
+            text
+        };
+        // One part is a handoff, not a fan-out.
+        let text = refused(
+            &mut e,
+            json!({"to_role": "ground", "subtasks": [{"title": "x", "brief": "y"}]}),
+        );
+        assert!(text.contains("tower_handoff"), "{text}");
+        // A cycle, a path out of the folder, a role that does no work.
+        let text = refused(
+            &mut e,
+            json!({"to_role": "ground", "subtasks": [
+            {"id": "a", "title": "a", "depends_on": ["b"]}, {"id": "b", "title": "b", "depends_on": ["a"]}]}),
+        );
+        assert!(text.contains("cycle"), "{text}");
+        let text = refused(
+            &mut e,
+            json!({"to_role": "ground", "subtasks": [
+            {"title": "a", "target_files": ["../x.rs"]}, {"title": "b"}]}),
+        );
+        assert!(text.contains("relative path"), "{text}");
+        let text = refused(
+            &mut e,
+            json!({"to_role": "triage", "subtasks": [{"title": "a"}, {"title": "b"}]}),
+        );
+        assert!(text.contains("no tools"), "{text}");
+        // A role that cannot run here.
+        e.on_path = |p| p != "opencode" && p != "cat";
+        let text = refused(
+            &mut e,
+            json!({"to_role": "review", "subtasks": [{"title": "a"}, {"title": "b"}]}),
+        );
+        assert!(text.contains("cannot run"), "{text}");
+        e.on_path = |_| true;
+        // Local-only work and a cloud worker.
+        e.mark_local_only(&fid, "test");
+        let text = refused(
+            &mut e,
+            json!({"to_role": "approach-chat", "subtasks": [{"title": "a"}, {"title": "b"}]}),
+        );
+        assert!(text.contains("must stay local"), "{text}");
+        assert!(e.st.fanouts.is_empty(), "nothing was stored");
+        assert!(!e.st.flights.iter().any(|f| f.group_id.is_some()));
+        let _ = lead;
+    }
+
+    #[tokio::test]
+    async fn a_part_cannot_fan_out_again_and_one_split_runs_at_a_time() {
+        let (mut e, _rx, dir) = engine();
+        let (_fid, lead) = fanout_setup(&mut e, &dir);
+        arm_fanout(&mut e);
+        call_tool(&mut e, &lead, "tower_fanout", diamond());
+        let (ok, text) = call_tool(&mut e, &lead, "tower_fanout", diamond());
+        assert!(!ok && text.contains("already has fan-out x-1"), "{text}");
+        let a1 = part_child(&e, "s1").agent_id.unwrap();
+        let (ok, text) = call_tool(&mut e, &a1, "tower_fanout", diamond());
+        assert!(!ok && text.contains("one part of a fan-out"), "{text}");
+        stop_all(&mut e);
+    }
+
+    #[tokio::test]
+    async fn deleting_the_flight_cancels_its_split_and_tells_the_lead() {
+        let (mut e, _rx, dir) = engine();
+        let (fid, lead) = fanout_setup(&mut e, &dir);
+        arm_fanout(&mut e);
+        let mut plan = diamond();
+        plan["max_agents"] = json!(1);
+        call_tool(&mut e, &lead, "tower_fanout", plan);
+        assert_eq!(part_state(&e, "s2"), TaskState::Queued);
+        let queued = part_child(&e, "s2").id;
+        e.cancel_fanout("x-1", "a test");
+        assert_eq!(e.st.fanouts[0].status, FanoutStatus::Cancelled);
+        assert!(
+            !e.st.local_queue.iter().any(|(c, _)| c == &queued),
+            "queued part dropped"
+        );
+        assert_eq!(part_state(&e, "s3"), TaskState::Skipped);
+        assert!(
+            e.st.queues[&lead][0].contains("was cancelled"),
+            "{:?}",
+            e.st.queues[&lead]
+        );
+        // Nothing starts later from the queue.
+        e.drain_local_queue();
+        assert!(!e.st.local_queue.iter().any(|(c, _)| c == &queued));
+        let _ = fid;
+        stop_all(&mut e);
+    }
+
+    #[tokio::test]
+    async fn a_swarm_role_splits_by_files_runs_the_parts_and_then_the_gates() {
+        let (mut e, _rx, dir) = engine();
+        let _gui = gui(&mut e);
+        e.on_path = |_| true;
+        let ground = e.cfg.roles.iter_mut().find(|r| r.id == "ground").unwrap();
+        ground.command = vec!["cat".into()];
+        // No planner can run: the heuristic split is used.
+        e.cfg.roles.retain(|r| {
+            r.driver != DriverKind::Llm && r.id != "ground-claude" && r.id != "approach-chat"
+        });
+        let mut swarm = config::parse_role("swarm", "s.toml".as_ref(), config::SEED_SWARM).unwrap();
+        swarm.swarm = Some(config::SwarmCfg {
+            worker: Some("ground".into()),
+            max_agents: None,
+        });
+        e.cfg.roles.push(swarm);
+        arm_fanout(&mut e);
+        let r = ask(
+            &mut e,
+            ClientMsg::LaunchAgent {
+                role_id: "swarm".into(),
+                flight_id: None,
+                task: Some("Fix the bug in src/a.rs and in lib/b.rs".into()),
+                workdir: Some(dir.display().to_string()),
+                new_folder: false,
+            },
+        );
+        assert!(matches!(r, ServerMsg::Ack), "{r:?}");
+        let f = e.st.fanouts[0].clone();
+        assert_eq!(f.planned_by, "heuristic");
+        assert!(f.return_to.starts_with("tower:"), "{}", f.return_to);
+        assert_eq!(f.subtasks.len(), 2);
+        assert_eq!(f.waves.len(), 1, "independent files run at once");
+        assert_eq!(part_state(&e, "s1"), TaskState::Running);
+        assert_eq!(part_state(&e, "s2"), TaskState::Running);
+        // No lead agent: the swarm flight itself has none.
+        let parent = e.flight(&f.flight_id).unwrap().clone();
+        assert_eq!(parent.role_id.as_deref(), Some("swarm"));
+        assert!(parent.agent_id.is_none());
+        for t in ["s1", "s2"] {
+            let a = part_child(&e, t).agent_id.unwrap();
+            call_tool(
+                &mut e,
+                &a,
+                "tower_return",
+                json!({"summary": format!("fixed {t}")}),
+            );
+        }
+        assert_eq!(e.st.fanouts[0].status, FanoutStatus::Done);
+        let parent = e.flight(&f.flight_id).unwrap().clone();
+        assert_eq!(parent.outcome.as_deref(), Some("resolved"));
+        assert_eq!(
+            parent.stage,
+            Stage::Gates,
+            "the checks run on the combined result"
+        );
+        stop_all(&mut e);
+    }
+
+    #[tokio::test]
+    async fn a_swarm_plans_with_the_triage_model_and_falls_back_on_garbage() {
+        let (mut e, mut rx, dir) = engine();
+        e.on_path = |_| true;
+        let ground = e.cfg.roles.iter_mut().find(|r| r.id == "ground").unwrap();
+        ground.command = vec!["cat".into()];
+        let plan = r#"{"analysis": "two files", "subtasks": [
+            {"id": "s1", "title": "A", "brief": "Change a", "tier": "low", "target_files": ["src/a.rs"]},
+            {"id": "s2", "title": "B", "brief": "Change b", "tier": "high", "target_files": ["src/b.rs"]}]}"#;
+        let fake = fake_acp_agent(&dir, &format!("Here is the plan: {plan}"));
+        e.cfg
+            .roles
+            .retain(|r| r.driver != DriverKind::Llm && r.id != "approach-chat");
+        let tri = e
+            .cfg
+            .roles
+            .iter_mut()
+            .find(|r| r.id == "ground-claude")
+            .unwrap();
+        tri.command = fake;
+        tri.acp_options.clear();
+        assert_eq!(e.snapshot().triage_role, "ground-claude");
+        let mut swarm = config::parse_role("swarm", "s.toml".as_ref(), config::SEED_SWARM).unwrap();
+        swarm.swarm = Some(config::SwarmCfg {
+            worker: Some("ground".into()),
+            max_agents: None,
+        });
+        e.cfg.roles.push(swarm);
+        arm_fanout(&mut e);
+        ask(
+            &mut e,
+            ClientMsg::LaunchAgent {
+                role_id: "swarm".into(),
+                flight_id: None,
+                task: Some("Make the two modules agree".into()),
+                workdir: Some(dir.display().to_string()),
+                new_folder: false,
+            },
+        );
+        let fid = e.st.flights[0].id.clone();
+        assert!(has_note(e.flight(&fid).unwrap(), "is planning the split"));
+        loop {
+            match next_input(&mut rx).await {
+                Input::Planned {
+                    flight_id,
+                    role_id,
+                    worker,
+                    planned_by,
+                    result,
+                } => {
+                    e.handle(Input::Planned {
+                        flight_id,
+                        role_id,
+                        worker,
+                        planned_by,
+                        result,
+                    });
+                    break;
+                }
+                _ => continue,
+            }
+        }
+        let f = e.st.fanouts[0].clone();
+        assert_eq!(f.planned_by, "triage:ground-claude");
+        assert_eq!(f.analysis, "two files");
+        assert_eq!(f.subtasks.len(), 2);
+        // The planner's tiers reach the parts' routing.
+        let c2 = part_child(&e, "s2");
+        assert_eq!(c2.route.as_ref().map(|r| r.tier.as_str()), Some("high"));
+        stop_all(&mut e);
+
+        // A planner answer that is no plan: split by the files instead.
+        let fid2 = e.new_flight(
+            "Edit both".into(),
+            "Change src/x.rs and lib/y.rs".into(),
+            Some(dir.display().to_string()),
+            "you",
+        );
+        e.on_planned(
+            &fid2,
+            "swarm",
+            "ground",
+            "triage:ground-claude",
+            Ok(("I would rather not.".into(), Usage::default())),
+        );
+        let g =
+            e.st.fanouts
+                .iter()
+                .find(|x| x.flight_id == fid2)
+                .unwrap()
+                .clone();
+        assert_eq!(g.planned_by, "heuristic");
+        assert_eq!(g.subtasks.len(), 2);
+        assert!(has_note(e.flight(&fid2).unwrap(), "did not hold"));
+        stop_all(&mut e);
+    }
+
+    #[tokio::test]
+    async fn auto_never_falls_back_to_the_swarm_role() {
+        let (mut e, _rx, _dir) = engine();
+        e.cfg.roles.retain(|r| r.id == "approach");
+        let swarm = config::parse_role("swarm", "s.toml".as_ref(), config::SEED_SWARM).unwrap();
+        e.cfg.roles.push(swarm);
+        // Two candidates, one of them the swarm: the only real one is picked.
+        assert_eq!(
+            e.auto_fallback(false).map(|(r, _)| r).as_deref(),
+            Some("approach")
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_mid_wave_starts_nothing_and_delivers_no_result() {
+        let (mut e, _rx, dir) = engine();
+        let (_fid, lead) = fanout_setup(&mut e, &dir);
+        arm_fanout(&mut e);
+        e.cfg.fanout.on_failure = "continue".into();
+        call_tool(&mut e, &lead, "tower_fanout", diamond());
+        let before = e.st.flights.len();
+        e.cancel_fanout("x-1", "a test");
+        assert_eq!(e.st.fanouts[0].status, FanoutStatus::Cancelled);
+        assert_eq!(e.st.flights.len(), before, "no wave-2 child was created");
+        assert_eq!(part_state(&e, "s3"), TaskState::Skipped);
+        let q = e.st.queues.get(&lead).cloned().unwrap_or_default();
+        assert!(!q.iter().any(|m| m.contains("Result of fan-out")), "{q:?}");
+        assert!(
+            !e.st.inbox.iter().any(|i| i.title.starts_with("Send ")),
+            "no result to send"
+        );
+        stop_all(&mut e);
+    }
+
+    #[tokio::test]
+    async fn a_fanout_question_only_takes_answers_that_fit() {
+        let (mut e, _rx, dir) = engine();
+        let (_fid, lead) = fanout_setup(&mut e, &dir);
+        arm_fanout(&mut e);
+        e.cfg.fanout.on_failure = "ask".into();
+        e.cfg.fanout.max_retries = 0;
+        call_tool(&mut e, &lead, "tower_fanout", diamond());
+        let a1 = part_child(&e, "s1").agent_id.unwrap();
+        e.mark_offline(&a1, "exited");
+        let a2 = part_child(&e, "s2").agent_id.unwrap();
+        call_tool(&mut e, &a2, "tower_return", json!({"summary": "ok"}));
+        let item =
+            e.st.inbox
+                .iter()
+                .find(|i| i.title.contains("part failed"))
+                .unwrap()
+                .clone();
+        let answer = |e: &mut Engine, opt: &str| {
+            ask(
+                e,
+                ClientMsg::ResolveInbox {
+                    item_id: item.id.clone(),
+                    approve: true,
+                    option_id: Some(opt.into()),
+                    text: None,
+                },
+            )
+        };
+        // Retry with none left, or nonsense: refused, and the question stays.
+        assert!(matches!(answer(&mut e, "retry"), ServerMsg::Error { .. }));
+        assert!(matches!(answer(&mut e, "gates"), ServerMsg::Error { .. }));
+        assert!(e.st.inbox.iter().any(|i| i.id == item.id), "still asked");
+        assert_eq!(e.st.fanouts[0].status, FanoutStatus::Paused);
+        // "Deny" means stop: it finishes with what came back.
+        answer(&mut e, "deny");
+        assert_eq!(e.st.fanouts[0].status, FanoutStatus::Partial);
+        assert!(!e.st.inbox.iter().any(|i| i.id == item.id));
+        // Answering again does not reopen it.
+        e.st.pending_actions.insert(
+            item.id.clone(),
+            crate::store::PendingAction::FanoutFailed { id: "x-1".into() },
+        );
+        answer(&mut e, "continue");
+        assert_eq!(e.st.fanouts[0].status, FanoutStatus::Partial);
+        stop_all(&mut e);
+    }
+
+    #[tokio::test]
+    async fn a_swarm_flight_is_not_split_twice() {
+        let (mut e, _rx, dir) = engine();
+        e.on_path = |_| true;
+        let ground = e.cfg.roles.iter_mut().find(|r| r.id == "ground").unwrap();
+        ground.command = vec!["cat".into()];
+        e.cfg.roles.retain(|r| {
+            r.driver != DriverKind::Llm && r.id != "ground-claude" && r.id != "approach-chat"
+        });
+        let mut swarm = config::parse_role("swarm", "s.toml".as_ref(), config::SEED_SWARM).unwrap();
+        swarm.swarm = Some(config::SwarmCfg {
+            worker: Some("ground".into()),
+            max_agents: None,
+        });
+        swarm.max_concurrency = 5;
+        e.cfg.roles.push(swarm);
+        arm_fanout(&mut e);
+        ask(
+            &mut e,
+            ClientMsg::LaunchAgent {
+                role_id: "swarm".into(),
+                flight_id: None,
+                task: Some("Fix src/a.rs and lib/b.rs".into()),
+                workdir: Some(dir.display().to_string()),
+                new_folder: false,
+            },
+        );
+        let fid = e.st.flights[0].id.clone();
+        let again = ask(
+            &mut e,
+            ClientMsg::LaunchAgent {
+                role_id: "swarm".into(),
+                flight_id: Some(fid.clone()),
+                task: None,
+                workdir: None,
+                new_folder: false,
+            },
+        );
+        assert!(
+            matches!(again, ServerMsg::Error { ref message } if message.contains("still")),
+            "{again:?}"
+        );
+        assert_eq!(
+            e.st.fanouts.iter().filter(|x| x.flight_id == fid).count(),
+            1
+        );
+        stop_all(&mut e);
+    }
+
+    #[tokio::test]
+    async fn parts_never_wait_behind_their_own_lead() {
+        let (mut e, _rx, dir) = engine();
+        let (_fid, lead) = fanout_setup(&mut e, &dir);
+        arm_fanout(&mut e);
+        // The lead's own role, at one agent at a time, does the parts.
+        let lead_role = e.cfg.roles.iter_mut().find(|r| r.id == "approach").unwrap();
+        lead_role.max_concurrency = 1;
+        lead_role.driver = DriverKind::Acp;
+        lead_role.command = vec!["cat".into()];
+        let mut plan = diamond();
+        plan["to_role"] = json!("approach");
+        // Refused up front instead of a part that can never start.
+        let (ok, text) = call_tool(&mut e, &lead, "tower_fanout", plan.clone());
+        assert!(!ok && text.contains("you are it"), "{text}");
+        assert!(e.st.fanouts.is_empty());
+        // With room for more than the lead it runs.
+        e.cfg
+            .roles
+            .iter_mut()
+            .find(|r| r.id == "approach")
+            .unwrap()
+            .max_concurrency = 3;
+        let (ok, text) = call_tool(&mut e, &lead, "tower_fanout", plan);
+        assert!(ok, "{text}");
+        assert_eq!(part_state(&e, "s1"), TaskState::Running);
+        stop_all(&mut e);
+    }
+
+    #[tokio::test]
+    async fn a_part_that_never_gets_a_slot_times_out_instead_of_holding_the_barrier() {
+        let (mut e, _rx, dir) = engine();
+        let (_fid, lead) = fanout_setup(&mut e, &dir);
+        arm_fanout(&mut e);
+        let mut plan = diamond();
+        plan["max_agents"] = json!(1);
+        call_tool(&mut e, &lead, "tower_fanout", plan);
+        assert_eq!(part_state(&e, "s2"), TaskState::Queued);
+        // Pretend it has waited past the limit.
+        let past = now_unix() - e.cfg.fanout.child_timeout_mins * 60 - 5;
+        e.st.fanouts[0].task_mut("s2").unwrap().started_unix = Some(past);
+        let queued = part_child(&e, "s2").id;
+        e.fanout_tick();
+        assert_eq!(part_state(&e, "s2"), TaskState::Failed);
+        assert_eq!(
+            e.st.fanouts[0].task("s2").unwrap().reason.as_deref(),
+            Some("waited 45 minutes for a free agent")
+        );
+        assert!(!e.st.local_queue.iter().any(|(c, _)| c == &queued));
+        stop_all(&mut e);
+    }
+
+    // -- hands-free ------------------------------------------------------------
+
+    fn audit_lines(dir: &std::path::Path) -> Vec<Value> {
+        let path = dir.join("audit.jsonl");
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn hands_free_and_armed_runs_without_inbox_stops_and_says_why() {
+        let (mut e, _rx, dir) = engine();
+        let (fid, lead) = fanout_setup(&mut e, &dir);
+        if let Some(f) = e.flight_mut(&fid) {
+            f.hands_free = true;
+        }
+        e.set_armed(true);
+        // A fan-out at the default `confirm` starts at once...
+        let (ok, text) = call_tool(&mut e, &lead, "tower_fanout", diamond());
+        assert!(ok && text.contains("started"), "{text}");
+        assert!(!e.st.inbox.iter().any(|i| i.title.starts_with("Fan out")));
+        // ...its parts are hands-free too...
+        assert!(part_child(&e, "s1").hands_free);
+        // ...and a plain handoff is released without a click.
+        let (ok, text) = call_tool(
+            &mut e,
+            &lead,
+            "tower_handoff",
+            json!({"to_role": "ground", "goal": "Docs", "acceptance": ["builds"]}),
+        );
+        assert!(ok && text.contains("released"), "{text}");
+        for t in ["s1", "s2", "s3"] {
+            if let Some(a) = e.st.fanouts[0]
+                .task(t)
+                .and_then(|x| x.flight_id.clone())
+                .and_then(|c| e.flight(&c).and_then(|f| f.agent_id.clone()))
+            {
+                call_tool(
+                    &mut e,
+                    &a,
+                    "tower_return",
+                    json!({"summary": format!("{t} ok")}),
+                );
+            }
+        }
+        // The combined result reaches the lead with no "Send" item.
+        assert!(
+            !e.st.inbox.iter().any(|i| i.title.starts_with("Send ")),
+            "{:?}",
+            e.st.inbox
+        );
+        assert!(e.st.queues[&lead]
+            .iter()
+            .any(|m| m.contains("Result of fan-out x-1")));
+        // The audit says why it ran.
+        let lines = audit_lines(&dir.join("data"));
+        let lines = if lines.is_empty() {
+            audit_lines(&e.paths.data)
+        } else {
+            lines
+        };
+        assert!(
+            lines.iter().any(|l| l["action"] == "handoff.fanout"
+                && l["via"] == "hands_free"
+                && l["decision"] == "run"),
+            "{lines:?}"
+        );
+        stop_all(&mut e);
+    }
+
+    #[tokio::test]
+    async fn hands_free_but_disarmed_still_asks_and_landing_always_asks() {
+        let (mut e, _rx, dir) = engine();
+        let (fid, lead) = fanout_setup(&mut e, &dir);
+        if let Some(f) = e.flight_mut(&fid) {
+            f.hands_free = true;
+        }
+        let (ok, text) = call_tool(&mut e, &lead, "tower_fanout", diamond());
+        assert!(
+            ok && text.contains("waiting for the human's clearance"),
+            "{text}"
+        );
+        assert!(has_note(
+            e.flight(&fid).unwrap(),
+            "(hands-free), but Tower is not armed"
         ));
+        // Landing is never raised by hands-free.
+        e.set_armed(true);
+        let o = e.overrides_for(&fid).unwrap();
+        assert_eq!(
+            e.cfg.policy.level(crate::policy::Action::Land, Some(&o)),
+            crate::policy::Level::Confirm
+        );
+        // A flight that is not hands-free keeps the plain policy.
+        let other = e.new_flight("x".into(), String::new(), None, "you");
+        assert!(e.overrides_for(&other).is_none());
+        stop_all(&mut e);
+    }
+
+    #[tokio::test]
+    async fn a_hands_free_flight_is_created_with_a_note_and_briefs_its_agent() {
+        let (mut e, _rx, dir) = engine();
+        let mut msg = auto_flight(&dir, "Fix it", AutoMode::Heuristic, false);
+        if let ClientMsg::CreateFlight { hands_free, .. } = &mut msg {
+            *hands_free = true;
+        }
+        ask(&mut e, msg);
+        let f = e.st.flights[0].clone();
+        assert!(f.hands_free);
+        assert!(has_note(&f, "Hands-free takes effect while Tower is armed"));
+        assert!(prompt::flight_brief(&f).contains("runs hands-free"));
+    }
+
+    #[tokio::test]
+    async fn a_swarm_with_nothing_to_split_gives_the_task_to_its_worker() {
+        let (mut e, _rx, dir) = engine();
+        e.on_path = |_| true;
+        let ground = e.cfg.roles.iter_mut().find(|r| r.id == "ground").unwrap();
+        ground.command = vec!["cat".into()];
+        e.cfg.roles.retain(|r| {
+            r.driver != DriverKind::Llm && r.id != "ground-claude" && r.id != "approach-chat"
+        });
+        let mut swarm = config::parse_role("swarm", "s.toml".as_ref(), config::SEED_SWARM).unwrap();
+        swarm.swarm = Some(config::SwarmCfg {
+            worker: Some("ground".into()),
+            max_agents: None,
+        });
+        e.cfg.roles.push(swarm);
+        ask(
+            &mut e,
+            ClientMsg::LaunchAgent {
+                role_id: "swarm".into(),
+                flight_id: None,
+                task: Some("Rename the config option".into()),
+                workdir: Some(dir.display().to_string()),
+                new_folder: false,
+            },
+        );
+        assert!(e.st.fanouts.is_empty());
+        let f = e.st.flights[0].clone();
+        assert_eq!(f.role_id.as_deref(), Some("ground"));
+        assert!(has_note(&f, "nothing to split"), "{:?}", f.timeline);
+        assert!(f.agent_id.is_some());
+        stop_all(&mut e);
     }
 
     #[tokio::test]
@@ -5853,9 +7306,11 @@ for line in sys.stdin:
                 worktree: false,
                 new_folder: false,
                 auto_assign: false,
+                auto_mode: AutoMode::Off,
                 launch: false,
                 tier: None,
                 local_only: true,
+                hands_free: false,
             },
         );
         let f = e.st.flights[0].clone();
@@ -7095,9 +8550,11 @@ for line in sys.stdin:
                 worktree: false,
                 new_folder: false,
                 auto_assign: true,
+                auto_mode: AutoMode::Off,
                 launch: false,
                 tier: None,
                 local_only: false,
+                hands_free: false,
             },
         );
         let f = e.st.flights[0].clone();
@@ -7148,9 +8605,11 @@ for line in sys.stdin:
                 worktree: false,
                 new_folder: false,
                 auto_assign: true,
+                auto_mode: AutoMode::Off,
                 launch: false,
                 tier: None,
                 local_only: false,
+                hands_free: false,
             },
         );
         let f = e.st.flights[0].clone();
@@ -7531,6 +8990,36 @@ for line in sys.stdin:
 
     fn last_mark(e: &Engine, id: &str) -> tower_proto::RunMark {
         e.st.schedules[id].recent.last().cloned().unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_hands_free_schedule_starts_hands_free_flights() {
+        let (mut e, _rx, dir) = engine();
+        let _gui_rx = gui(&mut e);
+        let id = save_schedule(&mut e, &dir, |s| s.hands_free = true);
+        // Saved to schedules.toml and read back with it.
+        let text = std::fs::read_to_string(dir.join("cfg").join("schedules.toml")).unwrap();
+        assert!(text.contains("hands_free = true"), "{text}");
+        assert!(e.cfg.schedules[0].hands_free);
+        fire_due(&mut e, &id);
+        let f =
+            e.st.flights
+                .iter()
+                .find(|f| f.started_by.as_deref() == Some(&format!("schedule:{id}")))
+                .expect("a run")
+                .clone();
+        assert!(f.hands_free);
+        assert!(has_note(&f, "Hands-free"), "{:?}", f.timeline);
+        // A plain schedule stays plain.
+        e.cfg.schedules[0].hands_free = false;
+        let before = e.st.flights.len();
+        if let Some(f) = e.st.flights.iter_mut().last() {
+            f.stage = Stage::Landed;
+        }
+        fire_due(&mut e, &id);
+        let newest = e.st.flights.last().unwrap();
+        assert!(e.st.flights.len() > before);
+        assert!(!newest.hands_free);
     }
 
     #[tokio::test]

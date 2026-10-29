@@ -39,6 +39,10 @@ pub enum Action {
     Land,
     /// Release a handoff to the next role.
     HandoffRelease,
+    /// Split one task into parts that run as parallel child flights, wave
+    /// by wave (`tower_fanout`, or a swarm role). Decided once per plan,
+    /// not once per part.
+    HandoffFanout,
     /// Hand a subtask to a model inside your own network, and give its
     /// result back to the agent that asked. Like schedules, its `auto` needs
     /// no Armed: nothing leaves your network and the result only goes back
@@ -54,7 +58,7 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Action; 12] = [
+    pub const ALL: [Action; 13] = [
         Action::IntakeLaunch,
         Action::IntakeTriage,
         Action::AckPost,
@@ -63,6 +67,7 @@ impl Action {
         Action::PrDraft,
         Action::Land,
         Action::HandoffRelease,
+        Action::HandoffFanout,
         Action::HandoffLocal,
         Action::ScoutRun,
         Action::PaneMessage,
@@ -80,6 +85,7 @@ impl Action {
             Action::PrDraft => "pr.draft",
             Action::Land => "land",
             Action::HandoffRelease => "handoff.release",
+            Action::HandoffFanout => "handoff.fanout",
             Action::HandoffLocal => "handoff.local",
             Action::ScoutRun => "scout.run",
             Action::PaneMessage => "pane.message",
@@ -107,6 +113,26 @@ impl Action {
     /// and only answer the agent that asked.
     pub fn needs_armed(self) -> bool {
         !matches!(self, Action::ScheduleRun | Action::HandoffLocal)
+    }
+}
+
+/// What a hands-free flight runs instead of asking, while Tower is armed:
+/// releasing a handoff, starting a fan-out, passing Tower's text on to an
+/// agent. Landing is deliberately not one of them.
+pub const HANDS_FREE: [Action; 3] = [
+    Action::HandoffRelease,
+    Action::HandoffFanout,
+    Action::PaneMessage,
+];
+
+/// Raise the `HANDS_FREE` actions that would ask (`confirm`) to `auto`.
+/// `off` and `draft` stay: hands-free never overrides "never" or "only
+/// prepare it". `auto` still runs only while armed (`needs_armed`).
+pub fn raise_for_hands_free(cfg: &PolicyCfg, o: &mut Overrides) {
+    for a in HANDS_FREE {
+        if cfg.level(a, Some(o)) == Level::Confirm {
+            o.insert(a.key().to_string(), Level::Auto);
+        }
     }
 }
 
@@ -270,6 +296,42 @@ pub fn legacy(action: Action, knob: &str, on: bool) -> Option<(Level, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hands_free_raises_only_what_would_ask_and_never_landing() {
+        let mut cfg = PolicyCfg::default();
+        cfg.actions.insert("pane.message".into(), Level::Draft);
+        let mut o = Overrides::new();
+        raise_for_hands_free(&cfg, &mut o);
+        assert_eq!(cfg.level(Action::HandoffRelease, Some(&o)), Level::Auto);
+        assert_eq!(cfg.level(Action::HandoffFanout, Some(&o)), Level::Auto);
+        assert_eq!(
+            cfg.level(Action::PaneMessage, Some(&o)),
+            Level::Draft,
+            "draft stays"
+        );
+        assert_eq!(
+            cfg.level(Action::Land, Some(&o)),
+            Level::Confirm,
+            "landing still asks"
+        );
+        // A watch that switched a release off keeps it off.
+        let mut o = Overrides::new();
+        o.insert("handoff.release".into(), Level::Off);
+        raise_for_hands_free(&cfg, &mut o);
+        assert_eq!(cfg.level(Action::HandoffRelease, Some(&o)), Level::Off);
+        // And auto still needs Armed for all of them.
+        for a in HANDS_FREE {
+            assert!(a.needs_armed(), "{}", a.key());
+            assert_eq!(
+                decide(Level::Auto, false, true, false),
+                Decision::Ask,
+                "disarmed, auto asks"
+            );
+        }
+        assert_eq!(Action::HandoffFanout.default_level(), Level::Confirm);
+        assert_eq!(Action::ALL.len(), 13);
+    }
 
     #[test]
     fn keys_round_trip_and_are_unique() {

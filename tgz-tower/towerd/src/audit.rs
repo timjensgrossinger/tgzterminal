@@ -26,6 +26,10 @@ pub struct Entry<'a> {
     pub target: Option<&'a str>,
     /// `asked`, `drafted`, `done`, `failed: …`, `skipped`.
     pub outcome: &'a str,
+    /// Why the level was what it was, when not the plain policy:
+    /// `hands_free` for a hands-free flight.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub via: Option<&'a str>,
 }
 
 impl<'a> Entry<'a> {
@@ -39,6 +43,7 @@ impl<'a> Entry<'a> {
             flight: None,
             target: None,
             outcome,
+            via: None,
         }
     }
 }

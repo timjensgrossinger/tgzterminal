@@ -33,6 +33,7 @@ pub enum FieldId {
     ModelNotes,
     ModelAtOnce,
     RoleName,
+    RoleSummary,
     RoleCommand,
     RoleMission,
     RoleLadder,
@@ -212,6 +213,10 @@ pub struct NewFlightForm {
     pub tier: Option<String>,
     /// Sensitive: only models inside your network may work on it.
     pub local_only: bool,
+    /// With Auto: pick the role from the router's tier, no triage call.
+    pub heuristic: bool,
+    /// While armed, nothing stops in the Inbox until landing.
+    pub hands_free: bool,
 }
 
 pub struct LaunchForm {
@@ -257,6 +262,8 @@ pub struct ScheduleForm {
     pub catch_up: bool,
     /// Its flights are sensitive: local models only.
     pub local_only: bool,
+    /// Its flights run hands-free while Tower is armed.
+    pub hands_free: bool,
     /// What the form does not edit, kept as it was.
     pub keep: ScheduleSpec,
 }
@@ -353,6 +360,9 @@ pub struct RoleForm {
     /// `pane`, `acp`, `llm` or `routed`.
     pub driver: String,
     pub command: Field,
+    /// For people: what the role does and who runs it.
+    pub summary: Field,
+    /// For the agent.
     pub mission: Field,
     /// One model per line, cheapest first.
     pub ladder: Field,
@@ -416,6 +426,7 @@ impl RoleForm {
                     .map(str::to_string)
                     .collect()
             },
+            summary: self.summary.text().trim().to_string(),
             mission: self.mission.text().trim().to_string(),
             ladder: if self.driver == "routed" {
                 vec![]
@@ -469,6 +480,10 @@ pub enum SheetFlag {
     CatchUp,
     /// New flight and schedule: sensitive, local models only.
     LocalOnly,
+    /// New flight with Auto: no triage call, the router's tier decides.
+    Heuristic,
+    /// New flight: no Inbox stops until landing while Tower is armed.
+    HandsFree,
 }
 
 /// Starting points for a new schedule: name, when, title, brief.
@@ -526,6 +541,7 @@ impl ScheduleForm {
             overlap: if self.overlap_run { "run" } else { "skip" }.to_string(),
             catch_up: self.catch_up,
             local_only: self.local_only,
+            hands_free: self.hands_free,
             ..self.keep.clone()
         }
     }
@@ -637,6 +653,8 @@ impl Sheet {
             place,
             tier: None,
             local_only: false,
+            heuristic: false,
+            hands_free: false,
         })
     }
 
@@ -704,6 +722,7 @@ impl Sheet {
             overlap_run: s.overlap == "run",
             catch_up: s.catch_up,
             local_only: s.local_only,
+            hands_free: s.hands_free,
             keep: s,
         })
     }
@@ -773,7 +792,9 @@ impl Sheet {
             driver,
             command: Field::new(false, "opencode acp")
                 .with_text(&r.map(|r| r.command.join(" ")).unwrap_or_default()),
-            mission: Field::new(true, "What this role does, and how it reports back")
+            summary: Field::new(false, "One line for people: what it does, who runs it")
+                .with_text(r.map(|r| r.summary.as_str()).unwrap_or("")),
+            mission: Field::new(true, "What the agent is told: its job, and how it reports back")
                 .with_text(r.map(|r| r.mission.as_str()).unwrap_or("")),
             ladder: Field::new(true, "One model per line, cheapest first")
                 .with_text(&ladder.join("\n")),
@@ -830,7 +851,7 @@ impl Sheet {
             Sheet::Endpoint(_) => vec![FieldId::EpName, FieldId::EpUrl, FieldId::EpKeyEnv],
             Sheet::Connect(_) => vec![],
             Sheet::Role(f) => {
-                let mut v = vec![FieldId::RoleName];
+                let mut v = vec![FieldId::RoleName, FieldId::RoleSummary];
                 if !matches!(f.driver.as_str(), "routed" | "llm") {
                     v.push(FieldId::RoleCommand);
                 }
@@ -881,6 +902,7 @@ impl Sheet {
             (Sheet::Model(f), FieldId::ModelNotes) => Some(&f.notes),
             (Sheet::Model(f), FieldId::ModelAtOnce) => Some(&f.at_once),
             (Sheet::Role(f), FieldId::RoleName) => Some(&f.name),
+            (Sheet::Role(f), FieldId::RoleSummary) => Some(&f.summary),
             (Sheet::Role(f), FieldId::RoleCommand) => Some(&f.command),
             (Sheet::Role(f), FieldId::RoleMission) => Some(&f.mission),
             (Sheet::Role(f), FieldId::RoleLadder) => Some(&f.ladder),
@@ -919,6 +941,7 @@ impl Sheet {
             (Sheet::Model(f), FieldId::ModelNotes) => Some(&mut f.notes),
             (Sheet::Model(f), FieldId::ModelAtOnce) => Some(&mut f.at_once),
             (Sheet::Role(f), FieldId::RoleName) => Some(&mut f.name),
+            (Sheet::Role(f), FieldId::RoleSummary) => Some(&mut f.summary),
             (Sheet::Role(f), FieldId::RoleCommand) => Some(&mut f.command),
             (Sheet::Role(f), FieldId::RoleMission) => Some(&mut f.mission),
             (Sheet::Role(f), FieldId::RoleLadder) => Some(&mut f.ladder),

@@ -5,6 +5,7 @@
 
 pub mod bandit;
 pub mod cron;
+pub mod fanout;
 pub mod router;
 pub mod work;
 

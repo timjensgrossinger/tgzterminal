@@ -8,7 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 8;
 
 // ---------------------------------------------------------------------------
 // Model
@@ -125,6 +125,10 @@ impl DriverKind {
 pub struct Role {
     pub id: String,
     pub name: String,
+    /// One or two plain sentences for people: what this role does and who
+    /// runs it. `mission` is what the agent is told.
+    #[serde(default)]
+    pub summary: String,
     pub mission: String,
     /// sRGB.
     pub color: [u8; 3],
@@ -156,6 +160,10 @@ pub struct Role {
     /// The program this role launches is not installed (not on PATH).
     #[serde(default)]
     pub missing: bool,
+    /// `driver = "swarm"`: Tower splits the task and runs the parts in
+    /// parallel on a worker role.
+    #[serde(default)]
+    pub swarm: bool,
 }
 
 /// A role as the Roster edits it (`roles/<id>.toml`).
@@ -171,6 +179,9 @@ pub struct RoleSpec {
     pub driver: String,
     #[serde(default)]
     pub command: Vec<String>,
+    /// For people; empty keeps what the file has.
+    #[serde(default)]
+    pub summary: String,
     pub mission: String,
     /// Models, cheapest first.
     #[serde(default)]
@@ -502,6 +513,190 @@ pub struct Flight {
     /// the flight itself or worked out from its folder or source.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub local_only: bool,
+    /// A child of a fan-out: the fan-out's id (`x-3`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_id: Option<String>,
+    /// Hands-free: while Tower is armed, what would only ask (release a
+    /// handoff or a fan-out, pass a message on) runs; landing still asks.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hands_free: bool,
+}
+
+/// One part of a fan-out: a subtask that becomes a child flight.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct FanoutTask {
+    /// Short id inside the plan (`s1`).
+    pub id: String,
+    pub title: String,
+    #[serde(default)]
+    pub brief: String,
+    /// `low` / `medium` / `high`; unset: the router decides.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier: Option<String>,
+    /// Ids of tasks that must have returned first.
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+    /// Files this task owns (relative to the flight's folder); two tasks
+    /// that both write a file are put in different waves.
+    #[serde(default)]
+    pub target_files: Vec<String>,
+    #[serde(default)]
+    pub acceptance: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub read_only: bool,
+    /// The role that runs it; unset: the fan-out's worker role.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(default)]
+    pub state: TaskState,
+    /// The child flight, once started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flight_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub packet_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_unix: Option<u64>,
+    /// Why it failed or was skipped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub retries: u8,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskState {
+    /// Not started yet (its wave has not begun, or it was reset for a retry).
+    #[default]
+    Pending,
+    /// Started, waiting for a free agent slot.
+    Queued,
+    Running,
+    Returned,
+    Failed,
+    /// Not run because a task it depends on failed.
+    Skipped,
+}
+
+impl TaskState {
+    pub fn is_done(self) -> bool {
+        matches!(
+            self,
+            TaskState::Returned | TaskState::Failed | TaskState::Skipped
+        )
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            TaskState::Pending => "pending",
+            TaskState::Queued => "queued",
+            TaskState::Running => "running",
+            TaskState::Returned => "returned",
+            TaskState::Failed => "failed",
+            TaskState::Skipped => "skipped",
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FanoutStatus {
+    /// Planned; waiting for the human's clearance.
+    #[default]
+    Waiting,
+    Running,
+    /// A wave ended with failures and the human is asked how to go on.
+    Paused,
+    /// Every task returned.
+    Done,
+    /// Finished with failed or skipped tasks.
+    Partial,
+    Cancelled,
+}
+
+impl FanoutStatus {
+    pub fn is_open(self) -> bool {
+        matches!(
+            self,
+            FanoutStatus::Waiting | FanoutStatus::Running | FanoutStatus::Paused
+        )
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            FanoutStatus::Waiting => "waiting for clearance",
+            FanoutStatus::Running => "running",
+            FanoutStatus::Paused => "paused",
+            FanoutStatus::Done => "done",
+            FanoutStatus::Partial => "finished with failures",
+            FanoutStatus::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// One task split into parts that run as child flights, wave by wave.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct Fanout {
+    /// `x-3`.
+    pub id: String,
+    /// The flight the parts belong to.
+    pub flight_id: String,
+    /// The agent the combined result goes to, or `tower:<id>` when Tower
+    /// itself planned the split and no agent is waiting.
+    #[serde(default)]
+    pub return_to: String,
+    #[serde(default)]
+    pub from_role: String,
+    /// The role parts run on unless a task names its own.
+    pub worker_role: String,
+    #[serde(default)]
+    pub subtasks: Vec<FanoutTask>,
+    /// Task ids per wave, in start order.
+    #[serde(default)]
+    pub waves: Vec<Vec<String>>,
+    /// Index of the wave in progress.
+    #[serde(default)]
+    pub wave: u32,
+    /// Parts running at once, at most.
+    #[serde(default)]
+    pub max_agents: u32,
+    #[serde(default)]
+    pub status: FanoutStatus,
+    /// `agent`, `triage:<role>` or `heuristic`.
+    #[serde(default)]
+    pub planned_by: String,
+    /// The planner's own words on the split, if any.
+    #[serde(default)]
+    pub analysis: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hands_free: bool,
+    #[serde(default)]
+    pub created_unix: u64,
+    #[serde(default)]
+    pub updated_unix: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_unix: Option<u64>,
+}
+
+impl Fanout {
+    pub fn task(&self, id: &str) -> Option<&FanoutTask> {
+        self.subtasks.iter().find(|t| t.id == id)
+    }
+
+    pub fn task_mut(&mut self, id: &str) -> Option<&mut FanoutTask> {
+        self.subtasks.iter_mut().find(|t| t.id == id)
+    }
+
+    /// The task a child flight runs.
+    pub fn task_of_flight(&self, flight_id: &str) -> Option<&FanoutTask> {
+        self.subtasks
+            .iter()
+            .find(|t| t.flight_id.as_deref() == Some(flight_id))
+    }
+
+    pub fn count(&self, state: TaskState) -> usize {
+        self.subtasks.iter().filter(|t| t.state == state).count()
+    }
 }
 
 /// One response-time clock: a Jira Service Management SLA, or a
@@ -824,6 +1019,9 @@ pub struct Snapshot {
     /// The `[routing]` engines, low tier first.
     #[serde(default)]
     pub engines: Vec<EngineInfo>,
+    /// Open and recently finished fan-outs.
+    #[serde(default)]
+    pub fanouts: Vec<Fanout>,
     /// `models.toml`'s `[[model]]` list.
     #[serde(default)]
     pub models: Vec<ModelInfo>,
@@ -931,6 +1129,34 @@ pub struct SetupInfo {
     /// The triage role can actually run, so "Auto" is worth offering.
     #[serde(default)]
     pub triage_usable: bool,
+    /// The role "Auto" falls back to without triage (by the router's tier):
+    /// `[triage] fallback_role`, else the routed role. Empty: none can run.
+    #[serde(default)]
+    pub auto_heuristic_role: String,
+}
+
+/// How "Auto" picks a role for a new flight.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AutoMode {
+    /// A role was given, or nobody yet.
+    #[default]
+    Off,
+    /// The triage role reads the task; with no triage that can run, the
+    /// heuristic below.
+    Triage,
+    /// No model call: the router's tier picks the fallback role.
+    Heuristic,
+}
+
+impl AutoMode {
+    /// What a `CreateFlight` asks for, counting the older `auto_assign`.
+    pub fn effective(self, auto_assign: bool) -> AutoMode {
+        match self {
+            AutoMode::Off if auto_assign => AutoMode::Triage,
+            m => m,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -998,6 +1224,10 @@ pub struct ScheduleSpec {
     /// Its flights are sensitive: local models only.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub local_only: bool,
+    /// Its flights run hands-free: while Tower is armed, nothing on them
+    /// stops in the Inbox until landing.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hands_free: bool,
 }
 
 impl Default for ScheduleSpec {
@@ -1019,6 +1249,7 @@ impl Default for ScheduleSpec {
             pause_after_failures: 3,
             policy: None,
             local_only: false,
+            hands_free: false,
         }
     }
 }
@@ -1199,6 +1430,15 @@ impl Snapshot {
     pub fn agents_of_role<'a>(&'a self, role_id: &'a str) -> impl Iterator<Item = &'a Agent> {
         self.agents.iter().filter(move |a| a.role_id == role_id)
     }
+
+    /// The fan-out a flight owns (its parts are its children), newest first.
+    pub fn fanout_of_flight(&self, flight_id: &str) -> Option<&Fanout> {
+        self.fanouts.iter().rev().find(|x| x.flight_id == flight_id)
+    }
+
+    pub fn fanout(&self, id: &str) -> Option<&Fanout> {
+        self.fanouts.iter().find(|x| x.id == id)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1216,6 +1456,9 @@ pub enum ClientMsg {
     },
     GetSnapshot,
     Ping,
+    /// Save state and exit; the GUI starts a fresh daemon (with its current
+    /// PATH and build). ACP agents stop with it, pane agents live on.
+    RestartDaemon,
 
     // -- from the Tower view -------------------------------------------------
     CreateFlight {
@@ -1235,6 +1478,10 @@ pub enum ClientMsg {
         /// No role given: let the triage role pick one.
         #[serde(default)]
         auto_assign: bool,
+        /// How "Auto" picks the role. `Off` together with `auto_assign`
+        /// means `Triage`, so older clients keep working.
+        #[serde(default)]
+        auto_mode: AutoMode,
         /// Start an agent of `role_id` on it right away.
         #[serde(default)]
         launch: bool,
@@ -1244,6 +1491,10 @@ pub enum ClientMsg {
         /// Sensitive: only models inside your network may work on it.
         #[serde(default)]
         local_only: bool,
+        /// While Tower is armed, nothing on this flight stops in the Inbox
+        /// until landing (handoffs, fan-outs and messages run on their own).
+        #[serde(default)]
+        hands_free: bool,
     },
     /// Launch an agent of a role on a flight, or on a new flight made from `task`.
     LaunchAgent {
@@ -1916,6 +2167,7 @@ pub fn demo_snapshot(now_unix: u64) -> Snapshot {
             busy: 0,
             max_concurrency: 1,
         }],
+        fanouts: vec![],
         engines: vec![
             EngineInfo {
                 id: "qwen-local".into(),
@@ -1969,6 +2221,7 @@ pub fn demo_snapshot(now_unix: u64) -> Snapshot {
             roles_usable: roles_len,
             terms_pending: Vec::new(),
             triage_usable: true,
+            auto_heuristic_role: String::new(),
         },
     }
 }

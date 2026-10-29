@@ -20,6 +20,7 @@ mod config_write;
 mod connect;
 mod drivers;
 mod engine;
+mod envpath;
 mod gates;
 mod history;
 mod issues;
@@ -32,6 +33,7 @@ mod privacy;
 mod projects;
 mod prompt;
 mod responses;
+mod role_migrate;
 mod routines;
 mod routing;
 mod schedule;
@@ -113,6 +115,11 @@ fn main() -> anyhow::Result<()> {
         "notify" => return shim::notify(rest.last().map(String::as_str).unwrap_or("")),
         "guard" => return local_guard::run(rest),
         _ => {}
+    }
+    if cmd == "daemon" {
+        // Before the runtime: no other thread exists yet, so setting PATH
+        // is safe, and everything started later inherits it.
+        envpath::apply();
     }
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)

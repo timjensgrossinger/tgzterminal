@@ -241,10 +241,15 @@ impl Engine {
             workdir,
             worktree,
             new_folder,
-            auto,
+            if auto {
+                tower_proto::AutoMode::Triage
+            } else {
+                tower_proto::AutoMode::Off
+            },
             true,
             spec.tier.clone(),
             spec.local_only,
+            spec.hands_free,
             &started_by,
         );
         // A failed launch can still leave its flight behind.
@@ -468,7 +473,7 @@ impl Engine {
             .map(|spec| {
                 let st = self.st.schedules.get(&spec.id).cloned().unwrap_or_default();
                 let timing = Timing::of(spec);
-                let role_err = (spec.role != "auto" && self.cfg.role(&spec.role).is_none())
+                let role_err = (spec.role != "auto" && self.cfg.resolve_role(&spec.role).is_none())
                     .then(|| format!("Unknown role {}", spec.role));
                 ScheduleRow {
                     spec: spec.clone(),
