@@ -127,6 +127,49 @@ fn is_pem_end(text: &str) -> bool {
     text.contains("-----END ") && text.contains("PRIVATE KEY-----")
 }
 
+/// Where the on-screen scan is relative to a private key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PemState {
+    Outside,
+    /// After the `BEGIN` line, before the first base64 line: RFC 1421 headers
+    /// (`Proc-Type: 4,ENCRYPTED`) and the blank line ending them may follow.
+    Headers,
+    Body,
+}
+
+/// A line of base64, the body of a key.
+fn is_base64_line(body: &str) -> bool {
+    !body.is_empty()
+        && body
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '='))
+}
+
+/// An RFC 1421 header line such as `DEK-Info: AES-128-CBC,ABCD`.
+fn is_pem_header_line(body: &str) -> bool {
+    match body.split_once(": ") {
+        Some((name, _)) => {
+            name.starts_with(|c: char| c.is_ascii_alphabetic())
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        }
+        None => false,
+    }
+}
+
+/// The state after `body` (a trimmed line) inside a key, or `None` when the
+/// line cannot be part of it. The `END` line is often never printed — `head`,
+/// `sed -n` and a cut-off paste stop short of it — so the key also ends at
+/// the first line that is not key material, and that line stays visible.
+fn pem_next_state(state: PemState, body: &str) -> Option<PemState> {
+    if is_base64_line(body) {
+        return Some(PemState::Body);
+    }
+    match state {
+        PemState::Headers if body.is_empty() || is_pem_header_line(body) => Some(state),
+        _ => None,
+    }
+}
+
 /// The compiled rule set for one configuration.
 pub(crate) struct SecretRules {
     rules: Vec<Regex>,
@@ -298,27 +341,34 @@ fn split_across_rows(
 ///
 /// Works on logical lines so a token wrapped across rows is matched once.
 /// `lines` must be in row order: a private key is recognised by its `BEGIN`
-/// line and everything up to the `END` line is hidden.
+/// line and its body is hidden up to the `END` line, or up to the first line
+/// that is not key material when there is none (see [`pem_next_state`]).
 pub(crate) fn scan_logical_lines(
     lines: &[LogicalLine],
     rules: &SecretRules,
 ) -> HashMap<StableRowIndex, Vec<MaskSpan>> {
     let mut rows: HashMap<StableRowIndex, Vec<MaskSpan>> = HashMap::new();
-    let mut in_pem = false;
+    let mut pem = PemState::Outside;
     for logical in lines {
         let (text, cells) = line_text(&logical.logical);
         let mut cols: Vec<Range<usize>> = vec![];
 
         if rules.pem_block.is_some() {
             if is_pem_end(&text) {
-                in_pem = false;
+                pem = PemState::Outside;
             } else if is_pem_begin(&text) {
-                in_pem = true;
-            } else if in_pem {
+                pem = PemState::Headers;
+            } else if pem != PemState::Outside {
                 let body = text.trim();
-                if !body.is_empty() {
-                    let start = text.len() - text.trim_start().len();
-                    cols.push(byte_range_to_cols(&cells, &(start..start + body.len())));
+                match pem_next_state(pem, body) {
+                    Some(next) => {
+                        pem = next;
+                        if !body.is_empty() {
+                            let start = text.len() - text.trim_start().len();
+                            cols.push(byte_range_to_cols(&cells, &(start..start + body.len())));
+                        }
+                    }
+                    None => pem = PemState::Outside,
                 }
             }
         }
@@ -884,6 +934,56 @@ mod tests {
         assert_eq!(rows[&2][0].cols, 2..6);
         assert!(!rows.contains_key(&0));
         assert!(!rows.contains_key(&3));
+        assert!(!rows.contains_key(&4));
+    }
+
+    #[test]
+    fn scan_ends_a_private_key_without_end_line_at_the_first_other_line() {
+        // `head -n 3 key; cat conf`: the END line is never printed.
+        let lines = [
+            logical(0, &["-----BEGIN OPENSSH PRIVATE KEY-----"]),
+            logical(1, &["b3BlbnNzaC1rZXktdjEAAAAABG5vbmU="]),
+            logical(2, &["ServerName \"ProFTPD\""]),
+            logical(3, &["  Port 21"]),
+            logical(4, &["root@host:/usr/local/src#"]),
+        ];
+        let rows = scan_logical_lines(&lines, &rules());
+        assert_eq!(rows[&1][0].cols, 0..32);
+        assert!(!rows.contains_key(&2));
+        assert!(!rows.contains_key(&3));
+        assert!(!rows.contains_key(&4));
+    }
+
+    #[test]
+    fn scan_masks_legacy_pem_headers_and_ends_at_a_blank_after_the_body() {
+        let lines = [
+            logical(0, &["-----BEGIN RSA PRIVATE KEY-----"]),
+            logical(1, &["Proc-Type: 4,ENCRYPTED"]),
+            logical(2, &["DEK-Info: AES-128-CBC,0123ABCD"]),
+            logical(3, &[""]),
+            logical(4, &["MIIEowIBAAKCAQEA"]),
+            logical(5, &[""]),
+            logical(6, &["done"]),
+        ];
+        let rows = scan_logical_lines(&lines, &rules());
+        assert!(rows.contains_key(&1));
+        assert!(rows.contains_key(&2));
+        assert_eq!(rows[&4][0].cols, 0..16);
+        assert!(!rows.contains_key(&6));
+    }
+
+    #[test]
+    fn scan_restarts_on_a_second_begin_line() {
+        let lines = [
+            logical(0, &["-----BEGIN OPENSSH PRIVATE KEY-----"]),
+            logical(1, &["AAAA"]),
+            logical(2, &["-----BEGIN OPENSSH PRIVATE KEY-----"]),
+            logical(3, &["BBBB"]),
+            logical(4, &["echo hi"]),
+        ];
+        let rows = scan_logical_lines(&lines, &rules());
+        assert!(rows.contains_key(&1));
+        assert!(rows.contains_key(&3));
         assert!(!rows.contains_key(&4));
     }
 
