@@ -8,7 +8,8 @@
 # it under dist/ instead of producing a zip.
 #
 # Usage:
-#   ci/build-macos-bundle.sh [--universal|--native] [--dmg] [--no-build] [--help]
+#   ci/build-macos-bundle.sh [--universal|--native] [--dmg] [--no-build]
+#                            [--tower|--no-tower] [--help]
 #
 # Flags:
 #   --universal   Build both x86_64-apple-darwin and aarch64-apple-darwin and
@@ -19,6 +20,14 @@
 #   --dmg         Also produce dist/TGZTerminal.dmg via hdiutil.
 #   --no-build    Skip the cargo build step entirely and just re-assemble the
 #                 bundle from whatever is already present under target/.
+#   --tower       Compile in the experimental Tower tab (TGZ_TOWER=1) and
+#                 build its daemon (tgz-tower/target/debug/tower) as well.
+#                 Off by default, and CI/release builds never pass it. A
+#                 machine that runs Tower opts in once, locally:
+#                     git config tgz.tower true
+#                 That lives in .git/config, so it never reaches CI, a clone
+#                 or a downstream fork.
+#   --no-tower    Leave Tower out even when git config tgz.tower is set.
 #   --help        Print this help and exit.
 #
 # Environment:
@@ -31,6 +40,7 @@
 #                         `ci/macos-signing-cert.sh create` once to stop that.
 #   CARGO_TARGET_DIR      Honored if set; otherwise defaults to "target" at
 #                         the repo root.
+#   TGZ_TOWER             TGZ_TOWER=1 is the same as --tower.
 #
 set -euo pipefail
 
@@ -41,9 +51,11 @@ set -euo pipefail
 BUILD_MODE="universal"
 BUILD_DMG=0
 SKIP_BUILD=0
+BUILD_TOWER=""
 
+# Print the comment block at the top of this file, whatever its length.
 print_help() {
-  sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'
+  awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"
 }
 
 while [[ $# -gt 0 ]]; do
@@ -62,6 +74,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --no-build)
       SKIP_BUILD=1
+      shift
+      ;;
+    --tower)
+      BUILD_TOWER=1
+      shift
+      ;;
+    --no-tower)
+      BUILD_TOWER=0
       shift
       ;;
     --help|-h)
@@ -131,6 +151,26 @@ if [[ ! -d "$APP_TEMPLATE" ]]; then
   fail "bundle template not found at $APP_TEMPLATE"
 fi
 
+# Tower: a flag wins, then TGZ_TOWER=1 from the environment, then the local
+# opt-in `git config tgz.tower true`. wezterm-gui/build.rs only reads
+# TGZ_TOWER, so export it (or clear it) for every cargo call below.
+if [[ -z "$BUILD_TOWER" ]]; then
+  if [[ "${TGZ_TOWER:-}" == "1" ]]; then
+    BUILD_TOWER=1
+  elif [[ "$(git config --type=bool --get tgz.tower 2>/dev/null || true)" == "true" ]]; then
+    BUILD_TOWER=1
+  else
+    BUILD_TOWER=0
+  fi
+fi
+if [[ "$BUILD_TOWER" -eq 1 ]]; then
+  [[ -f tgz-tower/gui/mod.rs ]] || fail "--tower: tgz-tower/gui/mod.rs is missing"
+  export TGZ_TOWER=1
+  log "Tower: on (TGZ_TOWER=1)"
+else
+  unset TGZ_TOWER
+fi
+
 # ---------------------------------------------------------------------------
 # Build binaries
 # ---------------------------------------------------------------------------
@@ -149,12 +189,37 @@ build_universal() {
   done
 }
 
+# The GUI starts towerd from tgz-tower/target/{debug,release} (see
+# daemon_binary in tgz-tower/gui/client.rs), never from the bundle, so build it
+# there: debug, the profile it looks at first, and without CARGO_TARGET_DIR,
+# which would send it somewhere the GUI does not look. A GUI and a towerd of
+# different PROTOCOL_VERSIONs refuse each other, so a daemon that is still
+# running the old binary has to be restarted by hand -- killing it from here
+# would end whatever flights it is running.
+build_tower_daemon() {
+  local bin="tgz-tower/target/debug/tower"
+  local before after
+  before=$(stat -f %m "$bin" 2>/dev/null || echo 0)
+  log "Building towerd (tgz-tower, debug profile)"
+  env -u CARGO_TARGET_DIR cargo build --manifest-path tgz-tower/Cargo.toml
+  after=$(stat -f %m "$bin" 2>/dev/null || echo 0)
+  if [[ "$after" != "$before" ]] && pgrep -f "tower daemon" >/dev/null 2>&1; then
+    echo "warning: towerd was rebuilt but the running daemon still uses the old" >&2
+    echo "         binary; restart it with: pkill -f \"tower daemon\"" >&2
+  fi
+}
+
 if [[ "$SKIP_BUILD" -eq 1 ]]; then
   log "Skipping cargo build (--no-build)"
-elif [[ "$BUILD_MODE" == "native" ]]; then
-  build_native
 else
-  build_universal
+  if [[ "$BUILD_TOWER" -eq 1 ]]; then
+    build_tower_daemon
+  fi
+  if [[ "$BUILD_MODE" == "native" ]]; then
+    build_native
+  else
+    build_universal
+  fi
 fi
 
 # Resolve the path to a built binary, combining per-arch outputs with lipo
@@ -381,7 +446,15 @@ if [[ "$BUILD_DMG" -eq 1 ]]; then
   ln -s /Applications "$STAGING_DIR/Applications"
 
   rm -f "$DMG_PATH"
-  hdiutil create -volname "$BRAND_APP_NAME" -srcfolder "$STAGING_DIR" -ov -format UDZO "$DMG_PATH"
+  # hdiutil sizes the temporary image from -srcfolder itself and, with the
+  # default APFS image, has under-estimated it on the CI runner: the build
+  # then dies copying the last binary into /Volumes/<name> with "No space
+  # left on device" while the host disk has 100 GiB free. Give it the size
+  # explicitly, with headroom, on HFS+ where the estimate is reliable.
+  STAGING_MB=$(du -sm "$STAGING_DIR" | cut -f1)
+  IMAGE_MB=$(( STAGING_MB + STAGING_MB / 4 + 64 ))
+  hdiutil create -volname "$BRAND_APP_NAME" -srcfolder "$STAGING_DIR" \
+    -fs HFS+ -size "${IMAGE_MB}m" -ov -format UDZO "$DMG_PATH"
 fi
 
 # ---------------------------------------------------------------------------
