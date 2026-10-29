@@ -226,6 +226,8 @@ impl crate::TermWindow {
                 divider_above: *divider_above,
                 indent: false,
                 trailing_chevron: false,
+                widget: None,
+                inert: false,
                 item_type: UIItemType::FileTreeMenuItem(*action),
             })
             .collect();

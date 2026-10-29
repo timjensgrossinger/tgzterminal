@@ -1523,6 +1523,19 @@ pub struct AgentSectionConfig {
     #[dynamic(default = "default_true")]
     pub show_tokens: bool,
 
+    /// Show subscription rate limits (Claude's and Codex's five-hour and
+    /// weekly windows) in the usage popup and as a fill in its `Σ` button.
+    /// Off also stops reading Claude's usage relay file.
+    #[dynamic(default = "default_true")]
+    pub show_quota: bool,
+
+    /// Route Claude Code's `statusLine` through the terminal's usage relay,
+    /// the only place Claude's rate limits can be read from. The relay keeps
+    /// running the status line command you had, unchanged. Off puts the
+    /// saved `statusLine` back in Claude's `settings.json`.
+    #[dynamic(default = "default_true")]
+    pub claude_usage_relay: bool,
+
     /// Sort attention-needing agents (blocked / waiting) to the top of the
     /// list so they are not buried under healthy rows.
     #[dynamic(default = "default_true")]
@@ -1537,6 +1550,8 @@ impl Default for AgentSectionConfig {
             show_non_interactive: false,
             show_activity: true,
             show_tokens: true,
+            show_quota: true,
+            claude_usage_relay: true,
             sort_attention_first: true,
         }
     }
@@ -4006,6 +4021,8 @@ mod agent_ui_tests {
         assert_eq!(section.refresh_ms, 500);
         assert!(section.show_activity);
         assert!(section.show_tokens);
+        assert!(section.show_quota);
+        assert!(section.claude_usage_relay);
     }
 
     /// The plain-pane Copy strip is on by default, and lives in its own table.

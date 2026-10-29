@@ -491,6 +491,9 @@ pub(crate) struct SidebarPalette {
     /// [`agent_herd::ATTENTION_RGB`] so a branded theme can speak its own
     /// attention colour without four literals drifting apart.
     attention: LinearRgba,
+    /// Fill of the `Σ` button, as far as the window closest to its limit is
+    /// used: a light red, so the button reads as a meter, not as the accent.
+    quota_fill: LinearRgba,
     ring: RingColors,
 }
 
@@ -499,6 +502,17 @@ impl SidebarPalette {
     /// two stops.
     pub(crate) fn accent(&self) -> LinearRgba {
         lerp_rgba(self.ring.a, self.ring.b, 0.5)
+    }
+
+    /// Fill of a quota bar: the accent while there is room, turning to the
+    /// attention colour as the window runs out.
+    pub(crate) fn gauge_color(&self, level: crate::agent_herd::quota::GaugeLevel) -> LinearRgba {
+        use crate::agent_herd::quota::GaugeLevel;
+        match level {
+            GaugeLevel::Ok => self.accent(),
+            GaugeLevel::Warn => lerp_rgba(self.accent(), self.attention, 0.55),
+            GaugeLevel::Critical => self.attention,
+        }
     }
 
     fn modern(ring: RingColors) -> Self {
@@ -519,6 +533,7 @@ impl SidebarPalette {
             text_meta: srgb8_to_linear(0x5a, 0x5a, 0x63),
             working_fill: srgb8_to_linear(0x13, 0x13, 0x17),
             attention: default_attention(),
+            quota_fill: default_quota_fill(),
         }
     }
 
@@ -563,6 +578,7 @@ impl SidebarPalette {
                 Some(c) => srgb8_to_linear_tuple(c),
                 None => default_attention(),
             },
+            quota_fill: default_quota_fill(),
             ring,
         }
     }
@@ -588,6 +604,7 @@ impl SidebarPalette {
             text_meta: text_idle.mul_alpha(0.60),
             working_fill: row_fill,
             attention: default_attention(),
+            quota_fill: default_quota_fill(),
             ring,
         }
     }
@@ -623,6 +640,7 @@ impl SidebarPalette {
             text_meta: lerp_rgba(surface, fg, 0.42),
             working_fill: lerp_rgba(surface, fg, 0.04),
             attention: default_attention(),
+            quota_fill: default_quota_fill(),
             ring,
         }
     }
@@ -685,6 +703,31 @@ const RAIL_BREATHE_FLOOR: f32 = 0.85;
 /// has no gradient primitive, so the ramp is a stack of adjacent flat quads;
 /// at 3px wide and ~24px tall the banding is not resolvable.
 const RAIL_GRADIENT_BANDS: usize = 5;
+
+/// Quota bars in the usage popup: gap between label, bar and caption (logical
+/// px, × DPI), bar height as a share of the cell height, and how far the
+/// empty track is mixed from the row fill towards the text colour.
+const USAGE_GAUGE_GAP: f32 = 8.;
+const USAGE_GAUGE_HEIGHT_RATIO: f32 = 0.42;
+const USAGE_GAUGE_TRACK_MIX: f32 = 0.16;
+/// The usage popup's bar graphs: the one-line graph's height as a share of
+/// the cell height, the gap between its bars and between the expanded
+/// chart's (logical px, × DPI), how far gridlines and idle buttons are mixed
+/// from the popup fill towards the text colour, and how far the selected
+/// span button is mixed towards the accent. The span mix stays low (the mix
+/// is linear, so 0.35 already lands mid-tone) so the label keeps the light
+/// text colour: at mid-tone neither light text nor dark ink reads.
+const USAGE_BARS_HEIGHT_RATIO: f32 = 0.8;
+const USAGE_BAR_GAP: f32 = 2.;
+const USAGE_CHART_BAR_GAP: f32 = 6.;
+const USAGE_CHART_GRID_MIX: f32 = 0.08;
+const USAGE_TAB_ACTIVE_MIX: f32 = 0.18;
+/// How far the `Σ` button's quota fill is mixed from the button fill towards
+/// [`SidebarPalette::quota_fill`]: enough to read as red, not so much that
+/// the percentage on top loses contrast. A window at its critical level gets
+/// the full colour.
+const USAGE_BUTTON_FILL_MIX: f32 = 0.6;
+const USAGE_BUTTON_FILL_CRITICAL_MIX: f32 = 0.9;
 /// Tile pitch along the ring, as a fraction of the stroke.
 ///
 /// The ring is a gradient drawn as flat tiles, so this is the difference
@@ -1042,6 +1085,11 @@ fn srgb8_to_linear_tuple((r, g, b): (u8, u8, u8)) -> LinearRgba {
 /// waiting queue has always used.
 fn default_attention() -> LinearRgba {
     srgb8_to_linear_tuple(crate::agent_herd::ATTENTION_RGB)
+}
+
+/// A soft red: the `Σ` button's quota fill in every theme.
+fn default_quota_fill() -> LinearRgba {
+    srgb8_to_linear(0xf2, 0x8b, 0x82)
 }
 
 /// Near-black label colour, for fills no scheme foreground can sit on.
@@ -4175,7 +4223,22 @@ pub(crate) struct SidebarDropdownRow {
     /// Draw a trailing `>` chevron, marking a row that expands into a
     /// submenu rather than acting immediately.
     pub(crate) trailing_chevron: bool,
+    /// Something drawn with the label (the usage popup's quota bars, bar
+    /// graph, chart and span buttons). A gauge or buttons take the right of
+    /// the row and the label gives way; a chart makes the row taller.
+    pub(crate) widget: Option<crate::termwindow::tgz_usage_menu::RowWidget>,
+    /// A line for reading only: no hover or press highlight.
+    pub(crate) inert: bool,
     pub(crate) item_type: UIItemType,
+}
+
+/// How many ordinary row heights a dropdown row takes: one, unless it holds
+/// a chart.
+fn dropdown_row_height_rows(row: &SidebarDropdownRow) -> usize {
+    row.widget
+        .as_ref()
+        .map_or(1, |widget| widget.height_rows())
+        .max(1)
 }
 
 /// Walk up from `start` to the nearest directory containing one of `markers`.
@@ -11123,6 +11186,8 @@ impl crate::TermWindow {
                 divider_above: false,
                 indent: false,
                 trailing_chevron: false,
+                widget: None,
+                inert: false,
                 item_type: UIItemType::SidebarAgentMenuRestoreLastWindow,
             });
         }
@@ -11152,6 +11217,8 @@ impl crate::TermWindow {
                 divider_above: false,
                 indent: false,
                 trailing_chevron: false,
+                widget: None,
+                inert: true,
                 // Not hit-testable as a session: there is no index behind it.
                 item_type: UIItemType::SidebarAgentMenuResume,
             });
@@ -11230,6 +11297,8 @@ impl crate::TermWindow {
                 divider_above: false,
                 indent: false,
                 trailing_chevron: true,
+                widget: None,
+                inert: false,
                 item_type: UIItemType::SidebarAgentMenuItem {
                     adapter_id: entry.adapter_id.clone(),
                 },
@@ -11243,6 +11312,8 @@ impl crate::TermWindow {
                         divider_above: false,
                         indent: true,
                         trailing_chevron: false,
+                        widget: None,
+                        inert: false,
                         item_type: UIItemType::SidebarAgentMenuTarget {
                             adapter_id: entry.adapter_id.clone(),
                             target,
@@ -11258,6 +11329,8 @@ impl crate::TermWindow {
             divider_above: true,
             indent: false,
             trailing_chevron: false,
+            widget: None,
+            inert: false,
             item_type: UIItemType::SidebarAgentMenuProjectRootToggle,
         });
         // Below the launch actions: this opens a whole tab rather than one
@@ -11270,6 +11343,8 @@ impl crate::TermWindow {
                 divider_above: false,
                 indent: false,
                 trailing_chevron: false,
+                widget: None,
+                inert: false,
                 item_type: UIItemType::SidebarAgentMenuTower,
             });
         }
@@ -11285,6 +11360,8 @@ impl crate::TermWindow {
                 divider_above: false,
                 indent: false,
                 trailing_chevron: true,
+                widget: None,
+                inert: false,
                 item_type: UIItemType::SidebarAgentMenuResume,
             });
             if resume_expanded {
@@ -11304,6 +11381,8 @@ impl crate::TermWindow {
                 divider_above: false,
                 indent: false,
                 trailing_chevron: false,
+                widget: None,
+                inert: false,
                 item_type: UIItemType::SidebarAgentMenuRestoreLastWindow,
             });
         }
@@ -11377,6 +11456,8 @@ impl crate::TermWindow {
             divider_above: false,
             indent: true,
             trailing_chevron: false,
+            widget: None,
+            inert: true,
             // Deliberately not a resume row: there is nothing to click, and a
             // hit-testable placeholder would resume an index that does not
             // exist.
@@ -11409,6 +11490,8 @@ impl crate::TermWindow {
                 divider_above: false,
                 indent: true,
                 trailing_chevron: false,
+                widget: None,
+                inert: false,
                 item_type: UIItemType::SidebarAgentMenuResumeSession {
                     index,
                     adapter_id: session.adapter_id.clone(),
@@ -11453,6 +11536,8 @@ impl crate::TermWindow {
                     divider_above,
                     indent: false,
                     trailing_chevron: false,
+                    widget: None,
+                    inert: false,
                     item_type: UIItemType::SidebarNewTabMenuItem { index },
                 }
             })
@@ -11498,6 +11583,8 @@ impl crate::TermWindow {
                 divider_above: false,
                 indent: false,
                 trailing_chevron: false,
+                widget: None,
+                inert: false,
                 item_type: UIItemType::CloseTabMenuItem {
                     source: menu.source,
                     action: CloseTabMenuAction::CloseAbove,
@@ -11510,6 +11597,8 @@ impl crate::TermWindow {
                 divider_above: false,
                 indent: false,
                 trailing_chevron: false,
+                widget: None,
+                inert: false,
                 item_type: UIItemType::CloseTabMenuItem {
                     source: menu.source,
                     action: CloseTabMenuAction::CloseBelow,
@@ -11522,6 +11611,8 @@ impl crate::TermWindow {
                 divider_above: false,
                 indent: false,
                 trailing_chevron: false,
+                widget: None,
+                inert: false,
                 item_type: UIItemType::CloseTabMenuItem {
                     source: menu.source,
                     action: CloseTabMenuAction::CloseAllOther,
@@ -11567,51 +11658,105 @@ impl crate::TermWindow {
 
     /// Sidebar SSH quick-launch dropdown. One row per pre-registered
     /// `SshDomain` whose transport is usable (installed binary for mosh/et).
-    /// The token usage popup: live sessions, today, the last week, and a bar
-    /// per day. Rows come from `tgz_usage_menu::usage_rows`; the per-day
-    /// history is scanned off this thread and the popup says so until it
-    /// arrives.
+    /// The usage popup: each subscription's rate-limit windows as bars
+    /// (Claude, then Codex), OpenCode's spend, then the live sessions, today,
+    /// the last week, and a bar per day. Rows come from `tgz_usage_menu`;
+    /// every figure was read off this thread, so painting only locks and
+    /// clones.
     pub fn paint_usage_menu(
         &mut self,
         layers: &mut TripleLayerQuadAllocator,
     ) -> anyhow::Result<()> {
-        use crate::termwindow::tgz_usage_menu;
+        use crate::termwindow::tgz_usage_menu::{self, UsageRowAction};
         let Some(menu) = self.usage_menu.clone() else {
+            // However it was closed, it opens again in its compact form.
+            self.usage_graph_expanded = false;
             return Ok(());
         };
         let history = tgz_usage_menu::history_for_menu();
-        let sessions: Vec<(String, u64)> = self
-            .agent_herd_state
-            .borrow()
-            .agents
-            .iter()
-            .filter_map(|agent| Some((agent.name.clone(), herd_agent_tokens(agent)?)))
-            .collect();
-        let rows: Vec<SidebarDropdownRow> = tgz_usage_menu::usage_rows(
+        let (sessions, claude_active) = {
+            let herd = self.agent_herd_state.borrow();
+            let sessions: Vec<tgz_usage_menu::LiveSession> = herd
+                .agents
+                .iter()
+                .filter_map(|agent| {
+                    Some(tgz_usage_menu::LiveSession {
+                        name: agent.name.clone(),
+                        tokens: herd_agent_tokens(agent)?,
+                        cost: agent.cost.clone(),
+                    })
+                })
+                .collect();
+            let claude_active = herd
+                .agents
+                .iter()
+                .any(|agent| agent.vendor == crate::agent_herd::vendor::AgentVendor::Claude);
+            (sessions, claude_active)
+        };
+        let now = std::time::SystemTime::now();
+        let cols = if self.usage_graph_expanded {
+            tgz_usage_menu::USAGE_MENU_WIDE_COLS
+        } else {
+            tgz_usage_menu::USAGE_MENU_COLS
+        };
+        let hovered_day = match self.last_ui_item.as_ref().map(|item| &item.item_type) {
+            Some(UIItemType::SidebarUsageMenuRow {
+                action: UsageRowAction::ChartDay(index),
+            }) => Some(*index),
+            _ => None,
+        };
+        let mut usage_rows = vec![];
+        if self.config.agent_ui.section.show_quota {
+            let snapshot = crate::agent_herd::quota::snapshot();
+            usage_rows = tgz_usage_menu::quota_rows(
+                &tgz_usage_menu::QuotaInputs {
+                    snapshot: &snapshot,
+                    relay: crate::termwindow::tgz_usage_relay::last_status(),
+                    claude_active,
+                    opencode: history.as_deref().and_then(|history| history.opencode),
+                    now,
+                },
+                cols,
+            );
+        }
+        let mut token_rows = tgz_usage_menu::usage_rows(
             &sessions,
             history.as_deref(),
             chrono::Local::now().date_naive(),
-            self.usage_graph_days,
-            tgz_usage_menu::USAGE_MENU_COLS,
-        )
-        .into_iter()
-        .map(|row| SidebarDropdownRow {
-            label: row.label,
-            dot_color: None,
-            checkbox: None,
-            divider_above: row.divider_above,
-            indent: false,
-            trailing_chevron: false,
-            item_type: UIItemType::SidebarUsageMenuRow {
-                cycles_graph: row.cycles_graph,
+            tgz_usage_menu::GraphView {
+                days: self.usage_graph_days,
+                expanded: self.usage_graph_expanded,
+                hovered: hovered_day,
             },
-        })
-        .collect();
+            cols,
+        );
+        if let Some(first) = token_rows.first_mut() {
+            first.divider_above = !usage_rows.is_empty();
+        }
+        usage_rows.extend(token_rows);
+
+        let rows: Vec<SidebarDropdownRow> = usage_rows
+            .into_iter()
+            .map(|row| SidebarDropdownRow {
+                label: row.label,
+                dot_color: row
+                    .vendor
+                    .as_ref()
+                    .map(|vendor| srgb8_to_linear_tuple(vendor.dot_color())),
+                checkbox: None,
+                divider_above: row.divider_above,
+                indent: false,
+                trailing_chevron: row.trailing_chevron,
+                widget: row.widget,
+                inert: row.action == UsageRowAction::Inert,
+                item_type: UIItemType::SidebarUsageMenuRow { action: row.action },
+            })
+            .collect();
 
         // In pre-DPI logical pixels, like `paint_sidebar_dropdown`'s `width`.
         let dpi_scale = (self.dimensions.dpi as f32 / 96.).clamp(1., 2.5);
         let cell_w_logical = self.render_metrics.cell_size.width as f32 / dpi_scale;
-        let menu_w = tgz_usage_menu::USAGE_MENU_COLS as f32 * cell_w_logical + SSH_MENU_TEXT_MARGIN;
+        let menu_w = cols as f32 * cell_w_logical + SSH_MENU_TEXT_MARGIN;
         self.paint_sidebar_dropdown(
             layers,
             menu.x as f32,
@@ -11621,7 +11766,76 @@ impl crate::TermWindow {
             &rows,
             None,
             None,
-        )
+        )?;
+
+        // Repaints are on demand: without a deadline the reset countdowns and
+        // "updated 2m ago" would only move when the mouse does. Once a minute,
+        // on the minute, and only while the popup is open.
+        let into_minute = now
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map(|since| since.as_millis() % 60_000)
+            .unwrap_or(0) as u64;
+        let next_minute = Instant::now() + Duration::from_millis(60_000 - into_minute + 50);
+        let mut animation = self.has_animation.borrow_mut();
+        if animation.map_or(true, |at| at > next_minute) {
+            *animation = Some(next_minute);
+        }
+        Ok(())
+    }
+
+    /// One day of a usage graph, standing on the bottom of `area`: Claude's
+    /// share at the foot and Codex's on top, as tall against `area` as the
+    /// day is against `max`. An empty day keeps a one-pixel stub, so the
+    /// graph still shows how many days it covers.
+    fn paint_usage_bar(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        area: RectF,
+        day: crate::agent_herd::usage_history::DayTokens,
+        max: u64,
+        track_bg: LinearRgba,
+        highlight: bool,
+    ) -> anyhow::Result<()> {
+        let sb = self.sidebar_palette();
+        let dpi_scale = (self.dimensions.dpi as f32 / 96.).clamp(1., 2.5);
+        let (x, w, bottom) = (area.min_x(), area.width(), area.max_y());
+        let total = day.total();
+        if total == 0 || max == 0 {
+            let stub = dpi_scale.max(1.);
+            self.filled_rectangle(
+                layers,
+                2,
+                euclid::rect(x, bottom - stub, w, stub),
+                lerp_rgba(track_bg, sb.text_active, USAGE_GAUGE_TRACK_MIX),
+            )?;
+            return Ok(());
+        }
+        let height = (area.height() * (total as f32 / max as f32).min(1.)).max(2. * dpi_scale);
+        let claude_h = height * day.claude as f32 / total as f32;
+        let lift = |color: LinearRgba| {
+            if highlight {
+                lerp_rgba(color, sb.text_active, 0.3)
+            } else {
+                color
+            }
+        };
+        if day.claude > 0 {
+            self.filled_rectangle(
+                layers,
+                2,
+                euclid::rect(x, bottom - claude_h, w, claude_h),
+                lift(srgb8_to_linear_tuple(AgentVendor::Claude.dot_color())),
+            )?;
+        }
+        if day.codex > 0 {
+            self.filled_rectangle(
+                layers,
+                2,
+                euclid::rect(x, bottom - height, w, height - claude_h),
+                lift(srgb8_to_linear_tuple(AgentVendor::Codex.dot_color())),
+            )?;
+        }
+        Ok(())
     }
 
     /// Clicking a row spawns the connection into a new tab — `WezTerm`/`Ssh`
@@ -11661,6 +11875,8 @@ impl crate::TermWindow {
             divider_above,
             indent: false,
             trailing_chevron: false,
+            widget: None,
+            inert: false,
             item_type: UIItemType::SidebarSshMenuItem {
                 domain_name: domain_name.to_string(),
             },
@@ -11793,7 +12009,10 @@ impl crate::TermWindow {
             .max(AGENT_LAUNCH_MENU_W);
         let row_heights: Vec<f32> = rows
             .iter()
-            .map(|row| row_h + if row.divider_above { divider_band } else { 0. })
+            .map(|row| {
+                row_h * dropdown_row_height_rows(row) as f32
+                    + if row.divider_above { divider_band } else { 0. }
+            })
             .collect();
         let window_h = self.dimensions.pixel_height as f32;
         let cap_body = (DROPDOWN_MAX_VISIBLE_ROWS as f32 * row_h)
@@ -12003,8 +12222,9 @@ impl crate::TermWindow {
                 row_y = divider_y + divider_h + divider_gap;
             }
 
+            let this_h = row_h * dropdown_row_height_rows(row) as f32;
             let item_type = row.item_type.clone();
-            let hovered = hovered_item.as_ref() == Some(&item_type);
+            let hovered = !row.inert && hovered_item.as_ref() == Some(&item_type);
             let pressed =
                 hovered && left_pressed && self.pressed_ui_item.as_ref() == Some(&item_type);
             let row_bg = if pressed {
@@ -12018,7 +12238,7 @@ impl crate::TermWindow {
                 self.sidebar_rounded_fill(
                     layers,
                     1,
-                    euclid::rect(menu_x + row_inset, row_y, rows_w - row_inset * 2., row_h),
+                    euclid::rect(menu_x + row_inset, row_y, rows_w - row_inset * 2., this_h),
                     row_radius,
                     row_bg,
                 )?;
@@ -12074,16 +12294,305 @@ impl crate::TermWindow {
             } else {
                 0.
             };
-            render_text(
-                self,
-                layers,
-                &row.label,
-                text_x,
-                row_y + (row_h - cell_h_f) * 0.5,
-                (menu_x + rows_w - row_text_inset - chevron_w - text_x).max(1.),
-                contrast_label_color(row_bg, sb.text_active),
-                row_bg,
-            )?;
+            // A quota bar and its caption take a fixed band at the right, so
+            // the bars of consecutive rows line up; the label gives way.
+            let mut label_right = menu_x + rows_w - row_text_inset - chevron_w;
+            // Hit areas a widget adds on top of its row (chart bars, span
+            // buttons): pushed after the row's own, so they win hit-testing.
+            let mut widget_items: Vec<UIItem> = vec![];
+            let mut draw_label = true;
+            use crate::termwindow::tgz_usage_menu::RowWidget;
+            match &row.widget {
+                None => {}
+                Some(RowWidget::Gauge(gauge)) => {
+                    use crate::termwindow::tgz_usage_menu::{GAUGE_COLS, GAUGE_TRAILING_COLS};
+                    let cell_w = cell_width as f32;
+                    let trailing_x = label_right - GAUGE_TRAILING_COLS as f32 * cell_w;
+                    let bar_w = GAUGE_COLS as f32 * cell_w;
+                    let bar_x = trailing_x - USAGE_GAUGE_GAP * dpi_scale - bar_w;
+                    let bar_h = (cell_h_f * USAGE_GAUGE_HEIGHT_RATIO).max(3. * dpi_scale);
+                    let bar_y = row_y + (row_h - bar_h) * 0.5;
+                    if bar_x > text_x {
+                        self.sidebar_pill_fill(
+                            layers,
+                            2,
+                            euclid::rect(bar_x, bar_y, bar_w, bar_h),
+                            bar_h * 0.5,
+                            lerp_rgba(row_bg, fg, USAGE_GAUGE_TRACK_MIX),
+                        )?;
+                        let fraction = gauge.fraction.clamp(0., 1.);
+                        if fraction > 0. {
+                            // Never thinner than its own rounded ends, so 1% shows.
+                            let fill_w = (bar_w * fraction).max(bar_h);
+                            self.sidebar_pill_fill(
+                                layers,
+                                2,
+                                euclid::rect(bar_x, bar_y, fill_w, bar_h),
+                                bar_h * 0.5,
+                                sb.gauge_color(gauge.level),
+                            )?;
+                        }
+                        label_right = bar_x - USAGE_GAUGE_GAP * dpi_scale;
+                    }
+                    render_text(
+                        self,
+                        layers,
+                        &gauge.trailing,
+                        trailing_x,
+                        row_y + (row_h - cell_h_f) * 0.5,
+                        GAUGE_TRAILING_COLS as f32 * cell_w,
+                        if gauge.fraction > 0. {
+                            contrast_label_color(row_bg, sb.text_active)
+                        } else {
+                            sb.text_meta
+                        },
+                        row_bg,
+                    )?;
+                }
+                Some(RowWidget::Bars(bars)) => {
+                    use crate::agent_herd::usage_history::DayTokens;
+                    use crate::termwindow::tgz_usage_menu::{bar_slots, GRAPH_BAR_COLS};
+                    let cell_w = cell_width as f32;
+                    let strip_w = (GRAPH_BAR_COLS as f32 * cell_w).min(label_right - text_x);
+                    let strip_h = (cell_h_f * USAGE_BARS_HEIGHT_RATIO).max(4. * dpi_scale);
+                    let base_y = row_y + (row_h + strip_h) * 0.5;
+                    let max = bars.days.iter().map(DayTokens::total).max().unwrap_or(0);
+                    let slots = bar_slots(
+                        bars.days.len(),
+                        strip_w,
+                        USAGE_BAR_GAP * dpi_scale,
+                        cell_w * 0.8,
+                    );
+                    // Flush left, under where a label would start.
+                    let shift = slots.first().map_or(0., |(x, _)| *x);
+                    for ((x, w), day) in slots.iter().zip(&bars.days) {
+                        self.paint_usage_bar(
+                            layers,
+                            euclid::rect(text_x + x - shift, base_y - strip_h, *w, strip_h),
+                            *day,
+                            max,
+                            row_bg,
+                            false,
+                        )?;
+                    }
+                }
+                Some(RowWidget::Chart(chart)) => {
+                    use crate::termwindow::tgz_usage_menu::{bar_slots, UsageRowAction};
+                    draw_label = false;
+                    let cell_w = cell_width as f32;
+                    let left = menu_x + row_text_inset;
+                    let right = menu_x + rows_w - row_text_inset;
+                    let tick_cols = chart
+                        .ticks
+                        .iter()
+                        .map(|(_, text)| text.chars().count())
+                        .max()
+                        .unwrap_or(1);
+                    let plot_x = left + (tick_cols + 1) as f32 * cell_w;
+                    let plot_w = (right - plot_x).max(1.);
+                    // A line for the legend above the plot, one for the dates
+                    // below it.
+                    let plot_top = row_y + cell_h_f * 1.5;
+                    let label_band = cell_h_f + 4. * dpi_scale;
+                    let plot_bottom = row_y + this_h - label_band;
+                    let plot_h = (plot_bottom - plot_top).max(1.);
+
+                    let mut legend_x = plot_x;
+                    for vendor in [AgentVendor::Claude, AgentVendor::Codex] {
+                        let used = chart.days.iter().any(|day| match vendor {
+                            AgentVendor::Claude => day.claude > 0,
+                            _ => day.codex > 0,
+                        });
+                        if !used {
+                            continue;
+                        }
+                        self.sidebar_rounded_fill(
+                            layers,
+                            2,
+                            euclid::rect(
+                                legend_x,
+                                row_y + (cell_h_f - dot_size) * 0.5,
+                                dot_size,
+                                dot_size,
+                            ),
+                            dot_size * 0.5,
+                            srgb8_to_linear_tuple(vendor.dot_color()),
+                        )?;
+                        legend_x += dot_size + ACTION_ICON_GAP;
+                        let name = vendor.label().to_string();
+                        let name_w = name.chars().count() as f32 * cell_w;
+                        render_text(
+                            self,
+                            layers,
+                            &name,
+                            legend_x,
+                            row_y,
+                            name_w,
+                            sb.text_meta,
+                            bg,
+                        )?;
+                        legend_x += name_w + cell_w * 2.;
+                    }
+
+                    for (value, text) in &chart.ticks {
+                        let fraction = if chart.axis_max == 0 {
+                            0.
+                        } else {
+                            *value as f32 / chart.axis_max as f32
+                        };
+                        let y = plot_bottom - plot_h * fraction;
+                        self.filled_rectangle(
+                            layers,
+                            2,
+                            euclid::rect(plot_x, y, plot_w, divider_h),
+                            lerp_rgba(bg, fg, USAGE_CHART_GRID_MIX),
+                        )?;
+                        let cols = text.chars().count();
+                        render_text(
+                            self,
+                            layers,
+                            text,
+                            left + tick_cols.saturating_sub(cols) as f32 * cell_w,
+                            y - cell_h_f * 0.5,
+                            cols as f32 * cell_w,
+                            sb.text_meta,
+                            bg,
+                        )?;
+                    }
+
+                    let gap = USAGE_CHART_BAR_GAP * dpi_scale;
+                    let slots = bar_slots(chart.days.len(), plot_w, gap, cell_w * 3.);
+                    for (index, ((x, w), day)) in slots.iter().zip(&chart.days).enumerate() {
+                        let x = plot_x + x;
+                        let hovered_bar = chart.hovered == Some(index);
+                        if hovered_bar {
+                            // The whole column, so the hovered day reads even
+                            // when its bar is short.
+                            self.sidebar_rounded_fill(
+                                layers,
+                                1,
+                                euclid::rect(x - gap * 0.5, plot_top, w + gap, plot_h),
+                                row_radius.min((w + gap) * 0.5),
+                                lerp_rgba(bg, fg, USAGE_CHART_GRID_MIX),
+                            )?;
+                        }
+                        self.paint_usage_bar(
+                            layers,
+                            euclid::rect(x, plot_top, *w, plot_h),
+                            *day,
+                            chart.axis_max,
+                            bg,
+                            hovered_bar,
+                        )?;
+                        widget_items.push(UIItem {
+                            x: (x - gap * 0.5).max(0.) as usize,
+                            y: plot_top as usize,
+                            width: (w + gap).ceil() as usize,
+                            height: (plot_h + label_band).ceil() as usize,
+                            item_type: UIItemType::SidebarUsageMenuRow {
+                                action: UsageRowAction::ChartDay(index),
+                            },
+                        });
+                    }
+
+                    let last = chart.days.len().saturating_sub(1);
+                    for (index, text) in &chart.x_labels {
+                        let Some((x, w)) = slots.get(*index) else {
+                            continue;
+                        };
+                        let text_w = text.chars().count() as f32 * cell_w;
+                        let centre = plot_x + x + w * 0.5;
+                        let label_x =
+                            (centre - text_w * 0.5).clamp(left, (right - text_w).max(left));
+                        let color = if chart.hovered == Some(*index) || *index == last {
+                            sb.text_active
+                        } else {
+                            sb.text_meta
+                        };
+                        render_text(
+                            self,
+                            layers,
+                            text,
+                            label_x,
+                            plot_bottom + 4. * dpi_scale,
+                            text_w,
+                            color,
+                            bg,
+                        )?;
+                    }
+                }
+                Some(RowWidget::Tabs(tabs)) => {
+                    let cell_w = cell_width as f32;
+                    let pad_x = cell_w * 0.6;
+                    let gap = 4. * dpi_scale;
+                    let tab_h = (cell_h_f + 6. * dpi_scale).min(row_h);
+                    let tab_y = row_y + (row_h - tab_h) * 0.5;
+                    let mut x = menu_x + rows_w - row_text_inset;
+                    for tab in tabs.iter().rev() {
+                        let text_w = tab.label.chars().count() as f32 * cell_w;
+                        let w = text_w + pad_x * 2.;
+                        x -= w;
+                        let tab_type = UIItemType::SidebarUsageMenuRow { action: tab.action };
+                        let tab_hovered = hovered_item.as_ref() == Some(&tab_type);
+                        let tab_pressed = tab_hovered
+                            && left_pressed
+                            && self.pressed_ui_item.as_ref() == Some(&tab_type);
+                        let fill = if tab_pressed {
+                            pressed_bg
+                        } else if tab.active {
+                            lerp_rgba(bg, sb.accent(), USAGE_TAB_ACTIVE_MIX)
+                        } else if tab_hovered {
+                            hover_bg
+                        } else {
+                            lerp_rgba(bg, fg, USAGE_CHART_GRID_MIX)
+                        };
+                        // Layer 1, same as the glyphs `render_text` emits
+                        // next: a layer-2 fill paints over its own label.
+                        self.sidebar_rounded_fill(
+                            layers,
+                            1,
+                            euclid::rect(x, tab_y, w, tab_h),
+                            row_radius.min(tab_h * 0.5),
+                            fill,
+                        )?;
+                        render_text(
+                            self,
+                            layers,
+                            &tab.label,
+                            x + pad_x,
+                            row_y + (row_h - cell_h_f) * 0.5,
+                            text_w,
+                            if tab.active || tab_hovered {
+                                contrast_label_color(fill, sb.text_active)
+                            } else {
+                                sb.text_idle
+                            },
+                            fill,
+                        )?;
+                        widget_items.push(UIItem {
+                            x: x as usize,
+                            y: tab_y as usize,
+                            width: w.ceil() as usize,
+                            height: tab_h.ceil() as usize,
+                            item_type: tab_type,
+                        });
+                        x -= gap;
+                    }
+                    label_right = x - gap;
+                }
+            }
+            if draw_label {
+                render_text(
+                    self,
+                    layers,
+                    &row.label,
+                    text_x,
+                    row_y + (row_h - cell_h_f) * 0.5,
+                    (label_right - text_x).max(1.),
+                    contrast_label_color(row_bg, sb.text_active),
+                    row_bg,
+                )?;
+            }
             if row.trailing_chevron {
                 render_text(
                     self,
@@ -12100,10 +12609,11 @@ impl crate::TermWindow {
                 x: (menu_x + row_inset) as usize,
                 y: row_y as usize,
                 width: (rows_w - row_inset * 2.) as usize,
-                height: row_h.ceil() as usize,
+                height: this_h.ceil() as usize,
                 item_type,
             });
-            row_y += row_h;
+            self.ui_items.extend(widget_items);
+            row_y += this_h;
         }
 
         if let Some(viewport) = viewport {
@@ -15065,10 +15575,24 @@ impl crate::TermWindow {
         };
         // Read config here; the worker has no handle on it.
         let distros = self.wsl_distro_specs();
+        let poll_quota = self.config.agent_ui.section.show_quota;
+        let want_relay = self.config.agent_ui.section.claude_usage_relay;
 
         self.agent_herd_scan_started_at = Some(Instant::now());
         let future = promise::spawn::spawn_into_new_thread(move || {
             let started = Instant::now();
+            // Claude's rate limits: the relay is put in place (or taken out)
+            // when due, then two stats per scan and a read only after a
+            // Claude reply rewrote the sample. See `tgz_usage_relay`.
+            {
+                use crate::termwindow::tgz_usage_relay;
+                if let Some(paths) = tgz_usage_relay::RelayPaths::for_user() {
+                    tgz_usage_relay::ensure(&paths, want_relay);
+                    if poll_quota {
+                        crate::agent_herd::quota::poll_claude_sample(&paths.sample);
+                    }
+                }
+            }
             let roots = agent_session_roots(home, &distros);
             let sessions = crate::agent_herd::default_registry().collect_all_from(&roots);
             // A scan reads every vendor's store, WSL ones through the 9p share;
@@ -15313,8 +15837,36 @@ impl crate::TermWindow {
         // Usage button, left of the sessions button and the same size. It is
         // the first to go when the header is narrow: the label needs room.
         let usage_type = UIItemType::SidebarUsageButton;
-        let usage_x = sessions_x - 4.0 * dpi - sessions_w;
-        let usage_fits = sessions_fits && usage_x > label_x + 10.0 * cell_w;
+        // The window closest to its limit (see
+        // `QuotaSnapshot::priority_band`): the button reads `Σ 28%` and fills
+        // from the left as far. Used share, and whether it is critical.
+        let usage_band = if self.config.agent_ui.section.show_quota {
+            let now = std::time::SystemTime::now();
+            crate::agent_herd::quota::snapshot()
+                .priority_band(now)
+                .map(|(_, band)| {
+                    (
+                        band.fraction(now),
+                        band.used_percent,
+                        crate::agent_herd::quota::gauge_level(band.used_percent),
+                    )
+                })
+        } else {
+            None
+        };
+        // The percentage while the header label keeps its room, else the
+        // bare glyph at the sessions button's size.
+        let usage_min_x = label_x + 10.0 * cell_w;
+        let (usage_label, usage_w) = usage_band
+            .map(|(_, used, _)| {
+                let label = format!("Σ {:.0}%", used.round().max(0.));
+                let w = label.chars().count() as f32 * cell_w + SESSIONS_BUTTON_PAD_X * dpi * 2.;
+                (label, w)
+            })
+            .filter(|(_, w)| sessions_x - 4.0 * dpi - w > usage_min_x)
+            .unwrap_or_else(|| ("Σ".to_string(), sessions_w));
+        let usage_x = sessions_x - 4.0 * dpi - usage_w;
+        let usage_fits = sessions_fits && usage_x > usage_min_x;
         let label_right = if usage_fits {
             usage_x - 4.0 * dpi
         } else if sessions_fits {
@@ -15443,7 +15995,7 @@ impl crate::TermWindow {
                 euclid::rect(
                     usage_x,
                     header_y + 2.0 * dpi + usage_offset,
-                    sessions_w,
+                    usage_w,
                     usage_h,
                 ),
                 (RADIUS * dpi).min(usage_h * 0.5),
@@ -15451,20 +16003,47 @@ impl crate::TermWindow {
                 usage_fill,
                 sb.row_border,
             )?;
+            if let Some((fraction, _, level)) = usage_band {
+                let inset = dpi.max(1.) + dpi;
+                let inner_w = (usage_w - inset * 2.).max(0.);
+                let inner_h = (usage_h - inset * 2.).max(0.);
+                let fill_w = inner_w * fraction;
+                if fill_w >= 1. && inner_h >= 1. {
+                    let mix = if level == crate::agent_herd::quota::GaugeLevel::Critical {
+                        USAGE_BUTTON_FILL_CRITICAL_MIX
+                    } else {
+                        USAGE_BUTTON_FILL_MIX
+                    };
+                    self.sidebar_rounded_fill(
+                        layers,
+                        1,
+                        euclid::rect(
+                            usage_x + inset,
+                            header_y + 2.0 * dpi + usage_offset + inset,
+                            fill_w,
+                            inner_h,
+                        ),
+                        ((RADIUS * dpi).min(usage_h * 0.5) - inset).max(0.),
+                        lerp_rgba(usage_fill, sb.quota_fill, mix),
+                    )?;
+                }
+            }
+            let usage_text_w = usage_label.chars().count() as f32 * cell_w;
             self.paint_text(
                 layers,
-                "Σ",
-                usage_x + (sessions_w - cell_w) * 0.5,
+                &usage_label,
+                usage_x + (usage_w - usage_text_w) * 0.5,
                 header_y + (header_h - cell_h) * 0.5 + usage_offset,
-                cell_w,
-                usage_fg,
+                usage_text_w,
+                // A figure on the fill has to be read, not glanced at.
+                if usage_band.is_some() { fg } else { usage_fg },
                 bg,
                 false,
             )?;
             self.ui_items.push(UIItem {
                 x: usage_x as usize,
                 y: header_y as usize,
-                width: sessions_w as usize,
+                width: usage_w as usize,
                 height: header_h as usize,
                 item_type: usage_type,
             });

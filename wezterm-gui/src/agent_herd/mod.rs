@@ -26,6 +26,7 @@ pub mod file_history;
 pub mod gemini;
 pub mod incremental;
 pub mod opencode;
+pub mod quota;
 pub mod sessions;
 pub mod touched;
 pub mod transcript;

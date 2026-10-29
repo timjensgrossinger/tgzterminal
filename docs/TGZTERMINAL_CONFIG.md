@@ -1239,6 +1239,8 @@ agent_ui = {
     show_non_interactive = false, -- also list SDK/headless/hook agent processes
     show_activity = true, -- transcript headline, attention, branch, subagent summary + tree
     show_tokens = true, -- token counts (transcript or pane-reported) and vendor-reported cost
+    show_quota = true, -- subscription rate limits in the usage popup and the Σ button
+    claude_usage_relay = true, -- read Claude's limits through its statusLine (see below)
     sort_attention_first = true, -- surface blocked/waiting agents at the top of the list
   },
 }
@@ -1253,10 +1255,22 @@ row to focus its pane, or the chevron to expand it.
 **Usage popup.** The `Σ` button in the section header (left of the sessions
 button; dropped first when the header is narrow) opens a panel with:
 
-- every open session and its tokens, largest first, with a total;
+- **subscription limits** (with `show_quota`, see below): a card per vendor
+  with a bar per rate-limit window, how much of it is used and when it
+  resets (`47% · 2h 13m`). Claude first, then Codex;
+- **OpenCode spend**: its own cost and token totals for today and the last
+  7 days, from `opencode.db` (a session counts whole on any day it was
+  updated);
+- every open session and its tokens, largest first, with a total, and its
+  cost where the agent reports one;
 - **Today** and **Last 7 days**, across all Claude Code and Codex sessions on
   this machine, open or not;
-- a bar per day. Click that row to step the graph through 7, 14 and 30 days.
+- a bar per day, stacked by vendor (Claude, Codex). Click it to open the
+  popup into a full chart in place: an axis with round-number gridlines, a
+  date under the bars, buttons for 7, 14 and 30 days, and a line naming the
+  day under the pointer (its total, and the Claude/Codex split when both
+  were used) or, with no day pointed at, the span's average and busiest day.
+  The `^` button, or closing the popup, folds it back.
 
 The per-day figures are worked out from the timestamps in the agents' own
 transcripts. Nothing is recorded for it, so there is no history file to manage.
@@ -1275,6 +1289,54 @@ transcripts. Nothing is recorded for it, so there is no history file to manage.
   Codex session does not recount the total it inherited.
 - OpenCode sessions count in the open sessions list but not in the per-day
   figures.
+
+**Subscription limits.** The `Σ` button shows how much of the window
+closest to its limit is used (`Σ 28%`) and fills from the left in a light
+red as far: of Claude's windows if any is still running, else of Codex's.
+The red is at full strength from 85%. When the header is too narrow for the
+percentage the button falls back to a bare `Σ`. In the popup the bars turn
+from the accent colour towards the attention colour past 60%. A
+window whose reset time has passed shows as `reset` with an empty bar until
+the vendor reports the new one, on the next turn. Nothing is read with your
+credentials and nothing is sent anywhere.
+
+- **Codex**: read from the `rate_limits` Codex writes into its own rollout
+  files on every turn (`~/.codex/sessions`), so it needs no setup. The card
+  shows the plan and the five-hour and weekly windows. A plan or model that
+  reports no window shows no Codex card.
+- **Claude**: Claude Code only hands its rate limits to its **status line**
+  command (Pro and Max accounts, after a session's first reply), so
+  TGZTerminal connects a usage relay by default (`claude_usage_relay`),
+  as soon as it finds Claude's config directory. It
+  1. copies `~/.claude/settings.json` to `settings.json.bak` and saves your
+     current `statusLine` setting beside TGZTerminal's state files;
+  2. writes `claude-statusline-relay.sh` there: a POSIX `sh` script that
+     stores each payload in `claude-statusline.json` and then runs your
+     previous status line command with the same input, so your status line
+     looks exactly as before;
+  3. points `statusLine.command` at the script (keeping `padding` and
+     `refreshInterval`).
+
+  The first connect is announced in a notification; later launches find it
+  in place and stay quiet. The last payload is kept, so the limits show as
+  soon as the terminal starts, marked with how old they are. If another tool
+  rewrites `statusLine`, the relay wraps the new command once per change of
+  the file and never fights it in a loop; an unreadable `settings.json` is
+  left alone. `claude_usage_relay = false` puts the saved setting back and
+  removes the script on the next scan. `CLAUDE_CONFIG_DIR` is honoured. If you had no status
+  line, the relay prints the model name, and Claude Code then hides the
+  keyboard hints in its footer, as it does for any status line. To keep your
+  settings untouched instead, make your own status line script save its
+  input to the same file, e.g. as its first line:
+  `input=$(cat); printf '%s' "$input" > "$HOME/Library/Application Support/wezterm/claude-statusline.json"`
+  (TGZTerminal's data directory: `~/Library/Application Support/wezterm` on
+  macOS, `~/.local/share/wezterm` on Linux; flavoured builds name the file
+  `claude-statusline-<flavour>.json`). Claude
+  agents running inside WSL are not covered, and the relay is not offered on
+  Windows yet.
+- `show_quota = false` hides the cards and the button's percentage and
+  stops reading the relay's file. The relay itself follows
+  `claude_usage_relay` alone.
 
 **Where the token counts come from.** With `show_tokens` on, an expanded row
 shows `tokens: in X · out Y`, and a collapsed row adds a compact total after

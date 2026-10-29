@@ -134,6 +134,7 @@ pub mod tgz_secret_mask;
 pub mod tgz_ssh_hosts;
 pub mod tgz_ui_state;
 pub mod tgz_usage_menu;
+pub mod tgz_usage_relay;
 // Untracked, opt-in experimental tab view; see `experimental_tab_views` in build.rs.
 #[cfg(tgz_tower)]
 #[rustfmt::skip]
@@ -651,10 +652,10 @@ pub enum UIItemType {
     SidebarSshLaunchButton,
     /// The `Σ` button in the Agents section header: opens the usage popup.
     SidebarUsageButton,
-    /// A line of the usage popup. Only the graph line does anything when
-    /// clicked: it steps the number of days the graph covers.
+    /// A line of the usage popup. `action` says what a click does: step the
+    /// graph's span, connect or disconnect the Claude usage relay, or nothing.
     SidebarUsageMenuRow {
-        cycles_graph: bool,
+        action: crate::termwindow::tgz_usage_menu::UsageRowAction,
     },
     /// A row in the SSH quick-launch dropdown.
     SidebarSshMenuItem {
@@ -1223,6 +1224,8 @@ pub struct TermWindow {
     usage_menu: Option<tgz_usage_menu::UsageMenuState>,
     /// Days covered by the usage popup's graph.
     usage_graph_days: usize,
+    /// The usage popup's graph is opened into its full chart.
+    usage_graph_expanded: bool,
     /// Shells/domains offered by the new-tab dropdown. Probing for shells
     /// touches the filesystem, so this is rebuilt only when the config
     /// generation changes.
@@ -1732,6 +1735,7 @@ impl TermWindow {
             ssh_launch_menu: None,
             usage_menu: None,
             usage_graph_days: 7,
+            usage_graph_expanded: false,
             new_tab_menu_cache: RefCell::new(None),
             agent_launcher_project_root: tgz_ui_state::load_agent_launcher_project_root()
                 .unwrap_or(config.agent_ui.launcher.cwd == config::AgentLauncherCwd::ProjectRoot),

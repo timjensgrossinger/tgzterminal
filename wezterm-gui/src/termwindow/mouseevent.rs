@@ -960,8 +960,8 @@ impl super::TermWindow {
             UIItemType::SidebarUsageButton => {
                 self.mouse_event_sidebar_usage_button(item, event, context);
             }
-            UIItemType::SidebarUsageMenuRow { cycles_graph } => {
-                self.mouse_event_sidebar_usage_menu_row(cycles_graph, event, context);
+            UIItemType::SidebarUsageMenuRow { action } => {
+                self.mouse_event_sidebar_usage_menu_row(action, event, context);
             }
             UIItemType::SidebarSshMenuItem { domain_name } => {
                 self.mouse_event_sidebar_ssh_menu_item(domain_name, event, context);
@@ -1322,19 +1322,23 @@ impl super::TermWindow {
         context.invalidate();
     }
 
-    /// A line of the usage popup. The popup is for reading, so a click leaves
-    /// it open; on the graph line it also steps the graph's span.
+    /// A line of the usage popup, or a control on one. The popup is for
+    /// reading, so a click leaves it open; the graph line opens the full
+    /// chart, whose buttons pick its span or fold it back.
     fn mouse_event_sidebar_usage_menu_row(
         &mut self,
-        cycles_graph: bool,
+        action: crate::termwindow::tgz_usage_menu::UsageRowAction,
         event: MouseEvent,
         context: &dyn WindowOps,
     ) {
+        use crate::termwindow::tgz_usage_menu::UsageRowAction;
         if event.kind == WMEK::Release(MousePress::Left) {
             self.pressed_ui_item = None;
-            if cycles_graph {
-                self.usage_graph_days =
-                    crate::termwindow::tgz_usage_menu::next_graph_span(self.usage_graph_days);
+            match action {
+                UsageRowAction::Inert | UsageRowAction::ChartDay(_) => {}
+                UsageRowAction::ExpandGraph => self.usage_graph_expanded = true,
+                UsageRowAction::CollapseGraph => self.usage_graph_expanded = false,
+                UsageRowAction::SetGraphSpan(days) => self.usage_graph_days = days,
             }
         }
         context.invalidate();

@@ -169,6 +169,8 @@ fn fold_codex_record(line: &str, state: &mut UsageState) {
     if !wanted {
         return;
     }
+    // The account's rate-limit windows ride on the `token_count` events.
+    super::quota::record_codex_line(line);
     let Ok(record) = serde_json::from_str::<CodexRecord>(line) else {
         return;
     };

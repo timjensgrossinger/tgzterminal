@@ -274,6 +274,43 @@ fn collect_database_sessions_cached(home: &Path) -> Vec<VendorSession> {
     sessions
 }
 
+/// Cost in US dollars and tokens (input + output) of every OpenCode session
+/// updated at or after each of `since_ms` (Unix milliseconds), read from
+/// `opencode.db`. A session's figures are its running totals, so one that
+/// started yesterday and is still going counts whole. `None` when there is
+/// no readable store.
+///
+/// Blocking SQLite read: call it off the GUI thread.
+pub(crate) fn spend_since(home: &Path, since_ms: &[i64]) -> Option<Vec<(f64, u64)>> {
+    let db = opencode_db(home);
+    if !db.is_file() {
+        return None;
+    }
+    let conn = Connection::open_with_flags(
+        db,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .ok()?;
+    let schema = detect_opencode_schema(&conn)?;
+    let sql = format!(
+        "SELECT COALESCE(SUM(cost), 0.0), COALESCE(SUM(tokens_input + tokens_output), 0) \
+         FROM {} WHERE time_updated >= ?1",
+        schema.sessions_table()
+    );
+    since_ms
+        .iter()
+        .map(|since| {
+            conn.query_row(&sql, [since], |row| {
+                Ok((row.get::<_, f64>(0)?, row.get::<_, i64>(1)?))
+            })
+            .ok()
+            .map(|(cost, tokens)| (cost.max(0.), u64::try_from(tokens).unwrap_or(0)))
+        })
+        .collect()
+}
+
 fn collect_database_sessions(home: &Path) -> Vec<VendorSession> {
     let db = opencode_db(home);
     if !db.is_file() {
@@ -1101,6 +1138,9 @@ mod tests {
         assert_eq!(sessions[0].input_tokens, Some(12));
         assert_eq!(sessions[0].output_tokens, Some(34));
         assert_eq!(sessions[0].cost.as_deref(), Some("$0.1250"));
+        let spend = spend_since(temp.path(), &[0, now + 1]).unwrap();
+        assert_eq!(spend[0], (0.125, 46));
+        assert_eq!(spend[1], (0.0, 0));
         assert_eq!(
             sessions[0]
                 .activity

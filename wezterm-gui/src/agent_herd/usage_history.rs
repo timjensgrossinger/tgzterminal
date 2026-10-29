@@ -50,20 +50,92 @@ const PAUSE_BETWEEN_FILES: Duration = Duration::from_millis(1);
 /// Tokens (uncached input + output) per local calendar day.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct UsageHistory {
-    pub days: BTreeMap<NaiveDate, u64>,
+    pub days: BTreeMap<NaiveDate, DayTokens>,
+    /// OpenCode's own cost and token totals, which its store records per
+    /// session; `None` when there is no OpenCode store.
+    pub opencode: Option<OpencodeSpend>,
+}
+
+/// One day's tokens, per vendor.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DayTokens {
+    pub claude: u64,
+    pub codex: u64,
+}
+
+impl DayTokens {
+    pub fn total(&self) -> u64 {
+        self.claude + self.codex
+    }
+}
+
+/// Cost and tokens over some span.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Spend {
+    /// US dollars, in millionths: kept integral so the history stays `Eq`.
+    pub cost_micros: u64,
+    pub tokens: u64,
+}
+
+impl Spend {
+    fn from_store((cost, tokens): (f64, u64)) -> Self {
+        Self {
+            cost_micros: (cost * 1_000_000.).round().max(0.) as u64,
+            tokens,
+        }
+    }
+
+    pub fn cost_usd(&self) -> f64 {
+        self.cost_micros as f64 / 1_000_000.
+    }
+}
+
+/// OpenCode sessions updated today, and in the last seven days.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OpencodeSpend {
+    pub today: Spend,
+    pub week: Spend,
+}
+
+/// Local midnight `days_back` days before `now`, in Unix milliseconds.
+fn local_midnight_ms(now: SystemTime, days_back: i64) -> Option<i64> {
+    let now = chrono::DateTime::<chrono::Local>::from(now);
+    let day = now.date_naive() - chrono::Duration::days(days_back);
+    let midnight = day.and_hms_opt(0, 0, 0)?;
+    let local = midnight.and_local_timezone(chrono::Local).earliest()?;
+    Some(local.timestamp_millis())
+}
+
+fn opencode_spend(home: &Path, now: SystemTime) -> Option<OpencodeSpend> {
+    let today = local_midnight_ms(now, 0)?;
+    let week = local_midnight_ms(now, 6)?;
+    let spend = super::opencode::spend_since(home, &[today, week])?;
+    Some(OpencodeSpend {
+        today: Spend::from_store(*spend.first()?),
+        week: Spend::from_store(*spend.get(1)?),
+    })
 }
 
 impl UsageHistory {
-    /// Tokens on each of the `count` days ending with `today`, oldest first.
-    pub fn series(&self, today: NaiveDate, count: usize) -> Vec<u64> {
+    /// Each of the `count` days ending with `today`, oldest first, per
+    /// vendor.
+    pub fn series_split(&self, today: NaiveDate, count: usize) -> Vec<DayTokens> {
         (0..count)
             .rev()
             .map(|back| {
                 today
                     .checked_sub_signed(chrono::Duration::days(back as i64))
                     .and_then(|day| self.days.get(&day).copied())
-                    .unwrap_or(0)
+                    .unwrap_or_default()
             })
+            .collect()
+    }
+
+    /// Tokens on each of the `count` days ending with `today`, oldest first.
+    pub fn series(&self, today: NaiveDate, count: usize) -> Vec<u64> {
+        self.series_split(today, count)
+            .iter()
+            .map(DayTokens::total)
             .collect()
     }
 
@@ -71,26 +143,6 @@ impl UsageHistory {
     pub fn total(&self, today: NaiveDate, count: usize) -> u64 {
         self.series(today, count).iter().sum()
     }
-}
-
-/// One bar per value, as block characters an eighth of a cell apart. The
-/// tallest value fills the cell; a zero day keeps the thinnest bar so the
-/// graph's width always shows how many days it covers.
-pub fn sparkline(values: &[u64]) -> String {
-    const BARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-    let max = values.iter().copied().max().unwrap_or(0);
-    values
-        .iter()
-        .map(|value| {
-            if max == 0 || *value == 0 {
-                BARS[0]
-            } else {
-                // 1..=7: any non-zero day stands clear of an empty one.
-                let step = (*value as u128 * 7).div_ceil(max as u128) as usize;
-                BARS[step.clamp(1, 7)]
-            }
-        })
-        .collect()
 }
 
 /// The local calendar day of an RFC 3339 timestamp.
@@ -213,6 +265,9 @@ fn fold_codex(line: &str, state: &mut FileState, day_of: &dyn Fn(&str) -> Option
         }
         return;
     }
+    // Keeps the Codex quota known after its rollouts age out of the herd's
+    // 15-minute window; the store keeps whichever sample is newest.
+    super::quota::record_codex_line(line);
     let Ok(record) = serde_json::from_str::<CodexRecord>(line) else {
         return;
     };
@@ -266,7 +321,7 @@ fn merge<'a>(states: impl Iterator<Item = &'a FileState>) -> UsageHistory {
     let mut messages: HashMap<MessageKey, (NaiveDate, u64)> = HashMap::new();
     for state in states {
         for (day, tokens) in &state.days {
-            *history.days.entry(*day).or_default() += tokens;
+            history.days.entry(*day).or_default().codex += tokens;
         }
         for (key, (day, tokens)) in &state.messages {
             messages
@@ -279,9 +334,9 @@ fn merge<'a>(states: impl Iterator<Item = &'a FileState>) -> UsageHistory {
         }
     }
     for (day, tokens) in messages.into_values() {
-        *history.days.entry(day).or_default() += tokens;
+        history.days.entry(day).or_default().claude += tokens;
     }
-    history.days.retain(|_, tokens| *tokens > 0);
+    history.days.retain(|_, tokens| tokens.total() > 0);
     history
 }
 
@@ -379,10 +434,14 @@ pub fn scan_history(home: &Path, now: SystemTime) -> UsageHistory {
             }
         }
     }
+    let opencode = opencode_spend(home, now);
     let mut cache = cache();
     // Transcripts that aged out of the window are not read again.
     cache.retain(|path, _| seen.contains(path));
-    merge(cache.values())
+    UsageHistory {
+        opencode,
+        ..merge(cache.values())
+    }
 }
 
 #[cfg(test)]
@@ -454,8 +513,16 @@ mod tests {
         state
     }
 
+    fn totals(history: UsageHistory) -> BTreeMap<NaiveDate, u64> {
+        history
+            .days
+            .into_iter()
+            .map(|(day, tokens)| (day, tokens.total()))
+            .collect()
+    }
+
     fn fold(format: UsageFormat, lines: &[String]) -> BTreeMap<NaiveDate, u64> {
-        merge(std::iter::once(&state(format, lines))).days
+        totals(merge(std::iter::once(&state(format, lines))))
     }
 
     #[test]
@@ -503,7 +570,7 @@ mod tests {
                 claude("2026-10-06T08:05:00Z", "m2", 5, 0, 5),
             ],
         );
-        let days = merge(vec![&original, &resumed].into_iter()).days;
+        let days = totals(merge(vec![&original, &resumed].into_iter()));
         assert_eq!(days.get(&day("2026-10-05")), Some(&100));
         assert_eq!(days.get(&day("2026-10-06")), Some(&10));
     }
@@ -564,6 +631,30 @@ mod tests {
     }
 
     #[test]
+    fn each_vendor_keeps_its_own_share_of_a_day() {
+        let claude = state(
+            UsageFormat::Claude,
+            &[claude("2026-10-05T09:00:00Z", "m1", 10, 0, 30)],
+        );
+        let codex = state(
+            UsageFormat::Codex,
+            &[
+                serde_json::json!({"type": "response_item", "payload": {"role": "assistant"}})
+                    .to_string(),
+                codex("2026-10-05T10:00:00Z", 100, 0, 20),
+            ],
+        );
+        let history = merge(vec![&claude, &codex].into_iter());
+        assert_eq!(
+            history.days.get(&day("2026-10-05")),
+            Some(&DayTokens {
+                claude: 40,
+                codex: 120
+            })
+        );
+    }
+
+    #[test]
     fn series_and_total_cover_the_days_up_to_today() {
         let history = UsageHistory {
             days: vec![
@@ -572,22 +663,15 @@ mod tests {
                 (day("2026-10-07"), 3),
             ]
             .into_iter()
+            .map(|(day, claude)| (day, DayTokens { claude, codex: 0 }))
             .collect(),
+            ..Default::default()
         };
         let today = day("2026-10-07");
         assert_eq!(history.series(today, 3), vec![10, 0, 3]);
         assert_eq!(history.total(today, 1), 3);
         assert_eq!(history.total(today, 7), 18);
         assert_eq!(history.total(today, 3), 13);
-    }
-
-    #[test]
-    fn sparkline_scales_to_the_tallest_day() {
-        assert_eq!(sparkline(&[0, 0, 0]), "▁▁▁");
-        assert_eq!(sparkline(&[0, 50, 100]), "▁▅█");
-        // A small non-zero day still stands clear of an empty one.
-        assert_eq!(sparkline(&[0, 1, 1_000_000]), "▁▂█");
-        assert_eq!(sparkline(&[]), "");
     }
 
     #[test]
@@ -632,7 +716,10 @@ mod tests {
         }
 
         let history = scan_history(home.path(), now);
-        assert_eq!(history.days.get(&today), Some(&(15 + 2 + 50 + 950)));
+        assert_eq!(
+            history.days.get(&today).map(DayTokens::total),
+            Some(15 + 2 + 50 + 950)
+        );
         // A second scan reads nothing new and reaches the same answer.
         assert_eq!(scan_history(home.path(), now), history);
 
