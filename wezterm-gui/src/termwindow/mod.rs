@@ -923,6 +923,44 @@ pub struct SshQuickLaunchEntry {
     pub recent: bool,
 }
 
+impl UIItemType {
+    /// Whether this is part of a menu painted by `paint_menus`.
+    pub(crate) fn is_floating_menu_part(&self) -> bool {
+        matches!(
+            self,
+            Self::FileTreeMenuItem(_)
+                | Self::SidebarAgentAction { .. }
+                | Self::SidebarAgentMenuItem { .. }
+                | Self::SidebarAgentMenuProjectRootToggle
+                | Self::SidebarAgentMenuTower
+                | Self::SidebarAgentMenuTarget { .. }
+                | Self::SidebarAgentMenuResume
+                | Self::SidebarAgentMenuResumeSession { .. }
+                | Self::SidebarAgentMenuRestoreLastWindow
+                | Self::SidebarDropdownBody
+                | Self::SidebarDropdownScrollTrack
+                | Self::SidebarDropdownScrollThumb
+                | Self::SidebarNewTabMenuItem { .. }
+                | Self::SidebarUsageMenuRow { .. }
+                | Self::SidebarSshMenuItem { .. }
+                | Self::PaneCopyMenuItem { .. }
+                | Self::CloseTabMenuItem { .. }
+        )
+    }
+}
+
+/// The agent row's right-click menu: laid out by the Agents section, painted
+/// with the other floating menus.
+pub(crate) struct AgentRowMenuLayout {
+    pub key: crate::agent_herd::AgentKey,
+    pub actions: Vec<AgentRowAction>,
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub row_h: f32,
+    pub pad: f32,
+}
+
 /// State for the agent section embedded in the sidebar.
 ///
 /// Lives on TermWindow and is updated by a background refresh thread.
@@ -1253,6 +1291,8 @@ pub struct TermWindow {
     /// these panes must never be badged as agents, split into, or picked as a
     /// target by anything that wants a shell.
     agent_herd_state: RefCell<AgentHerdState>,
+    /// Where the agent row's right-click menu goes this frame.
+    agent_row_menu_layout: Option<AgentRowMenuLayout>,
     /// Vendor session scan result. Filesystem work runs off the GUI thread.
     agent_herd_session_cache: Option<(Instant, Arc<Vec<crate::agent_herd::vendor::VendorSession>>)>,
     /// When the in-flight scan started, or `None` if none is. A timestamp
@@ -1745,6 +1785,7 @@ impl TermWindow {
             pane_toolbelt_painted: HashMap::new(),
             pane_toolbelt_drag_start: None,
             agent_detection_cache: RefCell::new(HashMap::new()),
+            agent_row_menu_layout: None,
             agent_herd_state: RefCell::new(AgentHerdState {
                 collapsed: tgz_ui_state::load_agent_section_collapsed().unwrap_or(false),
                 view: tgz_ui_state::load_agent_section_view()
@@ -5858,8 +5899,8 @@ done
             Confirmation(args) => self.show_confirmation(args),
             // Deliberately pane-kind-agnostic: these work on an agent pane
             // too (it is just text), and the provenance toast keeps them
-            // honest. That is the keyboard path to the same three actions on a
-            // pane whose strip is hover-only.
+            // honest. That is the keyboard path to the same actions the Copy
+            // icon's menu offers.
             CopyLastCommandOutput => {
                 self.perform_pane_copy(
                     pane,

@@ -6,6 +6,9 @@ use smol::Timer;
 use std::time::{Duration, Instant};
 use wezterm_font::ClearShapeCache;
 
+/// The layer floating menus paint on.
+const MENU_ZINDEX: i8 = 20;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AllowImage {
     Yes,
@@ -317,9 +320,31 @@ impl crate::TermWindow {
                 .context("paint_pane_toolbelt")?;
         }
 
-        // After the sidebar: the launch menu floats above it, and hit testing
-        // walks ui_items in reverse, so its rows must be pushed last to win
-        // clicks over the sidebar rows underneath.
+        self.paint_window_borders(&mut layers)
+            .context("paint_window_borders")?;
+        drop(layers);
+        self.paint_docked_input().context("paint_docked_input")?;
+        self.paint_menus().context("paint_menus")?;
+        self.paint_modal().context("paint_modal")?;
+
+        Ok(())
+    }
+
+    /// Every floating menu, on a layer of their own: above the panes, the
+    /// sidebar and the z-index 10 tab bar and docked input, below modals.
+    /// Sharing the panes' layer let its cursors, split lines and scrollbars,
+    /// which sit on a higher sub-layer than a menu's fill, draw through it.
+    ///
+    /// Hit testing walks `ui_items` in reverse, so painting these last among
+    /// everything they cover also makes their rows win clicks.
+    fn paint_menus(&mut self) -> anyhow::Result<()> {
+        let gl_state = self.render_state.as_ref().unwrap();
+        let layer = gl_state
+            .layer_for_zindex(MENU_ZINDEX)
+            .context("layer_for_zindex(MENU_ZINDEX)")?;
+        let mut layers = layer.quad_allocator();
+        self.paint_agent_row_menu(&mut layers)
+            .context("paint_agent_row_menu")?;
         self.paint_pane_copy_menu(&mut layers)
             .context("paint_pane_copy_menu")?;
         self.paint_agent_launch_menu(&mut layers)
@@ -336,13 +361,6 @@ impl crate::TermWindow {
             .context("paint_usage_menu")?;
         self.paint_file_tree_menu(&mut layers)
             .context("paint_file_tree_menu")?;
-
-        self.paint_window_borders(&mut layers)
-            .context("paint_window_borders")?;
-        drop(layers);
-        self.paint_docked_input().context("paint_docked_input")?;
-        self.paint_modal().context("paint_modal")?;
-
         Ok(())
     }
 

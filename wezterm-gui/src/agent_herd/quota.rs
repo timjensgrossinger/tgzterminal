@@ -22,6 +22,7 @@
 
 use super::vendor::AgentVendor;
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
@@ -213,7 +214,7 @@ impl QuotaSnapshot {
 pub struct QuotaStore {
     vendors: Vec<VendorQuota>,
     /// Modification time of the Claude sample file as last read.
-    claude_sample_mtime: Option<SystemTime>,
+    claude_sample_mtimes: HashMap<PathBuf, SystemTime>,
 }
 
 impl QuotaStore {
@@ -353,14 +354,18 @@ pub fn poll_claude_sample(path: &Path) -> bool {
     let Ok(modified) = metadata.modified() else {
         return false;
     };
-    if store().claude_sample_mtime == Some(modified) || metadata.len() > MAX_SAMPLE_BYTES {
+    if store().claude_sample_mtimes.get(path) == Some(&modified)
+        || metadata.len() > MAX_SAMPLE_BYTES
+    {
         return false;
     }
     let Ok(text) = std::fs::read_to_string(path) else {
         return false;
     };
     let mut store = store();
-    store.claude_sample_mtime = Some(modified);
+    store
+        .claude_sample_mtimes
+        .insert(path.to_path_buf(), modified);
     match parse_claude_statusline(&text, modified) {
         Some(quota) => store.record(quota),
         None => false,

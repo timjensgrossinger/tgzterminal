@@ -270,8 +270,7 @@ impl Default for FileBrowserConfig {
 /// `agent_ui.toolbelt_position` so the strip cannot sit in two places at once.
 #[derive(Debug, Clone, FromDynamic, ToDynamic)]
 pub struct PaneToolbeltConfig {
-    /// Show a Copy button on plain shell and ssh panes, revealed while the
-    /// pointer is inside the pane.
+    /// Show the Copy icon on the sidebar tab rows of plain shell and ssh panes.
     #[dynamic(default = "default_true")]
     pub shell_copy: bool,
 }

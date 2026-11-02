@@ -11,7 +11,7 @@
 
 use crate::agent_herd::quota::{self, BandState, GaugeLevel, QuotaSnapshot, VendorQuota};
 use crate::agent_herd::usage_history::{self, DayTokens, OpencodeSpend, Spend, UsageHistory};
-use crate::agent_herd::vendor::AgentVendor;
+use crate::agent_herd::vendor::{AgentVendor, SessionRoot};
 use crate::termwindow::render::sidebar::herd_scan_is_due;
 use crate::termwindow::tgz_usage_relay::RelayStatus;
 use chrono::NaiveDate;
@@ -72,6 +72,34 @@ struct HistoryCache {
 static HISTORY: LazyLock<Mutex<HistoryCache>> = LazyLock::new(Default::default);
 static LAUNCHED_AT: LazyLock<Instant> = LazyLock::new(Instant::now);
 
+/// The homes usage is read from, as of the last history scan.
+static USAGE_ROOTS: LazyLock<Mutex<Vec<SessionRoot>>> = LazyLock::new(Default::default);
+
+/// The homes usage is read from: this machine's, and those inside every WSL
+/// distro that is running, so a distro entered by typing `wsl` in a PowerShell
+/// tab counts as well. Reading a stopped distro's share would boot it.
+///
+/// Blocking (a hidden `wsl.exe`, and the distro's share): worker threads only.
+fn find_usage_roots(home: std::path::PathBuf) -> Vec<SessionRoot> {
+    let specs: Vec<(String, Option<String>)> = if cfg!(windows) {
+        crate::termwindow::wsl_paths::load_distros_with_state()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|distro| distro.state == config::WSL_STATE_RUNNING)
+            .map(|distro| (distro.name, None))
+            .collect()
+    } else {
+        vec![]
+    };
+    crate::termwindow::render::sidebar::agent_session_roots(home, &specs)
+}
+
+/// The homes found by the last history scan. Never blocks; empty before the
+/// first one.
+pub(crate) fn usage_roots() -> Vec<SessionRoot> {
+    USAGE_ROOTS.lock().unwrap().clone()
+}
+
 /// Note the launch time. Called once at GUI startup; the background scan
 /// counts its delay from here.
 pub fn note_launch() {
@@ -97,7 +125,9 @@ fn kick_scan_if_due(ttl: Duration) {
     let spawned = std::thread::Builder::new()
         .name("usage-history".into())
         .spawn(move || {
-            let history = usage_history::scan_history(&home, SystemTime::now());
+            let roots = find_usage_roots(home);
+            *USAGE_ROOTS.lock().unwrap() = roots.clone();
+            let history = usage_history::scan_history(&roots, SystemTime::now());
             let changed = {
                 let mut cache = HISTORY.lock().unwrap();
                 let changed = cache
@@ -356,6 +386,17 @@ pub(crate) fn bar_slots(count: usize, width: f32, gap: f32, max_bar: f32) -> Vec
         .collect()
 }
 
+/// A day's tokens per vendor, in the order a bar stacks them from its foot.
+pub(crate) fn day_vendors(day: &DayTokens) -> [(AgentVendor, u64); 5] {
+    [
+        (AgentVendor::Claude, day.claude),
+        (AgentVendor::Codex, day.codex),
+        (AgentVendor::OpenCode, day.opencode),
+        (AgentVendor::Gemini, day.gemini),
+        (AgentVendor::Copilot, day.copilot),
+    ]
+}
+
 /// The line under the chart: the hovered day in full, else the span's
 /// average and its busiest day.
 pub(crate) fn chart_detail(days: &[DayTokens], today: NaiveDate, hovered: Option<usize>) -> String {
@@ -367,14 +408,17 @@ pub(crate) fn chart_detail(days: &[DayTokens], today: NaiveDate, hovered: Option
             chart_day(today, count, index).format("%a %-d %b"),
             compact(tokens.total())
         );
-        // Split only when both vendors are in it; otherwise the total says
+        // Split only when several vendors are in it; otherwise the total says
         // it all.
-        if tokens.claude > 0 && tokens.codex > 0 {
-            text.push_str(&format!(
-                " · Claude {} · Codex {}",
-                compact(tokens.claude),
-                compact(tokens.codex)
-            ));
+        let parts: Vec<(AgentVendor, u64)> = day_vendors(&tokens)
+            .iter()
+            .filter(|(_, tokens)| *tokens > 0)
+            .cloned()
+            .collect();
+        if parts.len() > 1 {
+            for (vendor, tokens) in parts {
+                text.push_str(&format!(" · {} {}", vendor.label(), compact(tokens)));
+            }
         }
         return text;
     }
@@ -571,6 +615,9 @@ pub(crate) struct QuotaInputs<'a> {
     /// A Claude agent is in the herd: worth explaining why there is no
     /// Claude quota where it cannot be had.
     pub claude_active: bool,
+    /// Vendors in the herd with no figures anywhere in the popup, each worth
+    /// a line saying so rather than a popup that seems to have missed them.
+    pub without_figures: Vec<AgentVendor>,
     pub opencode: Option<OpencodeSpend>,
     pub now: SystemTime,
 }
@@ -630,6 +677,38 @@ fn vendor_card(quota: &VendorQuota, now: SystemTime, cols: usize) -> Vec<UsageRo
     rows
 }
 
+/// The vendors of `active`, deduplicated, that nothing in the popup has a
+/// figure for. Claude, Codex and OpenCode are not among them: they always
+/// have a store to read, and fill it on their first reply.
+pub(crate) fn vendors_without_figures(
+    active: &[AgentVendor],
+    sessions_with_tokens: &[AgentVendor],
+    history: Option<&UsageHistory>,
+) -> Vec<AgentVendor> {
+    let tokens_in_history = |vendor: &AgentVendor| {
+        history.is_some_and(|history| {
+            history.days.values().any(|day| {
+                day_vendors(day)
+                    .iter()
+                    .any(|(seen, tokens)| seen == vendor && *tokens > 0)
+            })
+        })
+    };
+    let mut vendors = vec![];
+    for vendor in active {
+        if !matches!(
+            vendor,
+            AgentVendor::Claude | AgentVendor::Codex | AgentVendor::OpenCode
+        ) && !sessions_with_tokens.contains(vendor)
+            && !tokens_in_history(vendor)
+            && !vendors.contains(vendor)
+        {
+            vendors.push(vendor.clone());
+        }
+    }
+    vendors
+}
+
 /// The subscription part of the popup: a card per vendor with its windows,
 /// then OpenCode's spend. Empty when there is nothing to say.
 pub(crate) fn quota_rows(inputs: &QuotaInputs, cols: usize) -> Vec<UsageRow> {
@@ -642,7 +721,7 @@ pub(crate) fn quota_rows(inputs: &QuotaInputs, cols: usize) -> Vec<UsageRow> {
         }),
         (None, Some(RelayStatus::Unsupported)) if inputs.claude_active => rows.push(UsageRow {
             vendor: Some(AgentVendor::Claude),
-            ..UsageRow::text("Claude · limits need macOS or Linux".to_string(), false)
+            ..UsageRow::text("Claude · limits need Git Bash".to_string(), false)
         }),
         _ => {}
     }
@@ -671,6 +750,16 @@ pub(crate) fn quota_rows(inputs: &QuotaInputs, cols: usize) -> Vec<UsageRow> {
             false,
         ));
     }
+    for vendor in &inputs.without_figures {
+        let note = match vendor {
+            AgentVendor::Copilot => "totals when a session ends",
+            _ => "no usage data on disk",
+        };
+        rows.push(UsageRow {
+            vendor: Some(vendor.clone()),
+            ..UsageRow::text(format!("{} · {note}", vendor.label()), false)
+        });
+    }
     // A divider between vendor cards, none above the first.
     let mut previous_vendor = false;
     for row in rows.iter_mut() {
@@ -691,7 +780,10 @@ mod tests {
     }
 
     fn claude_day(claude: u64) -> DayTokens {
-        DayTokens { claude, codex: 0 }
+        DayTokens {
+            claude,
+            ..Default::default()
+        }
     }
 
     fn history() -> UsageHistory {
@@ -703,6 +795,7 @@ mod tests {
                     DayTokens {
                         claude: 600_000,
                         codex: 400_000,
+                        ..Default::default()
                     },
                 ),
                 (day("2026-10-07"), claude_day(250_000)),
@@ -974,6 +1067,7 @@ mod tests {
             snapshot,
             relay,
             claude_active: true,
+            without_figures: vec![],
             opencode: None,
             now: at(NOW),
         }
@@ -1045,7 +1139,7 @@ mod tests {
         assert_eq!(rows[0].action, UsageRowAction::Inert);
 
         let rows = quota_rows(&inputs(&empty, Some(RelayStatus::Unsupported)), 40);
-        assert_eq!(labels(&rows), vec!["Claude · limits need macOS or Linux"]);
+        assert_eq!(labels(&rows), vec!["Claude · limits need Git Bash"]);
         // Before the first look, and on Windows without a Claude agent: nothing.
         assert!(quota_rows(&inputs(&empty, None), 40).is_empty());
         let quiet = QuotaInputs {
@@ -1084,5 +1178,49 @@ mod tests {
             ..inputs(&empty, None)
         };
         assert!(quota_rows(&none, 40).is_empty());
+    }
+
+    #[test]
+    fn a_vendor_nothing_can_be_read_for_says_so() {
+        use AgentVendor::*;
+        let active = [Claude, Antigravity, Antigravity, Gemini, Copilot, Cursor];
+        let history = UsageHistory {
+            days: vec![(
+                day("2026-10-07"),
+                DayTokens {
+                    gemini: 5,
+                    ..Default::default()
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        let without = vendors_without_figures(&active, &[Cursor], Some(&history));
+        assert_eq!(without, vec![Antigravity, Copilot]);
+
+        let empty = QuotaSnapshot::default();
+        let with = QuotaInputs {
+            without_figures: without,
+            ..inputs(&empty, None)
+        };
+        assert_eq!(
+            labels(&quota_rows(&with, 40)),
+            vec![
+                "Antigravity · no usage data on disk",
+                "Copilot · totals when a session ends",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_chart_detail_names_every_vendor_of_a_shared_day() {
+        let days = [DayTokens {
+            claude: 1_000,
+            gemini: 2_000,
+            ..Default::default()
+        }];
+        let text = chart_detail(&days, day("2026-10-07"), Some(0));
+        assert!(text.ends_with("· Claude 1.0k · Gemini 2.0k"), "{text}");
     }
 }

@@ -64,6 +64,11 @@ const CHEVRON_GAP: f32 = 4.;
 const ACTION_ICON_W: f32 = 16.;
 const ACTION_ICON_GAP: f32 = 8.;
 pub(crate) const RADIUS: f32 = 10.;
+/// Corner radius of a floating menu, and of the highlight on one of its rows.
+const MENU_RADIUS: f32 = 8.;
+const MENU_ROW_RADIUS: f32 = 4.;
+/// Soft edges of a floating menu's shadow, innermost first, as alpha.
+const MENU_SHADOW_ALPHAS: [f32; 4] = [0.18, 0.11, 0.06, 0.03];
 /// Corner radius of the working-agent throbber ring. One step outside
 /// [`RADIUS`] so the ring reads as sitting around the row rather than on it.
 const RING_RADIUS: f32 = 11.;
@@ -4406,7 +4411,10 @@ fn looks_like_an_agent_home(dir: &Path) -> bool {
 /// the distro's `/home` is listed and every child that looks like an agent home
 /// is taken, which covers the ordinary single-user distro without a `wsl.exe`
 /// subprocess.
-fn agent_session_roots(home: PathBuf, distros: &[(String, Option<String>)]) -> Vec<SessionRoot> {
+pub(crate) fn agent_session_roots(
+    home: PathBuf,
+    distros: &[(String, Option<String>)],
+) -> Vec<SessionRoot> {
     let mut roots = vec![SessionRoot::host(home)];
     // The UNC form only resolves on Windows; elsewhere this would stat paths
     // that cannot exist, so the host home is the whole answer.
@@ -4837,6 +4845,29 @@ pub(crate) struct PaneCopyResult {
     pub message: String,
     /// Toast title, per pane kind.
     pub title: &'static str,
+}
+
+/// What a left click on the sidebar's Copy icon copies; a right click opens
+/// the menu instead.
+///
+/// A terminal copies its pane without secrets. An agent copies its
+/// conversation, with secrets redacted unless the agent was identified by its
+/// process or an explicit user var: visible text and titles are something any
+/// program can print, and must not be able to turn a click that would have
+/// redacted into one that does not.
+pub(crate) fn sidebar_copy_click_action(kind: &PaneToolbeltKind) -> PaneCopyAction {
+    match kind {
+        PaneToolbeltKind::Agent(agent)
+            if matches!(
+                agent.evidence,
+                AgentEvidence::UserVar | AgentEvidence::Process
+            ) =>
+        {
+            PaneCopyAction::Agent(AgentCopyAction::Conversation)
+        }
+        PaneToolbeltKind::Agent(_) => PaneCopyAction::AgentRedacted(AgentCopyAction::Conversation),
+        PaneToolbeltKind::Shell => PaneCopyAction::ShellRedacted(ShellCopyAction::WholePane),
+    }
 }
 
 /// The copy menu for this kind of pane, including the "(no secrets)" rows.
@@ -9998,7 +10029,7 @@ impl crate::TermWindow {
         Some((left + width * 0.5, top + height * 0.5))
     }
 
-    /// Which copy menu the sidebar tab row's Copy icon opens for `pane`.
+    /// Which copy action and menu the sidebar tab row's Copy icon uses for `pane`.
     ///
     /// Unlike [`Self::pane_toolbelt_kind`] this ignores
     /// `agent_ui.show_pane_toolbelt`: that switch is about the floating strip,
@@ -10957,8 +10988,7 @@ impl crate::TermWindow {
         let row_vpad = 6. * dpi_scale;
         let row_h = (cell_h_f + 2. * row_vpad).max(PANE_COPY_MENU_ROW_H * dpi_scale);
         let menu_pad = 8. * dpi_scale;
-        let menu_radius = (RADIUS * dpi_scale).min(row_h * 0.5);
-        let row_radius = (7. * dpi_scale).min(row_h * 0.5);
+        let row_radius = (MENU_ROW_RADIUS * dpi_scale).min(row_h * 0.5);
         let row_inset = 4. * dpi_scale;
         let row_text_inset = 12. * dpi_scale;
         let menu_w = pane_copy_menu_width(
@@ -10993,45 +11023,11 @@ impl crate::TermWindow {
         let hover_bg = opaque(sb.pressed_fill);
         let pressed_bg = opaque(lerp_rgba(bg, fg, 0.28));
 
-        self.sidebar_rounded_fill(
+        self.paint_menu_surface(
             layers,
-            1,
             euclid::rect(menu_x, menu_y, menu_w, menu_h),
-            menu_radius,
             bg,
-        )?;
-
-        // Thin border stroke so the menu stands out against overlapping rows.
-        let border = opaque(sb.menu_border);
-        let border_w = (1. * dpi_scale).max(1.);
-        self.filled_rectangle(
-            layers,
-            2,
-            euclid::rect(menu_x, menu_y, menu_w, border_w),
-            border,
-        )?;
-        self.filled_rectangle(
-            layers,
-            2,
-            euclid::rect(menu_x, menu_y + menu_h - border_w, menu_w, border_w),
-            border,
-        )?;
-        self.filled_rectangle(
-            layers,
-            2,
-            euclid::rect(menu_x, menu_y + border_w, border_w, menu_h - border_w * 2.),
-            border,
-        )?;
-        self.filled_rectangle(
-            layers,
-            2,
-            euclid::rect(
-                menu_x + menu_w - border_w,
-                menu_y + border_w,
-                border_w,
-                menu_h - border_w * 2.,
-            ),
-            border,
+            sb.menu_border,
         )?;
 
         let palette = self.palette().clone();
@@ -11674,7 +11670,7 @@ impl crate::TermWindow {
             return Ok(());
         };
         let history = tgz_usage_menu::history_for_menu();
-        let (sessions, claude_active) = {
+        let (sessions, claude_active, without_figures) = {
             let herd = self.agent_herd_state.borrow();
             let sessions: Vec<tgz_usage_menu::LiveSession> = herd
                 .agents
@@ -11691,7 +11687,20 @@ impl crate::TermWindow {
                 .agents
                 .iter()
                 .any(|agent| agent.vendor == crate::agent_herd::vendor::AgentVendor::Claude);
-            (sessions, claude_active)
+            let active: Vec<AgentVendor> = herd
+                .agents
+                .iter()
+                .map(|agent| agent.vendor.clone())
+                .collect();
+            let with_tokens: Vec<AgentVendor> = herd
+                .agents
+                .iter()
+                .filter(|agent| herd_agent_tokens(agent).is_some())
+                .map(|agent| agent.vendor.clone())
+                .collect();
+            let without_figures =
+                tgz_usage_menu::vendors_without_figures(&active, &with_tokens, history.as_deref());
+            (sessions, claude_active, without_figures)
         };
         let now = std::time::SystemTime::now();
         let cols = if self.usage_graph_expanded {
@@ -11713,6 +11722,7 @@ impl crate::TermWindow {
                     snapshot: &snapshot,
                     relay: crate::termwindow::tgz_usage_relay::last_status(),
                     claude_active,
+                    without_figures,
                     opencode: history.as_deref().and_then(|history| history.opencode),
                     now,
                 },
@@ -11783,9 +11793,9 @@ impl crate::TermWindow {
         Ok(())
     }
 
-    /// One day of a usage graph, standing on the bottom of `area`: Claude's
-    /// share at the foot and Codex's on top, as tall against `area` as the
-    /// day is against `max`. An empty day keeps a one-pixel stub, so the
+    /// One day of a usage graph, standing on the bottom of `area`: each
+    /// vendor's share stacked in `day_vendors` order, as tall against `area` as
+    /// the day is against `max`. An empty day keeps a one-pixel stub, so the
     /// graph still shows how many days it covers.
     fn paint_usage_bar(
         &self,
@@ -11811,7 +11821,6 @@ impl crate::TermWindow {
             return Ok(());
         }
         let height = (area.height() * (total as f32 / max as f32).min(1.)).max(2. * dpi_scale);
-        let claude_h = height * day.claude as f32 / total as f32;
         let lift = |color: LinearRgba| {
             if highlight {
                 lerp_rgba(color, sb.text_active, 0.3)
@@ -11819,20 +11828,18 @@ impl crate::TermWindow {
                 color
             }
         };
-        if day.claude > 0 {
+        let mut top = bottom;
+        for (vendor, tokens) in crate::termwindow::tgz_usage_menu::day_vendors(&day) {
+            if tokens == 0 {
+                continue;
+            }
+            let share = height * tokens as f32 / total as f32;
+            top -= share;
             self.filled_rectangle(
                 layers,
                 2,
-                euclid::rect(x, bottom - claude_h, w, claude_h),
-                lift(srgb8_to_linear_tuple(AgentVendor::Claude.dot_color())),
-            )?;
-        }
-        if day.codex > 0 {
-            self.filled_rectangle(
-                layers,
-                2,
-                euclid::rect(x, bottom - height, w, height - claude_h),
-                lift(srgb8_to_linear_tuple(AgentVendor::Codex.dot_color())),
+                euclid::rect(x, top, w, share),
+                lift(srgb8_to_linear_tuple(vendor.dot_color())),
             )?;
         }
         Ok(())
@@ -11995,8 +12002,7 @@ impl crate::TermWindow {
         let row_vpad = 6. * dpi_scale;
         let row_h = (cell_h_f + 2. * row_vpad).max(PANE_COPY_MENU_ROW_H * dpi_scale);
         let menu_pad = 8. * dpi_scale;
-        let menu_radius = (RADIUS * dpi_scale).min(row_h * 0.5);
-        let row_radius = (7. * dpi_scale).min(row_h * 0.5);
+        let row_radius = (MENU_ROW_RADIUS * dpi_scale).min(row_h * 0.5);
         let row_inset = 4. * dpi_scale;
         let row_text_inset = 12. * dpi_scale;
         let divider_h = (1. * dpi_scale).max(1.);
@@ -12067,49 +12073,15 @@ impl crate::TermWindow {
 
         let sb = self.sidebar_palette();
         let fg = sb.text_active;
-        let bg = sb.row_fill;
-        let hover_bg = sb.pressed_fill;
-        let pressed_bg = lerp_rgba(bg, fg, 0.28);
+        let bg = opaque(sb.row_fill);
+        let hover_bg = opaque(sb.pressed_fill);
+        let pressed_bg = opaque(lerp_rgba(bg, fg, 0.28));
 
-        self.sidebar_rounded_fill(
+        self.paint_menu_surface(
             layers,
-            1,
             euclid::rect(menu_x, menu_y, menu_w, menu_h),
-            menu_radius,
             bg,
-        )?;
-
-        // Thin border stroke so the menu stands out against overlapping rows.
-        let border = sb.menu_border;
-        let border_w = (1. * dpi_scale).max(1.);
-        self.filled_rectangle(
-            layers,
-            2,
-            euclid::rect(menu_x, menu_y, menu_w, border_w),
-            border,
-        )?;
-        self.filled_rectangle(
-            layers,
-            2,
-            euclid::rect(menu_x, menu_y + menu_h - border_w, menu_w, border_w),
-            border,
-        )?;
-        self.filled_rectangle(
-            layers,
-            2,
-            euclid::rect(menu_x, menu_y + border_w, border_w, menu_h - border_w * 2.),
-            border,
-        )?;
-        self.filled_rectangle(
-            layers,
-            2,
-            euclid::rect(
-                menu_x + menu_w - border_w,
-                menu_y + border_w,
-                border_w,
-                menu_h - border_w * 2.,
-            ),
-            border,
+            sb.menu_border,
         )?;
 
         let palette = self.palette().clone();
@@ -14388,10 +14360,8 @@ impl crate::TermWindow {
             });
 
             // Copy, left of the close button, which keeps the far right where
-            // muscle memory expects it. Hover-revealed for the reason the pane
-            // row's close glyph is: a control on every row at rest is clutter on
-            // every row. The *reserve* above is unconditional, so nothing moves
-            // when it appears.
+            // muscle memory expects it. Drawn at rest; hovering only adds the
+            // rounded box behind the glyph.
             if copy_w > 0. {
                 // Same size as the close control, centred in its own zone
                 // rather than right-aligned in it.
@@ -15581,19 +15551,20 @@ impl crate::TermWindow {
         self.agent_herd_scan_started_at = Some(Instant::now());
         let future = promise::spawn::spawn_into_new_thread(move || {
             let started = Instant::now();
+            let roots = agent_session_roots(home, &distros);
             // Claude's rate limits: the relay is put in place (or taken out)
-            // when due, then two stats per scan and a read only after a
-            // Claude reply rewrote the sample. See `tgz_usage_relay`.
+            // when due, then a few stats per home and a read only after a
+            // Claude reply rewrote its sample. See `tgz_usage_relay`. The homes
+            // the herd reads, plus any other running distro's usage found.
             {
-                use crate::termwindow::tgz_usage_relay;
-                if let Some(paths) = tgz_usage_relay::RelayPaths::for_user() {
-                    tgz_usage_relay::ensure(&paths, want_relay);
-                    if poll_quota {
-                        crate::agent_herd::quota::poll_claude_sample(&paths.sample);
+                let mut relay_roots = roots.clone();
+                for root in crate::termwindow::tgz_usage_menu::usage_roots() {
+                    if !relay_roots.iter().any(|seen| seen.home == root.home) {
+                        relay_roots.push(root);
                     }
                 }
+                crate::termwindow::tgz_usage_relay::tick(&relay_roots, want_relay, poll_quota);
             }
-            let roots = agent_session_roots(home, &distros);
             let sessions = crate::agent_herd::default_registry().collect_all_from(&roots);
             // A scan reads every vendor's store, WSL ones through the 9p share;
             // on a slow machine that is where the herd's latency goes.
@@ -16533,98 +16504,132 @@ impl crate::TermWindow {
             y += row_h + detail_h + 2.0 * dpi;
         }
 
-        // Right-click action menu: a floating panel of the row's actions,
-        // painted last so its UIItems win the hit-test over the rows beneath.
+        // Right-click action menu: laid out here, where the section's geometry
+        // is known, and painted with the other menus so it floats above them.
         {
             let menu_key = self.agent_herd_state.borrow().context_menu.clone();
-            if let Some(menu_key) = menu_key {
-                if let Some(agent) = agents.iter().find(|a| a.key() == menu_key) {
-                    let actions = agent_row_actions(agent, self.config.agent_ui.show_stop);
-                    if !actions.is_empty() {
-                        // Widen the menu to fit the longest label so nothing is
-                        // silently truncated; cap at the section width.
-                        let max_label_cols = actions
-                            .iter()
-                            .map(|a| unicode_column_width(a.label(), None))
-                            .max()
-                            .unwrap_or(0);
-                        let min_menu_w = max_label_cols as f32 * cell_w + 24.0 * dpi;
-                        let menu_w = (section_w - pad * 2.0).max(min_menu_w).min(section_w);
-                        let row_h = cell_h + 4.0 * dpi;
-                        let menu_h = actions.len() as f32 * row_h + pad * 2.0;
-                        let menu_x = section_x + pad;
-                        let menu_y = (header_y + header_h + pad).min(section_bottom - menu_h);
-                        // Single panel colour (no per-row stripe), so the menu
-                        // reads as one unit rather than alternating shades.
-                        let menu_bg = lerp_rgba(bg, fg, 0.10);
-                        let hover_bg = lerp_rgba(bg, fg, 0.20);
-                        let pressed_bg = lerp_rgba(bg, fg, 0.28);
-                        let left_pressed = self.current_mouse_buttons.contains(&MousePress::Left);
-                        let hovered_item = self
-                            .last_ui_item
-                            .as_ref()
-                            .map(|item| item.item_type.clone());
-                        self.filled_rectangle(
-                            layers,
-                            1,
-                            euclid::rect(menu_x, menu_y, menu_w, menu_h),
-                            menu_bg,
-                        )?;
-                        let mut by = menu_y + pad;
-                        for action in actions {
-                            let action_type = UIItemType::SidebarAgentAction {
-                                key: menu_key.clone(),
-                                action,
-                            };
-                            let hovered = hovered_item.as_ref() == Some(&action_type);
-                            let pressed = hovered
-                                && left_pressed
-                                && self.pressed_ui_item.as_ref() == Some(&action_type);
-                            let row_bg = if pressed {
-                                pressed_bg
-                            } else if hovered {
-                                hover_bg
-                            } else {
-                                menu_bg
-                            };
-                            let label = action.label();
-                            let label_cols = unicode_column_width(label, None);
-                            let available_cols = ((menu_w - 24.0 * dpi) / cell_w).max(0.0) as usize;
-                            let display_label = truncate_with_ellipsis(label, available_cols);
-                            self.filled_rectangle(
-                                layers,
-                                1,
-                                euclid::rect(menu_x, by, menu_w, row_h),
-                                row_bg,
-                            )?;
-                            self.paint_text(
-                                layers,
-                                &display_label,
-                                menu_x + 8.0 * dpi,
-                                by + (row_h - cell_h) * 0.5,
-                                label_cols as f32 * cell_w,
-                                fg,
-                                row_bg,
-                                false,
-                            )?;
-                            self.ui_items.push(UIItem {
-                                x: menu_x as usize,
-                                y: by as usize,
-                                width: menu_w as usize,
-                                height: row_h as usize,
-                                item_type: action_type,
-                            });
-                            by += row_h;
-                        }
-                    }
+            let menu = menu_key.and_then(|key| {
+                let agent = agents.iter().find(|a| a.key() == key)?;
+                let actions = agent_row_actions(agent, self.config.agent_ui.show_stop);
+                if actions.is_empty() {
+                    return None;
                 }
-            }
+                // Widen the menu to fit the longest label so nothing is
+                // silently truncated; cap at the section width.
+                let max_label_cols = actions
+                    .iter()
+                    .map(|a| unicode_column_width(a.label(), None))
+                    .max()
+                    .unwrap_or(0);
+                let min_menu_w = max_label_cols as f32 * cell_w + 24.0 * dpi;
+                let width = (section_w - pad * 2.0).max(min_menu_w).min(section_w);
+                let row_h = cell_h + 4.0 * dpi;
+                let menu_h = actions.len() as f32 * row_h + pad * 2.0;
+                Some(crate::termwindow::AgentRowMenuLayout {
+                    key,
+                    actions,
+                    x: section_x + pad,
+                    y: (header_y + header_h + pad).min(section_bottom - menu_h),
+                    width,
+                    row_h,
+                    pad,
+                })
+            });
+            self.agent_row_menu_layout = menu;
         }
 
         let mut state = self.agent_herd_state.borrow_mut();
         state.visible_rows = visible_row_count;
         drop(state);
 
+        Ok(())
+    }
+
+    /// The agent row's right-click menu, as the section last laid it out.
+    pub(crate) fn paint_agent_row_menu(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+    ) -> anyhow::Result<()> {
+        // Taken so a sidebar that stopped painting the section takes its menu
+        // with it.
+        let Some(menu) = self.agent_row_menu_layout.take() else {
+            return Ok(());
+        };
+        let sb = self.sidebar_palette();
+        let fg = sb.text_active;
+        let bg = opaque(sb.row_fill);
+        let hover_bg = opaque(sb.pressed_fill);
+        let pressed_bg = opaque(lerp_rgba(bg, fg, 0.28));
+        let dpi = (self.dimensions.dpi as f32 / 96.).clamp(1., 2.5);
+        let cell_w = self.render_metrics.cell_size.width as f32;
+        let cell_h = self.render_metrics.cell_size.height as f32;
+        let row_radius = (MENU_ROW_RADIUS * dpi).min(menu.row_h * 0.5);
+        let row_inset = 4. * dpi;
+        let menu_h = menu.actions.len() as f32 * menu.row_h + menu.pad * 2.;
+        self.paint_menu_surface(
+            layers,
+            euclid::rect(menu.x, menu.y, menu.width, menu_h),
+            bg,
+            sb.menu_border,
+        )?;
+        let left_pressed = self.current_mouse_buttons.contains(&MousePress::Left);
+        let hovered_item = self
+            .last_ui_item
+            .as_ref()
+            .map(|item| item.item_type.clone());
+        let mut by = menu.y + menu.pad;
+        for action in menu.actions {
+            let action_type = UIItemType::SidebarAgentAction {
+                key: menu.key.clone(),
+                action,
+            };
+            let hovered = hovered_item.as_ref() == Some(&action_type);
+            let pressed =
+                hovered && left_pressed && self.pressed_ui_item.as_ref() == Some(&action_type);
+            let row_bg = if pressed {
+                pressed_bg
+            } else if hovered {
+                hover_bg
+            } else {
+                bg
+            };
+            if hovered {
+                self.sidebar_rounded_fill(
+                    layers,
+                    1,
+                    euclid::rect(
+                        menu.x + row_inset,
+                        by,
+                        menu.width - row_inset * 2.,
+                        menu.row_h,
+                    ),
+                    row_radius,
+                    row_bg,
+                )?;
+            }
+            let label = action.label();
+            let label_cols = unicode_column_width(label, None);
+            let available_cols = ((menu.width - 24.0 * dpi) / cell_w).max(0.0) as usize;
+            let display_label = truncate_with_ellipsis(label, available_cols);
+            self.paint_text(
+                layers,
+                &display_label,
+                menu.x + 12.0 * dpi,
+                by + (menu.row_h - cell_h) * 0.5,
+                label_cols as f32 * cell_w,
+                fg,
+                row_bg,
+                false,
+            )?;
+            self.ui_items.push(UIItem {
+                x: menu.x as usize,
+                y: by as usize,
+                width: menu.width as usize,
+                height: menu.row_h as usize,
+                item_type: action_type,
+            });
+            by += menu.row_h;
+        }
         Ok(())
     }
 
@@ -16697,6 +16702,53 @@ impl crate::TermWindow {
             deflate_rect(rect, stroke),
             (radius - stroke).max(0.),
             fill,
+        )
+    }
+
+    /// The panel of a floating menu: an opaque fill with a hairline border and
+    /// a soft shadow. Every menu paints through this on the layer
+    /// [`Self::paint_menus`] gives it, so nothing below can show through.
+    ///
+    /// The shadow is flat strips with its corners left out: corner sprites
+    /// ignore a colour's alpha, and there is no blur primitive to soften them.
+    fn paint_menu_surface(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        rect: RectF,
+        fill: LinearRgba,
+        border: LinearRgba,
+    ) -> anyhow::Result<()> {
+        let dpi_scale = (self.dimensions.dpi as f32 / 96.).clamp(1., 2.5);
+        let radius = (MENU_RADIUS * dpi_scale).min(rect.height() * 0.5);
+        let step = (1.5 * dpi_scale).round().max(1.);
+        // Light from above: the shadow falls further below the menu than above.
+        let drop = step;
+        for (i, alpha) in MENU_SHADOW_ALPHAS.iter().enumerate() {
+            let color = LinearRgba::with_components(0., 0., 0., *alpha);
+            let near = i as f32 * step;
+            let inset = (radius - near).max(0.);
+            let x = rect.min_x() + inset;
+            let y = rect.min_y() + inset;
+            let w = (rect.width() - inset * 2.).max(0.);
+            let h = (rect.height() - inset * 2.).max(0.);
+            let strips = [
+                euclid::rect(x, rect.min_y() - near - step + drop, w, step),
+                euclid::rect(x, rect.max_y() + near + drop, w, step),
+                euclid::rect(rect.min_x() - near - step, y + drop, step, h),
+                euclid::rect(rect.max_x() + near, y + drop, step, h),
+            ];
+            for strip in strips {
+                self.filled_rectangle(layers, 0, strip, color)?;
+            }
+        }
+        self.sidebar_bordered_fill(
+            layers,
+            1,
+            rect,
+            radius,
+            (1. * dpi_scale).max(1.),
+            opaque(fill),
+            opaque(border),
         )
     }
 
@@ -17161,6 +17213,43 @@ mod tests {
             pane_copy_menu_items_with_redacted(&PaneToolbeltKind::Shell, true),
             plain
         );
+    }
+
+    #[test]
+    fn copy_icon_left_click_redacts_a_shell_pane() {
+        assert_eq!(
+            sidebar_copy_click_action(&PaneToolbeltKind::Shell),
+            PaneCopyAction::ShellRedacted(ShellCopyAction::WholePane)
+        );
+    }
+
+    /// Only evidence a program cannot fake by printing text gets the plain
+    /// copy; every other agent still copies its conversation, redacted.
+    #[test]
+    fn copy_icon_left_click_copies_the_conversation_of_an_agent() {
+        for evidence in [AgentEvidence::UserVar, AgentEvidence::Process] {
+            assert_eq!(
+                sidebar_copy_click_action(&PaneToolbeltKind::Agent(claude_state_with_evidence(
+                    evidence
+                ))),
+                PaneCopyAction::Agent(AgentCopyAction::Conversation),
+                "{evidence:?}"
+            );
+        }
+        for evidence in [
+            AgentEvidence::TitlePhrase,
+            AgentEvidence::VisibleChrome,
+            AgentEvidence::TitleToken,
+            AgentEvidence::Metadata,
+        ] {
+            assert_eq!(
+                sidebar_copy_click_action(&PaneToolbeltKind::Agent(claude_state_with_evidence(
+                    evidence
+                ))),
+                PaneCopyAction::AgentRedacted(AgentCopyAction::Conversation),
+                "{evidence:?}"
+            );
+        }
     }
 
     /// The two menus are different lists, and the agent list is unchanged.

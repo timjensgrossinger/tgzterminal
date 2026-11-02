@@ -415,7 +415,11 @@ impl super::TermWindow {
         // Clicking inside the docked input band focuses the strip and consumes
         // the click; clicking above it releases focus back to the terminal but
         // lets the terminal handle the click.
-        if matches!(&event.kind, WMEK::Press(MousePress::Left)) {
+        // A menu floating over the band gets its own clicks.
+        let on_floating_menu = ui_item
+            .as_ref()
+            .is_some_and(|item| item.item_type.is_floating_menu_part());
+        if matches!(&event.kind, WMEK::Press(MousePress::Left)) && !on_floating_menu {
             if let Some(band_top) = self.docked_input_band_top() {
                 let y = event.coords.y as f32;
                 if y >= band_top {
@@ -441,6 +445,7 @@ impl super::TermWindow {
                             action: PaneToolbeltAction::CopyMenu,
                             ..
                         } | UIItemType::PaneCopyMenuItem { .. }
+                            | UIItemType::SidebarTabCopy { .. }
                     )
             );
             if !on_copy_menu {
@@ -1088,12 +1093,11 @@ impl super::TermWindow {
         context.invalidate();
     }
 
-    /// Opens the copy menu for a tab row's pane.
+    /// A tab row's Copy icon: left click copies, right click opens the menu.
     ///
     /// Resolves the pane at click time rather than at paint time: a tab's active
     /// pane can change, and a pane can die, while a painted rect waits to be
-    /// clicked. Everything below the menu is the toolbelt's path unchanged --
-    /// same rows, same painter, same `perform_pane_copy`.
+    /// clicked.
     fn mouse_event_sidebar_tab_copy(
         &mut self,
         tab_idx: usize,
@@ -1101,28 +1105,65 @@ impl super::TermWindow {
         event: MouseEvent,
         context: &dyn WindowOps,
     ) {
-        if event.kind == WMEK::Release(MousePress::Left) {
-            self.pressed_ui_item = None;
-            if let Some(pane) = self.sidebar_primary_pane_for_tab_idx(tab_idx) {
-                if let Some(kind) = self.sidebar_copy_kind(&pane) {
-                    let items =
-                        crate::termwindow::render::sidebar::pane_copy_menu_items_with_redacted(
-                            &kind,
-                            self.copy_actions_redact(),
-                        );
-                    self.pane_copy_menu = Some(PaneCopyMenuState {
-                        pane_id: pane.pane_id(),
-                        // Below the row and hard against the icon, so the menu
-                        // reads as belonging to the row it came from.
-                        x: item.x,
-                        y: item.y + item.height,
-                        items,
-                        opens_left: false,
-                    });
+        // macOS has no conversion of its own for ctrl+click, the platform's
+        // way of asking for a context menu.
+        let ctrl_click_is_right_click =
+            cfg!(target_os = "macos") && event.modifiers.contains(::window::Modifiers::CTRL);
+        match event.kind {
+            WMEK::Press(MousePress::Right) => self.toggle_sidebar_tab_copy_menu(tab_idx, &item),
+            WMEK::Press(MousePress::Left) if ctrl_click_is_right_click => {
+                // So letting go of ctrl first does not also copy.
+                self.pressed_ui_item = None;
+                self.toggle_sidebar_tab_copy_menu(tab_idx, &item)
+            }
+            WMEK::Release(MousePress::Left) => {
+                let pressed_here = self.pressed_ui_item.as_ref() == Some(&item.item_type);
+                self.pressed_ui_item = None;
+                if pressed_here {
+                    self.pane_copy_menu = None;
+                    if let Some(pane) = self.sidebar_primary_pane_for_tab_idx(tab_idx) {
+                        if let Some(kind) = self.sidebar_copy_kind(&pane) {
+                            let action =
+                                crate::termwindow::render::sidebar::sidebar_copy_click_action(
+                                    &kind,
+                                );
+                            self.perform_pane_copy(&pane, &action);
+                        }
+                    }
                 }
             }
+            _ => {}
         }
         context.invalidate();
+    }
+
+    /// Open the copy menu on the tab's pane, or close it when it is already
+    /// open on that pane.
+    fn toggle_sidebar_tab_copy_menu(&mut self, tab_idx: usize, item: &UIItem) {
+        let Some(pane) = self.sidebar_primary_pane_for_tab_idx(tab_idx) else {
+            self.pane_copy_menu = None;
+            return;
+        };
+        if self
+            .pane_copy_menu
+            .as_ref()
+            .is_some_and(|menu| menu.pane_id == pane.pane_id())
+        {
+            self.pane_copy_menu = None;
+            return;
+        }
+        self.pane_copy_menu = self.sidebar_copy_kind(&pane).map(|kind| PaneCopyMenuState {
+            pane_id: pane.pane_id(),
+            // Below the row and hard against the icon, so the menu reads as
+            // belonging to the row it came from.
+            x: item.x,
+            y: item.y + item.height,
+            items: crate::termwindow::render::sidebar::pane_copy_menu_items_with_redacted(
+                &kind,
+                self.copy_actions_redact(),
+            ),
+            opens_left: false,
+        });
     }
 
     fn mouse_event_sidebar_worktree_button(

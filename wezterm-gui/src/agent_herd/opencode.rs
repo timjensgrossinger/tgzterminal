@@ -281,7 +281,18 @@ fn collect_database_sessions_cached(home: &Path) -> Vec<VendorSession> {
 /// no readable store.
 ///
 /// Blocking SQLite read: call it off the GUI thread.
+#[cfg(test)]
 pub(crate) fn spend_since(home: &Path, since_ms: &[i64]) -> Option<Vec<(f64, u64)>> {
+    spend_and_sessions_since(home, since_ms, i64::MAX).map(|(spend, _)| spend)
+}
+
+/// [`spend_since`], plus `(last updated in ms, tokens)` of every session
+/// updated at or after `sessions_since_ms`, from one open of the store.
+pub(crate) fn spend_and_sessions_since(
+    home: &Path,
+    since_ms: &[i64],
+    sessions_since_ms: i64,
+) -> Option<(Vec<(f64, u64)>, Vec<(i64, u64)>)> {
     let db = opencode_db(home);
     if !db.is_file() {
         return None;
@@ -299,7 +310,7 @@ pub(crate) fn spend_since(home: &Path, since_ms: &[i64]) -> Option<Vec<(f64, u64
          FROM {} WHERE time_updated >= ?1",
         schema.sessions_table()
     );
-    since_ms
+    let spend = since_ms
         .iter()
         .map(|since| {
             conn.query_row(&sql, [since], |row| {
@@ -308,7 +319,22 @@ pub(crate) fn spend_since(home: &Path, since_ms: &[i64]) -> Option<Vec<(f64, u64
             .ok()
             .map(|(cost, tokens)| (cost.max(0.), u64::try_from(tokens).unwrap_or(0)))
         })
-        .collect()
+        .collect::<Option<Vec<_>>>()?;
+    let sql = format!(
+        "SELECT time_updated, COALESCE(tokens_input + tokens_output, 0) \
+         FROM {} WHERE time_updated >= ?1",
+        schema.sessions_table()
+    );
+    let mut statement = conn.prepare(&sql).ok()?;
+    let sessions = statement
+        .query_map([sessions_since_ms], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })
+        .ok()?
+        .flatten()
+        .map(|(updated, tokens)| (updated, u64::try_from(tokens).unwrap_or(0)))
+        .collect();
+    Some((spend, sessions))
 }
 
 fn collect_database_sessions(home: &Path) -> Vec<VendorSession> {

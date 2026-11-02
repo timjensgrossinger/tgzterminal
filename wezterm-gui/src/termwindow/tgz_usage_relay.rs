@@ -20,18 +20,59 @@
 //! read and nothing leaves the machine; the payload is the one Claude Code
 //! already gives any status line.
 //!
-//! Unix only for now.
+//! A home inside a running WSL distro gets a relay of its own, written through
+//! the distro's share: the paths in the script and in `statusLine` are the ones
+//! the distro sees. Claude Code on Windows itself runs status commands through
+//! Git Bash when it has one, so the relay is only connected there when Git Bash
+//! is installed.
+//!
 //! Blocking file I/O throughout: call it off the GUI thread.
 
 use crate::agent_herd::quota;
+use crate::agent_herd::vendor::{SessionOrigin, SessionRoot};
 use anyhow::{bail, Context};
 use serde_json::{Map, Value};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
-/// Whether the relay can run on this platform.
-pub const SUPPORTED: bool = cfg!(unix);
+/// How often a home inside WSL is looked at. The herd scan can run every
+/// 500ms, and each look is several stats over the distro's share.
+const WSL_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Whether a status command on this machine can find `sh`: everywhere but
+/// Windows, and there when Claude Code has a Git Bash to run it through.
+fn host_can_run_sh() -> bool {
+    if cfg!(unix) {
+        return true;
+    }
+    std::env::var_os("CLAUDE_CODE_GIT_BASH_PATH")
+        .into_iter()
+        .map(PathBuf::from)
+        .chain(
+            ["ProgramFiles", "ProgramFiles(x86)"]
+                .iter()
+                .filter_map(std::env::var_os)
+                .map(|dir| PathBuf::from(dir).join("Git\\bin\\bash.exe")),
+        )
+        .chain(
+            std::env::var_os("LOCALAPPDATA")
+                .map(|dir| PathBuf::from(dir).join("Programs\\Git\\bin\\bash.exe")),
+        )
+        .any(|path| path.is_file())
+}
+
+/// A path of this machine as `sh` wants it: Git Bash takes `C:/...`, and
+/// would read backslashes as escapes.
+fn host_shell_path(path: &Path) -> String {
+    let path = path.to_string_lossy();
+    if cfg!(windows) {
+        path.replace('\\', "/")
+    } else {
+        path.into_owned()
+    }
+}
 
 /// The files the relay reads and writes.
 #[derive(Clone, Debug)]
@@ -44,6 +85,13 @@ pub struct RelayPaths {
     pub original: PathBuf,
     /// The last payload, read by [`quota::poll_claude_sample`].
     pub sample: PathBuf,
+    /// `script` and `sample` as the shell running the relay spells them.
+    pub script_cmd: String,
+    pub sample_cmd: String,
+    /// Whether this home's status commands can run the relay at all.
+    pub supported: bool,
+    /// The WSL distro this home is in.
+    pub distro: Option<String>,
 }
 
 impl RelayPaths {
@@ -55,19 +103,63 @@ impl RelayPaths {
             _ => dirs_next::home_dir()?.join(".claude"),
         };
         let data = &*config::DATA_DIR;
+        let script = data.join(script_name());
+        let sample = quota::claude_sample_path(data);
         Some(Self {
             settings: claude_dir.join("settings.json"),
-            script: data.join(config::brand::state_file_name(
-                "claude-statusline-relay",
-                "sh",
-            )),
-            original: data.join(config::brand::state_file_name(
-                "claude-statusline-original",
-                "json",
-            )),
-            sample: quota::claude_sample_path(data),
+            original: data.join(original_name()),
+            script_cmd: host_shell_path(&script),
+            sample_cmd: host_shell_path(&sample),
+            script,
+            sample,
+            supported: host_can_run_sh(),
+            distro: None,
         })
     }
+
+    /// The paths for a home: this user's, or one inside a WSL distro.
+    pub fn for_root(root: &SessionRoot) -> Option<Self> {
+        match &root.origin {
+            SessionOrigin::Host => Self::for_user(),
+            SessionOrigin::Wsl(distro) => {
+                let unc = root.home.to_string_lossy();
+                let linux_home = crate::termwindow::wsl_paths::windows_to_wsl(&unc, distro)?;
+                Some(Self::in_distro(&root.home, &linux_home, distro))
+            }
+        }
+    }
+
+    /// `home` is the home as this process opens it, `linux_home` as the distro
+    /// sees it. The data directory is the one a Linux build in that distro
+    /// uses, so the two share one relay rather than wrapping each other.
+    fn in_distro(home: &Path, linux_home: &str, distro: &str) -> Self {
+        const DATA_DIR: &str = ".local/share/wezterm";
+        let data = home.join(DATA_DIR);
+        let sample = quota::claude_sample_path(&data);
+        let sample_name = sample
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let linux_home = linux_home.trim_end_matches('/');
+        Self {
+            settings: home.join(".claude").join("settings.json"),
+            script: data.join(script_name()),
+            original: data.join(original_name()),
+            script_cmd: format!("{linux_home}/{DATA_DIR}/{}", script_name()),
+            sample_cmd: format!("{linux_home}/{DATA_DIR}/{sample_name}"),
+            sample,
+            supported: true,
+            distro: Some(distro.to_string()),
+        }
+    }
+}
+
+fn script_name() -> String {
+    config::brand::state_file_name("claude-statusline-relay", "sh")
+}
+
+fn original_name() -> String {
+    config::brand::state_file_name("claude-statusline-original", "json")
 }
 
 /// Whether Claude's status line currently goes through the relay.
@@ -104,15 +196,15 @@ fn quote(text: &str) -> String {
 }
 
 /// The `statusLine.command` that runs the relay.
-pub fn relay_command(script: &Path) -> String {
-    format!("sh {}", quote(&script.to_string_lossy()))
+pub fn relay_command(script: &str) -> String {
+    format!("sh {}", quote(script))
 }
 
 /// The relay script's text. `original` is the command to pipe each payload
 /// into; without one the script prints the model name, so Claude Code's
 /// status row is not left empty.
-pub fn relay_script(sample: &Path, original: Option<&str>) -> String {
-    let sample = quote(&sample.to_string_lossy());
+pub fn relay_script(sample: &str, original: Option<&str>) -> String {
+    let sample = quote(sample);
     let show = match original {
         Some(command) => format!("printf '%s' \"$input\" | sh -c {}\n", quote(command)),
         None => "model=$(printf '%s' \"$input\" | sed -n \
@@ -136,17 +228,16 @@ pub fn relay_script(sample: &Path, original: Option<&str>) -> String {
     )
 }
 
-fn is_connected(settings: &Value, script: &Path) -> bool {
-    let script = script.to_string_lossy();
+fn is_connected(settings: &Value, script: &str) -> bool {
     settings
         .get("statusLine")
         .and_then(|line| line.get("command"))
         .and_then(Value::as_str)
-        .is_some_and(|command| command.contains(script.as_ref()))
+        .is_some_and(|command| command.contains(script))
 }
 
 /// The command a saved `statusLine` runs, when it is a command one.
-fn original_command(original: Option<&Value>, script: &Path) -> Option<String> {
+fn original_command(original: Option<&Value>, script: &str) -> Option<String> {
     let line = original?.as_object()?;
     if line
         .get("type")
@@ -158,8 +249,7 @@ fn original_command(original: Option<&Value>, script: &Path) -> Option<String> {
     }
     let command = line.get("command")?.as_str()?.trim();
     // Never pipe the relay into itself.
-    (!command.is_empty() && !command.contains(script.to_string_lossy().as_ref()))
-        .then(|| command.to_string())
+    (!command.is_empty() && !command.contains(script)).then(|| command.to_string())
 }
 
 /// Settings and their raw bytes, or `None` when the file does not exist.
@@ -236,7 +326,7 @@ fn read_original(path: &Path) -> Option<Option<Value>> {
 fn write_script(paths: &RelayPaths, original: Option<&str>) -> anyhow::Result<()> {
     write_atomic(
         &paths.script,
-        relay_script(&paths.sample, original).as_bytes(),
+        relay_script(&paths.sample_cmd, original).as_bytes(),
         Some(0o755),
     )
 }
@@ -247,12 +337,12 @@ pub fn connect(paths: &RelayPaths) -> anyhow::Result<ConnectOutcome> {
         Some((settings, raw)) => (settings, Some(raw)),
         None => (Value::Object(Map::new()), None),
     };
-    if is_connected(&settings, &paths.script) {
+    if is_connected(&settings, &paths.script_cmd) {
         // The script may have been deleted since; rebuild it.
         let original = read_original(&paths.original).flatten();
         write_script(
             paths,
-            original_command(original.as_ref(), &paths.script).as_deref(),
+            original_command(original.as_ref(), &paths.script_cmd).as_deref(),
         )?;
         return Ok(ConnectOutcome::AlreadyConnected);
     }
@@ -266,7 +356,7 @@ pub fn connect(paths: &RelayPaths) -> anyhow::Result<ConnectOutcome> {
     )?;
     write_script(
         paths,
-        original_command(original.as_ref(), &paths.script).as_deref(),
+        original_command(original.as_ref(), &paths.script_cmd).as_deref(),
     )?;
 
     // Keep `padding` and `refreshInterval`: they shape the same status row.
@@ -277,7 +367,7 @@ pub fn connect(paths: &RelayPaths) -> anyhow::Result<ConnectOutcome> {
     line.insert("type".into(), Value::String("command".into()));
     line.insert(
         "command".into(),
-        Value::String(relay_command(&paths.script)),
+        Value::String(relay_command(&paths.script_cmd)),
     );
     settings
         .as_object_mut()
@@ -292,7 +382,7 @@ pub fn connect(paths: &RelayPaths) -> anyhow::Result<ConnectOutcome> {
 /// Put the saved `statusLine` back and remove the relay's files.
 pub fn disconnect(paths: &RelayPaths) -> anyhow::Result<DisconnectOutcome> {
     let outcome = match read_settings(&paths.settings)? {
-        Some((mut settings, previous)) if is_connected(&settings, &paths.script) => {
+        Some((mut settings, previous)) if is_connected(&settings, &paths.script_cmd) => {
             let saved = read_original(&paths.original);
             let object = settings
                 .as_object_mut()
@@ -322,15 +412,15 @@ pub fn disconnect(paths: &RelayPaths) -> anyhow::Result<DisconnectOutcome> {
     Ok(outcome)
 }
 
-/// `settings.json`'s path and mtime, and whether it pointed at the relay then.
-static STATUS: LazyLock<Mutex<Option<(PathBuf, Option<SystemTime>, bool)>>> =
+/// Per `settings.json`: its mtime, and whether it pointed at the relay then.
+static STATUS: LazyLock<Mutex<HashMap<PathBuf, (Option<SystemTime>, bool)>>> =
     LazyLock::new(Default::default);
 
 /// Whether Claude's status line goes through the relay. Re-reads
 /// `settings.json` only when it changed, so it is cheap to ask on every herd
 /// scan.
 pub fn status(paths: &RelayPaths) -> RelayStatus {
-    if !SUPPORTED {
+    if !paths.supported {
         return RelayStatus::Unsupported;
     }
     let mtime = std::fs::metadata(&paths.settings)
@@ -339,14 +429,14 @@ pub fn status(paths: &RelayPaths) -> RelayStatus {
     let mut cached = STATUS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let connected = match &*cached {
-        Some((path, seen, connected)) if *path == paths.settings && *seen == mtime => *connected,
+    let connected = match cached.get(&paths.settings) {
+        Some((seen, connected)) if *seen == mtime => *connected,
         _ => {
             let connected = read_settings(&paths.settings)
                 .ok()
                 .flatten()
-                .is_some_and(|(settings, _)| is_connected(&settings, &paths.script));
-            *cached = Some((paths.settings.clone(), mtime, connected));
+                .is_some_and(|(settings, _)| is_connected(&settings, &paths.script_cmd));
+            cached.insert(paths.settings.clone(), (mtime, connected));
             connected
         }
     };
@@ -359,30 +449,45 @@ pub fn status(paths: &RelayPaths) -> RelayStatus {
 
 /// Forget the cached status, so the next [`status`] re-reads the settings
 /// (their mtime can stay put within one second of our own write).
-pub fn invalidate_status() {
-    *STATUS
+pub fn invalidate_status(paths: &RelayPaths) {
+    STATUS
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&paths.settings);
 }
 
-/// The status as the herd scan last saw it, for paint.
-static LAST: LazyLock<Mutex<Option<RelayStatus>>> = LazyLock::new(Default::default);
+/// Each home's status as the herd scan last saw it, for paint.
+static LAST: LazyLock<Mutex<HashMap<PathBuf, RelayStatus>>> = LazyLock::new(Default::default);
 
 /// Look at the settings again and remember the answer for [`last_status`].
 /// Called from the herd scan's worker thread.
 pub fn refresh_status(paths: &RelayPaths) -> RelayStatus {
     let status = status(paths);
-    *LAST.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(status);
+    LAST.lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(paths.settings.clone(), status);
     status
+}
+
+/// The one status to show for several homes: the most useful thing any of
+/// them can say.
+fn aggregate_status(statuses: impl Iterator<Item = RelayStatus>) -> Option<RelayStatus> {
+    statuses.max_by_key(|status| match status {
+        RelayStatus::Unsupported => 0,
+        RelayStatus::Disconnected => 1,
+        RelayStatus::Connected => 2,
+    })
 }
 
 /// The status as last seen, without touching the disk; `None` before the
 /// first herd scan has looked.
 pub fn last_status() -> Option<RelayStatus> {
-    if !SUPPORTED {
-        return Some(RelayStatus::Unsupported);
-    }
-    *LAST.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    aggregate_status(
+        LAST.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .copied(),
+    )
 }
 
 /// What the herd scan should do about the relay: `Some(true)` connect,
@@ -402,7 +507,7 @@ pub fn relay_change(wanted: bool, status: RelayStatus, claude_installed: bool) -
 /// A change is tried once per version of the file, so a tool that keeps
 /// rewriting `statusLine` gets wrapped once per rewrite, not in a loop, and
 /// a file that cannot be parsed is not retried until it is edited.
-static LAST_ATTEMPT: LazyLock<Mutex<Option<(bool, Option<SystemTime>)>>> =
+static LAST_ATTEMPT: LazyLock<Mutex<HashMap<PathBuf, (bool, Option<SystemTime>)>>> =
     LazyLock::new(Default::default);
 
 fn toast(title: &str, message: String) {
@@ -432,10 +537,10 @@ pub fn ensure(paths: &RelayPaths, wanted: bool) -> RelayStatus {
         let mut last = LAST_ATTEMPT
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if *last == Some((attach, mtime)) {
+        if last.get(&paths.settings) == Some(&(attach, mtime)) {
             return status;
         }
-        *last = Some((attach, mtime));
+        last.insert(paths.settings.clone(), (attach, mtime));
     }
     let message = if attach {
         connect(paths).map(|outcome| match outcome {
@@ -461,15 +566,52 @@ pub fn ensure(paths: &RelayPaths, wanted: bool) -> RelayStatus {
         disconnect(paths).map(|_| None)
     };
     match message {
-        Ok(Some(message)) => toast("Claude usage limits connected", message),
+        Ok(Some(message)) => toast(
+            &match &paths.distro {
+                Some(distro) => format!("Claude usage limits connected in {distro}"),
+                None => "Claude usage limits connected".to_string(),
+            },
+            message,
+        ),
         Ok(None) => {}
         Err(err) => log::warn!(
             "claude usage relay: could not {}: {err:#}",
             if attach { "connect" } else { "disconnect" }
         ),
     }
-    invalidate_status();
+    invalidate_status(paths);
     refresh_status(paths)
+}
+
+/// When homes inside WSL were last looked at.
+static LAST_WSL_CHECK: LazyLock<Mutex<Option<Instant>>> = LazyLock::new(Default::default);
+
+/// Keep the relay of each of `roots` as wanted and read its samples. Called
+/// from the herd scan's worker thread on every scan; this machine's own home
+/// is looked at each time, those inside WSL every [`WSL_CHECK_INTERVAL`].
+pub fn tick(roots: &[SessionRoot], wanted: bool, poll_quota: bool) {
+    let check_wsl = {
+        let mut last = LAST_WSL_CHECK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let due = last.map_or(true, |at| at.elapsed() >= WSL_CHECK_INTERVAL);
+        if due {
+            *last = Some(Instant::now());
+        }
+        due
+    };
+    for root in roots {
+        if root.origin != SessionOrigin::Host && !check_wsl {
+            continue;
+        }
+        let Some(paths) = RelayPaths::for_root(root) else {
+            continue;
+        };
+        ensure(&paths, wanted);
+        if poll_quota {
+            quota::poll_claude_sample(&paths.sample);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -482,6 +624,10 @@ mod tests {
             script: dir.join("data").join("relay.sh"),
             original: dir.join("data").join("original.json"),
             sample: dir.join("data").join("sample.json"),
+            script_cmd: host_shell_path(&dir.join("data").join("relay.sh")),
+            sample_cmd: host_shell_path(&dir.join("data").join("sample.json")),
+            supported: true,
+            distro: None,
         }
     }
 
@@ -511,7 +657,7 @@ mod tests {
         let connected = settings(&paths);
         assert_eq!(
             connected["statusLine"]["command"],
-            relay_command(&paths.script)
+            relay_command(&paths.script_cmd)
         );
         assert_eq!(connected["statusLine"]["padding"], 0);
         assert_eq!(
@@ -532,7 +678,7 @@ mod tests {
         assert_eq!(restored, original);
         assert!(!paths.script.exists());
         assert!(!paths.original.exists());
-        invalidate_status();
+        invalidate_status(&paths);
         assert_eq!(status(&paths), RelayStatus::Disconnected);
     }
 
@@ -596,7 +742,7 @@ mod tests {
     fn relay_script_saves_the_payload_and_runs_the_original() {
         let temp = tempfile::tempdir().unwrap();
         let sample = temp.path().join("it's sample.json");
-        let script = relay_script(&sample, Some("cat | wc -c | tr -d ' '"));
+        let script = relay_script(&sample.to_string_lossy(), Some("cat | wc -c | tr -d ' '"));
         let path = temp.path().join("relay.sh");
         std::fs::write(&path, script).unwrap();
         let mut child = std::process::Command::new("sh")
@@ -626,7 +772,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let sample = temp.path().join("sample.json");
         let path = temp.path().join("relay.sh");
-        std::fs::write(&path, relay_script(&sample, None)).unwrap();
+        std::fs::write(&path, relay_script(&sample.to_string_lossy(), None)).unwrap();
         let mut child = std::process::Command::new("sh")
             .arg(&path)
             .stdin(std::process::Stdio::piped())
@@ -642,5 +788,70 @@ mod tests {
             .unwrap();
         let out = child.wait_with_output().unwrap();
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "Opus 5.5");
+    }
+
+    /// The file is written through the share, but what runs inside the distro
+    /// has to name the distro's own paths.
+    #[test]
+    fn a_relay_in_a_distro_names_the_paths_the_distro_sees() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = RelayPaths::in_distro(temp.path(), "/home/me/", "Ubuntu");
+        let data = "/home/me/.local/share/wezterm/";
+        assert!(paths.script_cmd.starts_with(data), "{}", paths.script_cmd);
+        assert!(paths.sample_cmd.starts_with(data), "{}", paths.sample_cmd);
+        assert!(paths.script.starts_with(temp.path()));
+        assert_eq!(paths.distro.as_deref(), Some("Ubuntu"));
+
+        std::fs::create_dir_all(paths.settings.parent().unwrap()).unwrap();
+        std::fs::write(&paths.settings, "{}").unwrap();
+        connect(&paths).unwrap();
+        let line = settings(&paths);
+        let command = line["statusLine"]["command"].as_str().unwrap();
+        assert_eq!(command, format!("sh {}", paths.script_cmd));
+        let script = std::fs::read_to_string(&paths.script).unwrap();
+        assert!(script.contains(&paths.sample_cmd));
+        assert!(!script.contains(&temp.path().display().to_string()));
+        assert_eq!(status(&paths), RelayStatus::Connected);
+
+        assert_eq!(disconnect(&paths).unwrap(), DisconnectOutcome::Restored);
+        assert_eq!(settings(&paths), serde_json::json!({}));
+    }
+
+    #[test]
+    fn status_is_kept_per_home() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = RelayPaths::in_distro(&temp.path().join("a"), "/home/a", "A");
+        let second = RelayPaths::in_distro(&temp.path().join("b"), "/home/b", "B");
+        connect(&first).unwrap();
+        std::fs::create_dir_all(second.settings.parent().unwrap()).unwrap();
+        std::fs::write(&second.settings, "{}").unwrap();
+        assert_eq!(status(&first), RelayStatus::Connected);
+        assert_eq!(status(&second), RelayStatus::Disconnected);
+    }
+
+    #[test]
+    fn a_home_without_sh_is_unsupported_and_left_alone() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = RelayPaths {
+            supported: false,
+            ..paths(temp.path())
+        };
+        assert_eq!(status(&paths), RelayStatus::Unsupported);
+        assert_eq!(ensure(&paths, true), RelayStatus::Unsupported);
+        assert!(!paths.settings.exists());
+    }
+
+    #[test]
+    fn the_aggregate_says_the_most_useful_thing() {
+        use RelayStatus::*;
+        assert_eq!(aggregate_status(std::iter::empty()), None);
+        assert_eq!(
+            aggregate_status(vec![Unsupported, Disconnected].into_iter()),
+            Some(Disconnected)
+        );
+        assert_eq!(
+            aggregate_status(vec![Unsupported, Connected, Disconnected].into_iter()),
+            Some(Connected)
+        );
     }
 }

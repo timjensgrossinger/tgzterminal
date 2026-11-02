@@ -1263,12 +1263,16 @@ button; dropped first when the header is narrow) opens a panel with:
   updated);
 - every open session and its tokens, largest first, with a total, and its
   cost where the agent reports one;
-- **Today** and **Last 7 days**, across all Claude Code and Codex sessions on
-  this machine, open or not;
-- a bar per day, stacked by vendor (Claude, Codex). Click it to open the
+- **Today** and **Last 7 days**, across all Claude Code, Codex, OpenCode,
+  Gemini CLI and Copilot CLI sessions on this machine and in its running WSL
+  distros, open or not;
+- a line for any other agent running that has nothing to count, so it is not
+  mistaken for one the popup missed (`Antigravity · no usage data on disk`).
+  Copilot only records its totals when a session ends, and says so until then;
+- a bar per day, stacked by vendor. Click it to open the
   popup into a full chart in place: an axis with round-number gridlines, a
   date under the bars, buttons for 7, 14 and 30 days, and a line naming the
-  day under the pointer (its total, and the Claude/Codex split when both
+  day under the pointer (its total, and the split per vendor when several
   were used) or, with no day pointed at, the span's average and busiest day.
   The `^` button, or closing the popup, folds it back.
 
@@ -1331,9 +1335,15 @@ credentials and nothing is sent anywhere.
   `input=$(cat); printf '%s' "$input" > "$HOME/Library/Application Support/wezterm/claude-statusline.json"`
   (TGZTerminal's data directory: `~/Library/Application Support/wezterm` on
   macOS, `~/.local/share/wezterm` on Linux; flavoured builds name the file
-  `claude-statusline-<flavour>.json`). Claude
-  agents running inside WSL are not covered, and the relay is not offered on
-  Windows yet.
+  `claude-statusline-<flavour>.json`).
+- On Windows, each home with a `~/.claude` inside a **running WSL distro** gets
+  its own relay, connected the same way: in that distro's `settings.json`, with
+  its script and sample in the distro's `~/.local/share/wezterm`. Stopped
+  distros are never read or booted, and setting `claude_usage_relay = false`
+  disconnects each one the next time it runs. Sessions already running may need
+  a restart to pick up the status line. For Claude Code on Windows itself the
+  relay connects only when Git Bash is installed; otherwise the popup says
+  `limits need Git Bash`. Agents on SSH hosts are not covered.
 - `show_quota = false` hides the cards and the button's percentage and
   stops reading the relay's file. The relay itself follows
   `claude_usage_relay` alone.
@@ -1414,10 +1424,22 @@ config.pane_toolbelt = {
 ```
 
 Every tab gets a `Copy` control on its **sidebar tab row**, left of that row's
-`×`. On a shell or ssh tab it offers the rows below; on an agent tab it opens the
-agent copy menu (conversation, Markdown, last message, agent details) — also
-when `agent_ui.show_pane_toolbelt` is off, since that switch is about the
-floating strip. It is drawn on every eligible row at rest, the same way
+`×`. It behaves the same on every platform:
+
+| Tab | Left click | Right click (ctrl+click on macOS) |
+| --- | --- | --- |
+| Shell or ssh | Copies the pane without secrets, as `Copy pane (no secrets)` does | Opens the menu |
+| Agent | Copies the conversation | Opens the agent copy menu (conversation, Markdown, last message, agent details) |
+
+An agent's left click copies unredacted only when the agent was identified by
+its process or an `agent.*` user var. One identified only by its title or by
+text on screen copies its conversation with secrets redacted, since any program
+can print those. The menu's `Copy conversation` row is always plain, unless
+`secret_masking.redact_copy_actions` redacts it. A tab whose focused pane is a
+shell copies as a shell, even when another pane in that tab runs an agent.
+
+The agent behaviour also applies when `agent_ui.show_pane_toolbelt` is off, since
+that switch is about the floating strip. It is drawn on every eligible row at rest, the same way
 the `×` is — a control you have to find before it will show itself is not one
 anybody finds. Hovering it adds a rounded button behind the glyph; that box is
 centred in its own slot rather than pushed against the `×`.
@@ -1442,7 +1464,8 @@ absent, deliberately:
 | --- | --- | --- | --- |
 | `shell_copy` | bool | `true` | Show the Copy icon on tab rows whose pane has no detected agent. |
 
-The button opens a three-row menu:
+The menu on a shell or ssh tab starts with these rows, and the
+["(no secrets)" rows](#copy-menu-no-secrets-rows) follow them:
 
 | Row | Copies |
 | --- | --- |
@@ -1608,8 +1631,7 @@ config.secret_masking = {
 
 ### Copy menu: "(no secrets)" rows
 
-The pane copy menu (the toolbelt Copy button and the sidebar tab-row Copy icon)
-ends with two rows that redact recognised secrets **even when `enabled` is
+The menu of the sidebar tab-row Copy icon (right click) ends with two rows that redact recognised secrets **even when `enabled` is
 `false`**:
 
 | Pane | Rows |
