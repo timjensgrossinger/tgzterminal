@@ -2635,6 +2635,15 @@ pub struct Config {
     #[dynamic(default = "default_true")]
     pub heal_stranded_alt_screen: bool,
 
+    /// TGZTerminal (macOS): hold Secure Keyboard Entry
+    /// (`EnableSecureEventInput`) automatically while the focused window's
+    /// active pane is at a password prompt (local echo off, canonical input
+    /// on). Released the moment the prompt ends or the window loses focus.
+    /// The manual toggle (app menu, sidebar lock, `ToggleSecureKeyboardEntry`)
+    /// works regardless of this setting. Ignored on other platforms.
+    #[dynamic(default = "default_true")]
+    pub macos_secure_keyboard_entry_auto: bool,
+
     #[dynamic(default = "default_status_update_interval")]
     pub status_update_interval: u64,
 
@@ -4022,6 +4031,13 @@ mod agent_ui_tests {
         assert!(section.show_tokens);
         assert!(section.show_quota);
         assert!(section.claude_usage_relay);
+    }
+
+    /// Secure Keyboard Entry engages on password prompts unless the user
+    /// opts out, matching Ghostty's `macos-auto-secure-input` default.
+    #[test]
+    fn secure_keyboard_entry_auto_is_on_by_default() {
+        assert!(Config::default_config().macos_secure_keyboard_entry_auto);
     }
 
     /// The plain-pane Copy strip is on by default, and lives in its own table.

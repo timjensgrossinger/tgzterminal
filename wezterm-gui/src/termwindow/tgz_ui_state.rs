@@ -75,6 +75,11 @@ struct TgzUiState {
     /// [`FILE_TREE_MAX_ROOTS`] roots.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     file_tree_expanded: Option<Vec<(String, Vec<String>)>>,
+
+    /// Whether Secure Keyboard Entry is pinned on from the app menu or the
+    /// sidebar lock (macOS). App-wide, not per window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    secure_keyboard_entry: Option<bool>,
 }
 
 /// Most roots whose open folders are remembered.
@@ -276,6 +281,18 @@ pub fn save_pane_toolbelt_hidden(value: bool) {
     write_state(&state);
 }
 
+/// Persisted Secure Keyboard Entry pin, or `None` when unset.
+pub fn load_secure_keyboard_entry() -> Option<bool> {
+    read_state().secure_keyboard_entry
+}
+
+/// Persist the Secure Keyboard Entry pin. Best-effort.
+pub fn save_secure_keyboard_entry(value: bool) {
+    let mut state = read_state();
+    state.secure_keyboard_entry = Some(value);
+    write_state(&state);
+}
+
 fn write_state(state: &TgzUiState) {
     let path = state_path();
     let json = match serde_json::to_string_pretty(state) {
@@ -466,6 +483,7 @@ mod tests {
             pane_toolbelt_hidden: Some(true),
             file_tree_width: Some(500),
             file_tree_expanded: Some(vec![("/repo".into(), vec!["src".into()])]),
+            secure_keyboard_entry: Some(true),
         };
         let json = serde_json::to_string_pretty(&state).unwrap();
         let parsed: TgzUiState = serde_json::from_str(&json).unwrap();
@@ -474,6 +492,7 @@ mod tests {
         assert_eq!(parsed.diff_panel_height, Some(0));
         assert_eq!(parsed.pane_toolbelt_offset, Some([120.0, 300.0]));
         assert_eq!(parsed.pane_toolbelt_hidden, Some(true));
+        assert_eq!(parsed.secure_keyboard_entry, Some(true));
         assert_eq!(parsed.agent_launcher_project_root, Some(true));
         assert_eq!(parsed.sidebar_expanded_tabs, Some(vec![0, 2]));
         assert_eq!(parsed.wsl_session_distros, Some(vec!["Ubuntu".into()]));
@@ -539,6 +558,8 @@ mod tests {
             pane_toolbelt_hidden: Some(true),
             file_tree_width: Some(500),
             file_tree_expanded: None,
+            // App-wide runtime pin, not a config key: never an override.
+            secure_keyboard_entry: Some(true),
         });
         assert_eq!(overrides, Value::Null);
     }

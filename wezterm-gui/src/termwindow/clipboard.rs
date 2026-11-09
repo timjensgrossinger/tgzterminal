@@ -1,4 +1,4 @@
-use crate::termwindow::{PaneCopyAction, TermWindowNotif};
+use crate::termwindow::{CopyFlash, CopySource, PaneCopyAction, TermWindowNotif};
 use crate::TermWindow;
 use config::keyassignment::{ClipboardCopyDestination, ClipboardPasteSource};
 use mux::pane::Pane;
@@ -33,10 +33,35 @@ impl TermWindow {
     /// success toast is how this bug hid the first time. The message is built
     /// from the payload *before* the guard, so the empty case still reports
     /// itself rather than going silent.
-    pub fn perform_pane_copy(&mut self, pane: &Arc<dyn Pane>, action: &PaneCopyAction) {
+    ///
+    /// A successful copy also starts the Copy controls' checkmark
+    /// ([`CopyFlash`]). From a button that checkmark *is* the confirmation, so
+    /// the toast is kept only for what it cannot say: an empty copy, or how
+    /// many secrets were redacted.
+    pub fn perform_pane_copy(
+        &mut self,
+        pane: &Arc<dyn Pane>,
+        action: &PaneCopyAction,
+        source: CopySource,
+    ) {
         let result = self.pane_copy_result(pane, action);
-        if !result.text.trim().is_empty() {
+        let copied = !result.text.trim().is_empty();
+        if copied {
             self.copy_to_clipboard(ClipboardCopyDestination::Clipboard, result.text);
+            let pane_id = pane.pane_id();
+            self.copy_flash = Some(CopyFlash {
+                pane_id,
+                tab_id: Mux::get()
+                    .resolve_pane_id(pane_id)
+                    .map(|(_domain, _window, tab_id)| tab_id),
+                started: std::time::Instant::now(),
+            });
+            if let Some(window) = self.window.as_ref() {
+                window.invalidate();
+            }
+        }
+        if !copy_toast_wanted(source, copied, result.redacted) {
+            return;
         }
         wezterm_toast_notification::show(wezterm_toast_notification::ToastNotification {
             title: result.title.to_string(),
@@ -79,5 +104,37 @@ impl TermWindow {
         })
         .detach();
         self.maybe_scroll_to_bottom_for_input(&pane);
+    }
+}
+
+/// Whether a pane copy shows a toast.
+///
+/// A key-assignment copy always does: nothing on screen confirms it. A button
+/// copy is confirmed by its checkmark, so it toasts only for an empty copy
+/// (there is no checkmark then, and silence would look like success) or a
+/// redaction (the count is worth knowing and the checkmark cannot say it).
+fn copy_toast_wanted(source: CopySource, copied: bool, redacted: usize) -> bool {
+    match source {
+        CopySource::Key => true,
+        CopySource::Button => !copied || redacted > 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn key_copies_always_toast() {
+        assert!(copy_toast_wanted(CopySource::Key, true, 0));
+        assert!(copy_toast_wanted(CopySource::Key, false, 0));
+        assert!(copy_toast_wanted(CopySource::Key, true, 3));
+    }
+
+    #[test]
+    fn button_copies_toast_only_when_the_checkmark_cannot_say_it() {
+        assert!(!copy_toast_wanted(CopySource::Button, true, 0));
+        assert!(copy_toast_wanted(CopySource::Button, false, 0));
+        assert!(copy_toast_wanted(CopySource::Button, true, 1));
     }
 }

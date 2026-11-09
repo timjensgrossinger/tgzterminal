@@ -1438,6 +1438,14 @@ can print those. The menu's `Copy conversation` row is always plain, unless
 `secret_masking.redact_copy_actions` redacts it. A tab whose focused pane is a
 shell copies as a shell, even when another pane in that tab runs an agent.
 
+A successful copy confirms itself in place. The tab row's Copy icon, and the
+agent toolbelt's `Copy` button, turn into a checkmark that draws itself in,
+holds for about a second, then fades back. A copy started from one of these
+controls (or its menu) shows a toast only when nothing was copied or when
+secrets were redacted. Copies from the `CopyLastCommandOutput`,
+`CopyLastCommandWithOutput` and `CopyPaneScrollback` key assignments still
+toast every time.
+
 The agent behaviour also applies when `agent_ui.show_pane_toolbelt` is off, since
 that switch is about the floating strip. It is drawn on every eligible row at rest, the same way
 the `×` is — a control you have to find before it will show itself is not one
@@ -1678,6 +1686,55 @@ In particular:
   longer masked on screen (copied text is not affected by this).
 - Text an application puts on the clipboard itself (OSC 52) is not redacted.
 - Nothing matched is ever written to the log.
+
+## Secure Keyboard Entry (macOS)
+
+While Secure Keyboard Entry is held, macOS stops passing what you type to other
+processes' event taps and global keyboard monitors: keyloggers, input-monitoring
+tools, text expanders. Terminal.app, iTerm2 and Ghostty offer the same switch.
+
+It is held only while a TGZTerminal window has focus, and in two cases:
+
+- **Pinned:** you switched it on with *TGZTerminal ▸ Secure Keyboard Entry* (a
+  checkmark shows it is pinned), the lock button in the sidebar, or the
+  `ToggleSecureKeyboardEntry` action. The pin is app-wide and survives restarts.
+- **Automatically**, at a password prompt: when the focused pane's terminal has
+  local echo off and canonical input on, as for `sudo`, `ssh`'s own password
+  prompt, `gpg` or `passwd`. It is released as soon as the prompt ends.
+
+```lua
+-- default: engage automatically at password prompts
+config.macos_secure_keyboard_entry_auto = true
+-- bind the manual toggle
+config.keys = {
+  { key = 'S', mods = 'CMD|SHIFT', action = wezterm.action.ToggleSecureKeyboardEntry },
+}
+```
+
+The sidebar lock (beside `±` and the wrench, or at the top of the bottom stack in
+the collapsed rail) is lit whenever secure input is held, pinned or automatic.
+Clicking it flips the pin. On a very narrow sidebar the lock gives way first; the
+menu item still works. Changing focus to another app always releases it.
+
+Check who holds secure input with:
+
+```sh
+ioreg -l -w 0 | grep -o '"kCGSSessionSecureInputPID"=[0-9]*'
+```
+
+Limits:
+
+- Only one process at a time can usefully hold it. While TGZTerminal holds it,
+  other apps' global hotkeys (Alfred, Raycast), text expansion and some password
+  manager autofill stop working. That is why it is released whenever the window
+  loses focus.
+- It does not protect against root, screen capture, or anything that reads the
+  terminal's pty directly.
+- Automatic mode only sees prompts on this machine's pty. A `sudo` prompt on the
+  far side of an `ssh` session, or in a pane attached to a mux server, is not
+  detected (the local pty is in raw mode); pin it on for those.
+- macOS only. On Linux under Wayland, other clients cannot read your keystrokes
+  in the first place; X11 and Windows have no equivalent switch.
 
 ## Rich Input Composer
 

@@ -597,6 +597,9 @@ pub enum UIItemType {
     SidebarDiffPanelButton,
     /// Square button beside Changes: shows or hides the agent pane toolbelt.
     SidebarToolbeltToggle,
+    /// Square lock beside Changes (macOS): pins Secure Keyboard Entry on or
+    /// off; lit while secure input is held.
+    SidebarSecureInputToggle,
     /// Sidebar button that starts a fresh agent session.
     SidebarAgentLaunchButton,
     /// A single agent row in the launch dropdown.
@@ -809,6 +812,31 @@ pub struct PaneCopyMenuState {
     /// window's left edge: growing leftwards from there would pin every menu
     /// against the window frame. Either way the painter clamps into the window.
     pub opens_left: bool,
+}
+
+/// What started a pane copy, which decides whether it toasts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CopySource {
+    /// A Copy control was clicked. The control confirms in place with the
+    /// checkmark, so a toast is only shown when it has something the
+    /// checkmark cannot say: nothing was copied, or secrets were redacted.
+    Button,
+    /// A key assignment. There is no control on screen to animate, so the
+    /// toast stays the confirmation.
+    Key,
+}
+
+/// The most recent successful copy, which the Copy controls of that pane (the
+/// toolbelt button) and its tab (the sidebar row icon) animate as a
+/// checkmark. One at a time: a newer copy replaces it. Never cleared — paint
+/// reads it through `copy_check_frame`, which ignores an expired one.
+#[derive(Clone, Copy, Debug)]
+pub struct CopyFlash {
+    pub pane_id: PaneId,
+    /// Resolved when the copy happens so the sidebar can match its rows
+    /// without a mux lookup per frame.
+    pub tab_id: Option<TabId>,
+    pub started: Instant,
 }
 
 /// Which row of the agent launch dropdown has its submenu open.
@@ -1246,6 +1274,8 @@ pub struct TermWindow {
     sidebar_auto_hide_close_after: Option<Instant>,
     sidebar_search: Option<SidebarSearchState>,
     pane_copy_menu: Option<PaneCopyMenuState>,
+    /// Drives the copy → checkmark → copy animation; see [`CopyFlash`].
+    copy_flash: Option<CopyFlash>,
     agent_launch_menu: Option<AgentLaunchMenuState>,
     /// Anchor for the sessions dropdown opened from the agent section header.
     /// Reuses `AgentLaunchMenuState`; `expanded` is always `None` because both
@@ -1578,8 +1608,61 @@ impl TermWindow {
             crate::macos_dock_badge::set_waiting_count(count);
         }
 
+        self.sync_secure_input();
+
         self.update_title();
         self.emit_window_event("window-focus-changed", None);
+    }
+
+    /// Take or drop the process-wide Secure Keyboard Entry hold for this
+    /// window (macOS; inert elsewhere). Held only while this window is
+    /// focused and either the user pinned it on or, with
+    /// `macos_secure_keyboard_entry_auto`, the active pane is at a password
+    /// prompt. Called on focus changes, pane focus changes and every paint:
+    /// a prompt appears and ends with output, and output always repaints.
+    pub fn sync_secure_input(&self) {
+        if !crate::secure_input::SUPPORTED {
+            return;
+        }
+        let focused = self.focused.is_some();
+        let pinned = crate::secure_input::pinned();
+        let auto = self.config.macos_secure_keyboard_entry_auto;
+        // Only ask the pty when the answer can matter: the read is a termios
+        // syscall.
+        let password_input = focused
+            && !pinned
+            && auto
+            && self
+                .get_active_pane_or_overlay()
+                .map(|pane| {
+                    matches!(
+                        pane.get_metadata(),
+                        wezterm_dynamic::Value::Object(ref obj)
+                            if obj.get_by_str("password_input")
+                                == Some(&wezterm_dynamic::Value::Bool(true))
+                    )
+                })
+                .unwrap_or(false);
+        let wants = crate::secure_input::wanted(focused, pinned, auto, password_input);
+        if crate::secure_input::request(self.mux_window_id, wants) {
+            if let Some(window) = self.window.as_ref() {
+                window.invalidate();
+            }
+        }
+    }
+
+    /// Flip the Secure Keyboard Entry pin (app menu, sidebar lock, key
+    /// binding) and re-evaluate this window's hold right away.
+    pub fn toggle_secure_keyboard_entry(&mut self) {
+        if !crate::secure_input::SUPPORTED {
+            return;
+        }
+        crate::secure_input::toggle_pinned();
+        self.sync_secure_input();
+        self.quad_generation += 1;
+        if let Some(window) = self.window.as_ref() {
+            window.invalidate();
+        }
     }
 
     fn created(&mut self, ctx: RenderContext) -> anyhow::Result<()> {
@@ -1767,6 +1850,7 @@ impl TermWindow {
             sidebar_auto_hide_close_after: None,
             sidebar_search: None,
             pane_copy_menu: None,
+            copy_flash: None,
             agent_launch_menu: None,
             sessions_menu: None,
             sidebar_dropdown_scroll: None,
@@ -2053,6 +2137,9 @@ impl TermWindow {
                 // the window is gone and we'll linger forever.
                 // <https://github.com/wezterm/wezterm/issues/3522>
                 self.clear_all_overlays();
+                // A destroyed window can no longer resign key, so drop a
+                // Secure Keyboard Entry hold it owns here or it would leak.
+                crate::secure_input::request(self.mux_window_id, false);
                 Ok(false)
             }
             WindowEvent::CloseRequested => {
@@ -2446,6 +2533,7 @@ impl TermWindow {
                 MuxNotification::PaneFocused(_) => {
                     // Also handled by clientpane
                     self.update_title_post_status();
+                    self.sync_secure_input();
                 }
                 MuxNotification::TabResized(_) => {
                     // Also handled by wezterm-client
@@ -5894,6 +5982,9 @@ done
             ToggleDiffPanel => {
                 self.toggle_diff_panel_pane(pane.pane_id());
             }
+            ToggleSecureKeyboardEntry => {
+                self.toggle_secure_keyboard_entry();
+            }
             PromptInputLine(args) => self.show_prompt_input_line(args),
             InputSelector(args) => self.show_input_selector(args),
             Confirmation(args) => self.show_confirmation(args),
@@ -5905,18 +5996,21 @@ done
                 self.perform_pane_copy(
                     pane,
                     &PaneCopyAction::Shell(shell_copy::ShellCopyAction::LastCommandOutput),
+                    CopySource::Key,
                 );
             }
             CopyLastCommandWithOutput => {
                 self.perform_pane_copy(
                     pane,
                     &PaneCopyAction::Shell(shell_copy::ShellCopyAction::LastCommandWithOutput),
+                    CopySource::Key,
                 );
             }
             CopyPaneScrollback => {
                 self.perform_pane_copy(
                     pane,
                     &PaneCopyAction::Shell(shell_copy::ShellCopyAction::WholePane),
+                    CopySource::Key,
                 );
             }
             CycleWaitingAgent => {

@@ -659,6 +659,9 @@ pub enum KeyAssignment {
     ToggleDockedInput,
     /// Show or hide the Changes (diff) panel for the active pane.
     ToggleDiffPanel,
+    /// Pin Secure Keyboard Entry on or off (macOS; a no-op elsewhere).
+    /// TGZTerminal.
+    ToggleSecureKeyboardEntry,
     ActivateWindow(usize),
     ActivateWindowRelative(isize),
     ActivateWindowRelativeNoWrap(isize),

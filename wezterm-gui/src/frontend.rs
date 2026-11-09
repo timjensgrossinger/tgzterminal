@@ -333,6 +333,11 @@ impl GuiFrontEnd {
                     KeyAssignment::SpawnCommandInNewWindow(spawn) => {
                         spawn_command(&spawn, SpawnWhere::NewWindow);
                     }
+                    KeyAssignment::ToggleSecureKeyboardEntry => {
+                        // No window to hold it for; the next window to gain
+                        // focus picks the new pin up.
+                        crate::secure_input::toggle_pinned();
+                    }
                     _ => {
                         log::warn!("unhandled perform: {action:?}");
                     }

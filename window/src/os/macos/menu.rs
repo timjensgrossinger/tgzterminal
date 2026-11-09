@@ -329,6 +329,15 @@ impl MenuItem {
         unsafe { msg_send![*self.item, tag] }
     }
 
+    /// Show (`true`) or clear the checkmark in front of the item
+    /// (`NSControlStateValueOn` / `Off`).
+    pub fn set_state(&self, on: bool) {
+        let state: NSInteger = if on { 1 } else { 0 };
+        unsafe {
+            let () = msg_send![*self.item, setState: state];
+        }
+    }
+
     /// Associate the item to an object
     fn set_represented_object(&self, object: id) {
         unsafe {

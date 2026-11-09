@@ -29,6 +29,13 @@ impl crate::TermWindow {
         // Start with the assumption that we should allow images to render
         self.allow_images = AllowImage::Yes;
 
+        // Before the passes, so this frame's sidebar lock shows the hold the
+        // pane's current prompt state calls for. Only the focused window
+        // reads the pty; the others just keep their (absent) hold.
+        if self.focused.is_some() {
+            self.sync_secure_input();
+        }
+
         let start = Instant::now();
 
         {

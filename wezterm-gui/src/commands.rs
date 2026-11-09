@@ -368,6 +368,30 @@ impl CommandDef {
     #[cfg(not(target_os = "macos"))]
     pub fn recreate_menubar(_config: &ConfigHandle) {}
 
+    #[cfg(not(target_os = "macos"))]
+    pub fn refresh_secure_input_menu_state() {}
+
+    /// Move the app menu's "Secure Keyboard Entry" checkmark to the current
+    /// pinned state, without rebuilding the menubar.
+    #[cfg(target_os = "macos")]
+    pub fn refresh_secure_input_menu_state() {
+        use window::os::macos::menu::*;
+
+        let Some(main_menu) = Menu::get_main_menu() else {
+            return;
+        };
+        let Some(app_menu) = main_menu
+            .item_with_title("WezTerm")
+            .and_then(|item| item.get_sub_menu())
+        else {
+            return;
+        };
+        let wanted = RepresentedItem::KeyAssignment(KeyAssignment::ToggleSecureKeyboardEntry);
+        if let Some(item) = app_menu.get_item_with_represented_item(&wanted) {
+            item.set_state(crate::secure_input::pinned());
+        }
+    }
+
     /// Update the menubar to reflect the current config state.
     /// We cannot simply build a completely new one and replace it at runtime,
     /// because something in cocoa get's unhappy and crashes shortly after.
@@ -561,6 +585,9 @@ impl CommandDef {
 
                 item.set_represented_item(represented_item);
                 item.set_tool_tip(&cmd.doc);
+                if cmd.action == KeyAssignment::ToggleSecureKeyboardEntry {
+                    item.set_state(crate::secure_input::pinned());
+                }
                 // Update the tag to indicate that this item should
                 // not be removed by the sweep below
                 item.set_tag(1);
@@ -2164,6 +2191,18 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             menubar: &["View"],
             icon: None,
         },
+        ToggleSecureKeyboardEntry => CommandDef {
+            brief: "Secure Keyboard Entry".into(),
+            doc: "Keeps other apps from reading what you type while a \
+                  TGZTerminal window is focused. Engages on its own at \
+                  password prompts unless macos_secure_keyboard_entry_auto \
+                  is false. This is macOS specific."
+                .into(),
+            keys: vec![],
+            args: &[],
+            menubar: &["WezTerm"],
+            icon: Some("md_shield_lock"),
+        },
     })
 }
 
@@ -2174,6 +2213,8 @@ fn compute_default_actions() -> Vec<KeyAssignment> {
     return vec![
         // ----------------- WezTerm
         ReloadConfiguration,
+        #[cfg(target_os = "macos")]
+        ToggleSecureKeyboardEntry,
         #[cfg(target_os = "macos")]
         HideApplication,
         #[cfg(target_os = "macos")]

@@ -55,6 +55,7 @@ mod renderstate;
 mod resize_increment_calculator;
 mod scripting;
 mod scrollbar;
+mod secure_input;
 mod selection;
 mod shapecache;
 mod spawn;
@@ -901,6 +902,7 @@ fn main() {
             std::process::exit(1);
         }
     }
+    secure_input::release_all();
     Mux::shutdown();
     frontend::shutdown();
 }

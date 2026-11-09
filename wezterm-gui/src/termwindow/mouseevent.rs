@@ -3,9 +3,9 @@ use crate::tabbar::TabBarItem;
 use crate::termwindow::render::sidebar::pane_toolbelt_dragged_offset;
 use crate::termwindow::{
     tgz_ui_state, AgentLaunchMenuState, AgentRowAction, CloseTabMenuAction, CloseTabMenuState,
-    CloseTabSource, ExpandedMenuRow, GuiWin, MouseCapture, PaneCopyAction, PaneCopyMenuState,
-    PaneToolbeltAction, PositionedSplit, SshLaunchMenuState, TermWindowNotif, UIItem, UIItemType,
-    TMB,
+    CloseTabSource, CopySource, ExpandedMenuRow, GuiWin, MouseCapture, PaneCopyAction,
+    PaneCopyMenuState, PaneToolbeltAction, PositionedSplit, SshLaunchMenuState, TermWindowNotif,
+    UIItem, UIItemType, TMB,
 };
 use ::window::{
     CursorIcon, MouseButtons as WMB, MouseEvent, MouseEventKind as WMEK, MousePress,
@@ -78,6 +78,7 @@ impl super::TermWindow {
             | UIItemType::SidebarWorktreeButton
             | UIItemType::SidebarDiffPanelButton
             | UIItemType::SidebarToolbeltToggle
+            | UIItemType::SidebarSecureInputToggle
             | UIItemType::SidebarAgentLaunchButton
             | UIItemType::SidebarSessionsButton
             | UIItemType::SidebarUsageButton
@@ -145,6 +146,7 @@ impl super::TermWindow {
             | UIItemType::SidebarWorktreeButton
             | UIItemType::SidebarDiffPanelButton
             | UIItemType::SidebarToolbeltToggle
+            | UIItemType::SidebarSecureInputToggle
             | UIItemType::SidebarAgentLaunchButton
             | UIItemType::SidebarSessionsButton
             | UIItemType::SidebarUsageButton
@@ -892,6 +894,15 @@ impl super::TermWindow {
                 }
                 context.invalidate();
             }
+            UIItemType::SidebarSecureInputToggle => {
+                if event.kind == WMEK::Release(MousePress::Left)
+                    && self.pressed_ui_item.as_ref() == Some(&UIItemType::SidebarSecureInputToggle)
+                {
+                    self.pressed_ui_item = None;
+                    self.toggle_secure_keyboard_entry();
+                }
+                context.invalidate();
+            }
             UIItemType::SidebarAgentLaunchButton => {
                 self.mouse_event_sidebar_agent_launch_button(item, event, context);
             }
@@ -1127,7 +1138,7 @@ impl super::TermWindow {
                                 crate::termwindow::render::sidebar::sidebar_copy_click_action(
                                     &kind,
                                 );
-                            self.perform_pane_copy(&pane, &action);
+                            self.perform_pane_copy(&pane, &action, CopySource::Button);
                         }
                     }
                 }
@@ -2031,7 +2042,7 @@ impl super::TermWindow {
             WMEK::Release(MousePress::Left) => {
                 if self.pressed_ui_item.as_ref() == Some(&item_type) {
                     if let Some(pane) = Mux::get().get_pane(pane_id) {
-                        self.perform_pane_copy(&pane, &action);
+                        self.perform_pane_copy(&pane, &action, CopySource::Button);
                     }
                     self.pane_copy_menu = None;
                     self.pressed_ui_item.take();

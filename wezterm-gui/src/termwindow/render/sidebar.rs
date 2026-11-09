@@ -86,6 +86,10 @@ const SIDEBAR_COPY_GLYPH: &str = "\u{f0c5}";
 /// toolbelt. From the bundled Symbols Nerd Font for the same reason as
 /// [`SIDEBAR_COPY_GLYPH`].
 const SIDEBAR_TOOLBELT_GLYPH: &str = "\u{f0ad}";
+/// `nf-fa-lock`, for the sidebar's Secure Keyboard Entry button (macOS). The
+/// same glyph upstream draws as the cursor at a password prompt, so the two
+/// read as one feature.
+const SIDEBAR_SECURE_INPUT_GLYPH: &str = "\u{f023}";
 
 /// Gap between the close button's right edge and the right edge of its zone.
 /// Both the hover button and the `×` inside it derive from this, and so does the
@@ -769,6 +773,109 @@ const WAITING_GLOW_STRENGTH: f32 = 0.8;
 /// list, long enough to be seen as movement rather than a jump.
 const AGENT_ENTER_MS: u64 = 340;
 const AGENT_ENTER_SLIDE_PX: f32 = 12.;
+
+/// Copy → checkmark → copy, all measured from the click. The check draws
+/// itself in over `DRAW` while the copy icon fades out over `ICON_OUT`, stays
+/// until `HOLD`, then the two crossfade back over `FADE`.
+const COPY_CHECK_DRAW_MS: u64 = 220;
+const COPY_CHECK_ICON_OUT_MS: u64 = 120;
+const COPY_CHECK_HOLD_MS: u64 = 1000;
+const COPY_CHECK_FADE_MS: u64 = 180;
+/// The check's path in a unit box: down to the elbow, then up to the right.
+/// The short leg is a third of the length, so it is drawn first and quickly.
+const COPY_CHECK_PATH: [(f32, f32); 3] = [(0.18, 0.54), (0.42, 0.76), (0.82, 0.28)];
+/// Stroke width as a share of the check's box, and its floor in px.
+const COPY_CHECK_STROKE_RATIO: f32 = 0.11;
+const COPY_CHECK_STROKE_MIN_PX: f32 = 1.5;
+
+/// One frame of the copy checkmark.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct CopyCheckFrame {
+    /// How much of the check's stroke is drawn, `0.0..=1.0`.
+    pub draw: f32,
+    /// Opacity of the check.
+    pub check_alpha: f32,
+    /// Opacity of the control's normal face (copy glyph or "Copy" label).
+    pub icon_alpha: f32,
+}
+
+/// Where the copy animation is `elapsed` after the click; `None` once it is
+/// over and the control paints its normal face.
+///
+/// Pure function of time, like the agent pulse, so it needs no per-frame
+/// mutable state and is unit-testable.
+pub(crate) fn copy_check_frame(elapsed: Duration) -> Option<CopyCheckFrame> {
+    let ms = elapsed.as_secs_f32() * 1000.;
+    let hold = COPY_CHECK_HOLD_MS as f32;
+    let fade = COPY_CHECK_FADE_MS as f32;
+    if ms >= hold + fade {
+        return None;
+    }
+    let draw_t = (ms / COPY_CHECK_DRAW_MS as f32).clamp(0., 1.);
+    // Ease-out cubic: the stroke flicks in and settles.
+    let draw = 1. - (1. - draw_t).powi(3);
+    let (check_alpha, icon_alpha) = if ms < hold {
+        let out = (ms / COPY_CHECK_ICON_OUT_MS as f32).clamp(0., 1.);
+        (1., 1. - out)
+    } else {
+        let back = ((ms - hold) / fade).clamp(0., 1.);
+        (1. - back, back)
+    };
+    Some(CopyCheckFrame {
+        draw,
+        check_alpha,
+        icon_alpha,
+    })
+}
+
+/// Centres of the tiles that draw the first `progress` of the check, in px
+/// from the top-left of a `side`-sized box.
+///
+/// The renderer has no line primitive and `poly_quad` takes only static
+/// shapes, so a partial stroke is stamped from overlapping squares, the way
+/// the throbber ring is.
+pub(crate) fn check_stroke_points(progress: f32, side: f32, stroke: f32) -> Vec<(f32, f32)> {
+    let progress = progress.clamp(0., 1.);
+    if progress <= 0. || side <= 0. {
+        return Vec::new();
+    }
+    let path: Vec<(f32, f32)> = COPY_CHECK_PATH
+        .iter()
+        .map(|(x, y)| (x * side, y * side))
+        .collect();
+    let lengths: Vec<f32> = path
+        .windows(2)
+        .map(|w| ((w[1].0 - w[0].0).powi(2) + (w[1].1 - w[0].1).powi(2)).sqrt())
+        .collect();
+    let total: f32 = lengths.iter().sum();
+    let target = total * progress;
+    let pitch = (stroke * THROBBER_TILE_PITCH).max(0.5);
+    let mut points = Vec::new();
+    let mut walked = 0.;
+    for (w, len) in path.windows(2).zip(&lengths) {
+        if walked >= target || *len <= 0. {
+            break;
+        }
+        let along = (target - walked).min(*len);
+        let mut d = 0.;
+        while d < along {
+            let t = d / len;
+            points.push((
+                w[0].0 + (w[1].0 - w[0].0) * t,
+                w[0].1 + (w[1].1 - w[0].1) * t,
+            ));
+            d += pitch;
+        }
+        // Always land exactly on the stroke's current end.
+        let t = along / len;
+        points.push((
+            w[0].0 + (w[1].0 - w[0].0) * t,
+            w[0].1 + (w[1].1 - w[0].1) * t,
+        ));
+        walked += len;
+    }
+    points
+}
 
 /// Linear `0.0..1.0` sawtooth.
 ///
@@ -4845,6 +4952,10 @@ pub(crate) struct PaneCopyResult {
     pub message: String,
     /// Toast title, per pane kind.
     pub title: &'static str,
+    /// How many secrets the copy redacted. A copy started from a button
+    /// confirms itself with the checkmark and only toasts when this is
+    /// non-zero (or nothing was copied), so the count is not lost.
+    pub redacted: usize,
 }
 
 /// What a left click on the sidebar's Copy icon copies; a right click opens
@@ -8107,6 +8218,12 @@ impl crate::TermWindow {
         self.config.agent_ui.enabled && self.config.agent_ui.show_pane_toolbelt
     }
 
+    /// Whether the sidebar offers the Secure Keyboard Entry lock: wherever the
+    /// platform has the feature (macOS).
+    pub(crate) fn sidebar_secure_input_toggle_shown(&self) -> bool {
+        crate::secure_input::SUPPORTED
+    }
+
     /// The sidebar's toolbelt button: show or hide the agent pane toolbelt in
     /// this window, and remember it for windows opened later and restarts.
     pub fn toggle_pane_toolbelt_hidden(&mut self) {
@@ -9179,14 +9296,15 @@ impl crate::TermWindow {
         };
         let mut result = self.pane_copy_payload_result(pane, &plain);
         let text = std::mem::take(&mut result.text);
-        let (text, note) = if forced {
+        let (text, redacted, note) = if forced {
             let (text, redacted) = self.redact_always(&text);
-            (text, forced_redaction_note(redacted))
+            (text, redacted, forced_redaction_note(redacted))
         } else {
             let (text, redacted) = self.redact_for_copy_action(text);
-            (text, redaction_note(redacted))
+            (text, redacted, redaction_note(redacted))
         };
         result.text = text;
+        result.redacted = redacted;
         result.message.push_str(&note);
         result
     }
@@ -9204,6 +9322,7 @@ impl crate::TermWindow {
                     text: payload.text,
                     // Keeps today's wording on agent panes byte-identical.
                     title: "Agent copy",
+                    redacted: 0,
                 }
             }
             PaneCopyAction::Shell(action) | PaneCopyAction::ShellRedacted(action) => {
@@ -9212,6 +9331,7 @@ impl crate::TermWindow {
                     message: shell_copy_toast_message(*action, &payload),
                     text: payload.text,
                     title: "Copy",
+                    redacted: 0,
                 }
             }
         }
@@ -9615,6 +9735,9 @@ impl crate::TermWindow {
             if self.sidebar_toolbelt_toggle_shown() {
                 rows += 1.;
             }
+            if self.sidebar_secure_input_toggle_shown() {
+                rows += 1.;
+            }
             if ssh_present {
                 rows += 1.;
             }
@@ -9993,6 +10116,66 @@ impl crate::TermWindow {
     /// Measured from the glyph cache on every call rather than remembered: a
     /// measurement taken while the fallback font was still loading would
     /// otherwise stick, and shaping one glyph per visible row is cheap.
+    /// The copy checkmark's current frame, if the latest copy matches.
+    ///
+    /// Also books the next frame: repaints are on demand, and a checkmark
+    /// that did not ask for one would draw its first tile and freeze.
+    fn copy_check_frame_where(
+        &self,
+        matches: impl FnOnce(&crate::termwindow::CopyFlash) -> bool,
+    ) -> Option<CopyCheckFrame> {
+        let flash = self.copy_flash.as_ref()?;
+        let frame = copy_check_frame(flash.started.elapsed())?;
+        if !matches(flash) {
+            return None;
+        }
+        let next = next_agent_pulse_frame_due();
+        let mut animation = self.has_animation.borrow_mut();
+        if animation.map_or(true, |at| at > next) {
+            *animation = Some(next);
+        }
+        Some(frame)
+    }
+
+    /// The checkmark for the toolbelt Copy button of `pane_id`.
+    fn copy_check_for_pane(&self, pane_id: PaneId) -> Option<CopyCheckFrame> {
+        self.copy_check_frame_where(|flash| flash.pane_id == pane_id)
+    }
+
+    /// The checkmark for the sidebar row of the tab at `tab_idx`. The mux
+    /// lookup only runs while an animation is live, never at rest.
+    fn copy_check_for_tab_idx(&self, tab_idx: usize) -> Option<CopyCheckFrame> {
+        self.copy_check_frame_where(|flash| {
+            let row_tab = Mux::get()
+                .get_window(self.mux_window_id)
+                .and_then(|window| window.get_tab_at_idx(tab_idx).map(|tab| tab.tab_id()));
+            row_tab.is_some() && row_tab == flash.tab_id
+        })
+    }
+
+    /// Draw the first `progress` of the checkmark in the `side`-sized box at
+    /// `(x, y)`.
+    fn paint_copy_check(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        x: f32,
+        y: f32,
+        side: f32,
+        progress: f32,
+        color: LinearRgba,
+    ) -> anyhow::Result<()> {
+        let stroke = (side * COPY_CHECK_STROKE_RATIO).max(COPY_CHECK_STROKE_MIN_PX);
+        for (px, py) in check_stroke_points(progress, side, stroke) {
+            self.filled_rectangle(
+                layers,
+                2,
+                euclid::rect(x + px - stroke * 0.5, y + py - stroke * 0.5, stroke, stroke),
+                color,
+            )?;
+        }
+        Ok(())
+    }
+
     fn sidebar_copy_glyph_ink_center(&self) -> Option<(f32, f32)> {
         let style = self
             .fonts
@@ -10940,17 +11123,39 @@ impl crate::TermWindow {
             )?;
             let button_fg = contrast_label_color(button_bg, sb.text_active);
             let button_side_pad = PANE_TOOLBELT_BUTTON_PAD_X * dpi_scale * 0.5;
-            render_text(
-                self,
-                layers,
-                button_label,
-                button_x + button_side_pad,
-                button_box_y + offset + (button_h - cell_h_f) * 0.5,
-                (button_w - button_side_pad * 2.).max(1.),
-                button_fg,
-                button_bg,
-                true,
-            )?;
+            // After a copy from this pane's menu the label gives way to a
+            // checkmark in the label's colour. The button keeps its width, so
+            // nothing beside it moves.
+            let check = if action == PaneToolbeltAction::CopyMenu {
+                self.copy_check_for_pane(pos.pane.pane_id())
+            } else {
+                None
+            };
+            let label_alpha = check.map_or(1., |frame| frame.icon_alpha);
+            if label_alpha > 0. {
+                render_text(
+                    self,
+                    layers,
+                    button_label,
+                    button_x + button_side_pad,
+                    button_box_y + offset + (button_h - cell_h_f) * 0.5,
+                    (button_w - button_side_pad * 2.).max(1.),
+                    button_fg.mul_alpha(label_alpha),
+                    button_bg,
+                    true,
+                )?;
+            }
+            if let Some(frame) = check.filter(|frame| frame.check_alpha > 0.) {
+                let side = (button_h * 0.8).min(button_w);
+                self.paint_copy_check(
+                    layers,
+                    button_x + (button_w - side) * 0.5,
+                    button_box_y + offset + (button_h - side) * 0.5,
+                    side,
+                    frame.draw,
+                    button_fg.mul_alpha(frame.check_alpha),
+                )?;
+            }
             self.ui_items.push(UIItem {
                 x: button_x as usize,
                 y: button_box_y as usize,
@@ -12998,6 +13203,28 @@ impl crate::TermWindow {
                 hit,
             )
         };
+        // Lit while secure input is actually held, whether pinned or engaged
+        // by a password prompt; a click flips the pin.
+        let paint_secure_input_toggle = |this: &mut Self,
+                                         layers: &mut TripleLayerQuadAllocator,
+                                         rect: (f32, f32, f32, f32),
+                                         radius: f32,
+                                         hit: (f32, f32)|
+         -> anyhow::Result<()> {
+            let on = crate::secure_input::is_held();
+            paint_square_toggle(
+                this,
+                layers,
+                (
+                    UIItemType::SidebarSecureInputToggle,
+                    SIDEBAR_SECURE_INPUT_GLYPH,
+                    on,
+                ),
+                rect,
+                radius,
+                hit,
+            )
+        };
 
         if self.config.sidebar_auto_hide && !self.sidebar_auto_hide_open {
             let tabs: Vec<_> = self
@@ -13072,7 +13299,17 @@ impl crate::TermWindow {
                     .unwrap_or(new_tab_y)
                     - row_stride
             });
-            let list_bottom = toolbelt_rail_y
+            // The Secure Keyboard Entry lock tops the whole stack.
+            let secure_rail_y = self.sidebar_secure_input_toggle_shown().then(|| {
+                toolbelt_rail_y
+                    .or(changes_rail_y)
+                    .or(rail_launch_y)
+                    .or(ssh_rail_y)
+                    .unwrap_or(new_tab_y)
+                    - row_stride
+            });
+            let list_bottom = secure_rail_y
+                .or(toolbelt_rail_y)
                 .or(changes_rail_y)
                 .or(rail_launch_y)
                 .or(ssh_rail_y)
@@ -13289,6 +13526,15 @@ impl crate::TermWindow {
                     self,
                     layers,
                     (rail_x, toolbelt_y, rail_side, rail_side),
+                    rail_radius,
+                    (left, width as f32),
+                )?;
+            }
+            if let Some(secure_y) = secure_rail_y {
+                paint_secure_input_toggle(
+                    self,
+                    layers,
+                    (rail_x, secure_y, rail_side, rail_side),
                     rail_radius,
                     (left, width as f32),
                 )?;
@@ -14408,23 +14654,42 @@ impl crate::TermWindow {
                         y + row_offset + (row_height as f32 - cell_height as f32) * 0.5,
                     ),
                 };
-                render_text(
-                    self,
-                    layers,
-                    SIDEBAR_COPY_GLYPH,
-                    &CellAttributes::default(),
-                    copy_glyph_x,
-                    copy_glyph_y + copy_glyph_offset,
-                    cell_width as f32,
-                    if copy_hovered {
-                        hover_fg
-                    } else if active {
-                        active_fg
-                    } else {
-                        inactive_fg
-                    },
-                    LinearRgba::default(),
-                )?;
+                let copy_fg = if copy_hovered {
+                    hover_fg
+                } else if active {
+                    active_fg
+                } else {
+                    inactive_fg
+                };
+                // Right after a copy the glyph gives way to a checkmark in
+                // the same colour, which draws itself in and fades back.
+                let check = self.copy_check_for_tab_idx(tab_idx);
+                let icon_alpha = check.map_or(1., |frame| frame.icon_alpha);
+                if icon_alpha > 0. {
+                    render_text(
+                        self,
+                        layers,
+                        SIDEBAR_COPY_GLYPH,
+                        &CellAttributes::default(),
+                        copy_glyph_x,
+                        copy_glyph_y + copy_glyph_offset,
+                        cell_width as f32,
+                        copy_fg.mul_alpha(icon_alpha),
+                        LinearRgba::default(),
+                    )?;
+                }
+                if let Some(frame) = check.filter(|frame| frame.check_alpha > 0.) {
+                    self.paint_copy_check(
+                        layers,
+                        copy_x + copy_geometry.button_dx,
+                        y + row_offset
+                            + (row_height as f32 - copy_geometry.side) * 0.5
+                            + copy_glyph_offset,
+                        copy_geometry.side,
+                        frame.draw,
+                        copy_fg.mul_alpha(frame.check_alpha),
+                    )?;
+                }
                 self.ui_items.push(UIItem {
                     x: copy_x as usize,
                     y: y as usize,
@@ -14553,7 +14818,10 @@ impl crate::TermWindow {
             // split what the Worktree pill can give up.
             let show_changes = self.config.diff_panel.enabled;
             let show_toolbelt = self.sidebar_toolbelt_toggle_shown();
-            let squares = show_changes as usize + show_toolbelt as usize;
+            // The Secure Keyboard Entry lock is carved last, so it sits left
+            // of the other two: lock | ± | wrench.
+            let show_secure = self.sidebar_secure_input_toggle_shown();
+            let squares = show_changes as usize + show_toolbelt as usize + show_secure as usize;
             let changes_side = (row_height as f32).min(
                 ((bottom_row.worktree_fill_w - GAP * squares as f32) / (squares + 1) as f32)
                     .max(1.),
@@ -14566,6 +14834,7 @@ impl crate::TermWindow {
             };
             let toolbelt_x = show_toolbelt.then(&mut carve_square);
             let changes_x = show_changes.then(&mut carve_square);
+            let secure_x = show_secure.then(&mut carve_square);
 
             let worktree_type = UIItemType::SidebarWorktreeButton;
             let worktree_hovered = hovered_item.as_ref() == Some(&worktree_type);
@@ -14665,6 +14934,15 @@ impl crate::TermWindow {
                     (toolbelt_x, worktree_y, changes_side, row_height as f32),
                     RADIUS * dpi_scale,
                     (toolbelt_x, changes_side),
+                )?;
+            }
+            if let Some(secure_x) = secure_x {
+                paint_secure_input_toggle(
+                    self,
+                    layers,
+                    (secure_x, worktree_y, changes_side, row_height as f32),
+                    RADIUS * dpi_scale,
+                    (secure_x, changes_side),
                 )?;
             }
 
@@ -14789,7 +15067,29 @@ impl crate::TermWindow {
         } else {
             0.
         };
+        // The lock goes first when space runs out, under the same rule: the
+        // app menu still offers Secure Keyboard Entry.
+        let narrow_secure_w = if width <= 180 && self.sidebar_secure_input_toggle_shown() {
+            let side = (row_height as f32).min(((item_w - chevron_w - GAP) * 0.5).max(1.));
+            let used = [narrow_changes_w, narrow_toolbelt_w]
+                .iter()
+                .filter(|w| **w > 0.)
+                .map(|w| w + GAP)
+                .sum::<f32>();
+            if item_w - chevron_w - used - side - GAP >= side {
+                side
+            } else {
+                0.
+            }
+        } else {
+            0.
+        };
         let split_w = item_w
+            - if narrow_secure_w > 0. {
+                narrow_secure_w + GAP
+            } else {
+                0.
+            }
             - if narrow_changes_w > 0. {
                 narrow_changes_w + GAP
             } else {
@@ -14906,8 +15206,26 @@ impl crate::TermWindow {
             });
         }
 
+        // Left to right after "+": lock | ± | wrench.
+        if narrow_secure_w > 0. {
+            let secure_x = item_x + split_w + GAP;
+            paint_secure_input_toggle(
+                self,
+                layers,
+                (secure_x, new_tab_y, narrow_secure_w, row_height as f32),
+                RADIUS * dpi_scale,
+                (secure_x, narrow_secure_w),
+            )?;
+        }
         if narrow_changes_w > 0. {
-            let changes_x = item_x + split_w + GAP;
+            let changes_x = item_x
+                + split_w
+                + GAP
+                + if narrow_secure_w > 0. {
+                    narrow_secure_w + GAP
+                } else {
+                    0.
+                };
             paint_changes_button(
                 self,
                 layers,
@@ -17250,6 +17568,61 @@ mod tests {
                 "{evidence:?}"
             );
         }
+    }
+
+    #[test]
+    fn copy_check_starts_on_the_icon_and_draws_in() {
+        let start = copy_check_frame(Duration::ZERO).unwrap();
+        assert_eq!(start.draw, 0.);
+        assert_eq!(start.icon_alpha, 1.);
+        let drawn = copy_check_frame(Duration::from_millis(COPY_CHECK_DRAW_MS)).unwrap();
+        assert!((drawn.draw - 1.).abs() < 1e-6);
+        assert_eq!(drawn.icon_alpha, 0.);
+        assert_eq!(drawn.check_alpha, 1.);
+    }
+
+    #[test]
+    fn copy_check_crossfades_back_and_ends() {
+        let mid = copy_check_frame(Duration::from_millis(
+            COPY_CHECK_HOLD_MS + COPY_CHECK_FADE_MS / 2,
+        ))
+        .unwrap();
+        assert!((mid.check_alpha - 0.5).abs() < 0.02, "{mid:?}");
+        assert!((mid.icon_alpha - 0.5).abs() < 0.02, "{mid:?}");
+        let end = Duration::from_millis(COPY_CHECK_HOLD_MS + COPY_CHECK_FADE_MS);
+        assert_eq!(copy_check_frame(end), None);
+        assert_eq!(copy_check_frame(end * 10), None);
+    }
+
+    #[test]
+    fn copy_check_stroke_never_retracts() {
+        let mut last = -1.;
+        for ms in (0..COPY_CHECK_HOLD_MS + COPY_CHECK_FADE_MS).step_by(7) {
+            let draw = copy_check_frame(Duration::from_millis(ms)).unwrap().draw;
+            assert!(draw >= last, "draw went back at {ms}ms");
+            last = draw;
+        }
+    }
+
+    #[test]
+    fn check_stroke_points_follow_progress() {
+        let (side, stroke) = (20., 2.);
+        assert!(check_stroke_points(0., side, stroke).is_empty());
+        let full = check_stroke_points(1., side, stroke);
+        let (end_x, end_y) = *full.last().unwrap();
+        let (want_x, want_y) = COPY_CHECK_PATH[2];
+        assert!((end_x - want_x * side).abs() < 1e-3);
+        assert!((end_y - want_y * side).abs() < 1e-3);
+        let mut last = 0;
+        for step in 1..=10 {
+            let n = check_stroke_points(step as f32 / 10., side, stroke).len();
+            assert!(n >= last, "fewer tiles at {step}/10");
+            last = n;
+        }
+        // Every tile stays inside the box.
+        assert!(full
+            .iter()
+            .all(|(x, y)| (0. ..=side).contains(x) && (0. ..=side).contains(y)));
     }
 
     /// The two menus are different lists, and the agent list is unchanged.
