@@ -1588,6 +1588,34 @@ pub(crate) fn next_waiting_since(
     }
 }
 
+/// One look at a waiting pane: the next `(focused_since, acknowledged_at)`.
+///
+/// Focus has to be held for `dwell` without a break before the visit counts as
+/// the acknowledgement; leaving earlier restarts the clock, so tabbing through a
+/// pane on the way to another leaves its glow alone. An acknowledgement, once
+/// given, is kept until the episode ends — the caller resets it then.
+pub(crate) fn next_waiting_ack(
+    waiting: bool,
+    focused: bool,
+    focused_since: Option<Instant>,
+    acknowledged_at: Option<Instant>,
+    now: Instant,
+    dwell: Duration,
+) -> (Option<Instant>, Option<Instant>) {
+    if !waiting || acknowledged_at.is_some() {
+        return (None, acknowledged_at);
+    }
+    if !focused {
+        return (None, None);
+    }
+    let since = focused_since.unwrap_or(now);
+    if now.saturating_duration_since(since) >= dwell {
+        (None, Some(now))
+    } else {
+        (Some(since), None)
+    }
+}
+
 /// Exited-unseen timestamp: set when a real agent identity is lost while the
 /// window is unfocused, cleared when the pane is (still) an agent or the
 /// window has focus.
@@ -5348,8 +5376,8 @@ pub(crate) struct AgentDetectionCacheEntry {
     /// When this pane entered the waiting queue (a `WaitingForInput`
     /// transition). `None` otherwise. Drives the waiting-queue UX.
     waiting_since: Option<Instant>,
-    /// When the user acknowledged this pane's *current* waiting episode by
-    /// focusing it.
+    /// When the user acknowledged this pane's *current* waiting episode, by
+    /// keeping it focused for `agent_ui.waiting_ack_ms` or by clicking its row.
     ///
     /// The active pane of a focused window is also excluded from the queue at
     /// query time, but that exclusion alone is not enough: it stops applying
@@ -5358,6 +5386,10 @@ pub(crate) struct AgentDetectionCacheEntry {
     /// stick. Cleared when a *new* waiting episode begins, so a later prompt
     /// re-arms the glow — see the reset beside `next_waiting_since`.
     acknowledged_at: Option<Instant>,
+    /// Since when the pane has been focused without a break during its current,
+    /// still unacknowledged waiting episode. Becomes `acknowledged_at` once it
+    /// is `agent_ui.waiting_ack_ms` old; see [`next_waiting_ack`].
+    focused_since: Option<Instant>,
     /// The agent identity was lost (became non-agent) while the window was
     /// unfocused, so the user probably never saw it finish. Experimental; only
     /// consulted when `agent_ui.track_exited_unseen` is on.
@@ -8463,6 +8495,11 @@ impl crate::TermWindow {
             program_status: program_status_fingerprint(&program_status),
             subagent_working,
         };
+        // Before either cache return below: a waiting agent sits on an
+        // unchanged screen, so it is served from the cache for as long as it
+        // waits, and an acknowledgement recorded only on the slow path never
+        // happened — the glow came straight back after every visit.
+        self.refresh_waiting_ack(pane.pane_id());
         let previous_entry = self
             .agent_detection_cache
             .borrow()
@@ -8667,6 +8704,7 @@ impl crate::TermWindow {
                     waiting_since: None,
                     unseen_exited_since: None,
                     acknowledged_at: None,
+                    focused_since: None,
                     first_seen_at: None,
                     done_ring_started_at: None,
                     last_seqno: activity.seqno,
@@ -8698,6 +8736,7 @@ impl crate::TermWindow {
                     waiting_since: None,
                     unseen_exited_since: None,
                     acknowledged_at: None,
+                    focused_since: None,
                     first_seen_at: None,
                     done_ring_started_at: None,
                     last_seqno: activity.seqno,
@@ -8723,6 +8762,7 @@ impl crate::TermWindow {
                     waiting_since: None,
                     unseen_exited_since: None,
                     acknowledged_at: None,
+                    focused_since: None,
                     first_seen_at: None,
                     done_ring_started_at: None,
                     last_seqno: activity.seqno,
@@ -8932,21 +8972,17 @@ impl crate::TermWindow {
         // transition is a *new* prompt, so any earlier acknowledgement is stale
         // and the glow re-arms; while one episode persists the acknowledgement
         // carries over untouched.
-        let acknowledged_at = if previous_waiting_since.is_none() {
-            None
+        // Keeping the pane focused is the acknowledgement; that is recorded by
+        // `refresh_waiting_ack` at the top of this function, which every route
+        // to focus passes through, so this only carries the result over.
+        let (acknowledged_at, focused_since) = if previous_waiting_since.is_none() {
+            (None, None)
         } else {
-            previous_entry.as_ref().and_then(|e| e.acknowledged_at)
+            previous_entry
+                .as_ref()
+                .map(|e| (e.acknowledged_at, e.focused_since))
+                .unwrap_or((None, None))
         };
-        // Focusing a waiting pane is the acknowledgement. Doing it here rather
-        // than in the click handlers covers every route to focus: the sidebar
-        // row and herd row clicks, the rail chip, `CycleWaitingAgent`, keyboard
-        // tab switching, and a plain click into the terminal itself.
-        let acknowledged_at =
-            if waiting_since.is_some() && self.is_focused_active_pane(pane.pane_id()) {
-                acknowledged_at.or(Some(now))
-            } else {
-                acknowledged_at
-            };
         // Exited-unseen: the pane was an agent last time, is not anymore, and
         // the window was not focused when we noticed. Experimental; off unless
         // the user opts in.
@@ -9014,6 +9050,7 @@ impl crate::TermWindow {
                 waiting_since,
                 unseen_exited_since,
                 acknowledged_at,
+                focused_since,
                 first_seen_at: Some(first_seen_at),
                 done_ring_started_at,
                 last_seqno: activity.seqno,
@@ -9023,6 +9060,9 @@ impl crate::TermWindow {
                 spinner_changed_at,
             },
         );
+        // A waiting episode that began on this pass starts its dwell now, and
+        // asks for the frame that completes it; the screen will not change.
+        self.refresh_waiting_ack(pane.pane_id());
         // Runs at most once per pane per 500ms (the fast path above returns
         // before here), and names no pane content: ids, enums and whether the
         // screen was read at all.
@@ -9102,7 +9142,52 @@ impl crate::TermWindow {
         if let Some(entry) = cache.get_mut(&pane_id) {
             if entry.waiting_since.is_some() && entry.acknowledged_at.is_none() {
                 entry.acknowledged_at = Some(Instant::now());
+                entry.focused_since = None;
             }
+        }
+    }
+
+    /// Advance a waiting pane's focus dwell, recording the acknowledgement once
+    /// it has been held for `agent_ui.waiting_ack_ms` (see [`next_waiting_ack`]).
+    ///
+    /// Runs on every detection call, cache hit or not, because a waiting agent
+    /// is served from the cache for as long as it waits. Panes that are not
+    /// waiting or already acknowledged return before the mux lookup, so the
+    /// per-frame cost falls only on the few rows that still glow.
+    fn refresh_waiting_ack(&self, pane_id: PaneId) {
+        let pending = self
+            .agent_detection_cache
+            .borrow()
+            .get(&pane_id)
+            .is_some_and(|e| e.waiting_since.is_some() && e.acknowledged_at.is_none());
+        if !pending {
+            return;
+        }
+        let focused = self.is_focused_active_pane(pane_id);
+        let dwell = Duration::from_millis(self.config.agent_ui.waiting_ack_ms);
+        let due = {
+            let mut cache = self.agent_detection_cache.borrow_mut();
+            let Some(entry) = cache.get_mut(&pane_id) else {
+                return;
+            };
+            let (focused_since, acknowledged_at) = next_waiting_ack(
+                entry.waiting_since.is_some(),
+                focused,
+                entry.focused_since,
+                entry.acknowledged_at,
+                Instant::now(),
+                dwell,
+            );
+            entry.focused_since = focused_since;
+            entry.acknowledged_at = acknowledged_at;
+            // `checked_add`: an absurd `waiting_ack_ms` must not panic the
+            // paint path; it just never completes, like an infinite dwell.
+            focused_since.and_then(|since| since.checked_add(dwell))
+        };
+        // WezTerm repaints on demand and this screen is not going to change,
+        // so without this the frame that completes the dwell never comes.
+        if let Some(due) = due {
+            self.schedule_sidebar_frame(due);
         }
     }
 
@@ -22283,6 +22368,71 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
         assert_eq!(next_waiting_since(Some(earlier), false, now), None);
     }
 
+    /// The reported bug: glancing at a waiting agent and switching back left
+    /// its ring red. A visit has to count once focus has been held for the
+    /// dwell, and only then.
+    #[test]
+    fn waiting_ack_needs_continuous_focus_for_the_dwell() {
+        let dwell = Duration::from_millis(1500);
+        let t0 = Instant::now();
+        // First focused look starts the clock, nothing acknowledged yet.
+        assert_eq!(
+            next_waiting_ack(true, true, None, None, t0, dwell),
+            (Some(t0), None)
+        );
+        // Still inside the dwell.
+        let t1 = t0 + Duration::from_millis(1000);
+        assert_eq!(
+            next_waiting_ack(true, true, Some(t0), None, t1, dwell),
+            (Some(t0), None)
+        );
+        // Dwell reached: acknowledged, clock cleared.
+        let t2 = t0 + dwell;
+        assert_eq!(
+            next_waiting_ack(true, true, Some(t0), None, t2, dwell),
+            (None, Some(t2))
+        );
+    }
+
+    #[test]
+    fn leaving_before_the_dwell_restarts_it() {
+        let dwell = Duration::from_millis(1500);
+        let t0 = Instant::now();
+        let left = t0 + Duration::from_millis(1000);
+        assert_eq!(
+            next_waiting_ack(true, false, Some(t0), None, left, dwell),
+            (None, None)
+        );
+        // Coming back starts over from the new look, not from t0.
+        let back = t0 + Duration::from_millis(1600);
+        assert_eq!(
+            next_waiting_ack(true, true, None, None, back, dwell),
+            (Some(back), None)
+        );
+    }
+
+    #[test]
+    fn waiting_ack_is_kept_once_given_and_never_given_without_a_wait() {
+        let dwell = Duration::from_millis(1500);
+        let t0 = Instant::now();
+        let later = t0 + Duration::from_secs(10);
+        // Acknowledged: focus moving away does not take it back.
+        assert_eq!(
+            next_waiting_ack(true, false, None, Some(t0), later, dwell),
+            (None, Some(t0))
+        );
+        // Not waiting: no clock, no acknowledgement however long it is focused.
+        assert_eq!(
+            next_waiting_ack(false, true, Some(t0), None, later, dwell),
+            (None, None)
+        );
+        // `waiting_ack_ms = 0`: focus alone acknowledges, on the first look.
+        assert_eq!(
+            next_waiting_ack(true, true, None, None, t0, Duration::ZERO),
+            (None, Some(t0))
+        );
+    }
+
     #[test]
     fn waiting_glow_tracks_queue_membership() {
         let now = Instant::now();
@@ -22739,6 +22889,7 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
             waiting_since: None,
             unseen_exited_since: None,
             acknowledged_at: None,
+            focused_since: None,
             first_seen_at: None,
             done_ring_started_at: None,
             last_seqno: SEQ_ZERO,
@@ -22766,6 +22917,7 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
             waiting_since: None,
             unseen_exited_since: None,
             acknowledged_at: None,
+            focused_since: None,
             first_seen_at: None,
             done_ring_started_at: None,
             last_seqno: SEQ_ZERO,

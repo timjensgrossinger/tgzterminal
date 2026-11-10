@@ -381,6 +381,7 @@ config.agent_ui = {
   trust_visible_evidence = true,
   pulse_working_dot = true,
   pulse_period_ms = 1600,
+  waiting_ack_ms = 5000, -- focus time that counts as "seen"; 0 = instant
   ring_colors = "RedBlue", -- or "OrangeCyan", "TanSage", "BrownSlate", "Brand"
   animations = {
     enabled = true,
@@ -557,6 +558,7 @@ vendor-neutral agent.
 | `animations` | table | *(absent)* | Sidebar motion switches and per-animation colour overrides. See [Sidebar animations](#sidebar-animations). |
 | `dock_badge` | bool | `true` | Show a count badge on the macOS dock icon for agents waiting for input while the app is unfocused. Ignored on non-macOS platforms. |
 | `track_exited_unseen` | bool | `true` | Keep agents that finished while the window was unfocused in the waiting queue with a dimmed badge until seen. **Experimental**: relies on detecting the loss of agent identity, which is less reliable than the `WaitingForInput` signal. |
+| `waiting_ack_ms` | integer | `5000` | How long a waiting agent's pane has to stay focused before it counts as seen and its glow clears. Leaving sooner keeps it queued; `0` = on focus. Clicking its sidebar row or notification acknowledges immediately. |
 | `activity_from_output` | bool | `true` | Treat a sustained burst of pane output (>=400 ms of activity, still flowing within the last 1.5 s) as evidence that the agent is working, even when its visible text shows a prompt. Ignored for the focused pane, where the output is your own keystrokes echoing back. This is what keeps the throbber — and with it the sidebar's whole repaint chain — alive while a tool call runs behind a redrawn prompt box. |
 | `activity_from_subagents` | bool | `true` | Treat a working subagent as evidence that its parent agent is working. Covers what `activity_from_output` cannot see: a subagent runs inside its parent's process and may write nothing to the parent's screen for minutes. Needs `agent_ui.section.enabled`, which is what populates the herd state subagents are read from. |
 
@@ -771,9 +773,14 @@ Surfaces:
 - **Rail badges** — waiting panes keep the amber attention dot; exited-unseen
   panes render dimmed.
 
-Acknowledge is lazy: focusing a waiting pane (or clicking its rail row) drops it
-from the queue immediately, even before the agent's status changes. Re-prompts
-after you have looked restart the timer cleanly.
+Acknowledge is lazy: a waiting pane leaves the queue once it has stayed focused
+for `agent_ui.waiting_ack_ms` (default `5000`, i.e. 5 seconds; `0` = on focus),
+however you got there (keyboard, tab bar, a click into the
+terminal), even before the agent's status changes. Switching away sooner leaves it
+queued, so tabbing *through* a pane does not clear it. Clicking its sidebar or
+rail row (or the notification) acknowledges it immediately. While you are looking
+at a pane its glow is hidden either way. Re-prompts after you have looked restart
+the timer cleanly.
 
 The default key assignment is:
 

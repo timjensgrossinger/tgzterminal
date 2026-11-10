@@ -1702,6 +1702,14 @@ pub struct AgentUiConfig {
     #[dynamic(default = "default_true")]
     pub track_exited_unseen: bool,
 
+    /// How long, in milliseconds, a waiting agent's pane has to stay focused
+    /// before the visit counts as having seen it and its sidebar glow clears.
+    /// Switching away sooner leaves it queued, so tabbing *through* a pane does
+    /// not clear it. `0` acknowledges on focus. Clicking the agent's sidebar
+    /// row or its notification always acknowledges immediately.
+    #[dynamic(default = "default_agent_waiting_ack_ms")]
+    pub waiting_ack_ms: u64,
+
     /// Treat a sustained burst of pane output as evidence that the agent is
     /// working, even when its visible text says otherwise.
     ///
@@ -1746,6 +1754,7 @@ impl Default for AgentUiConfig {
             animations: None,
             dock_badge: true,
             track_exited_unseen: true,
+            waiting_ack_ms: default_agent_waiting_ack_ms(),
             activity_from_output: true,
             activity_from_subagents: true,
         }
@@ -1780,6 +1789,10 @@ fn default_agent_visible_identity_signals() -> u8 {
 
 fn default_agent_pulse_period_ms() -> u64 {
     1600
+}
+
+fn default_agent_waiting_ack_ms() -> u64 {
+    5000
 }
 
 #[derive(Debug, Clone, FromDynamic, ToDynamic, ConfigMeta)]
