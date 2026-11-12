@@ -692,6 +692,30 @@ pub enum KeyAssignment {
     /// typing. Falls back to the launcher's domain list when the sidebar
     /// button is not on screen.
     ShowSshHostMenu,
+    /// Pin the sidebar open or let it collapse to its rail (TGZTerminal).
+    ToggleSidebarAutoHide,
+    /// Put the keyboard in the sidebar's tab search field (TGZTerminal).
+    FocusSidebarSearch,
+    /// Show or hide the agent pane toolbelt (TGZTerminal).
+    TogglePaneToolbelt,
+    /// Start the default agent, as a click on the sidebar's agent button
+    /// does (TGZTerminal).
+    LaunchDefaultAgent,
+    /// Start the agent with this adapter id, e.g. `"claude"` (TGZTerminal).
+    LaunchAgent(String),
+    /// Open the sidebar's agent launch menu (TGZTerminal).
+    ShowAgentLaunchMenu,
+    /// Open the sidebar's new-tab menu of shells and domains (TGZTerminal).
+    ShowNewTabMenu,
+    /// Open the agent usage popup (TGZTerminal).
+    ShowUsageMenu,
+    /// Open the recent agent sessions menu (TGZTerminal).
+    ShowSessionsMenu,
+    /// Switch the Agents section between this project and all projects
+    /// (TGZTerminal).
+    ToggleAgentHerdView,
+    /// Rearrange the sidebar footer's buttons by dragging (TGZTerminal).
+    CustomizeSidebarButtons,
 }
 impl_lua_conversion_dynamic!(KeyAssignment);
 

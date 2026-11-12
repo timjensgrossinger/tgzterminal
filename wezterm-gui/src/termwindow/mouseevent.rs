@@ -4,8 +4,9 @@ use crate::termwindow::render::sidebar::pane_toolbelt_dragged_offset;
 use crate::termwindow::{
     tgz_ui_state, AgentLaunchMenuState, AgentRowAction, CloseTabMenuAction, CloseTabMenuState,
     CloseTabSource, CopySource, ExpandedMenuRow, GuiWin, MouseCapture, PaneCopyAction,
-    PaneCopyMenuState, PaneToolbeltAction, PositionedSplit, SshLaunchMenuState, TermWindowNotif,
-    UIItem, UIItemType, TMB,
+    PaneCopyMenuState, PaneToolbeltAction, PositionedSplit, SidebarContextAction,
+    SidebarContextMenuKind, SidebarContextMenuState, SshLaunchMenuState, TermWindowNotif, UIItem,
+    UIItemType, TMB,
 };
 use ::window::{
     CursorIcon, MouseButtons as WMB, MouseEvent, MouseEventKind as WMEK, MousePress,
@@ -58,6 +59,7 @@ impl super::TermWindow {
             | UIItemType::CloseTab(_)
             | UIItemType::SidebarCloseTab(_)
             | UIItemType::CloseTabMenuItem { .. }
+            | UIItemType::SidebarContextMenuItem { .. }
             | UIItemType::SidebarResize { .. }
             | UIItemType::DiffPanelResize { .. }
             | UIItemType::DiffPanelBody
@@ -98,6 +100,9 @@ impl super::TermWindow {
             | UIItemType::SidebarAgentRowChevron { .. }
             | UIItemType::SidebarAgentAction { .. }
             | UIItemType::SidebarNewTabMenuButton
+            | UIItemType::SidebarNewTabButton
+            | UIItemType::SidebarFooterEdit(_)
+            | UIItemType::SidebarFooterResize(_)
             | UIItemType::SidebarNewTabMenuItem { .. }
             | UIItemType::SidebarSshLaunchButton
             | UIItemType::SidebarSshMenuItem { .. }
@@ -126,6 +131,7 @@ impl super::TermWindow {
             | UIItemType::CloseTab(_)
             | UIItemType::SidebarCloseTab(_)
             | UIItemType::CloseTabMenuItem { .. }
+            | UIItemType::SidebarContextMenuItem { .. }
             | UIItemType::SidebarResize { .. }
             | UIItemType::DiffPanelResize { .. }
             | UIItemType::DiffPanelBody
@@ -166,6 +172,9 @@ impl super::TermWindow {
             | UIItemType::SidebarAgentRowChevron { .. }
             | UIItemType::SidebarAgentAction { .. }
             | UIItemType::SidebarNewTabMenuButton
+            | UIItemType::SidebarNewTabButton
+            | UIItemType::SidebarFooterEdit(_)
+            | UIItemType::SidebarFooterResize(_)
             | UIItemType::SidebarNewTabMenuItem { .. }
             | UIItemType::SidebarSshLaunchButton
             | UIItemType::SidebarSshMenuItem { .. }
@@ -278,6 +287,12 @@ impl super::TermWindow {
                         if matches!(item.item_type, UIItemType::PaneToolbeltHandle { .. }) {
                             self.finish_pane_toolbelt_drag(context);
                         }
+                        // A dropped footer button loses its drag outline.
+                        if crate::termwindow::render::sidebar::footer_item_for(&item.item_type)
+                            .is_some()
+                        {
+                            context.invalidate();
+                        }
                         if let Some(tab_idx) = dropped_tab {
                             self.sidebar_drop_flash = Some((tab_idx, Instant::now()));
                             *self.has_animation.borrow_mut() = Some(Instant::now());
@@ -385,6 +400,33 @@ impl super::TermWindow {
             }
         }
 
+        // A press outside the Agents section ends its keyboard navigation and
+        // closes its row menu, wherever the press lands: on other chrome or in
+        // the terminal. Otherwise the arrows stay captured by a section the
+        // user has plainly left.
+        if matches!(&event.kind, WMEK::Press(_)) {
+            let on_agents = matches!(
+                ui_item.as_ref().map(|item| &item.item_type),
+                Some(
+                    UIItemType::SidebarAgentSectionHeader
+                        | UIItemType::SidebarAgentRow { .. }
+                        | UIItemType::SidebarAgentRowChevron { .. }
+                        | UIItemType::SidebarAgentAction { .. }
+                        | UIItemType::SidebarDropdownBody
+                )
+            );
+            if !on_agents {
+                let mut state = self.agent_herd_state.borrow_mut();
+                if state.nav_active || state.context_menu.is_some() {
+                    state.nav_active = false;
+                    state.context_menu = None;
+                    drop(state);
+                    self.dropdown_key_selected = None;
+                    context.invalidate();
+                }
+            }
+        }
+
         // A press on the Worktree panel gives it the keyboard; one anywhere
         // else gives the keyboard back.
         if matches!(&event.kind, WMEK::Press(_)) {
@@ -448,6 +490,7 @@ impl super::TermWindow {
                             ..
                         } | UIItemType::PaneCopyMenuItem { .. }
                             | UIItemType::SidebarTabCopy { .. }
+                            | UIItemType::SidebarDropdownBody
                     )
             );
             if !on_copy_menu {
@@ -513,7 +556,12 @@ impl super::TermWindow {
                     if matches!(
                         item.item_type,
                         UIItemType::SidebarNewTabMenuButton
+                            | UIItemType::SidebarNewTabButton
                             | UIItemType::SidebarNewTabMenuItem { .. }
+                            | UIItemType::SidebarContextMenuItem {
+                                action: SidebarContextAction::ShowLauncher
+                            }
+                            | UIItemType::SidebarDropdownBody
                     )
             );
             if !on_new_tab_menu {
@@ -531,10 +579,26 @@ impl super::TermWindow {
                         UIItemType::CloseTab(_)
                             | UIItemType::SidebarCloseTab(_)
                             | UIItemType::CloseTabMenuItem { .. }
+                            | UIItemType::SidebarDropdownBody
                     )
             );
             if !on_close_tab_menu {
                 self.close_tab_menu = None;
+                context.invalidate();
+            }
+        }
+
+        if matches!(&event.kind, WMEK::Press(_)) && self.sidebar_context_menu.is_some() {
+            let on_context_menu = matches!(
+                &ui_item,
+                Some(item)
+                    if matches!(
+                        item.item_type,
+                        UIItemType::SidebarContextMenuItem { .. } | UIItemType::SidebarDropdownBody
+                    )
+            );
+            if !on_context_menu {
+                self.sidebar_context_menu = None;
                 context.invalidate();
             }
         }
@@ -545,7 +609,9 @@ impl super::TermWindow {
                 Some(item)
                     if matches!(
                         item.item_type,
-                        UIItemType::SidebarUsageButton | UIItemType::SidebarUsageMenuRow { .. }
+                        UIItemType::SidebarUsageButton
+                            | UIItemType::SidebarUsageMenuRow { .. }
+                            | UIItemType::SidebarDropdownBody
                     )
             );
             if !on_usage_menu {
@@ -562,6 +628,9 @@ impl super::TermWindow {
                         item.item_type,
                         UIItemType::SidebarSshLaunchButton
                             | UIItemType::SidebarSshMenuItem { .. }
+                            | UIItemType::SidebarDropdownBody
+                            | UIItemType::SidebarDropdownScrollTrack
+                            | UIItemType::SidebarDropdownScrollThumb
                     )
             );
             if !on_ssh_menu {
@@ -719,6 +788,18 @@ impl super::TermWindow {
             UIItemType::PaneToolbeltHandle { .. } => {
                 self.drag_pane_toolbelt(item, start_event, event, context);
             }
+            UIItemType::SidebarWorktreeButton
+            | UIItemType::SidebarDiffPanelButton
+            | UIItemType::SidebarToolbeltToggle
+            | UIItemType::SidebarSecureInputToggle
+            | UIItemType::SidebarAgentLaunchButton
+            | UIItemType::SidebarSshLaunchButton
+            | UIItemType::SidebarNewTabButton => {
+                self.drag_sidebar_footer_item(item, start_event, event, context);
+            }
+            UIItemType::SidebarFooterResize(footer_item) => {
+                self.drag_sidebar_footer_resize(item, footer_item, start_event, event, context);
+            }
             _ => {
                 log::error!("drag not implemented for {:?}", item);
             }
@@ -730,9 +811,34 @@ impl super::TermWindow {
         item: UIItem,
         pane: Arc<dyn Pane>,
         _y: i64,
-        event: MouseEvent,
+        mut event: MouseEvent,
         context: &dyn WindowOps,
     ) {
+        // macOS has no conversion of its own for ctrl+click, the platform's
+        // way of asking for a context menu, so the fork's chrome reads it as
+        // a right click everywhere rather than one handler at a time.
+        if cfg!(target_os = "macos")
+            && event.modifiers.contains(KeyModifiers::CTRL)
+            && item.item_type.is_fork_chrome()
+        {
+            event.kind = match event.kind {
+                WMEK::Press(MousePress::Left) => WMEK::Press(MousePress::Right),
+                WMEK::Release(MousePress::Left) => WMEK::Release(MousePress::Right),
+                kind => kind,
+            };
+        }
+        // While the footer is being customized its buttons are things to
+        // drag, not things to press.
+        if self.sidebar_footer_edit
+            && crate::termwindow::render::sidebar::footer_item_for(&item.item_type).is_some()
+        {
+            if event.kind == WMEK::Press(MousePress::Left) {
+                self.dragging.replace((item, event));
+            }
+            context.set_cursor(Some(CursorIcon::Grab));
+            context.invalidate();
+            return;
+        }
         let is_left_press = event.kind == WMEK::Press(MousePress::Left);
         self.last_ui_item.replace(item.clone());
         if matches!(event.kind, WMEK::VertWheel(_) | WMEK::HorzWheel(_))
@@ -749,7 +855,9 @@ impl super::TermWindow {
         }
         if let WMEK::VertWheel(n) = event.kind {
             if Self::is_session_dropdown_item(&item.item_type)
-                && (self.sessions_menu.is_some() || self.agent_launch_menu.is_some())
+                && (self.sessions_menu.is_some()
+                    || self.agent_launch_menu.is_some()
+                    || self.ssh_launch_menu.is_some())
             {
                 // Consumed even when the menu has nothing to scroll: the
                 // wheel must not reach whatever the menu covers.
@@ -760,14 +868,29 @@ impl super::TermWindow {
             }
         }
         // A press anywhere that is not an agent action closes an open row menu.
+        // A right press on an agent row is that row's own toggle.
+        let toggles_row_menu = event.kind == WMEK::Press(MousePress::Right)
+            && matches!(item.item_type, UIItemType::SidebarAgentRow { .. });
         if matches!(event.kind, WMEK::Press(_))
-            && !matches!(item.item_type, UIItemType::SidebarAgentAction { .. })
+            && !toggles_row_menu
+            && !matches!(
+                item.item_type,
+                UIItemType::SidebarAgentAction { .. } | UIItemType::SidebarDropdownBody
+            )
         {
             self.agent_herd_state.borrow_mut().context_menu = None;
         }
         if is_left_press {
             self.pressed_ui_item.replace(item.item_type.clone());
             context.invalidate();
+        }
+        // A button acts on release, and only for a click that began on it.
+        if event.kind == WMEK::Release(MousePress::Left)
+            && item.item_type.release_needs_matching_press()
+            && self.pressed_ui_item.as_ref() != Some(&item.item_type)
+        {
+            context.invalidate();
+            return;
         }
         match item.item_type {
             UIItemType::TabBar(item) => {
@@ -811,6 +934,32 @@ impl super::TermWindow {
             }
             UIItemType::SidebarTabList => {
                 self.mouse_event_sidebar_tab_list(event, context);
+            }
+            UIItemType::SidebarFooterResize(_) => {
+                if event.kind == WMEK::Press(MousePress::Left) {
+                    self.dragging.replace((item, event));
+                }
+                context.set_cursor(Some(CursorIcon::EwResize));
+                context.invalidate();
+            }
+            UIItemType::SidebarFooterEdit(action) => {
+                if event.kind == WMEK::Release(MousePress::Left) {
+                    self.pressed_ui_item = None;
+                    match action {
+                        crate::termwindow::FooterEditAction::Done => {
+                            self.finish_sidebar_footer_edit()
+                        }
+                        crate::termwindow::FooterEditAction::Reset => {
+                            self.sidebar_footer_custom = None;
+                            self.sidebar_footer_weights.clear();
+                            crate::termwindow::tgz_ui_state::save_sidebar_footer(None);
+                            crate::termwindow::tgz_ui_state::save_sidebar_footer_weights(
+                                Default::default(),
+                            );
+                        }
+                    }
+                }
+                context.invalidate();
             }
             UIItemType::SidebarScrollTrack => {
                 self.mouse_event_sidebar_scroll_track(item, event, context);
@@ -967,6 +1116,9 @@ impl super::TermWindow {
             UIItemType::SidebarNewTabMenuButton => {
                 self.mouse_event_sidebar_new_tab_menu_button(item, event, context);
             }
+            UIItemType::SidebarNewTabButton => {
+                self.mouse_event_sidebar_new_tab_button(item, event, context);
+            }
             UIItemType::SidebarNewTabMenuItem { index } => {
                 self.mouse_event_sidebar_new_tab_menu_item(index, event, context);
             }
@@ -984,6 +1136,9 @@ impl super::TermWindow {
             }
             UIItemType::SidebarWaitingCounter => {
                 self.mouse_event_sidebar_waiting_counter(event, context);
+            }
+            UIItemType::SidebarContextMenuItem { action } => {
+                self.mouse_event_sidebar_context_menu_item(action, event, context);
             }
             UIItemType::PaneToolbeltButton { pane_id, action } => {
                 self.mouse_event_pane_toolbelt_button(pane_id, action, event, context);
@@ -1116,16 +1271,11 @@ impl super::TermWindow {
         event: MouseEvent,
         context: &dyn WindowOps,
     ) {
-        // macOS has no conversion of its own for ctrl+click, the platform's
-        // way of asking for a context menu.
-        let ctrl_click_is_right_click =
-            cfg!(target_os = "macos") && event.modifiers.contains(::window::Modifiers::CTRL);
         match event.kind {
-            WMEK::Press(MousePress::Right) => self.toggle_sidebar_tab_copy_menu(tab_idx, &item),
-            WMEK::Press(MousePress::Left) if ctrl_click_is_right_click => {
-                // So letting go of ctrl first does not also copy.
-                self.pressed_ui_item = None;
-                self.toggle_sidebar_tab_copy_menu(tab_idx, &item)
+            WMEK::Press(MousePress::Right) => {
+                // Below the row and hard against the icon, so the menu reads
+                // as belonging to the row it came from.
+                self.toggle_sidebar_tab_copy_menu(tab_idx, item.x, item.y + item.height)
             }
             WMEK::Release(MousePress::Left) => {
                 let pressed_here = self.pressed_ui_item.as_ref() == Some(&item.item_type);
@@ -1150,7 +1300,7 @@ impl super::TermWindow {
 
     /// Open the copy menu on the tab's pane, or close it when it is already
     /// open on that pane.
-    fn toggle_sidebar_tab_copy_menu(&mut self, tab_idx: usize, item: &UIItem) {
+    fn toggle_sidebar_tab_copy_menu(&mut self, tab_idx: usize, x: usize, y: usize) {
         let Some(pane) = self.sidebar_primary_pane_for_tab_idx(tab_idx) else {
             self.pane_copy_menu = None;
             return;
@@ -1165,10 +1315,8 @@ impl super::TermWindow {
         }
         self.pane_copy_menu = self.sidebar_copy_kind(&pane).map(|kind| PaneCopyMenuState {
             pane_id: pane.pane_id(),
-            // Below the row and hard against the icon, so the menu reads as
-            // belonging to the row it came from.
-            x: item.x,
-            y: item.y + item.height,
+            x,
+            y,
             items: crate::termwindow::render::sidebar::pane_copy_menu_items_with_redacted(
                 &kind,
                 self.copy_actions_redact(),
@@ -1283,6 +1431,44 @@ impl super::TermWindow {
 
     /// Chevron beside the sidebar new-tab button: toggles the shell/domain
     /// picker. The `+` label itself is untouched and still spawns a tab.
+    /// The sidebar's "+": a left click opens a tab, a right click the menu of
+    /// what else can be opened. With no menu to show (it is switched off, or
+    /// has no entries) a right click opens the launcher, as it always did.
+    fn mouse_event_sidebar_new_tab_button(
+        &mut self,
+        item: UIItem,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        match event.kind {
+            WMEK::Release(MousePress::Left) => {
+                self.new_tab_menu = None;
+                self.do_new_tab_button_click(MousePress::Left);
+            }
+            WMEK::Press(MousePress::Middle) => {
+                self.do_new_tab_button_click(MousePress::Middle);
+            }
+            WMEK::Press(MousePress::Right) => {
+                if self.new_tab_menu.take().is_none() {
+                    if self.new_tab_menu_entries().is_empty() {
+                        self.do_new_tab_button_click(MousePress::Right);
+                    } else {
+                        self.new_tab_menu = Some(AgentLaunchMenuState {
+                            x: item.x,
+                            y: item.y,
+                            expanded: None,
+                            scroll_offset: 0,
+                            pinned_top: None,
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+        context.set_cursor(Some(CursorIcon::Default));
+        context.invalidate();
+    }
+
     fn mouse_event_sidebar_new_tab_menu_button(
         &mut self,
         item: UIItem,
@@ -1328,24 +1514,37 @@ impl super::TermWindow {
         event: MouseEvent,
         context: &dyn WindowOps,
     ) {
-        if event.kind == WMEK::Release(MousePress::Left) {
-            self.pressed_ui_item = None;
-            // Don't open an empty dropdown — the button shouldn't have been
-            // hit-testable in that case, but be defensive against a stale
-            // render between the cache rebuild and the click.
-            if self.ssh_quick_launch_entries().is_empty() {
-                self.ssh_launch_menu = None;
-            } else {
-                self.ssh_launch_menu = match self.ssh_launch_menu.take() {
-                    Some(_) => None,
-                    None => Some(SshLaunchMenuState {
-                        x: item.x,
-                        y: item.y,
-                        query: String::new(),
-                        scroll_offset: 0,
-                    }),
-                };
+        // Left connects to the host the button names; right opens the list
+        // of all of them. With no host to name yet (nothing configured,
+        // nothing used), left opens the list too, since there is nothing else
+        // it could do.
+        let open_menu = match event.kind {
+            WMEK::Release(MousePress::Left) => {
+                self.pressed_ui_item = None;
+                if self.ssh_launch_menu.take().is_some() {
+                    // The click that dismisses an open menu does only that.
+                    false
+                } else if let Some((domain_name, _)) = self.ssh_default_host() {
+                    self.spawn_ssh_quick_launch_entry(&domain_name);
+                    false
+                } else {
+                    true
+                }
             }
+            WMEK::Press(MousePress::Right) => self.ssh_launch_menu.take().is_none(),
+            _ => false,
+        };
+        // Don't open an empty dropdown — the button shouldn't have been
+        // hit-testable in that case, but be defensive against a stale
+        // render between the cache rebuild and the click.
+        if open_menu && !self.ssh_quick_launch_entries().is_empty() {
+            self.ssh_launch_menu = Some(SshLaunchMenuState {
+                x: item.x,
+                y: item.y,
+                query: String::new(),
+                search_active: false,
+                scroll_offset: 0,
+            });
         }
         context.invalidate();
     }
@@ -1404,11 +1603,13 @@ impl super::TermWindow {
     ) {
         if event.kind == WMEK::Release(MousePress::Left) {
             self.pressed_ui_item = None;
-            // The filter row carries no domain: clicking it leaves the menu
-            // open for more typing.
+            // The search row carries no domain: clicking it leaves the menu
+            // open and puts the caret in the field.
             if !domain_name.is_empty() {
                 self.ssh_launch_menu = None;
                 self.spawn_ssh_quick_launch_entry(&domain_name);
+            } else if let Some(menu) = self.ssh_launch_menu.as_mut() {
+                menu.search_active = true;
             }
         }
         context.invalidate();
@@ -1525,6 +1726,7 @@ impl super::TermWindow {
                 | UIItemType::SidebarAgentMenuResume
                 | UIItemType::SidebarAgentMenuResumeSession { .. }
                 | UIItemType::SidebarAgentMenuRestoreLastWindow
+                | UIItemType::SidebarSshMenuItem { .. }
                 | UIItemType::SidebarDropdownBody
                 | UIItemType::SidebarDropdownScrollTrack
                 | UIItemType::SidebarDropdownScrollThumb
@@ -1703,7 +1905,8 @@ impl super::TermWindow {
                 self.close_specific_tab(tab_idx, true);
             }
             WMEK::Press(MousePress::Right) => {
-                self.show_tab_navigator();
+                self.open_sidebar_context_menu(SidebarContextMenuKind::Tab { tab_idx }, &event);
+                context.invalidate();
             }
             WMEK::VertWheel(n) => {
                 if self.scroll_sidebar_tabs(n.into()) {
@@ -1723,6 +1926,11 @@ impl super::TermWindow {
             if self.scroll_sidebar_tabs(n.into()) {
                 context.invalidate();
             }
+        }
+        // The empty part of the list stands for the sidebar itself.
+        if event.kind == WMEK::Press(MousePress::Right) {
+            self.open_sidebar_context_menu(SidebarContextMenuKind::Sidebar, &event);
+            context.invalidate();
         }
         context.set_cursor(Some(CursorIcon::Default));
     }
@@ -1794,6 +2002,395 @@ impl super::TermWindow {
         context.set_cursor(Some(CursorIcon::Text));
     }
 
+    /// Pin the sidebar open or let it collapse to its rail, and remember it.
+    pub(crate) fn toggle_sidebar_auto_hide(&mut self) {
+        let new_val = !self.config.sidebar_auto_hide;
+
+        // Merge the new value into any existing per-window config
+        // overrides so every read site of self.config.sidebar_auto_hide
+        // picks it up on the next paint.
+        use wezterm_dynamic::Value;
+        let mut map: std::collections::BTreeMap<Value, Value> = match &self.config_overrides {
+            Value::Object(o) => o.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            _ => Default::default(),
+        };
+        map.insert(
+            Value::String("sidebar_auto_hide".to_string()),
+            Value::Bool(new_val),
+        );
+        self.config_overrides = Value::Object(map.into());
+
+        // Persist across restarts, then rebuild self.config from the
+        // overrides. config_was_reloaded relayouts against
+        // sidebar_reserved_width(), so the window keeps its size and
+        // the pane takes whatever the sidebar leaves: everything but
+        // the collapsed rail when hidden, the (drag-resizable)
+        // sidebar width less when pinned.
+        crate::termwindow::tgz_ui_state::save_sidebar_auto_hide(new_val);
+        self.config_was_reloaded();
+    }
+
+    /// Put the keyboard in the sidebar's search field, opening a collapsed
+    /// sidebar so the field is there to type into.
+    pub(crate) fn focus_sidebar_search(&mut self) {
+        if self.config.sidebar_auto_hide {
+            self.sidebar_auto_hide_open = true;
+        }
+        self.sidebar_search.get_or_insert_with(Default::default);
+        if let Some(window) = self.window.as_ref() {
+            window.invalidate();
+        }
+    }
+
+    /// Start customizing the footer: its buttons then drag instead of
+    /// acting, until "Done" or Esc. Refused, with the reason, while the
+    /// layout comes from Lua.
+    pub(crate) fn start_sidebar_footer_edit(&mut self) {
+        let (rows, from_lua) = self.sidebar_footer_full_rows();
+        if from_lua {
+            wezterm_toast_notification::show(wezterm_toast_notification::ToastNotification {
+                title: "Sidebar buttons".to_string(),
+                message: "The layout is set by `sidebar_footer` in your config; remove that \
+                          key to arrange the buttons by dragging"
+                    .to_string(),
+                url: None,
+                timeout: Some(Duration::from_millis(4000)),
+            });
+            return;
+        }
+        self.close_floating_menus();
+        // The buttons live in the expanded sidebar.
+        if self.config.sidebar_auto_hide {
+            self.sidebar_auto_hide_open = true;
+        }
+        self.sidebar_footer_custom = Some(rows);
+        self.sidebar_footer_edit = true;
+        if let Some(window) = self.window.as_ref() {
+            window.invalidate();
+        }
+    }
+
+    /// Leave footer customizing and remember the arrangement. One that is
+    /// the built-in layout again is forgotten instead, so a later change of
+    /// the default reaches this user too.
+    pub(crate) fn finish_sidebar_footer_edit(&mut self) {
+        use crate::termwindow::tgz_footer;
+        self.sidebar_footer_edit = false;
+        self.dragging = None;
+        if self.sidebar_footer_custom.as_ref() == Some(&tgz_footer::default_footer_rows()) {
+            self.sidebar_footer_custom = None;
+        }
+        crate::termwindow::tgz_ui_state::save_sidebar_footer(
+            self.sidebar_footer_custom
+                .as_ref()
+                .map(tgz_footer::rows_to_names),
+        );
+        crate::termwindow::tgz_ui_state::save_sidebar_footer_weights(
+            self.sidebar_footer_weights
+                .iter()
+                .map(|(item, weight)| (tgz_footer::item_name(*item).to_string(), *weight))
+                .collect(),
+        );
+        if let Some(window) = self.window.as_ref() {
+            window.invalidate();
+        }
+    }
+
+    /// A footer button on the move: put it where the pointer says, live, the
+    /// way a dragged tab row moves.
+    fn drag_sidebar_footer_item(
+        &mut self,
+        item: UIItem,
+        start_event: MouseEvent,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        use crate::termwindow::tgz_footer;
+        if !self.sidebar_footer_edit {
+            return;
+        }
+        let moved = (event.coords.x - start_event.coords.x).abs()
+            + (event.coords.y - start_event.coords.y).abs();
+        if moved >= 4 {
+            if let Some(dragged) =
+                crate::termwindow::render::sidebar::footer_item_for(&item.item_type)
+            {
+                let (rows, _) = self.sidebar_footer_full_rows();
+                let pointer = (event.coords.x as f32, event.coords.y as f32);
+                if let Some(target) = tgz_footer::footer_drag_target(
+                    &self.sidebar_footer_slots,
+                    &rows,
+                    dragged,
+                    pointer,
+                ) {
+                    let next = tgz_footer::footer_move_capped(
+                        &rows,
+                        dragged,
+                        target,
+                        self.sidebar_footer_max_per_row(),
+                    );
+                    if next != rows {
+                        tgz_footer::settle_weight(&mut self.sidebar_footer_weights, &next, dragged);
+                        self.sidebar_footer_custom = Some(next);
+                    }
+                }
+            }
+        }
+        context.set_cursor(Some(CursorIcon::Grabbing));
+        context.invalidate();
+        self.dragging.replace((item, start_event));
+    }
+
+    /// The boundary between two footer buttons on the move: the button on
+    /// its left takes the width asked for, the ones after it give way, and
+    /// when they cannot give any more the row's last button moves up a row.
+    fn drag_sidebar_footer_resize(
+        &mut self,
+        item: UIItem,
+        footer_item: config::SidebarFooterItem,
+        start_event: MouseEvent,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        use crate::termwindow::render::sidebar::FOOTER_GAP;
+        use crate::termwindow::tgz_footer::{self, FooterResize};
+        if !self.sidebar_footer_edit {
+            return;
+        }
+        let row: Vec<tgz_footer::PaintedSlot> = self
+            .sidebar_footer_slots
+            .iter()
+            .find(|slot| slot.item == footer_item)
+            .map(|own| {
+                self.sidebar_footer_slots
+                    .iter()
+                    .filter(|slot| slot.row == own.row)
+                    .copied()
+                    .collect()
+            })
+            .unwrap_or_default();
+        let min_side = row.first().map_or(1., |slot| slot.h);
+        match tgz_footer::footer_resize(
+            &row,
+            footer_item,
+            event.coords.x as f32,
+            min_side,
+            FOOTER_GAP,
+        ) {
+            FooterResize::Widths(widths) => {
+                // Weights average 1 within the row, so a button that joins
+                // it later at weight 1 is an ordinary one.
+                let total: f32 = widths.iter().map(|(_, width)| *width).sum();
+                if total > 0. {
+                    let count = widths.len() as f32;
+                    for (button, width) in widths {
+                        self.sidebar_footer_weights
+                            .insert(button, width / total * count);
+                    }
+                }
+            }
+            FooterResize::Overflow(last) => {
+                let (rows, _) = self.sidebar_footer_full_rows();
+                let next = tgz_footer::footer_move_up_capped(
+                    &rows,
+                    last,
+                    self.sidebar_footer_max_per_row(),
+                );
+                if next != rows {
+                    tgz_footer::settle_weight(&mut self.sidebar_footer_weights, &next, last);
+                    self.sidebar_footer_custom = Some(next);
+                }
+            }
+            FooterResize::Nothing => {}
+        }
+        context.set_cursor(Some(CursorIcon::EwResize));
+        context.invalidate();
+        self.dragging.replace((item, start_event));
+    }
+
+    /// Close every floating menu the fork paints. Returns whether one was
+    /// open.
+    pub(crate) fn close_floating_menus(&mut self) -> bool {
+        let was_open = self.any_floating_menu_open();
+        self.pane_copy_menu = None;
+        self.agent_launch_menu = None;
+        self.sessions_menu = None;
+        self.new_tab_menu = None;
+        self.close_tab_menu = None;
+        self.sidebar_context_menu = None;
+        self.ssh_launch_menu = None;
+        self.usage_menu = None;
+        if let Ok(mut state) = self.agent_herd_state.try_borrow_mut() {
+            state.context_menu = None;
+        }
+        self.close_file_tree_menu();
+        self.dropdown_key_selected = None;
+        self.dropdown_key_pending_edge = None;
+        was_open
+    }
+
+    /// Open `menu` from the keyboard, anchored at the button that opens it
+    /// with the mouse, or at the window's corner when that button is not on
+    /// screen. Opening one closes the others; asking for the open one closes
+    /// it.
+    pub(crate) fn show_chrome_menu(&mut self, menu: crate::termwindow::ChromeMenu) {
+        use crate::termwindow::ChromeMenu;
+        let button = match menu {
+            ChromeMenu::AgentLaunch => UIItemType::SidebarAgentLaunchButton,
+            ChromeMenu::NewTab => UIItemType::SidebarNewTabButton,
+            ChromeMenu::Usage => UIItemType::SidebarUsageButton,
+            ChromeMenu::Sessions => UIItemType::SidebarSessionsButton,
+        };
+        let (x, y) = self
+            .ui_items
+            .iter()
+            .find(|item| item.item_type == button)
+            .map_or((8, 40), |item| (item.x, item.y));
+        let was_open = match menu {
+            ChromeMenu::AgentLaunch => self.agent_launch_menu.is_some(),
+            ChromeMenu::NewTab => self.new_tab_menu.is_some(),
+            ChromeMenu::Usage => self.usage_menu.is_some(),
+            ChromeMenu::Sessions => self.sessions_menu.is_some(),
+        };
+        self.close_floating_menus();
+        if !was_open {
+            let anchored = || AgentLaunchMenuState {
+                x,
+                y,
+                expanded: None,
+                scroll_offset: 0,
+                pinned_top: None,
+            };
+            match menu {
+                ChromeMenu::AgentLaunch => self.agent_launch_menu = Some(anchored()),
+                ChromeMenu::NewTab => {
+                    if self.new_tab_menu_entries().is_empty() {
+                        // Nothing to pick from: the launcher is the list.
+                        self.show_launcher();
+                    } else {
+                        self.new_tab_menu = Some(anchored());
+                    }
+                }
+                ChromeMenu::Usage => {
+                    self.usage_menu =
+                        Some(crate::termwindow::tgz_usage_menu::UsageMenuState { x, y });
+                }
+                ChromeMenu::Sessions => {
+                    self.kick_agent_session_scan();
+                    self.sessions_menu = Some(anchored());
+                }
+            }
+        }
+        if let Some(window) = self.window.as_ref() {
+            window.invalidate();
+        }
+    }
+
+    /// Arrows, Enter and Esc while a menu is open: move over its rows, pick
+    /// one, close it. Returns whether the key was taken.
+    pub(crate) fn dropdown_menu_key(&mut self, keycode: &::window::KeyCode) -> bool {
+        use ::window::KeyCode as WK;
+        if self.sidebar_footer_edit && matches!(keycode, WK::Char('\u{1b}')) {
+            self.finish_sidebar_footer_edit();
+            return true;
+        }
+        if !self.any_floating_menu_open() {
+            return false;
+        }
+        let delta: isize = match keycode {
+            WK::UpArrow => -1,
+            WK::DownArrow => 1,
+            WK::Char('\u{1b}') => {
+                self.close_floating_menus();
+                return true;
+            }
+            WK::Char('\r') => {
+                let Some(item) = self.dropdown_key_selected.as_ref().and_then(|selected| {
+                    self.dropdown_key_rows
+                        .iter()
+                        .find(|item| item.item_type == *selected)
+                        .cloned()
+                }) else {
+                    // Nothing selected: Enter keeps whatever meaning the
+                    // menu gives it (the ssh menu connects to the first
+                    // match).
+                    return false;
+                };
+                self.click_ui_item(item);
+                return true;
+            }
+            _ => return false,
+        };
+        let current = self.dropdown_key_selected.as_ref().and_then(|selected| {
+            self.dropdown_key_rows
+                .iter()
+                .position(|item| item.item_type == *selected)
+        });
+        match dropdown_key_step(self.dropdown_key_rows.len(), current, delta) {
+            DropdownKeyStep::Select(idx) => {
+                self.dropdown_key_selected = Some(self.dropdown_key_rows[idx].item_type.clone());
+            }
+            DropdownKeyStep::PastEdge => {
+                // One row further, if the list scrolls; the row that comes
+                // into view is selected once it has been painted.
+                if self.scroll_sidebar_dropdown(-delta) {
+                    self.dropdown_key_pending_edge = Some(delta > 0);
+                }
+            }
+            DropdownKeyStep::Nothing => {}
+        }
+        true
+    }
+
+    /// After the menus are painted: drop a selection whose row is gone, and
+    /// select the row a key press scrolled into view.
+    pub(crate) fn settle_dropdown_key_selection(&mut self) {
+        if let Some(bottom) = self.dropdown_key_pending_edge.take() {
+            let row = if bottom {
+                self.dropdown_key_rows.last()
+            } else {
+                self.dropdown_key_rows.first()
+            };
+            let next = row.map(|item| item.item_type.clone());
+            if next != self.dropdown_key_selected {
+                self.dropdown_key_selected = next;
+                // The highlight was painted before this was known.
+                if let Some(window) = self.window.as_ref() {
+                    window.invalidate();
+                }
+            }
+        }
+        if self.dropdown_key_rows.is_empty() {
+            self.dropdown_key_selected = None;
+        }
+    }
+
+    /// Act on `item` as a left click on it would.
+    fn click_ui_item(&mut self, item: UIItem) {
+        let Some(pane) = self.get_active_pane_or_overlay() else {
+            return;
+        };
+        let Some(window) = self.window.clone() else {
+            return;
+        };
+        let x = (item.x + item.width / 2) as isize;
+        let y = (item.y + item.height / 2) as isize;
+        for kind in [
+            WMEK::Press(MousePress::Left),
+            WMEK::Release(MousePress::Left),
+        ] {
+            let event = MouseEvent {
+                kind,
+                coords: ::window::Point::new(x, y),
+                screen_coords: ::window::ScreenPoint::new(x, y),
+                mouse_buttons: ::window::MouseButtons::NONE,
+                modifiers: ::window::Modifiers::NONE,
+            };
+            self.mouse_event_ui_item(item.clone(), Arc::clone(&pane), 0, event, &window);
+        }
+        self.dropdown_key_selected = None;
+    }
+
     fn mouse_event_sidebar_autohide_toggle(&mut self, event: MouseEvent, context: &dyn WindowOps) {
         let item_type = UIItemType::SidebarAutoHideToggle;
         match event.kind {
@@ -1803,32 +2400,7 @@ impl super::TermWindow {
             }
             WMEK::Release(MousePress::Left) => {
                 if self.pressed_ui_item.as_ref() == Some(&item_type) {
-                    let new_val = !self.config.sidebar_auto_hide;
-
-                    // Merge the new value into any existing per-window config
-                    // overrides so every read site of self.config.sidebar_auto_hide
-                    // picks it up on the next paint.
-                    use wezterm_dynamic::Value;
-                    let mut map: std::collections::BTreeMap<Value, Value> = match &self
-                        .config_overrides
-                    {
-                        Value::Object(o) => o.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
-                        _ => Default::default(),
-                    };
-                    map.insert(
-                        Value::String("sidebar_auto_hide".to_string()),
-                        Value::Bool(new_val),
-                    );
-                    self.config_overrides = Value::Object(map.into());
-
-                    // Persist across restarts, then rebuild self.config from the
-                    // overrides. config_was_reloaded relayouts against
-                    // sidebar_reserved_width(), so the window keeps its size and
-                    // the pane takes whatever the sidebar leaves: everything but
-                    // the collapsed rail when hidden, the (drag-resizable)
-                    // sidebar width less when pinned.
-                    crate::termwindow::tgz_ui_state::save_sidebar_auto_hide(new_val);
-                    self.config_was_reloaded();
+                    self.toggle_sidebar_auto_hide();
 
                     self.pressed_ui_item.take();
                     context.invalidate();
@@ -1919,6 +2491,37 @@ impl super::TermWindow {
         context.invalidate();
     }
 
+    /// Open the copy menu at the pointer for the toolbelt's pane, or close it
+    /// when it is already open on that pane.
+    fn toggle_pane_toolbelt_copy_menu(&mut self, pane_id: mux::pane::PaneId, event: &MouseEvent) {
+        if self
+            .pane_copy_menu
+            .take()
+            .is_some_and(|menu| menu.pane_id == pane_id)
+        {
+            return;
+        }
+        let items = Mux::get()
+            .get_pane(pane_id)
+            .and_then(|pane| self.pane_toolbelt_kind(&pane))
+            .map(|kind| {
+                crate::termwindow::render::sidebar::pane_copy_menu_items_with_redacted(
+                    &kind,
+                    self.copy_actions_redact(),
+                )
+            })
+            .unwrap_or_default();
+        if !items.is_empty() {
+            self.pane_copy_menu = Some(PaneCopyMenuState {
+                pane_id,
+                x: event.coords.x.max(0) as usize,
+                y: event.coords.y.max(0) as usize,
+                items,
+                opens_left: true,
+            });
+        }
+    }
+
     fn mouse_event_pane_toolbelt_button(
         &mut self,
         pane_id: mux::pane::PaneId,
@@ -1933,6 +2536,10 @@ impl super::TermWindow {
         match event.kind {
             WMEK::Press(MousePress::Left) => {
                 self.pressed_ui_item.replace(item_type);
+                context.invalidate();
+            }
+            WMEK::Press(MousePress::Right) if action == PaneToolbeltAction::CopyMenu => {
+                self.toggle_pane_toolbelt_copy_menu(pane_id, &event);
                 context.invalidate();
             }
             WMEK::Release(MousePress::Left) => {
@@ -1956,27 +2563,18 @@ impl super::TermWindow {
                                     );
                                 }
                             }
+                            // Left click copies, as the Copy icon on a
+                            // tab row does; the choices are on right click.
                             PaneToolbeltAction::CopyMenu => {
+                                self.pane_copy_menu = None;
                                 // The one `detect_agent_pane` on this path, and
                                 // it happens on a click, not in paint.
-                                let items = Mux::get()
-                                    .get_pane(pane_id)
-                                    .and_then(|pane| self.pane_toolbelt_kind(&pane))
-                                    .map(|kind| {
-                                        crate::termwindow::render::sidebar::pane_copy_menu_items_with_redacted(
+                                if let Some(kind) = self.pane_toolbelt_kind(&pane) {
+                                    let action =
+                                        crate::termwindow::render::sidebar::sidebar_copy_click_action(
                                             &kind,
-                                            self.copy_actions_redact(),
-                                        )
-                                    })
-                                    .unwrap_or_default();
-                                if !items.is_empty() {
-                                    self.pane_copy_menu = Some(PaneCopyMenuState {
-                                        pane_id,
-                                        x: event.coords.x.max(0) as usize,
-                                        y: event.coords.y.max(0) as usize,
-                                        items,
-                                        opens_left: true,
-                                    });
+                                        );
+                                    self.perform_pane_copy(&pane, &action, CopySource::Button);
                                 }
                             }
                             PaneToolbeltAction::Compose => {
@@ -2076,6 +2674,15 @@ impl super::TermWindow {
                     log::debug!("Should close tab {}", idx);
                     self.close_specific_tab(idx, true);
                 }
+            }
+            // The sidebar's close button belongs to its row: same menu as the
+            // rest of the row.
+            WMEK::Press(MousePress::Right) if source == CloseTabSource::Sidebar => {
+                self.open_sidebar_context_menu(
+                    SidebarContextMenuKind::Tab { tab_idx: idx },
+                    &event,
+                );
+                context.invalidate();
             }
             WMEK::Press(MousePress::Right) => {
                 if self.config.tab_close_context_menu {
@@ -2804,24 +3411,99 @@ impl super::TermWindow {
         event: MouseEvent,
         context: &dyn WindowOps,
     ) {
-        if event.kind == WMEK::Release(MousePress::Right) {
-            let view = {
-                let mut state = self.agent_herd_state.borrow_mut();
-                state.view = state.view.toggled();
-                state.view
-            };
-            crate::termwindow::tgz_ui_state::save_agent_section_view(view);
+        // Right-click offers the section's options; it never changes one
+        // itself.
+        if event.kind == WMEK::Press(MousePress::Right) {
+            self.open_sidebar_context_menu(SidebarContextMenuKind::AgentSection, &event);
             context.invalidate();
             return;
         }
         if event.kind == WMEK::Release(MousePress::Left) {
-            let collapsed = {
-                let mut state = self.agent_herd_state.borrow_mut();
-                state.collapsed = !state.collapsed;
-                state.collapsed
-            };
-            crate::termwindow::tgz_ui_state::save_agent_section_collapsed(collapsed);
+            self.toggle_agent_section_collapsed();
             context.invalidate();
+        }
+    }
+
+    fn toggle_agent_section_collapsed(&mut self) {
+        let collapsed = {
+            let mut state = self.agent_herd_state.borrow_mut();
+            state.collapsed = !state.collapsed;
+            state.collapsed
+        };
+        crate::termwindow::tgz_ui_state::save_agent_section_collapsed(collapsed);
+    }
+
+    pub(crate) fn toggle_agent_herd_view(&mut self) {
+        let view = {
+            let mut state = self.agent_herd_state.borrow_mut();
+            state.view = state.view.toggled();
+            state.view
+        };
+        crate::termwindow::tgz_ui_state::save_agent_section_view(view);
+    }
+
+    /// Open the context menu for `kind` at the pointer.
+    fn open_sidebar_context_menu(&mut self, kind: SidebarContextMenuKind, event: &MouseEvent) {
+        self.sidebar_context_menu = Some(SidebarContextMenuState {
+            x: event.coords.x.max(0) as usize,
+            y: event.coords.y.max(0) as usize,
+            kind,
+        });
+    }
+
+    fn mouse_event_sidebar_context_menu_item(
+        &mut self,
+        action: SidebarContextAction,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        context.set_cursor(Some(CursorIcon::Default));
+        if event.kind != WMEK::Release(MousePress::Left) {
+            return;
+        }
+        context.invalidate();
+        // A row of the new-tab menu rather than of a context menu.
+        if action == SidebarContextAction::ShowLauncher {
+            self.new_tab_menu = None;
+            self.do_new_tab_button_click(MousePress::Right);
+            return;
+        }
+        let Some(menu) = self.sidebar_context_menu.take() else {
+            return;
+        };
+        match (menu.kind, action) {
+            (SidebarContextMenuKind::Tab { tab_idx }, SidebarContextAction::CopyMenu) => {
+                self.toggle_sidebar_tab_copy_menu(tab_idx, menu.x, menu.y);
+            }
+            (SidebarContextMenuKind::Tab { .. }, SidebarContextAction::TabNavigator) => {
+                self.show_tab_navigator();
+            }
+            (SidebarContextMenuKind::Tab { tab_idx }, SidebarContextAction::CloseTab) => {
+                self.close_specific_tab(tab_idx, true);
+            }
+            (SidebarContextMenuKind::Tab { tab_idx }, SidebarContextAction::CloseTabsAbove) => {
+                self.close_tabs_above(tab_idx);
+            }
+            (SidebarContextMenuKind::Tab { tab_idx }, SidebarContextAction::CloseTabsBelow) => {
+                self.close_tabs_below(tab_idx);
+            }
+            (SidebarContextMenuKind::Tab { tab_idx }, SidebarContextAction::CloseOtherTabs) => {
+                self.close_all_other_tabs(tab_idx);
+            }
+            (SidebarContextMenuKind::AgentSection, SidebarContextAction::ToggleHerdView) => {
+                self.toggle_agent_herd_view();
+            }
+            (
+                SidebarContextMenuKind::AgentSection,
+                SidebarContextAction::ToggleAgentSectionCollapsed,
+            ) => {
+                self.toggle_agent_section_collapsed();
+            }
+            (SidebarContextMenuKind::Sidebar, SidebarContextAction::CustomizeFooter) => {
+                self.start_sidebar_footer_edit();
+            }
+            // A row that does not belong to the menu it was painted in.
+            _ => {}
         }
     }
 
@@ -2865,8 +3547,9 @@ impl super::TermWindow {
         event: MouseEvent,
         context: &dyn WindowOps,
     ) {
-        // Right-click opens/closes this row's action menu.
-        if event.kind == WMEK::Release(MousePress::Right) {
+        // Right-click opens/closes this row's action menu, on press like every
+        // other context menu.
+        if event.kind == WMEK::Press(MousePress::Right) {
             let mut state = self.agent_herd_state.borrow_mut();
             state.context_menu = if state.context_menu.as_ref() == Some(key) {
                 None
@@ -2876,10 +3559,10 @@ impl super::TermWindow {
             context.invalidate();
             return;
         }
-        if event.kind != WMEK::Release(MousePress::Left) {
+        // A row is selected on press, as a tab row is.
+        if event.kind != WMEK::Press(MousePress::Left) {
             return;
         }
-        self.pressed_ui_item = None;
         // A left click anywhere while a row menu is open closes it (the menu's
         // own actions are separate UIItems that win the hit-test).
         self.agent_herd_state.borrow_mut().context_menu = None;
@@ -3083,7 +3766,20 @@ impl super::TermWindow {
                     AgentRowAction::Attach => self.agent_attach_pane(&pane),
                     AgentRowAction::Logs => self.agent_open_logs_for_pane(&pane),
                     AgentRowAction::Stop => {
-                        pane.key_down(KeyCode::Char('c'), KeyModifiers::CTRL).ok();
+                        if let Err(err) = pane.key_down(KeyCode::Char('c'), KeyModifiers::CTRL) {
+                            log::warn!("failed to send agent interrupt: {err:#}");
+                        } else {
+                            // The same word the toolbelt's Stop gives, so the
+                            // click is seen to have done something.
+                            wezterm_toast_notification::show(
+                                wezterm_toast_notification::ToastNotification {
+                                    title: "Agent control".to_string(),
+                                    message: "Sent Ctrl-C to the agent pane".to_string(),
+                                    url: None,
+                                    timeout: Some(Duration::from_millis(1800)),
+                                },
+                            );
+                        }
                     }
                     _ => unreachable!("outer match limits this to attach/logs/stop"),
                 }
@@ -3099,5 +3795,52 @@ fn mouse_press_to_tmb(press: &MousePress) -> TMB {
         MousePress::Left => TMB::Left,
         MousePress::Right => TMB::Right,
         MousePress::Middle => TMB::Middle,
+    }
+}
+
+/// What an arrow key does to the selection in an open menu.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DropdownKeyStep {
+    Select(usize),
+    /// Already on the first or last visible row: scroll, if there is more.
+    PastEdge,
+    Nothing,
+}
+
+/// Move the selection among `len` visible rows by `delta` (-1 up, 1 down).
+/// With nothing selected, down starts at the first row and up at the last.
+pub(crate) fn dropdown_key_step(
+    len: usize,
+    current: Option<usize>,
+    delta: isize,
+) -> DropdownKeyStep {
+    if len == 0 {
+        return DropdownKeyStep::Nothing;
+    }
+    match current {
+        None if delta > 0 => DropdownKeyStep::Select(0),
+        None => DropdownKeyStep::Select(len - 1),
+        Some(idx) if delta > 0 && idx + 1 < len => DropdownKeyStep::Select(idx + 1),
+        Some(idx) if delta < 0 && idx > 0 => DropdownKeyStep::Select(idx - 1),
+        Some(_) => DropdownKeyStep::PastEdge,
+    }
+}
+
+#[cfg(test)]
+mod dropdown_key_tests {
+    use super::*;
+
+    #[test]
+    fn arrows_walk_the_rows_and_stop_at_the_edges() {
+        assert_eq!(dropdown_key_step(0, None, 1), DropdownKeyStep::Nothing);
+        assert_eq!(dropdown_key_step(3, None, 1), DropdownKeyStep::Select(0));
+        assert_eq!(dropdown_key_step(3, None, -1), DropdownKeyStep::Select(2));
+        assert_eq!(dropdown_key_step(3, Some(0), 1), DropdownKeyStep::Select(1));
+        assert_eq!(
+            dropdown_key_step(3, Some(2), -1),
+            DropdownKeyStep::Select(1)
+        );
+        assert_eq!(dropdown_key_step(3, Some(2), 1), DropdownKeyStep::PastEdge);
+        assert_eq!(dropdown_key_step(3, Some(0), -1), DropdownKeyStep::PastEdge);
     }
 }

@@ -350,6 +350,7 @@ impl crate::TermWindow {
             .layer_for_zindex(MENU_ZINDEX)
             .context("layer_for_zindex(MENU_ZINDEX)")?;
         let mut layers = layer.quad_allocator();
+        self.dropdown_key_rows.clear();
         self.paint_agent_row_menu(&mut layers)
             .context("paint_agent_row_menu")?;
         self.paint_pane_copy_menu(&mut layers)
@@ -362,12 +363,17 @@ impl crate::TermWindow {
             .context("paint_new_tab_menu")?;
         self.paint_close_tab_menu(&mut layers)
             .context("paint_close_tab_menu")?;
+        self.paint_sidebar_context_menu(&mut layers)
+            .context("paint_sidebar_context_menu")?;
         self.paint_ssh_launch_menu(&mut layers)
             .context("paint_ssh_launch_menu")?;
         self.paint_usage_menu(&mut layers)
             .context("paint_usage_menu")?;
         self.paint_file_tree_menu(&mut layers)
             .context("paint_file_tree_menu")?;
+        self.settle_dropdown_key_selection();
+        self.paint_chrome_tooltip(&mut layers)
+            .context("paint_chrome_tooltip")?;
         Ok(())
     }
 

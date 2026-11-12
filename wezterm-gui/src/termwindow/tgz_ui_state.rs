@@ -14,6 +14,14 @@ use std::path::PathBuf;
 /// defaults, and so new toggles can be added without breaking older files.
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct TgzUiState {
+    /// The sidebar footer's rows as arranged by dragging, as button names
+    /// (see `tgz_footer::item_name`). Absent: the built-in layout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sidebar_footer: Option<Vec<Vec<String>>>,
+    /// Relative widths of the footer's buttons, by button name; a button
+    /// that is absent weighs 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sidebar_footer_weights: Option<std::collections::BTreeMap<String, f32>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sidebar_auto_hide: Option<bool>,
 
@@ -146,6 +154,34 @@ pub fn load_ssh_recent_hosts() -> Vec<String> {
 pub fn save_ssh_recent_hosts(hosts: &[String]) {
     let mut state = read_state();
     state.ssh_recent_hosts = Some(hosts.to_vec());
+    write_state(&state);
+}
+
+/// The sidebar footer arrangement made by dragging, or `None` when unset.
+pub fn load_sidebar_footer() -> Option<Vec<Vec<String>>> {
+    read_state().sidebar_footer
+}
+
+/// The footer buttons' relative widths as set by dragging; empty when unset.
+pub fn load_sidebar_footer_weights() -> std::collections::BTreeMap<String, f32> {
+    read_state().sidebar_footer_weights.unwrap_or_default()
+}
+
+/// Persist the footer buttons' relative widths; an empty map forgets them.
+pub fn save_sidebar_footer_weights(weights: std::collections::BTreeMap<String, f32>) {
+    let mut state = read_state();
+    state.sidebar_footer_weights = if weights.is_empty() {
+        None
+    } else {
+        Some(weights)
+    };
+    write_state(&state);
+}
+
+/// Persist the sidebar footer arrangement; `None` forgets it. Best-effort.
+pub fn save_sidebar_footer(rows: Option<Vec<Vec<String>>>) {
+    let mut state = read_state();
+    state.sidebar_footer = rows;
     write_state(&state);
 }
 
@@ -471,6 +507,8 @@ mod tests {
         // keep every toggle; otherwise saving one would clear the rest.
         let state = TgzUiState {
             sidebar_auto_hide: Some(false),
+            sidebar_footer: None,
+            sidebar_footer_weights: None,
             agent_launcher_project_root: Some(true),
             ssh_recent_hosts: None,
             sidebar_expanded_tabs: Some(vec![0, 2]),
@@ -545,6 +583,8 @@ mod tests {
         // user's agent_ui table. See `seed_config_overrides`.
         let overrides = overrides_from_state(&TgzUiState {
             sidebar_auto_hide: None,
+            sidebar_footer: None,
+            sidebar_footer_weights: None,
             agent_launcher_project_root: Some(true),
             ssh_recent_hosts: None,
             sidebar_expanded_tabs: Some(vec![0]),

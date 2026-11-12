@@ -18,18 +18,18 @@ use crate::termwindow::tgz_last_session::{
     self, LayoutTree, RestoreTab, SnapshotSession, SnapshotSplit, WindowAgents,
 };
 use crate::termwindow::{
-    agent_launch, wsl_paths, AgentCopyAction, AgentLauncherEntry, AgentRowAction,
-    CloseTabMenuAction, CloseTabSource, ExpandedMenuRow, NewTabMenuEntry, NewTabTarget,
-    OverlayState, PaneCopyAction, PaneToolbeltAction, SshQuickLaunchEntry, TermWindowNotif, UIItem,
-    UIItemType,
+    agent_launch, tgz_footer, wsl_paths, AgentCopyAction, AgentLauncherEntry, AgentRowAction,
+    CloseTabMenuAction, CloseTabSource, ExpandedMenuRow, FooterEditAction, NewTabMenuEntry,
+    NewTabTarget, OverlayState, PaneCopyAction, PaneToolbeltAction, SidebarContextAction,
+    SidebarContextMenuKind, SshQuickLaunchEntry, TermWindowNotif, UIItem, UIItemType,
 };
 use config::keyassignment::{SpawnCommand, SpawnTabDomain};
 use config::{
     brand, default_agent_adapters, dim_srgb, AgentAdapterConfig, AgentAnimationColors,
     AgentLaunchTarget, AgentRemoteBehavior, AgentRingColors, AgentSplitDirection,
     AgentTelemetryField, AgentUiConfig, ConfigHandle, EasingFunction, PaneToolbeltPosition,
-    SidebarPosition, SidebarTabDensity, SidebarTabMetadata, SidebarTabTitleSource, SidebarTheme,
-    TabBarColors,
+    SidebarFooterItem, SidebarPosition, SidebarTabDensity, SidebarTabMetadata,
+    SidebarTabTitleSource, SidebarTheme, TabBarColors,
 };
 use finl_unicode::grapheme_clusters::Graphemes;
 use mux::pane::{CachePolicy, Pane, PaneId, SpawnTitlePolicy};
@@ -54,6 +54,8 @@ use window::{MousePress, RectF, WindowOps};
 
 const INSET: f32 = 8.;
 const GAP: f32 = 4.;
+/// The gap between two footer buttons, for the code that drags them.
+pub(crate) const FOOTER_GAP: f32 = GAP;
 pub(crate) const PAD_X: f32 = 10.;
 const ACTIVE_RAIL_W: f32 = 3.;
 const ACTIVE_TEXT_GAP: f32 = 7.;
@@ -61,7 +63,6 @@ const ACTIVE_TEXT_GAP: f32 = 7.;
 const PANE_ROW_INDENT: f32 = 14.;
 /// Space between the expand chevron and the label that follows it.
 const CHEVRON_GAP: f32 = 4.;
-const ACTION_ICON_W: f32 = 16.;
 const ACTION_ICON_GAP: f32 = 8.;
 pub(crate) const RADIUS: f32 = 10.;
 /// Corner radius of a floating menu, and of the highlight on one of its rows.
@@ -86,6 +87,9 @@ const SIDEBAR_COPY_GLYPH: &str = "\u{f0c5}";
 /// toolbelt. From the bundled Symbols Nerd Font for the same reason as
 /// [`SIDEBAR_COPY_GLYPH`].
 const SIDEBAR_TOOLBELT_GLYPH: &str = "\u{f0ad}";
+/// `nf-fa-folder`, for the Worktree toggle in the sidebar footer. From the
+/// bundled Symbols Nerd Font for the same reason as [`SIDEBAR_COPY_GLYPH`].
+const SIDEBAR_WORKTREE_GLYPH: &str = "\u{f07b}";
 /// `nf-fa-lock`, for the sidebar's Secure Keyboard Entry button (macOS). The
 /// same glyph upstream draws as the cursor at a password prompt, so the two
 /// read as one feature.
@@ -2557,69 +2561,21 @@ fn sidebar_row_text_offsets(
     }
 }
 
-/// Horizontal composition of the shared Worktree / agent-launcher row.
-///
-/// Both halves derive from one split point so they can never overlap, whichever
-/// side the scrollbar gutter is on (the content column is narrower than the row
-/// and is not centered in it). The two *fills* still reach the row's outer
-/// edges; only the text budgets are confined to the content column.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct SidebarBottomRowLayout {
-    pub worktree_fill_x: f32,
-    pub worktree_fill_w: f32,
-    pub worktree_icon_x: f32,
-    pub worktree_text_x: f32,
-    pub worktree_text_w: f32,
-    pub agent_fill_x: f32,
-    pub agent_fill_w: f32,
-    pub agent_dot_x: f32,
-    pub agent_text_x: f32,
-    pub agent_text_w: f32,
-}
+/// Padding between a create-row segment's edge and its label.
+const FOOTER_SEGMENT_PAD: f32 = 6.;
 
-fn sidebar_bottom_row_layout(
-    item_x: f32,
-    item_w: f32,
-    content_x: f32,
-    content_w: f32,
-    dot_size: f32,
-    has_agent: bool,
-) -> SidebarBottomRowLayout {
-    let worktree_icon_x = content_x + PAD_X;
-    if !has_agent {
-        return SidebarBottomRowLayout {
-            worktree_fill_x: item_x,
-            worktree_fill_w: item_w.max(1.),
-            worktree_icon_x,
-            worktree_text_x: worktree_icon_x + ACTION_ICON_W + ACTION_ICON_GAP,
-            worktree_text_w: (content_w - PAD_X * 2. - ACTION_ICON_W - ACTION_ICON_GAP).max(0.),
-            agent_fill_x: 0.,
-            agent_fill_w: 0.,
-            agent_dot_x: 0.,
-            agent_text_x: 0.,
-            agent_text_w: 0.,
-        };
-    }
-
-    let content_half = ((content_w - GAP) * 0.5).max(0.);
-    let agent_x = content_x + content_half + GAP;
-    let agent_w = (content_w - content_half - GAP).max(0.);
-    let agent_dot_x = agent_x + PAD_X;
-    let agent_text_x = agent_dot_x + dot_size + ACTION_ICON_GAP;
-    SidebarBottomRowLayout {
-        worktree_fill_x: item_x,
-        worktree_fill_w: (agent_x - GAP - item_x).max(1.),
-        worktree_icon_x,
-        worktree_text_x: worktree_icon_x + ACTION_ICON_W + ACTION_ICON_GAP,
-        worktree_text_w: (content_half - PAD_X * 2. - ACTION_ICON_W - ACTION_ICON_GAP).max(0.),
-        agent_fill_x: agent_x,
-        // The pill reaches the row's right edge even though the text budget is
-        // confined to the content column.
-        agent_fill_w: (item_x + item_w - agent_x).max(1.),
-        agent_dot_x,
-        agent_text_x,
-        agent_text_w: (agent_x + agent_w - PAD_X - agent_text_x).max(0.),
-    }
+/// The sidebar button a footer item is drawn as, and back.
+pub(crate) fn footer_item_for(item_type: &UIItemType) -> Option<SidebarFooterItem> {
+    Some(match item_type {
+        UIItemType::SidebarWorktreeButton => SidebarFooterItem::Worktree,
+        UIItemType::SidebarDiffPanelButton => SidebarFooterItem::Changes,
+        UIItemType::SidebarToolbeltToggle => SidebarFooterItem::Toolbelt,
+        UIItemType::SidebarSecureInputToggle => SidebarFooterItem::SecureInput,
+        UIItemType::SidebarAgentLaunchButton => SidebarFooterItem::Agent,
+        UIItemType::SidebarSshLaunchButton => SidebarFooterItem::Ssh,
+        UIItemType::SidebarNewTabButton => SidebarFooterItem::NewTab,
+        _ => return None,
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -2821,10 +2777,34 @@ pub(crate) fn sidebar_reserved_width_for_config(config: &ConfigHandle, dpi: f64)
 }
 
 /// Label ladders for the sidebar's fixed-width buttons, widest first.
-const WORKTREE_LABELS: [&str; 3] = ["Worktree", "Tree", "Wt"];
 const NEW_TAB_LABELS: [&str; 3] = ["+ New Tab", "+ Tab", "+"];
 const SSH_ROW_LABELS: [&str; 3] = ["SSH Connect", "SSH", ">_"];
 const SEARCH_PLACEHOLDER_LABELS: [&str; 3] = ["Search tabs...", "Search...", "Search"];
+
+/// What the SSH button says in `cols` columns.
+///
+/// With a host a click connects to (`default_host`), the button names it: a
+/// button that opens a connection must say where to. `SSH · host` when that
+/// fits, else the bare host, elided while a few characters of it still fit;
+/// below that only the icon is left. Without a default host the click opens
+/// the list, and the generic ladder says so.
+fn ssh_button_label(default_host: Option<&str>, cols: usize) -> Option<Cow<'static, str>> {
+    /// Three characters of the host and the ellipsis.
+    const MIN_HOST_COLS: usize = 4;
+    match default_host {
+        Some(host) => {
+            let full = format!("SSH · {host}");
+            if unicode_column_width(&full, None) <= cols {
+                Some(Cow::Owned(full))
+            } else if cols >= MIN_HOST_COLS {
+                Some(Cow::Owned(truncate_with_ellipsis(host, cols).into_owned()))
+            } else {
+                fit_label(&SSH_ROW_LABELS[2..], cols).map(Cow::Borrowed)
+            }
+        }
+        None => fit_label(&SSH_ROW_LABELS, cols).map(Cow::Borrowed),
+    }
+}
 
 fn compact_label(value: &str, fallback: &str) -> String {
     let label: String = value
@@ -4372,6 +4352,93 @@ pub(crate) struct SidebarDropdownRow {
     pub(crate) item_type: UIItemType,
 }
 
+/// One row of a sidebar context menu, before it is given geometry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SidebarContextRow {
+    pub(crate) action: SidebarContextAction,
+    pub(crate) label: &'static str,
+    pub(crate) divider_above: bool,
+    /// `Some` for a setting that is on or off rather than a command.
+    pub(crate) checkbox: Option<bool>,
+    /// The row opens a further menu instead of acting.
+    pub(crate) opens_submenu: bool,
+}
+
+/// The rows of the context menu for `kind`.
+///
+/// Order is the same in every menu: what you can do with the object first,
+/// ways to go elsewhere next, and the rows that close things last under a
+/// divider, where a slip of the pointer is least likely to land. A row that
+/// could do nothing (close the tabs above the first tab) is left out.
+pub(crate) fn sidebar_context_menu_rows(
+    kind: SidebarContextMenuKind,
+    tab_count: usize,
+    all_projects: bool,
+    collapsed: bool,
+) -> Vec<SidebarContextRow> {
+    let row = |action, label| SidebarContextRow {
+        action,
+        label,
+        divider_above: false,
+        checkbox: None,
+        opens_submenu: false,
+    };
+    match kind {
+        SidebarContextMenuKind::Tab { tab_idx } => {
+            if tab_idx >= tab_count {
+                return Vec::new();
+            }
+            let mut rows = vec![
+                SidebarContextRow {
+                    opens_submenu: true,
+                    ..row(SidebarContextAction::CopyMenu, "Copy")
+                },
+                row(SidebarContextAction::TabNavigator, "Tab Navigator\u{2026}"),
+                SidebarContextRow {
+                    divider_above: true,
+                    ..row(SidebarContextAction::CloseTab, "Close Tab")
+                },
+            ];
+            if tab_idx > 0 {
+                rows.push(row(
+                    SidebarContextAction::CloseTabsAbove,
+                    "Close Tabs Above",
+                ));
+            }
+            if tab_idx + 1 < tab_count {
+                rows.push(row(
+                    SidebarContextAction::CloseTabsBelow,
+                    "Close Tabs Below",
+                ));
+            }
+            if tab_count > 1 {
+                rows.push(row(
+                    SidebarContextAction::CloseOtherTabs,
+                    "Close Other Tabs",
+                ));
+            }
+            rows
+        }
+        SidebarContextMenuKind::Sidebar => vec![row(
+            SidebarContextAction::CustomizeFooter,
+            "Customize buttons\u{2026}",
+        )],
+        SidebarContextMenuKind::AgentSection => vec![
+            SidebarContextRow {
+                checkbox: Some(all_projects),
+                ..row(SidebarContextAction::ToggleHerdView, "Show all projects")
+            },
+            SidebarContextRow {
+                checkbox: Some(collapsed),
+                ..row(
+                    SidebarContextAction::ToggleAgentSectionCollapsed,
+                    "Collapse section",
+                )
+            },
+        ],
+    }
+}
+
 /// How many ordinary row heights a dropdown row takes: one, unless it holds
 /// a chart.
 fn dropdown_row_height_rows(row: &SidebarDropdownRow) -> usize {
@@ -5087,6 +5154,22 @@ pub(crate) fn pane_copy_menu_items(kind: &PaneToolbeltKind) -> Vec<(&'static str
             ),
         ],
     }
+}
+
+/// The agent row menu's actions in display order, each with whether a
+/// divider goes above it: everything as given, except that Stop moves to the
+/// end and is set apart, where a slip of the pointer is least likely to land.
+pub(crate) fn agent_row_menu_order(actions: &[AgentRowAction]) -> Vec<(AgentRowAction, bool)> {
+    let mut ordered: Vec<(AgentRowAction, bool)> = actions
+        .iter()
+        .filter(|action| **action != AgentRowAction::Stop)
+        .map(|action| (*action, false))
+        .collect();
+    if actions.contains(&AgentRowAction::Stop) {
+        let divider = !ordered.is_empty();
+        ordered.push((AgentRowAction::Stop, divider));
+    }
+    ordered
 }
 
 /// Width of the copy menu in physical pixels.
@@ -9799,9 +9882,71 @@ impl crate::TermWindow {
                 .unwrap_or(0.)
     }
 
+    /// Every footer button in its row, shown or not, and whether the list
+    /// comes from Lua (and so cannot be rearranged by hand). See
+    /// `tgz_footer`.
+    pub(crate) fn sidebar_footer_full_rows(&self) -> (tgz_footer::FooterRows, bool) {
+        let max_row = self.sidebar_footer_max_per_row();
+        if let Some(rows) = self.config.sidebar_footer.as_ref() {
+            let rows = tgz_footer::normalize_footer_rows_capped(rows, false, max_row);
+            if !rows.is_empty() {
+                return (rows, true);
+            }
+        }
+        let rows = match self.sidebar_footer_custom.as_ref() {
+            Some(rows) => tgz_footer::normalize_footer_rows_capped(rows, true, max_row),
+            None => tgz_footer::default_footer_rows(),
+        };
+        // Widths from Lua fix the layout as much as rows from Lua do.
+        (rows, !self.config.sidebar_footer_weights.is_empty())
+    }
+
+    /// Most buttons a footer row holds (`sidebar_footer_max_per_row`).
+    pub(crate) fn sidebar_footer_max_per_row(&self) -> usize {
+        tgz_footer::clamp_max_row_items(self.config.sidebar_footer_max_per_row)
+    }
+
+    /// The footer buttons' relative widths: from Lua when set there, else
+    /// as dragged.
+    pub(crate) fn sidebar_footer_effective_weights(&self) -> tgz_footer::FooterWeights {
+        if self.config.sidebar_footer_weights.is_empty() {
+            return self.sidebar_footer_weights.clone();
+        }
+        self.config
+            .sidebar_footer_weights
+            .iter()
+            .filter_map(|(name, weight)| {
+                Some((tgz_footer::item_from_loose_name(name)?, *weight as f32))
+            })
+            .collect()
+    }
+
+    /// The footer rows to draw: the buttons with something to offer.
+    pub(crate) fn sidebar_footer_visible_rows(&self) -> tgz_footer::FooterRows {
+        let has_ssh = !self.ssh_quick_launch_entries().is_empty();
+        let available = |item: SidebarFooterItem| match item {
+            SidebarFooterItem::Worktree | SidebarFooterItem::Agent | SidebarFooterItem::NewTab => {
+                true
+            }
+            SidebarFooterItem::Changes => self.config.diff_panel.enabled,
+            SidebarFooterItem::Toolbelt => self.sidebar_toolbelt_toggle_shown(),
+            SidebarFooterItem::SecureInput => self.sidebar_secure_input_toggle_shown(),
+            SidebarFooterItem::Ssh => has_ssh,
+        };
+        let (rows, _) = self.sidebar_footer_full_rows();
+        let visible = tgz_footer::visible_footer_rows(&rows, available);
+        if visible.is_empty() {
+            // A Lua list of nothing but unavailable buttons: the sidebar
+            // still needs its way to open a tab.
+            tgz_footer::visible_footer_rows(&tgz_footer::default_footer_rows(), available)
+        } else {
+            visible
+        }
+    }
+
     /// Rows reserved below the tab list for the bottom buttons.
     ///
-    /// Expanded: "+ New Tab" plus the shared Worktree/agent row. Collapsed:
+    /// Expanded: the create row plus the view strip. Collapsed:
     /// the "+" rail icon plus the agent launcher slot when an agent is
     /// installed, the Changes slot when the panel is enabled and the toolbelt
     /// slot when there is a toolbelt. Kept in one place so the paint pass, the wheel-scroll
@@ -9827,21 +9972,10 @@ impl crate::TermWindow {
                 rows += 1.;
             }
             rows
-        } else if self.sidebar_width() > 180 {
-            // worktree/agent shared row + new tab, plus a dedicated SSH row when
-            // the SSH quick-launch has any usable entries.
-            if ssh_present {
-                3.
-            } else {
-                2.
-            }
         } else {
-            // Narrow expanded: only the new-tab row, plus an SSH row when present.
-            if ssh_present {
-                2.
-            } else {
-                1.
-            }
+            // The footer's rows, plus the bar shown while customizing.
+            self.sidebar_footer_visible_rows().len() as f32
+                + if self.sidebar_footer_edit { 1. } else { 0. }
         }
     }
 
@@ -11254,6 +11388,8 @@ impl crate::TermWindow {
         Ok(())
     }
 
+    /// The Copy menu of a pane, opened from the agent toolbelt or from a tab
+    /// row. Painted by the shared dropdown, like every other menu.
     pub fn paint_pane_copy_menu(
         &mut self,
         layers: &mut TripleLayerQuadAllocator,
@@ -11266,179 +11402,52 @@ impl crate::TermWindow {
             return Ok(());
         }
 
-        // Frozen at open time — see `PaneCopyMenuState::items`.
-        let items = menu.items.clone();
-        let cell_width = self.render_metrics.cell_size.width;
-        let cell_height = self.render_metrics.cell_size.height;
-        let cell_h_f = cell_height as f32;
-        // DPI-scaled geometry: row height must enclose the (DPI-scaled) font
-        // cell height, not just the fixed PANE_COPY_MENU_ROW_H constant, or
-        // labels spill outside the row on HiDPI/Retina displays.
         let dpi_scale = (self.dimensions.dpi as f32 / 96.).clamp(1., 2.5);
-        let row_vpad = 6. * dpi_scale;
-        let row_h = (cell_h_f + 2. * row_vpad).max(PANE_COPY_MENU_ROW_H * dpi_scale);
-        let menu_pad = 8. * dpi_scale;
-        let row_radius = (MENU_ROW_RADIUS * dpi_scale).min(row_h * 0.5);
-        let row_inset = 4. * dpi_scale;
-        let row_text_inset = 12. * dpi_scale;
         let menu_w = pane_copy_menu_width(
-            items.iter().map(|(label, _)| *label),
-            cell_width as f32,
-            row_text_inset,
+            menu.items.iter().map(|(label, _)| *label),
+            self.render_metrics.cell_size.width as f32,
+            12. * dpi_scale,
             dpi_scale,
             self.dimensions.pixel_width as f32,
         );
-        let menu_h = items.len() as f32 * row_h + menu_pad;
-        let max_x = (self.dimensions.pixel_width as f32 - menu_w - FLOAT_GAP).max(FLOAT_GAP);
-        let max_y = (self.dimensions.pixel_height as f32 - menu_h - FLOAT_GAP).max(FLOAT_GAP);
         // The toolbelt's button sits at the pane's right edge, so its menu grows
         // leftwards to stay off the window frame; the sidebar's sits at the
         // window's left edge, where growing leftwards would do the opposite.
-        let menu_anchor_x = if menu.opens_left {
+        let anchor_x = if menu.opens_left {
             menu.x as f32 - menu_w + PANE_TOOLBELT_MIN_BUTTON_W
         } else {
             menu.x as f32
         };
-        let menu_x = menu_anchor_x.clamp(FLOAT_GAP, max_x);
-        let menu_y = (menu.y as f32 + FLOAT_GAP).clamp(FLOAT_GAP, max_y);
-
-        let sb = self.sidebar_palette();
-        let fg = sb.text_active;
-        // Forced opaque. This menu is painted *over the terminal*, and a panel
-        // you can read the scrollback through is a panel whose own rows are hard
-        // to read. A palette derived from the window colours inherits whatever
-        // alpha those carry, so the guarantee is made here rather than assumed of
-        // the palette.
-        let bg = opaque(sb.row_fill);
-        let hover_bg = opaque(sb.pressed_fill);
-        let pressed_bg = opaque(lerp_rgba(bg, fg, 0.28));
-
-        self.paint_menu_surface(
-            layers,
-            euclid::rect(menu_x, menu_y, menu_w, menu_h),
-            bg,
-            sb.menu_border,
-        )?;
-
-        let palette = self.palette().clone();
-        let gl_state = self.render_state.as_ref().unwrap();
-        let white_space = gl_state.util_sprites.white_space.texture_coords();
-        let filled_box = gl_state.util_sprites.filled_box.texture_coords();
-        let render_text = |this: &mut Self,
-                           layers: &mut TripleLayerQuadAllocator,
-                           text: &str,
-                           x: f32,
-                           y: f32,
-                           pixel_width: f32,
-                           fg: LinearRgba,
-                           default_bg: LinearRgba|
-         -> anyhow::Result<()> {
-            let cols = sidebar_text_cols(pixel_width, cell_width as usize);
-            if cols == 0 {
-                return Ok(());
-            }
-            let text = truncate_to_cols(text, cols);
-            let mut attrs = CellAttributes::default();
-            attrs.set_foreground(ColorAttribute::TrueColorWithDefaultFallback(fg.to_srgb()));
-            let mut line = Line::from_text(text, &attrs, 1, None);
-            line.resize(cols, SEQ_ZERO);
-            this.render_screen_line(
-                RenderScreenLineParams {
-                    top_pixel_y: y,
-                    left_pixel_x: x,
-                    pixel_width,
-                    stable_line_idx: None,
-                    line: &line,
-                    selection: 0..0,
-                    cursor: &Default::default(),
-                    palette: &palette,
-                    dims: &RenderableDimensions {
-                        cols,
-                        physical_top: 0,
-                        scrollback_rows: 0,
-                        scrollback_top: 0,
-                        viewport_rows: 1,
-                        dpi: this.terminal_size.dpi,
-                        pixel_height: cell_height as usize,
-                        pixel_width: pixel_width as usize,
-                        reverse_video: false,
-                    },
-                    config: &this.config,
-                    cursor_border_color: LinearRgba::default(),
-                    foreground: fg,
-                    pane: None,
-                    is_active: true,
-                    selection_fg: LinearRgba::default(),
-                    selection_bg: LinearRgba::default(),
-                    cursor_fg: LinearRgba::default(),
-                    cursor_bg: LinearRgba::default(),
-                    cursor_is_default_color: true,
-                    white_space,
-                    filled_box,
-                    window_is_transparent: true,
-                    default_bg,
-                    style: None,
-                    font: None,
-                    use_pixel_positioning: this.config.experimental_pixel_positioning,
-                    render_metrics: this.render_metrics,
-                    shape_key: None,
-                    password_input: false,
+        // Frozen at open time, see `PaneCopyMenuState::items`.
+        let rows: Vec<SidebarDropdownRow> = menu
+            .items
+            .iter()
+            .map(|(label, action)| SidebarDropdownRow {
+                label: label.to_string(),
+                dot_color: None,
+                checkbox: None,
+                divider_above: false,
+                indent: false,
+                trailing_chevron: false,
+                widget: None,
+                inert: false,
+                item_type: UIItemType::PaneCopyMenuItem {
+                    pane_id: menu.pane_id,
+                    action: action.clone(),
                 },
-                layers,
-            )
-            .map(|_| ())
-        };
-
-        let hovered_item = self
-            .last_ui_item
-            .as_ref()
-            .map(|item| item.item_type.clone());
-        let left_pressed = self.current_mouse_buttons.contains(&MousePress::Left);
-        for (idx, (label, action)) in items.iter().enumerate() {
-            let item_type = UIItemType::PaneCopyMenuItem {
-                pane_id: menu.pane_id,
-                action: action.clone(),
-            };
-            let row_y = menu_y + menu_pad * 0.5 + idx as f32 * row_h;
-            let hovered = hovered_item.as_ref() == Some(&item_type);
-            let pressed =
-                hovered && left_pressed && self.pressed_ui_item.as_ref() == Some(&item_type);
-            let row_bg = if pressed {
-                pressed_bg
-            } else if hovered {
-                hover_bg
-            } else {
-                bg
-            };
-            if hovered || pressed {
-                self.sidebar_rounded_fill(
-                    layers,
-                    1,
-                    euclid::rect(menu_x + row_inset, row_y, menu_w - row_inset * 2., row_h),
-                    row_radius,
-                    row_bg,
-                )?;
-            }
-            render_text(
-                self,
-                layers,
-                label,
-                menu_x + row_text_inset,
-                row_y + (row_h - cell_h_f) * 0.5,
-                menu_w - row_text_inset * 2.,
-                contrast_label_color(row_bg, sb.text_active),
-                row_bg,
-            )?;
-            self.ui_items.push(UIItem {
-                x: (menu_x + row_inset) as usize,
-                y: row_y as usize,
-                width: (menu_w - row_inset * 2.) as usize,
-                height: row_h.ceil() as usize,
-                item_type,
-            });
-        }
-
-        Ok(())
+            })
+            .collect();
+        self.paint_sidebar_dropdown(
+            layers,
+            anchor_x,
+            menu.y as f32,
+            menu_w / dpi_scale,
+            true,
+            &rows,
+            None,
+            None,
+            0,
+        )
     }
 
     /// Dropdown opened from the sidebar agent launch button: one row per
@@ -11547,6 +11556,7 @@ impl crate::TermWindow {
             &rows,
             Some(menu.scroll_offset),
             Some(&mut pin),
+            0,
         );
         if let Some(menu) = self.sessions_menu.as_mut() {
             menu.pinned_top = pin.top;
@@ -11700,6 +11710,7 @@ impl crate::TermWindow {
             &rows,
             Some(menu.scroll_offset),
             None,
+            0,
         )
     }
 
@@ -11828,6 +11839,22 @@ impl crate::TermWindow {
                 }
             })
             .collect();
+        let mut rows = rows;
+        // Everything else that can be started, which a right click on "+"
+        // used to open directly.
+        rows.push(SidebarDropdownRow {
+            label: "Launcher\u{2026}".to_string(),
+            dot_color: None,
+            checkbox: None,
+            divider_above: true,
+            indent: false,
+            trailing_chevron: false,
+            widget: None,
+            inert: false,
+            item_type: UIItemType::SidebarContextMenuItem {
+                action: SidebarContextAction::ShowLauncher,
+            },
+        });
 
         self.paint_sidebar_dropdown(
             layers,
@@ -11838,6 +11865,7 @@ impl crate::TermWindow {
             &rows,
             None,
             None,
+            0,
         )
     }
 
@@ -11939,6 +11967,80 @@ impl crate::TermWindow {
             &rows,
             None,
             None,
+            0,
+        )
+    }
+
+    /// The right-click menu of a sidebar tab row or of the Agents header.
+    /// Right-click on the fork's chrome always means "this object's options",
+    /// so everything such a click used to do directly is a row here instead.
+    pub fn paint_sidebar_context_menu(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+    ) -> anyhow::Result<()> {
+        let Some(menu) = self.sidebar_context_menu.clone() else {
+            return Ok(());
+        };
+        let tab_count = Mux::get()
+            .get_window(self.mux_window_id)
+            .map_or(0, |window| window.count_tabs());
+        let (all_projects, collapsed) = {
+            let state = self.agent_herd_state.borrow();
+            (
+                state.view == crate::agent_herd::HerdView::AllGrouped,
+                state.collapsed,
+            )
+        };
+        let specs = sidebar_context_menu_rows(menu.kind, tab_count, all_projects, collapsed);
+        if specs.is_empty() {
+            self.sidebar_context_menu = None;
+            return Ok(());
+        }
+
+        // Sized to the longest label, as the close-tab menu is.
+        let dpi_scale = (self.dimensions.dpi as f32 / 96.).clamp(1., 2.5);
+        let cell_w_logical = self.render_metrics.cell_size.width as f32 / dpi_scale;
+        let longest_cols = specs
+            .iter()
+            .map(|spec| {
+                unicode_column_width(spec.label, None) + if spec.checkbox.is_some() { 3 } else { 0 }
+            })
+            .max()
+            .unwrap_or(0) as f32;
+        let needed_w =
+            longest_cols * cell_w_logical + 2. * 12. * dpi_scale + cell_w_logical * dpi_scale;
+        let menu_w = needed_w.max(AGENT_LAUNCH_MENU_W);
+
+        let rows: Vec<SidebarDropdownRow> = specs
+            .into_iter()
+            .map(|spec| SidebarDropdownRow {
+                label: spec.label.to_string(),
+                dot_color: None,
+                checkbox: spec.checkbox,
+                divider_above: spec.divider_above,
+                indent: false,
+                trailing_chevron: spec.opens_submenu,
+                widget: None,
+                inert: false,
+                item_type: UIItemType::SidebarContextMenuItem {
+                    action: spec.action,
+                },
+            })
+            .collect();
+
+        // The Agents section sits right above the footer: its menu grows
+        // upward, over the tab list, rather than down over the buttons.
+        let downward = !matches!(menu.kind, SidebarContextMenuKind::AgentSection);
+        self.paint_sidebar_dropdown(
+            layers,
+            menu.x as f32,
+            menu.y as f32,
+            menu_w,
+            downward,
+            &rows,
+            None,
+            None,
+            0,
         )
     }
 
@@ -12066,6 +12168,7 @@ impl crate::TermWindow {
             &rows,
             None,
             None,
+            0,
         )?;
 
         // Repaints are on demand: without a deadline the reset countdowns and
@@ -12173,26 +12276,34 @@ impl crate::TermWindow {
             indent: false,
             trailing_chevron: false,
             widget: None,
-            inert: false,
+            // A row without a host (the search row, "No hosts match") is
+            // not a button: no hover fill, and a click on it does nothing
+            // (see `mouse_event_sidebar_ssh_menu_item`).
+            inert: domain_name.is_empty(),
             item_type: UIItemType::SidebarSshMenuItem {
                 domain_name: domain_name.to_string(),
             },
         };
 
-        let mut rows: Vec<SidebarDropdownRow> = Vec::with_capacity(matching.len() + 1);
-        // The filter row is not a host: its empty domain name makes a click
-        // on it a no-op (see `mouse_event_sidebar_ssh_menu_item`).
-        if let Some(label) = tgz_ssh_hosts::filter_row_label(&menu.query, entries.len(), text_cols)
-        {
-            rows.push(ssh_row(label, "", false));
-        }
+        let mut rows: Vec<SidebarDropdownRow> = Vec::with_capacity(matching.len() + 2);
+        // The search row leads the menu and stays put while the hosts scroll
+        // under it (`sticky_rows` below).
+        rows.push(ssh_row(
+            tgz_ssh_hosts::search_row_label(&menu.query, menu.search_active, text_cols),
+            "",
+            false,
+        ));
         if matching.is_empty() {
-            rows.push(ssh_row(tgz_ssh_hosts::NO_MATCH_ROW.to_string(), "", false));
+            rows.push(ssh_row(tgz_ssh_hosts::NO_MATCH_ROW.to_string(), "", true));
         }
         let mut previous_recent = None;
         for entry in matching {
-            // One divider where the recent hosts end and the rest begin.
-            let divider_above = previous_recent == Some(true) && !entry.recent;
+            // One divider under the search row, and one where the recent
+            // hosts end and the rest begin.
+            let divider_above = match previous_recent {
+                None => true,
+                Some(was_recent) => was_recent && !entry.recent,
+            };
             previous_recent = Some(entry.recent);
             rows.push(ssh_row(
                 tgz_ssh_hosts::entry_row_label(entry),
@@ -12212,41 +12323,8 @@ impl crate::TermWindow {
             &rows,
             Some(menu.scroll_offset),
             None,
+            1,
         )
-    }
-
-    /// Downward chevron centered on `(cx, cy)`, drawn as stacked rounded bars
-    /// of decreasing width. Hand-drawn rather than a `▾` glyph, which is not
-    /// guaranteed to be in the user's font.
-    pub(crate) fn draw_sidebar_chevron(
-        &self,
-        layers: &mut TripleLayerQuadAllocator,
-        cx: f32,
-        cy: f32,
-        dpi_scale: f32,
-        color: LinearRgba,
-    ) -> anyhow::Result<()> {
-        let bar_h = (1.6 * dpi_scale).max(1.5);
-        let widest = 9. * dpi_scale;
-        const STEPS: usize = 4;
-        // Bars shrink from `widest` to a point, stacked downward, so the
-        // silhouette reads as a triangle at any DPI.
-        for step in 0..STEPS {
-            let t = step as f32 / STEPS as f32;
-            let w = widest * (1. - t);
-            if w < 1. {
-                break;
-            }
-            let y = cy - (widest * 0.25) + step as f32 * bar_h;
-            self.sidebar_rounded_fill(
-                layers,
-                2,
-                euclid::rect(cx - w * 0.5, y, w, bar_h),
-                bar_h * 0.5,
-                color,
-            )?;
-        }
-        Ok(())
     }
 
     /// Shared renderer for the sidebar's small anchored dropdowns.
@@ -12265,6 +12343,10 @@ impl crate::TermWindow {
     /// the rows from `offset`, and adds a scroll thumb once they overflow. The
     /// geometry lands in `sidebar_dropdown_scroll` for the mouse handlers.
     /// `None` paints every row, as a menu that never scrolls always has.
+    ///
+    /// The first `sticky_rows` rows are a head that does not scroll (a search
+    /// row): they are painted on a sunken field, the rest scrolls under them,
+    /// and the scroll offset counts rows after the head.
     pub(crate) fn paint_sidebar_dropdown(
         &mut self,
         layers: &mut TripleLayerQuadAllocator,
@@ -12275,6 +12357,7 @@ impl crate::TermWindow {
         rows: &[SidebarDropdownRow],
         scroll: Option<usize>,
         pin: Option<&mut DropdownPin>,
+        sticky_rows: usize,
     ) -> anyhow::Result<()> {
         if scroll.is_some() {
             // Recomputed below; a menu that no longer overflows must not keep
@@ -12337,14 +12420,22 @@ impl crate::TermWindow {
                 .max(row_h),
             None => cap_body,
         };
-        let viewport = scroll.and_then(|offset| dropdown_viewport(&row_heights, offset, max_body));
+        let sticky_rows = sticky_rows.min(rows.len());
+        let sticky_h: f32 = row_heights[..sticky_rows].iter().sum();
+        // What is left for the rows that scroll, once the head has its share.
+        let scroll_body = (max_body - sticky_h).max(row_h);
+        let viewport = scroll
+            .and_then(|offset| dropdown_viewport(&row_heights[sticky_rows..], offset, scroll_body));
         // A scrolling panel keeps one fixed height, so it neither jitters as a
         // divider scrolls in and out nor flips sides mid-scroll.
         let menu_h = match viewport {
-            Some(_) => max_body + menu_pad,
+            Some(_) => sticky_h + scroll_body + menu_pad,
             None => row_heights.iter().sum::<f32>() + menu_pad,
         };
-        let (view_first, view_end) = viewport.map_or((0, rows.len()), |v| (v.first, v.end));
+        // Indices into `rows`; the viewport's own count from after the head.
+        let (view_first, view_end) = viewport.map_or((sticky_rows, rows.len()), |v| {
+            (sticky_rows + v.first, sticky_rows + v.end)
+        });
         let scrollbar_w = SIDEBAR_SCROLLBAR_W * 0.6 * dpi_scale;
         let scrollbar_gutter = if viewport.is_some() {
             scrollbar_w + DROPDOWN_SCROLLBAR_INSET * dpi_scale
@@ -12443,19 +12534,17 @@ impl crate::TermWindow {
             .map(|_| ())
         };
 
-        if scroll.is_some() {
-            // Behind the rows (hit-testing walks `ui_items` newest first): a
-            // wheel over the padding or a divider scrolls this menu instead of
-            // falling through to the sidebar underneath, and a click there no
-            // longer dismisses it.
-            self.ui_items.push(UIItem {
-                x: menu_x.max(0.) as usize,
-                y: menu_y.max(0.) as usize,
-                width: menu_w as usize,
-                height: menu_h.ceil() as usize,
-                item_type: UIItemType::SidebarDropdownBody,
-            });
-        }
+        // Behind the rows (hit-testing walks `ui_items` newest first), for
+        // every dropdown: a wheel over the padding or a divider scrolls this
+        // menu instead of falling through to what it covers, and a click
+        // there neither dismisses it nor reaches the control underneath.
+        self.ui_items.push(UIItem {
+            x: menu_x.max(0.) as usize,
+            y: menu_y.max(0.) as usize,
+            width: menu_w as usize,
+            height: menu_h.ceil() as usize,
+            item_type: UIItemType::SidebarDropdownBody,
+        });
 
         let hovered_item = self
             .last_ui_item
@@ -12467,7 +12556,21 @@ impl crate::TermWindow {
         let box_size = (cell_h_f * 0.62).clamp(9., 16.);
         let mut row_y = menu_y + menu_pad * 0.5;
 
-        for row in &rows[view_first..view_end] {
+        if sticky_rows > 0 {
+            // The head reads as a field to type into, not as a menu row.
+            self.sidebar_rounded_fill(
+                layers,
+                1,
+                euclid::rect(menu_x + row_inset, row_y, rows_w - row_inset * 2., sticky_h),
+                row_radius,
+                opaque(lerp_rgba(bg, fg, 0.10)),
+            )?;
+        }
+
+        for row in rows[..sticky_rows]
+            .iter()
+            .chain(&rows[view_first..view_end])
+        {
             if row.divider_above {
                 let divider_y = row_y + divider_gap;
                 self.filled_rectangle(
@@ -12486,7 +12589,10 @@ impl crate::TermWindow {
 
             let this_h = row_h * dropdown_row_height_rows(row) as f32;
             let item_type = row.item_type.clone();
-            let hovered = !row.inert && hovered_item.as_ref() == Some(&item_type);
+            // The row the arrow keys are on is drawn as the hovered one.
+            let hovered = !row.inert
+                && (hovered_item.as_ref() == Some(&item_type)
+                    || self.dropdown_key_selected.as_ref() == Some(&item_type));
             let pressed =
                 hovered && left_pressed && self.pressed_ui_item.as_ref() == Some(&item_type);
             let row_bg = if pressed {
@@ -12867,28 +12973,34 @@ impl crate::TermWindow {
                     row_bg,
                 )?;
             }
-            self.ui_items.push(UIItem {
+            let hit = UIItem {
                 x: (menu_x + row_inset) as usize,
                 y: row_y as usize,
                 width: (rows_w - row_inset * 2.) as usize,
                 height: this_h.ceil() as usize,
                 item_type,
-            });
+            };
+            if !row.inert {
+                self.dropdown_key_rows.push(hit.clone());
+            }
+            self.ui_items.push(hit);
             self.ui_items.extend(widget_items);
             row_y += this_h;
         }
 
         if let Some(viewport) = viewport {
-            let track_y = menu_y + menu_pad * 0.5;
+            // The track covers the rows that scroll, not the head above them.
+            let track_y = menu_y + menu_pad * 0.5 + sticky_h;
             let track_x = menu_x + menu_w - scrollbar_gutter;
+            let scrolling_rows = rows.len() - sticky_rows;
             // Rows per page, as seen from the scroll limit: with it the
             // geometry's own `max_offset` matches the viewport's exactly.
-            let page_rows = rows.len() - viewport.max_offset;
+            let page_rows = scrolling_rows - viewport.max_offset;
             if let Some(geometry) = SidebarScrollGeometry::new(
                 track_y,
-                max_body,
+                scroll_body,
                 page_rows,
-                rows.len(),
+                scrolling_rows,
                 viewport.first,
                 row_h * 0.75,
             ) {
@@ -13204,7 +13316,8 @@ impl crate::TermWindow {
                                    (item_type, glyph, on): (UIItemType, &str, bool),
                                    (x, y, w, h): (f32, f32, f32, f32),
                                    radius: f32,
-                                   hit: (f32, f32)|
+                                   hit: (f32, f32),
+                                   label: Option<&str>|
          -> anyhow::Result<()> {
             let hovered = hovered_item.as_ref() == Some(&item_type);
             let pressed =
@@ -13228,21 +13341,47 @@ impl crate::TermWindow {
                 bg,
                 sb.row_border,
             )?;
+            let fg = if hovered || on {
+                hover_fg
+            } else {
+                inactive_fg.mul_alpha(0.86)
+            };
+            // Icon alone, or icon and label as one centred group.
+            let label_w = label.map_or(0., |l| {
+                unicode_column_width(l, None) as f32 * cell_width as f32
+            });
+            let group_w = cell_width as f32
+                + if label.is_some() {
+                    ACTION_ICON_GAP + label_w
+                } else {
+                    0.
+                };
+            let group_x = x + ((w - group_w) * 0.5).max(0.);
+            let text_y = y + offset + (h - cell_height as f32) * 0.5;
             render_text(
                 this,
                 layers,
                 glyph,
                 &CellAttributes::default(),
-                x + (w - cell_width as f32) * 0.5,
-                y + offset + (h - cell_height as f32) * 0.5,
+                group_x,
+                text_y,
                 cell_width as f32,
-                if hovered || on {
-                    hover_fg
-                } else {
-                    inactive_fg.mul_alpha(0.86)
-                },
+                fg,
                 bg,
             )?;
+            if let Some(label) = label {
+                render_text(
+                    this,
+                    layers,
+                    label,
+                    &CellAttributes::default(),
+                    group_x + cell_width as f32 + ACTION_ICON_GAP,
+                    text_y,
+                    label_w + 0.5,
+                    fg,
+                    bg,
+                )?;
+            }
             this.ui_items.push(UIItem {
                 x: hit.0 as usize,
                 y: y as usize,
@@ -13256,7 +13395,8 @@ impl crate::TermWindow {
                                     layers: &mut TripleLayerQuadAllocator,
                                     rect: (f32, f32, f32, f32),
                                     radius: f32,
-                                    hit: (f32, f32)|
+                                    hit: (f32, f32),
+                                    label: Option<&str>|
          -> anyhow::Result<()> {
             let on = this.diff_panel_shown();
             paint_square_toggle(
@@ -13266,13 +13406,15 @@ impl crate::TermWindow {
                 rect,
                 radius,
                 hit,
+                label,
             )
         };
         let paint_toolbelt_toggle = |this: &mut Self,
                                      layers: &mut TripleLayerQuadAllocator,
                                      rect: (f32, f32, f32, f32),
                                      radius: f32,
-                                     hit: (f32, f32)|
+                                     hit: (f32, f32),
+                                     label: Option<&str>|
          -> anyhow::Result<()> {
             let on = !this.pane_toolbelt_hidden;
             paint_square_toggle(
@@ -13286,6 +13428,7 @@ impl crate::TermWindow {
                 rect,
                 radius,
                 hit,
+                label,
             )
         };
         // Lit while secure input is actually held, whether pinned or engaged
@@ -13294,7 +13437,8 @@ impl crate::TermWindow {
                                          layers: &mut TripleLayerQuadAllocator,
                                          rect: (f32, f32, f32, f32),
                                          radius: f32,
-                                         hit: (f32, f32)|
+                                         hit: (f32, f32),
+                                         label: Option<&str>|
          -> anyhow::Result<()> {
             let on = crate::secure_input::is_held();
             paint_square_toggle(
@@ -13308,6 +13452,7 @@ impl crate::TermWindow {
                 rect,
                 radius,
                 hit,
+                label,
             )
         };
 
@@ -13604,6 +13749,7 @@ impl crate::TermWindow {
                     (rail_x, changes_y, rail_side, rail_side),
                     rail_radius,
                     (left, width as f32),
+                    None,
                 )?;
             }
             if let Some(toolbelt_y) = toolbelt_rail_y {
@@ -13613,6 +13759,7 @@ impl crate::TermWindow {
                     (rail_x, toolbelt_y, rail_side, rail_side),
                     rail_radius,
                     (left, width as f32),
+                    None,
                 )?;
             }
             if let Some(secure_y) = secure_rail_y {
@@ -13622,6 +13769,7 @@ impl crate::TermWindow {
                     (rail_x, secure_y, rail_side, rail_side),
                     rail_radius,
                     (left, width as f32),
+                    None,
                 )?;
             }
 
@@ -13737,7 +13885,7 @@ impl crate::TermWindow {
                 });
             }
 
-            let new_tab_type = UIItemType::TabBar(TabBarItem::NewTabButton);
+            let new_tab_type = UIItemType::SidebarNewTabButton;
             let new_tab_hovered = hovered_item.as_ref() == Some(&new_tab_type);
             let new_tab_pressed = new_tab_hovered && left_pressed;
             let new_tab_bg = if new_tab_pressed {
@@ -13847,36 +13995,6 @@ impl crate::TermWindow {
                         }
                     }
                 }
-            }
-
-            // No room for a side-by-side chevron on the rail, so it takes the
-            // icon's bottom-right corner. Pushed after the "+" item because
-            // hit testing walks ui_items in reverse: last pushed wins the
-            // overlap.
-            if self.config.new_tab_menu.enabled && !self.new_tab_menu_entries().is_empty() {
-                let chevron_type = UIItemType::SidebarNewTabMenuButton;
-                let chevron_hovered = hovered_item.as_ref() == Some(&chevron_type);
-                let corner = rail_side * 0.42;
-                let corner_x = rail_x + rail_side - corner;
-                let corner_y = new_tab_y + new_tab_offset + rail_side - corner;
-                self.draw_sidebar_chevron(
-                    layers,
-                    corner_x + corner * 0.5,
-                    corner_y + corner * 0.5,
-                    dpi_scale,
-                    if chevron_hovered {
-                        hover_fg
-                    } else {
-                        inactive_fg.mul_alpha(0.75)
-                    },
-                )?;
-                self.ui_items.push(UIItem {
-                    x: corner_x as usize,
-                    y: corner_y as usize,
-                    width: corner as usize,
-                    height: corner as usize,
-                    item_type: chevron_type,
-                });
             }
 
             self.ui_items.push(UIItem {
@@ -14632,56 +14750,66 @@ impl crate::TermWindow {
 
             let close_x = row_content_x + row_content_w - CLOSE_ZONE_W;
             let copy_x = close_x - copy_w;
-            let close_bg = if close_pressed {
-                lerp_rgba(surface, active_fg, 0.38)
-            } else if close_hovered {
-                lerp_rgba(surface, active_fg, 0.22)
-            } else {
-                row_bg
-            };
-            let close_geometry = sidebar_close_geometry(
-                cell_width as f32,
-                cell_height as f32,
-                row_height as f32,
-                close_inset,
-            );
-            let close_glyph_offset = if close_pressed { 1. } else { 0. };
-            if close_hovered {
-                self.sidebar_rounded_fill(
+            // The row's own controls are drawn on the active row and on the
+            // row under the pointer only: a bordered Copy and a × on every
+            // row made the list a grid of buttons with titles squeezed
+            // between them. Their zones stay reserved and clickable on every
+            // row, so the title never reflows and the pointer finds them
+            // from any direction.
+            let show_row_controls =
+                active || tab_hovered || close_hovered || copy_hovered || expand_hovered;
+            if show_row_controls {
+                let close_bg = if close_pressed {
+                    lerp_rgba(surface, active_fg, 0.38)
+                } else if close_hovered {
+                    lerp_rgba(surface, active_fg, 0.22)
+                } else {
+                    row_bg
+                };
+                let close_geometry = sidebar_close_geometry(
+                    cell_width as f32,
+                    cell_height as f32,
+                    row_height as f32,
+                    close_inset,
+                );
+                let close_glyph_offset = if close_pressed { 1. } else { 0. };
+                if close_hovered {
+                    self.sidebar_rounded_fill(
+                        layers,
+                        1,
+                        euclid::rect(
+                            close_x + close_geometry.button_dx,
+                            y + row_offset
+                                + (row_height as f32 - close_geometry.side) * 0.5
+                                + close_glyph_offset,
+                            close_geometry.side,
+                            close_geometry.side,
+                        ),
+                        close_geometry.side * 0.38,
+                        close_bg,
+                    )?;
+                }
+                let close_glyph_x = close_x + close_geometry.glyph_dx;
+                render_text(
+                    self,
                     layers,
-                    1,
-                    euclid::rect(
-                        close_x + close_geometry.button_dx,
-                        y + row_offset
-                            + (row_height as f32 - close_geometry.side) * 0.5
-                            + close_glyph_offset,
-                        close_geometry.side,
-                        close_geometry.side,
-                    ),
-                    close_geometry.side * 0.38,
-                    close_bg,
+                    "×",
+                    &CellAttributes::default(),
+                    close_glyph_x,
+                    y + row_offset
+                        + (row_height as f32 - cell_height as f32) * 0.5
+                        + close_glyph_offset,
+                    cell_width as f32,
+                    if close_hovered {
+                        hover_fg
+                    } else if active {
+                        active_fg
+                    } else {
+                        inactive_fg.mul_alpha(0.78)
+                    },
+                    LinearRgba::default(),
                 )?;
             }
-            let close_glyph_x = close_x + close_geometry.glyph_dx;
-            render_text(
-                self,
-                layers,
-                "×",
-                &CellAttributes::default(),
-                close_glyph_x,
-                y + row_offset
-                    + (row_height as f32 - cell_height as f32) * 0.5
-                    + close_glyph_offset,
-                cell_width as f32,
-                if close_hovered {
-                    hover_fg
-                } else if active {
-                    active_fg
-                } else {
-                    inactive_fg.mul_alpha(0.78)
-                },
-                LinearRgba::default(),
-            )?;
             self.ui_items.push(UIItem {
                 x: close_x as usize,
                 y: y as usize,
@@ -14691,89 +14819,110 @@ impl crate::TermWindow {
             });
 
             // Copy, left of the close button, which keeps the far right where
-            // muscle memory expects it. Drawn at rest; hovering only adds the
-            // rounded box behind the glyph.
+            // muscle memory expects it. Shown with the close button; the zone
+            // and its hit box are there on every row.
             if copy_w > 0. {
-                // Same size as the close control, centred in its own zone
-                // rather than right-aligned in it.
-                let copy_geometry = sidebar_tab_copy_geometry(
-                    cell_width as f32,
-                    cell_height as f32,
-                    row_height as f32,
-                    copy_w,
-                );
-                let copy_glyph_offset = if copy_pressed { 1. } else { 0. };
-                if copy_hovered {
-                    self.sidebar_rounded_fill(
-                        layers,
-                        1,
-                        euclid::rect(
+                if show_row_controls || self.copy_check_for_tab_idx(tab_idx).is_some() {
+                    // Same size as the close control, centred in its own zone
+                    // rather than right-aligned in it.
+                    let copy_geometry = sidebar_tab_copy_geometry(
+                        cell_width as f32,
+                        cell_height as f32,
+                        row_height as f32,
+                        copy_w,
+                    );
+                    let copy_glyph_offset = if copy_pressed { 1. } else { 0. };
+                    // A bordered box at rest, not only on hover: without an edge
+                    // there was no telling where the button begins, or whether
+                    // the pointer was on it. The outline is two fills, the outer
+                    // one showing as a ring around the inner.
+                    {
+                        let box_x = copy_x + copy_geometry.button_dx;
+                        let box_y = y
+                            + row_offset
+                            + (row_height as f32 - copy_geometry.side) * 0.5
+                            + copy_glyph_offset;
+                        let side = copy_geometry.side;
+                        let radius = side * 0.38;
+                        let ring = (1. * dpi_scale).max(1.);
+                        let (ring_mix, fill_mix) = if copy_pressed {
+                            (0.62, 0.38)
+                        } else if copy_hovered {
+                            (0.56, 0.26)
+                        } else {
+                            (0.34, 0.10)
+                        };
+                        self.sidebar_rounded_fill(
+                            layers,
+                            1,
+                            euclid::rect(box_x, box_y, side, side),
+                            radius,
+                            lerp_rgba(surface, active_fg, ring_mix),
+                        )?;
+                        self.sidebar_rounded_fill(
+                            layers,
+                            1,
+                            euclid::rect(
+                                box_x + ring,
+                                box_y + ring,
+                                (side - ring * 2.).max(1.),
+                                (side - ring * 2.).max(1.),
+                            ),
+                            (radius - ring).max(0.),
+                            lerp_rgba(surface, active_fg, fill_mix),
+                        )?;
+                    }
+                    // Full strength: a dimmed icon reads as disabled.
+                    // Centre the glyph's *ink* on the hover box; the cell-based
+                    // placement is the fallback when the glyph cannot be measured.
+                    let (copy_glyph_x, copy_glyph_y) = match self.sidebar_copy_glyph_ink_center() {
+                        Some((ink_x, ink_y)) => (
+                            copy_x + copy_geometry.button_dx + copy_geometry.side * 0.5 - ink_x,
+                            y + row_offset + row_height as f32 * 0.5 - ink_y,
+                        ),
+                        None => (
+                            copy_x + copy_geometry.glyph_dx,
+                            y + row_offset + (row_height as f32 - cell_height as f32) * 0.5,
+                        ),
+                    };
+                    // Brighter than the title beside it on an idle row: the icon
+                    // is small, and at the title's grey it sank into its box.
+                    let copy_fg = if copy_hovered {
+                        hover_fg
+                    } else if active {
+                        active_fg
+                    } else {
+                        lerp_rgba(inactive_fg, active_fg, 0.55)
+                    };
+                    // Right after a copy the glyph gives way to a checkmark in
+                    // the same colour, which draws itself in and fades back.
+                    let check = self.copy_check_for_tab_idx(tab_idx);
+                    let icon_alpha = check.map_or(1., |frame| frame.icon_alpha);
+                    if icon_alpha > 0. {
+                        render_text(
+                            self,
+                            layers,
+                            SIDEBAR_COPY_GLYPH,
+                            &CellAttributes::default(),
+                            copy_glyph_x,
+                            copy_glyph_y + copy_glyph_offset,
+                            cell_width as f32,
+                            copy_fg.mul_alpha(icon_alpha),
+                            LinearRgba::default(),
+                        )?;
+                    }
+                    if let Some(frame) = check.filter(|frame| frame.check_alpha > 0.) {
+                        self.paint_copy_check(
+                            layers,
                             copy_x + copy_geometry.button_dx,
                             y + row_offset
                                 + (row_height as f32 - copy_geometry.side) * 0.5
                                 + copy_glyph_offset,
                             copy_geometry.side,
-                            copy_geometry.side,
-                        ),
-                        copy_geometry.side * 0.38,
-                        if copy_pressed {
-                            lerp_rgba(surface, active_fg, 0.38)
-                        } else {
-                            lerp_rgba(surface, active_fg, 0.22)
-                        },
-                    )?;
-                }
-                // Drawn on every row, at rest, like the close glyph beside it:
-                // a control that only exists once you have already found it is
-                // not a control anybody finds. Full strength for the same
-                // reason — a dimmed icon reads as disabled.
-                // Centre the glyph's *ink* on the hover box; the cell-based
-                // placement is the fallback when the glyph cannot be measured.
-                let (copy_glyph_x, copy_glyph_y) = match self.sidebar_copy_glyph_ink_center() {
-                    Some((ink_x, ink_y)) => (
-                        copy_x + copy_geometry.button_dx + copy_geometry.side * 0.5 - ink_x,
-                        y + row_offset + row_height as f32 * 0.5 - ink_y,
-                    ),
-                    None => (
-                        copy_x + copy_geometry.glyph_dx,
-                        y + row_offset + (row_height as f32 - cell_height as f32) * 0.5,
-                    ),
-                };
-                let copy_fg = if copy_hovered {
-                    hover_fg
-                } else if active {
-                    active_fg
-                } else {
-                    inactive_fg
-                };
-                // Right after a copy the glyph gives way to a checkmark in
-                // the same colour, which draws itself in and fades back.
-                let check = self.copy_check_for_tab_idx(tab_idx);
-                let icon_alpha = check.map_or(1., |frame| frame.icon_alpha);
-                if icon_alpha > 0. {
-                    render_text(
-                        self,
-                        layers,
-                        SIDEBAR_COPY_GLYPH,
-                        &CellAttributes::default(),
-                        copy_glyph_x,
-                        copy_glyph_y + copy_glyph_offset,
-                        cell_width as f32,
-                        copy_fg.mul_alpha(icon_alpha),
-                        LinearRgba::default(),
-                    )?;
-                }
-                if let Some(frame) = check.filter(|frame| frame.check_alpha > 0.) {
-                    self.paint_copy_check(
-                        layers,
-                        copy_x + copy_geometry.button_dx,
-                        y + row_offset
-                            + (row_height as f32 - copy_geometry.side) * 0.5
-                            + copy_glyph_offset,
-                        copy_geometry.side,
-                        frame.draw,
-                        copy_fg.mul_alpha(frame.check_alpha),
-                    )?;
+                            frame.draw,
+                            copy_fg.mul_alpha(frame.check_alpha),
+                        )?;
+                    }
                 }
                 self.ui_items.push(UIItem {
                     x: copy_x as usize,
@@ -14827,508 +14976,365 @@ impl crate::TermWindow {
             });
         }
 
-        let ssh_rail_present = !self.ssh_quick_launch_entries().is_empty();
-        // SSH row sits directly above the new-tab row; the worktree/agent row
-        // moves one stride higher when the SSH row is present.
-        let ssh_row_y = new_tab_y - row_height as f32 - GAP;
-        let worktree_y = if ssh_rail_present {
-            ssh_row_y - row_height as f32 - GAP
-        } else {
-            ssh_row_y
-        };
-        if ssh_rail_present {
-            let ssh_type = UIItemType::SidebarSshLaunchButton;
-            let ssh_hovered = hovered_item.as_ref() == Some(&ssh_type);
-            let ssh_pressed =
-                ssh_hovered && left_pressed && self.pressed_ui_item.as_ref() == Some(&ssh_type);
-            let ssh_bg = if ssh_pressed {
-                pressed_fill
-            } else if ssh_hovered {
-                hover_fill
-            } else {
-                search_fill
-            };
-            let ssh_offset = if ssh_pressed { 1. } else { 0. };
-            self.sidebar_rounded_fill(
-                layers,
-                1,
-                euclid::rect(item_x, ssh_row_y + ssh_offset, item_w, row_height as f32),
-                RADIUS,
-                ssh_bg,
-            )?;
-            let ssh_label_w = (item_w - PAD_X * 2. - ACTIVE_TEXT_GAP).max(0.);
-            if let Some(ssh_label) =
-                fit_label(&SSH_ROW_LABELS, sidebar_text_cols(ssh_label_w, cell_width))
-            {
-                render_text(
-                    self,
-                    layers,
-                    ssh_label,
-                    &CellAttributes::default(),
-                    text_x,
-                    ssh_row_y + ssh_offset + (row_height as f32 - cell_height as f32) * 0.5,
-                    ssh_label_w,
-                    if ssh_hovered {
-                        hover_fg
-                    } else {
-                        inactive_fg.mul_alpha(0.86)
-                    },
-                    ssh_bg,
-                )?;
-            }
-            self.ui_items.push(UIItem {
-                x: content_x as usize,
-                y: ssh_row_y as usize,
-                width: item_w as usize,
-                height: row_height,
-                item_type: ssh_type,
-            });
-        }
-        if width > 180 {
-            // The row is shared: Worktree on the left, the agent launcher on
-            // the right. With no agent installed the worktree button keeps the
-            // full width it had before the launcher existed.
-            let launcher_entry = self.agent_launcher_default();
-            let dot_size = sidebar_status_dot_size(cell_height as f32);
-            // Always reserve the agent launcher area even when no adapter is
-            // installed: the button opens a dropdown whose "Tower" and
-            // "Resume session" rows are useful without any adapter.
-            let mut bottom_row =
-                sidebar_bottom_row_layout(item_x, item_w, content_x, content_w, dot_size, true);
-            // The Changes toggle is a square carved off the Worktree pill's
-            // right end, so the row keeps its height and the launcher its half.
-            // On a narrow sidebar it shrinks to half the pill rather than go:
-            // the Worktree label gives way first.
-            // The toolbelt toggle joins it on the far right, and the two
-            // split what the Worktree pill can give up.
-            let show_changes = self.config.diff_panel.enabled;
-            let show_toolbelt = self.sidebar_toolbelt_toggle_shown();
-            // The Secure Keyboard Entry lock is carved last, so it sits left
-            // of the other two: lock | ± | wrench.
-            let show_secure = self.sidebar_secure_input_toggle_shown();
-            let squares = show_changes as usize + show_toolbelt as usize + show_secure as usize;
-            let changes_side = (row_height as f32).min(
-                ((bottom_row.worktree_fill_w - GAP * squares as f32) / (squares + 1) as f32)
-                    .max(1.),
-            );
-            let mut carve_square = || {
-                bottom_row.worktree_fill_w -= changes_side + GAP;
-                bottom_row.worktree_text_w =
-                    (bottom_row.worktree_text_w - changes_side - GAP).max(0.);
-                bottom_row.worktree_fill_x + bottom_row.worktree_fill_w + GAP
-            };
-            let toolbelt_x = show_toolbelt.then(&mut carve_square);
-            let changes_x = show_changes.then(&mut carve_square);
-            let secure_x = show_secure.then(&mut carve_square);
+        // The footer: rows of buttons, bottom-anchored. Which buttons, in
+        // which rows, is data (`tgz_footer`): the default, the user's dragged
+        // arrangement, or `sidebar_footer` from Lua. The same rows decide the
+        // paint, the hit boxes and the row count, so they cannot drift apart.
+        let footer_rows = self.sidebar_footer_visible_rows();
+        let footer_radius = RADIUS * dpi_scale;
+        let footer_stride = row_height as f32 + GAP;
+        let footer_top_y = new_tab_y - (footer_rows.len() as f32 - 1.) * footer_stride;
+        let footer_weights = self.sidebar_footer_effective_weights();
+        let mut painted_slots: Vec<tgz_footer::PaintedSlot> = Vec::new();
 
-            let worktree_type = UIItemType::SidebarWorktreeButton;
-            let worktree_hovered = hovered_item.as_ref() == Some(&worktree_type);
-            let worktree_pressed = worktree_hovered
-                && left_pressed
-                && self.pressed_ui_item.as_ref() == Some(&worktree_type);
-            let worktree_bg = if worktree_pressed {
+        // One footer segment that opens something: the bordered fill and its
+        // hit box. Returns what its content is drawn with: `(background, text
+        // colour, pressed offset, hovered)`.
+        let paint_create_segment = |this: &mut Self,
+                                    layers: &mut TripleLayerQuadAllocator,
+                                    item_type: UIItemType,
+                                    (x, w): (f32, f32),
+                                    create_y: f32|
+         -> anyhow::Result<(LinearRgba, LinearRgba, f32, bool)> {
+            let hovered = hovered_item.as_ref() == Some(&item_type);
+            let pressed =
+                hovered && left_pressed && this.pressed_ui_item.as_ref() == Some(&item_type);
+            let bg = if pressed {
                 pressed_fill
-            } else if worktree_hovered {
+            } else if hovered {
                 hover_fill
             } else {
                 search_fill
             };
-            let worktree_offset = if worktree_pressed { 1. } else { 0. };
-            self.sidebar_bordered_fill(
+            let offset = if pressed { 1. } else { 0. };
+            this.sidebar_bordered_fill(
                 layers,
                 1,
-                euclid::rect(
-                    bottom_row.worktree_fill_x,
-                    worktree_y + worktree_offset,
-                    bottom_row.worktree_fill_w,
-                    row_height as f32,
-                ),
-                RADIUS * dpi_scale,
+                euclid::rect(x, create_y + offset, w, row_height as f32),
+                footer_radius.min(w * 0.5),
                 dpi_scale.max(1.),
-                worktree_bg,
+                bg,
                 sb.row_border,
             )?;
-            let folder_color = if worktree_hovered {
-                hover_fg.mul_alpha(0.90)
+            this.ui_items.push(UIItem {
+                x: x as usize,
+                y: create_y as usize,
+                width: w as usize,
+                height: row_height,
+                item_type,
+            });
+            let fg = if hovered {
+                hover_fg
             } else {
-                inactive_fg.mul_alpha(0.70)
+                inactive_fg.mul_alpha(0.86)
             };
-            let icon_x = bottom_row.worktree_icon_x;
-            let icon_y = worktree_y
-                + worktree_offset
-                + (row_height as f32 - cell_height as f32) * 0.5
-                + (cell_height as f32 - 16.) * 0.5;
-            self.sidebar_rounded_fill(
-                layers,
-                2,
-                euclid::rect(icon_x + 2., icon_y, 10., 5.),
-                2.,
-                folder_color.mul_alpha(0.84),
-            )?;
-            self.sidebar_rounded_fill(
-                layers,
-                2,
-                euclid::rect(icon_x, icon_y + 4., 18., 12.),
-                3.,
-                folder_color,
-            )?;
-            // Widest label that actually fits its half, measured — not chosen by
-            // a width threshold, which cannot know the cell width, the adapter's
-            // configured label length or whether the scrollbar gutter is present.
-            // Nothing fits at all -> the folder icon speaks for itself.
-            let worktree_cols = sidebar_text_cols(bottom_row.worktree_text_w, cell_width);
-            if let Some(worktree_label) = fit_label(&WORKTREE_LABELS, worktree_cols) {
+            Ok((bg, fg, offset, hovered))
+        };
+        let text_inset_y = (row_height as f32 - cell_height as f32) * 0.5;
+        // Pixel width of a label, with a hair to spare so the column count
+        // derived from it never rounds the last character away.
+        let label_px = |label: &str| unicode_column_width(label, None) as f32 * cell_width as f32;
+
+        for (row_idx, row) in footer_rows.iter().enumerate() {
+            let row_y = footer_top_y + row_idx as f32 * footer_stride;
+            let slots = tgz_footer::footer_row_layout_weighted(
+                item_x,
+                item_w,
+                row_height as f32,
+                GAP,
+                row,
+                &footer_weights,
+            );
+            let labelled = tgz_footer::toggles_labelled(
+                &slots,
+                cell_width as f32,
+                FOOTER_SEGMENT_PAD * 2. + ACTION_ICON_GAP,
+            );
+            for slot in &slots {
+                let (x, w) = (slot.x, slot.w);
+                painted_slots.push(tgz_footer::PaintedSlot {
+                    item: slot.item,
+                    row: row_idx,
+                    x,
+                    y: row_y,
+                    w,
+                    h: row_height as f32,
+                });
+                let rect = (x, row_y, w, row_height as f32);
+                let toggle_label = if labelled {
+                    tgz_footer::toggle_label(slot.item)
+                } else {
+                    None
+                };
+                match slot.item {
+                    SidebarFooterItem::Worktree => {
+                        let on = self.file_tree_shown();
+                        paint_square_toggle(
+                            self,
+                            layers,
+                            (
+                                UIItemType::SidebarWorktreeButton,
+                                SIDEBAR_WORKTREE_GLYPH,
+                                on,
+                            ),
+                            rect,
+                            footer_radius,
+                            (x, w),
+                            toggle_label,
+                        )?;
+                    }
+                    SidebarFooterItem::Changes => {
+                        paint_changes_button(
+                            self,
+                            layers,
+                            rect,
+                            footer_radius,
+                            (x, w),
+                            toggle_label,
+                        )?;
+                    }
+                    SidebarFooterItem::Toolbelt => {
+                        paint_toolbelt_toggle(
+                            self,
+                            layers,
+                            rect,
+                            footer_radius,
+                            (x, w),
+                            toggle_label,
+                        )?;
+                    }
+                    SidebarFooterItem::SecureInput => {
+                        paint_secure_input_toggle(
+                            self,
+                            layers,
+                            rect,
+                            footer_radius,
+                            (x, w),
+                            toggle_label,
+                        )?;
+                    }
+                    // Agent: left launches the default agent, right opens the
+                    // launcher menu. The button is there even with no adapter
+                    // installed: the menu still offers "Resume session".
+                    SidebarFooterItem::Agent => {
+                        let (bg, fg, offset, hovered) = paint_create_segment(
+                            self,
+                            layers,
+                            UIItemType::SidebarAgentLaunchButton,
+                            (x, w),
+                            row_y,
+                        )?;
+                        let launcher_entry = self.agent_launcher_default();
+                        let dot_size = sidebar_status_dot_size(cell_height as f32);
+                        let label_room =
+                            (w - FOOTER_SEGMENT_PAD * 2. - dot_size - ACTION_ICON_GAP).max(0.);
+                        let cols = sidebar_text_cols(label_room, cell_width);
+                        // Widest label that actually fits, measured; none fits -> the dot
+                        // alone stands for the agent.
+                        let label = match launcher_entry.as_ref() {
+                            Some(entry) => {
+                                fit_label(&[entry.label.as_str(), entry.short_label.as_str()], cols)
+                                    .map(str::to_string)
+                            }
+                            None => fit_label(&["Agents", "Agent"], cols).map(str::to_string),
+                        };
+                        let label_w = label.as_deref().map_or(0., label_px);
+                        let group_w = dot_size
+                            + if label.is_some() {
+                                ACTION_ICON_GAP + label_w
+                            } else {
+                                0.
+                            };
+                        let group_x = x + ((w - group_w) * 0.5).max(0.);
+                        let dot_color = match launcher_entry.as_ref() {
+                            Some(entry) if hovered => entry.color,
+                            Some(entry) => entry.color.mul_alpha(0.88),
+                            None => inactive_fg.mul_alpha(0.5),
+                        };
+                        self.sidebar_rounded_fill(
+                            layers,
+                            2,
+                            euclid::rect(
+                                group_x,
+                                row_y + offset + (row_height as f32 - dot_size) * 0.5,
+                                dot_size,
+                                dot_size,
+                            ),
+                            dot_size * 0.5,
+                            dot_color,
+                        )?;
+                        if let Some(label) = label {
+                            render_text(
+                                self,
+                                layers,
+                                &label,
+                                &CellAttributes::default(),
+                                group_x + dot_size + ACTION_ICON_GAP,
+                                row_y + text_inset_y + offset,
+                                label_w + 0.5,
+                                fg,
+                                bg,
+                            )?;
+                        }
+                    }
+                    // Tab: left opens a tab, right the shell/domain picker.
+                    SidebarFooterItem::NewTab => {
+                        let (bg, fg, offset, _) = paint_create_segment(
+                            self,
+                            layers,
+                            UIItemType::SidebarNewTabButton,
+                            (x, w),
+                            row_y,
+                        )?;
+                        let cols =
+                            sidebar_text_cols((w - FOOTER_SEGMENT_PAD * 2.).max(0.), cell_width);
+                        if let Some(label) = fit_label(&NEW_TAB_LABELS, cols) {
+                            let label_w = label_px(label);
+                            render_text(
+                                self,
+                                layers,
+                                label,
+                                &CellAttributes::default(),
+                                x + ((w - label_w) * 0.5).max(0.),
+                                row_y + text_inset_y + offset,
+                                label_w + 0.5,
+                                fg,
+                                bg,
+                            )?;
+                        }
+                    }
+                    // SSH: left connects to the host the button names, right
+                    // opens the host menu.
+                    SidebarFooterItem::Ssh => {
+                        let (bg, fg, offset, _) = paint_create_segment(
+                            self,
+                            layers,
+                            UIItemType::SidebarSshLaunchButton,
+                            (x, w),
+                            row_y,
+                        )?;
+                        let cols =
+                            sidebar_text_cols((w - FOOTER_SEGMENT_PAD * 2.).max(0.), cell_width);
+                        let ssh_default = self.ssh_default_host_label();
+                        if let Some(label) = ssh_button_label(ssh_default.as_deref(), cols) {
+                            let label_w = label_px(&label);
+                            render_text(
+                                self,
+                                layers,
+                                &label,
+                                &CellAttributes::default(),
+                                x + ((w - label_w) * 0.5).max(0.),
+                                row_y + text_inset_y + offset,
+                                label_w + 0.5,
+                                fg,
+                                bg,
+                            )?;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Customizing: a bar above the footer says what to do and how to
+        // stop, and the button being dragged is outlined.
+        if self.sidebar_footer_edit {
+            // A grip in each gap between two buttons: drag it to change how
+            // the row is shared. Registered after the buttons so it wins the
+            // few pixels it overlaps them by.
+            let grip_w = (2. * dpi_scale).max(2.);
+            let grip_reach = 4. * dpi_scale;
+            for pair in painted_slots.windows(2) {
+                let (slot, next) = (pair[0], pair[1]);
+                if slot.row != next.row {
+                    continue;
+                }
+                let edge = slot.x + slot.w;
+                self.filled_rectangle(
+                    layers,
+                    2,
+                    euclid::rect(
+                        edge + (GAP - grip_w) * 0.5,
+                        slot.y + slot.h * 0.25,
+                        grip_w,
+                        slot.h * 0.5,
+                    ),
+                    accent,
+                )?;
+                self.ui_items.push(UIItem {
+                    x: (edge - grip_reach).max(0.) as usize,
+                    y: slot.y as usize,
+                    width: (GAP + grip_reach * 2.) as usize,
+                    height: slot.h as usize,
+                    item_type: UIItemType::SidebarFooterResize(slot.item),
+                });
+            }
+            let bar_y = footer_top_y - footer_stride;
+            let cell_w = cell_width as f32;
+            let done_w = (4. * cell_w + FOOTER_SEGMENT_PAD * 2.).min(item_w);
+            let reset_w = 5. * cell_w + FOOTER_SEGMENT_PAD * 2.;
+            let done_x = item_x + item_w - done_w;
+            let show_reset = item_w >= done_w + GAP + reset_w;
+            let reset_x = done_x - GAP - reset_w;
+            let mut buttons = vec![(FooterEditAction::Done, "Done", done_x, done_w)];
+            if show_reset {
+                buttons.push((FooterEditAction::Reset, "Reset", reset_x, reset_w));
+            }
+            for (action, label, x, w) in buttons {
+                let (bg, fg, offset, _) = paint_create_segment(
+                    self,
+                    layers,
+                    UIItemType::SidebarFooterEdit(action),
+                    (x, w),
+                    bar_y,
+                )?;
+                let label_w = label_px(label);
                 render_text(
                     self,
                     layers,
-                    worktree_label,
+                    label,
                     &CellAttributes::default(),
-                    bottom_row.worktree_text_x,
-                    worktree_y + worktree_offset + (row_height as f32 - cell_height as f32) * 0.5,
-                    bottom_row.worktree_text_w,
-                    if worktree_hovered {
-                        hover_fg
-                    } else {
-                        inactive_fg.mul_alpha(0.86)
-                    },
-                    worktree_bg,
+                    x + ((w - label_w) * 0.5).max(0.),
+                    bar_y + text_inset_y + offset,
+                    label_w + 0.5,
+                    fg,
+                    bg,
                 )?;
             }
-            self.ui_items.push(UIItem {
-                x: content_x as usize,
-                y: worktree_y as usize,
-                width: (bottom_row.worktree_fill_x + bottom_row.worktree_fill_w - content_x).max(1.)
-                    as usize,
-                height: row_height,
-                item_type: worktree_type,
-            });
-
-            if let Some(changes_x) = changes_x {
-                paint_changes_button(
-                    self,
-                    layers,
-                    (changes_x, worktree_y, changes_side, row_height as f32),
-                    RADIUS * dpi_scale,
-                    (changes_x, changes_side),
-                )?;
-            }
-            if let Some(toolbelt_x) = toolbelt_x {
-                paint_toolbelt_toggle(
-                    self,
-                    layers,
-                    (toolbelt_x, worktree_y, changes_side, row_height as f32),
-                    RADIUS * dpi_scale,
-                    (toolbelt_x, changes_side),
-                )?;
-            }
-            if let Some(secure_x) = secure_x {
-                paint_secure_input_toggle(
-                    self,
-                    layers,
-                    (secure_x, worktree_y, changes_side, row_height as f32),
-                    RADIUS * dpi_scale,
-                    (secure_x, changes_side),
-                )?;
-            }
-
-            {
-                let agent_type = UIItemType::SidebarAgentLaunchButton;
-                let agent_hovered = hovered_item.as_ref() == Some(&agent_type);
-                let agent_pressed = agent_hovered
-                    && left_pressed
-                    && self.pressed_ui_item.as_ref() == Some(&agent_type);
-                let agent_bg = if agent_pressed {
-                    pressed_fill
-                } else if agent_hovered {
-                    hover_fill
-                } else {
-                    search_fill
-                };
-                let agent_offset = if agent_pressed { 1. } else { 0. };
-                self.sidebar_bordered_fill(
-                    layers,
-                    1,
-                    euclid::rect(
-                        bottom_row.agent_fill_x,
-                        worktree_y + agent_offset,
-                        bottom_row.agent_fill_w,
-                        row_height as f32,
-                    ),
-                    RADIUS * dpi_scale,
-                    dpi_scale.max(1.),
-                    agent_bg,
-                    sb.row_border,
-                )?;
-
-                // Adapter-colored dot (or a neutral dot when no adapter).
-                let dot_y = worktree_y + agent_offset + (row_height as f32 - dot_size) * 0.5;
-                let dot_color = if let Some(ref entry) = launcher_entry {
-                    if agent_hovered {
-                        entry.color
-                    } else {
-                        entry.color.mul_alpha(0.88)
-                    }
-                } else {
-                    inactive_fg.mul_alpha(0.5)
-                };
-                self.sidebar_rounded_fill(
-                    layers,
-                    2,
-                    euclid::rect(bottom_row.agent_dot_x, dot_y, dot_size, dot_size),
-                    dot_size * 0.5,
-                    dot_color,
-                )?;
-
-                // Label: adapter label when available, generic "Agents" otherwise.
-                let agent_label_opt = if let Some(ref entry) = launcher_entry {
-                    let agent_label_rungs = [entry.label.as_str(), entry.short_label.as_str()];
-                    let agent_cols = sidebar_text_cols(bottom_row.agent_text_w, cell_width);
-                    fit_label(&agent_label_rungs, agent_cols).map(|s| s.to_string())
-                } else {
-                    let agent_cols = sidebar_text_cols(bottom_row.agent_text_w, cell_width);
-                    fit_label(&["Agents", "Agent"], agent_cols).map(|s| s.to_string())
-                };
-                if let Some(agent_label) = agent_label_opt {
+            let hint_right = if show_reset { reset_x } else { done_x } - GAP;
+            let hint_cols = sidebar_text_cols((hint_right - item_x - PAD_X).max(0.), cell_width);
+            if let Some(hint) = fit_label(&["Drag to arrange", "Drag", ""], hint_cols) {
+                if !hint.is_empty() {
+                    let hint_w = label_px(hint);
                     render_text(
                         self,
                         layers,
-                        &agent_label,
+                        hint,
                         &CellAttributes::default(),
-                        bottom_row.agent_text_x,
-                        worktree_y + agent_offset + (row_height as f32 - cell_height as f32) * 0.5,
-                        bottom_row.agent_text_w,
-                        if agent_hovered {
-                            hover_fg
-                        } else {
-                            inactive_fg.mul_alpha(0.86)
-                        },
-                        agent_bg,
+                        item_x + PAD_X,
+                        bar_y + text_inset_y,
+                        hint_w + 0.5,
+                        accent,
+                        surface,
                     )?;
                 }
-                // Hit region matches the drawn pill (which reaches the row's
-                // right edge), not the narrower content column.
-                self.ui_items.push(UIItem {
-                    x: bottom_row.agent_fill_x as usize,
-                    y: worktree_y as usize,
-                    width: bottom_row.agent_fill_w as usize,
-                    height: row_height,
-                    item_type: agent_type,
-                });
+            }
+            let dragged = self
+                .dragging
+                .as_ref()
+                .and_then(|(item, _)| footer_item_for(&item.item_type));
+            if let Some(slot) = painted_slots.iter().find(|slot| Some(slot.item) == dragged) {
+                let stroke = (2. * dpi_scale).max(2.);
+                for edge in [
+                    euclid::rect(slot.x, slot.y, slot.w, stroke),
+                    euclid::rect(slot.x, slot.y + slot.h - stroke, slot.w, stroke),
+                    euclid::rect(slot.x, slot.y, stroke, slot.h),
+                    euclid::rect(slot.x + slot.w - stroke, slot.y, stroke, slot.h),
+                ] {
+                    self.filled_rectangle(layers, 2, edge, accent)?;
+                }
             }
         }
-
-        // Windows-Terminal-style split button: the label opens a tab, the
-        // chevron on the right opens the shell/domain picker. Right-clicking
-        // the label still opens WezTerm's full launcher overlay.
-        let show_chevron =
-            self.config.new_tab_menu.enabled && !self.new_tab_menu_entries().is_empty();
-        let chevron_w = if show_chevron {
-            (row_height as f32 * 0.85).clamp(20., 34.)
-        } else {
-            0.
-        };
-        // Too narrow for the Worktree row, which is where the Changes toggle
-        // lives: it takes the right end of this row instead.
-        let narrow_changes_w = if width <= 180 && self.config.diff_panel.enabled {
-            (row_height as f32).min(((item_w - chevron_w - GAP) * 0.5).max(1.))
-        } else {
-            0.
-        };
-        // The toolbelt toggle follows it there, but only while "+" keeps at
-        // least a square of its own: at the 140px drag floor it does not, and
-        // the rail and the wide row still offer it.
-        let narrow_toolbelt_w = if width <= 180 && self.sidebar_toolbelt_toggle_shown() {
-            let side = (row_height as f32).min(((item_w - chevron_w - GAP) * 0.5).max(1.));
-            let used = if narrow_changes_w > 0. {
-                narrow_changes_w + GAP
-            } else {
-                0.
-            };
-            if item_w - chevron_w - used - side - GAP >= side {
-                side
-            } else {
-                0.
-            }
-        } else {
-            0.
-        };
-        // The lock goes first when space runs out, under the same rule: the
-        // app menu still offers Secure Keyboard Entry.
-        let narrow_secure_w = if width <= 180 && self.sidebar_secure_input_toggle_shown() {
-            let side = (row_height as f32).min(((item_w - chevron_w - GAP) * 0.5).max(1.));
-            let used = [narrow_changes_w, narrow_toolbelt_w]
-                .iter()
-                .filter(|w| **w > 0.)
-                .map(|w| w + GAP)
-                .sum::<f32>();
-            if item_w - chevron_w - used - side - GAP >= side {
-                side
-            } else {
-                0.
-            }
-        } else {
-            0.
-        };
-        let split_w = item_w
-            - if narrow_secure_w > 0. {
-                narrow_secure_w + GAP
-            } else {
-                0.
-            }
-            - if narrow_changes_w > 0. {
-                narrow_changes_w + GAP
-            } else {
-                0.
-            }
-            - if narrow_toolbelt_w > 0. {
-                narrow_toolbelt_w + GAP
-            } else {
-                0.
-            };
-        let new_tab_fill_w = (split_w - chevron_w).max(1.);
-        let chevron_x = item_x + new_tab_fill_w;
-        // Both hit regions key off the drawn geometry. Deriving them from the
-        // content column instead put the chevron's hit box a full button width
-        // left of the glyph: the fills span the whole item width, while the
-        // content column stops short of the resize grip + scrollbar gutter.
-        let new_tab_hit_w = (chevron_x - content_x).max(1.);
-
-        let new_tab_type = UIItemType::TabBar(TabBarItem::NewTabButton);
-        let new_tab_hovered = hovered_item.as_ref() == Some(&new_tab_type);
-        let new_tab_pressed = new_tab_hovered && left_pressed;
-        let new_tab_bg = if new_tab_pressed {
-            pressed_fill
-        } else if new_tab_hovered {
-            hover_fill
-        } else {
-            search_fill
-        };
-        let new_tab_offset = if new_tab_pressed { 1. } else { 0. };
-        self.sidebar_rounded_fill(
-            layers,
-            1,
-            euclid::rect(
-                item_x,
-                new_tab_y + new_tab_offset,
-                new_tab_fill_w,
-                row_height as f32,
-            ),
-            RADIUS,
-            new_tab_bg,
-        )?;
-        let new_tab_text_w = (new_tab_hit_w - PAD_X * 2. - ACTIVE_TEXT_GAP).max(0.);
-        if let Some(new_tab_label) = fit_label(
-            &NEW_TAB_LABELS,
-            sidebar_text_cols(new_tab_text_w, cell_width),
-        ) {
-            render_text(
-                self,
-                layers,
-                new_tab_label,
-                &CellAttributes::default(),
-                text_x,
-                new_tab_y + new_tab_offset + (row_height as f32 - cell_height as f32) * 0.5,
-                new_tab_text_w,
-                if new_tab_hovered {
-                    hover_fg
-                } else {
-                    inactive_fg
-                },
-                new_tab_bg,
-            )?;
-        }
-        self.ui_items.push(UIItem {
-            x: content_x as usize,
-            y: new_tab_y as usize,
-            width: new_tab_hit_w as usize,
-            height: row_height,
-            item_type: new_tab_type,
-        });
-
-        if show_chevron {
-            let chevron_type = UIItemType::SidebarNewTabMenuButton;
-            let chevron_hovered = hovered_item.as_ref() == Some(&chevron_type);
-            let chevron_pressed = chevron_hovered
-                && left_pressed
-                && self.pressed_ui_item.as_ref() == Some(&chevron_type);
-            let chevron_bg = if chevron_pressed {
-                pressed_fill
-            } else if chevron_hovered {
-                hover_fill
-            } else {
-                search_fill
-            };
-            let chevron_offset = if chevron_pressed { 1. } else { 0. };
-            self.sidebar_rounded_fill(
-                layers,
-                1,
-                euclid::rect(
-                    chevron_x,
-                    new_tab_y + chevron_offset,
-                    chevron_w,
-                    row_height as f32,
-                ),
-                RADIUS,
-                chevron_bg,
-            )?;
-            self.draw_sidebar_chevron(
-                layers,
-                chevron_x + chevron_w * 0.5,
-                new_tab_y + chevron_offset + row_height as f32 * 0.5,
-                dpi_scale,
-                if chevron_hovered {
-                    hover_fg
-                } else {
-                    inactive_fg.mul_alpha(0.86)
-                },
-            )?;
-            self.ui_items.push(UIItem {
-                x: chevron_x as usize,
-                y: new_tab_y as usize,
-                width: chevron_w as usize,
-                height: row_height,
-                item_type: chevron_type,
-            });
-        }
-
-        // Left to right after "+": lock | ± | wrench.
-        if narrow_secure_w > 0. {
-            let secure_x = item_x + split_w + GAP;
-            paint_secure_input_toggle(
-                self,
-                layers,
-                (secure_x, new_tab_y, narrow_secure_w, row_height as f32),
-                RADIUS * dpi_scale,
-                (secure_x, narrow_secure_w),
-            )?;
-        }
-        if narrow_changes_w > 0. {
-            let changes_x = item_x
-                + split_w
-                + GAP
-                + if narrow_secure_w > 0. {
-                    narrow_secure_w + GAP
-                } else {
-                    0.
-                };
-            paint_changes_button(
-                self,
-                layers,
-                (changes_x, new_tab_y, narrow_changes_w, row_height as f32),
-                RADIUS * dpi_scale,
-                (changes_x, narrow_changes_w),
-            )?;
-        }
-        if narrow_toolbelt_w > 0. {
-            let toolbelt_x = item_x + item_w - narrow_toolbelt_w;
-            paint_toolbelt_toggle(
-                self,
-                layers,
-                (toolbelt_x, new_tab_y, narrow_toolbelt_w, row_height as f32),
-                RADIUS * dpi_scale,
-                (toolbelt_x, narrow_toolbelt_w),
-            )?;
-        }
+        self.sidebar_footer_slots = painted_slots;
 
         self.ui_items.push(UIItem {
             x: match self.config.sidebar_position {
@@ -16926,16 +16932,13 @@ impl crate::TermWindow {
                     .unwrap_or(0);
                 let min_menu_w = max_label_cols as f32 * cell_w + 24.0 * dpi;
                 let width = (section_w - pad * 2.0).max(min_menu_w).min(section_w);
-                let row_h = cell_h + 4.0 * dpi;
-                let menu_h = actions.len() as f32 * row_h + pad * 2.0;
                 Some(crate::termwindow::AgentRowMenuLayout {
                     key,
                     actions,
                     x: section_x + pad,
-                    y: (header_y + header_h + pad).min(section_bottom - menu_h),
+                    // Grows upward from the section's top, off the footer.
+                    y: header_y,
                     width,
-                    row_h,
-                    pad,
                 })
             });
             self.agent_row_menu_layout = menu;
@@ -16949,6 +16952,8 @@ impl crate::TermWindow {
     }
 
     /// The agent row's right-click menu, as the section last laid it out.
+    /// Painted by the shared dropdown; Stop goes last, under a divider, like
+    /// the closing rows of every other menu.
     pub(crate) fn paint_agent_row_menu(
         &mut self,
         layers: &mut TripleLayerQuadAllocator,
@@ -16958,82 +16963,35 @@ impl crate::TermWindow {
         let Some(menu) = self.agent_row_menu_layout.take() else {
             return Ok(());
         };
-        let sb = self.sidebar_palette();
-        let fg = sb.text_active;
-        let bg = opaque(sb.row_fill);
-        let hover_bg = opaque(sb.pressed_fill);
-        let pressed_bg = opaque(lerp_rgba(bg, fg, 0.28));
         let dpi = (self.dimensions.dpi as f32 / 96.).clamp(1., 2.5);
-        let cell_w = self.render_metrics.cell_size.width as f32;
-        let cell_h = self.render_metrics.cell_size.height as f32;
-        let row_radius = (MENU_ROW_RADIUS * dpi).min(menu.row_h * 0.5);
-        let row_inset = 4. * dpi;
-        let menu_h = menu.actions.len() as f32 * menu.row_h + menu.pad * 2.;
-        self.paint_menu_surface(
+        let rows: Vec<SidebarDropdownRow> = agent_row_menu_order(&menu.actions)
+            .into_iter()
+            .map(|(action, divider_above)| SidebarDropdownRow {
+                label: action.label().to_string(),
+                dot_color: None,
+                checkbox: None,
+                divider_above,
+                indent: false,
+                trailing_chevron: false,
+                widget: None,
+                inert: false,
+                item_type: UIItemType::SidebarAgentAction {
+                    key: menu.key.clone(),
+                    action,
+                },
+            })
+            .collect();
+        self.paint_sidebar_dropdown(
             layers,
-            euclid::rect(menu.x, menu.y, menu.width, menu_h),
-            bg,
-            sb.menu_border,
-        )?;
-        let left_pressed = self.current_mouse_buttons.contains(&MousePress::Left);
-        let hovered_item = self
-            .last_ui_item
-            .as_ref()
-            .map(|item| item.item_type.clone());
-        let mut by = menu.y + menu.pad;
-        for action in menu.actions {
-            let action_type = UIItemType::SidebarAgentAction {
-                key: menu.key.clone(),
-                action,
-            };
-            let hovered = hovered_item.as_ref() == Some(&action_type);
-            let pressed =
-                hovered && left_pressed && self.pressed_ui_item.as_ref() == Some(&action_type);
-            let row_bg = if pressed {
-                pressed_bg
-            } else if hovered {
-                hover_bg
-            } else {
-                bg
-            };
-            if hovered {
-                self.sidebar_rounded_fill(
-                    layers,
-                    1,
-                    euclid::rect(
-                        menu.x + row_inset,
-                        by,
-                        menu.width - row_inset * 2.,
-                        menu.row_h,
-                    ),
-                    row_radius,
-                    row_bg,
-                )?;
-            }
-            let label = action.label();
-            let label_cols = unicode_column_width(label, None);
-            let available_cols = ((menu.width - 24.0 * dpi) / cell_w).max(0.0) as usize;
-            let display_label = truncate_with_ellipsis(label, available_cols);
-            self.paint_text(
-                layers,
-                &display_label,
-                menu.x + 12.0 * dpi,
-                by + (menu.row_h - cell_h) * 0.5,
-                label_cols as f32 * cell_w,
-                fg,
-                row_bg,
-                false,
-            )?;
-            self.ui_items.push(UIItem {
-                x: menu.x as usize,
-                y: by as usize,
-                width: menu.width as usize,
-                height: menu.row_h as usize,
-                item_type: action_type,
-            });
-            by += menu.row_h;
-        }
-        Ok(())
+            menu.x,
+            menu.y,
+            menu.width / dpi,
+            false,
+            &rows,
+            None,
+            None,
+            0,
+        )
     }
 
     /// Paint the sidebar auto-hide toggle button into `rect` and register its
@@ -17152,6 +17110,129 @@ impl crate::TermWindow {
             (1. * dpi_scale).max(1.),
             opaque(fill),
             opaque(border),
+        )
+    }
+
+    /// Whether any of the fork's floating menus is open.
+    pub(crate) fn any_floating_menu_open(&self) -> bool {
+        self.pane_copy_menu.is_some()
+            || self.agent_launch_menu.is_some()
+            || self.sessions_menu.is_some()
+            || self.new_tab_menu.is_some()
+            || self.close_tab_menu.is_some()
+            || self.sidebar_context_menu.is_some()
+            || self.ssh_launch_menu.is_some()
+            || self.usage_menu.is_some()
+            || self
+                .agent_herd_state
+                .try_borrow()
+                .map_or(false, |state| state.context_menu.is_some())
+            || self.file_tree_menu_open()
+    }
+
+    /// The tooltip of the icon control the pointer rests on; see
+    /// `tgz_tooltip`. Painted last among the floating surfaces. It registers
+    /// no hit item, so it never takes a click from what it covers.
+    pub(crate) fn paint_chrome_tooltip(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+    ) -> anyhow::Result<()> {
+        use crate::termwindow::tgz_tooltip::{
+            advance_hover, chrome_tooltip, tooltip_origin, TooltipPhase,
+        };
+        let under_pointer = self.last_ui_item.clone();
+        let blocked = !self.current_mouse_buttons.is_empty() || self.any_floating_menu_open();
+        let (hover, phase) = advance_hover(
+            self.chrome_tooltip_hover.take(),
+            under_pointer.as_ref().map(|item| &item.item_type),
+            blocked,
+            Instant::now(),
+        );
+        self.chrome_tooltip_hover = hover;
+        match phase {
+            TooltipPhase::Hidden => return Ok(()),
+            TooltipPhase::Waiting(due) => {
+                let mut animation = self.has_animation.borrow_mut();
+                if animation.map_or(true, |at| at > due) {
+                    *animation = Some(due);
+                }
+                return Ok(());
+            }
+            TooltipPhase::Shown => {}
+        }
+        let Some(item) = under_pointer else {
+            return Ok(());
+        };
+        let Some(tooltip) = chrome_tooltip(&item.item_type) else {
+            return Ok(());
+        };
+
+        let shortcut = tooltip.action.as_ref().and_then(|action| {
+            let (key, mods) = self
+                .input_map
+                .locate_app_wide_key_assignment(action)
+                .into_iter()
+                .next()?;
+            let rendering = self.config.ui_key_cap_rendering;
+            let separator = if rendering == ::window::UIKeyCapRendering::AppleSymbols {
+                ""
+            } else {
+                "-"
+            };
+            let mut text = mods.to_string_with_separator(::window::ModifierToStringArgs {
+                separator,
+                want_none: false,
+                ui_key_cap_rendering: Some(rendering),
+            });
+            if !text.is_empty() {
+                text.push_str(separator);
+            }
+            text.push_str(&crate::inputmap::ui_key(&key, rendering));
+            Some(text)
+        });
+        let text = match shortcut {
+            Some(keys) => format!("{}  {keys}", tooltip.label),
+            None => tooltip.label.to_string(),
+        };
+
+        let dpi_scale = (self.dimensions.dpi as f32 / 96.).clamp(1., 2.5);
+        let cell_w = self.render_metrics.cell_size.width as f32;
+        let cell_h = self.render_metrics.cell_size.height as f32;
+        let pad_x = 8. * dpi_scale;
+        let pad_y = 4. * dpi_scale;
+        let text_w = unicode_column_width(&text, None) as f32 * cell_w;
+        let size = (text_w + pad_x * 2., cell_h + pad_y * 2.);
+        let (x, y) = tooltip_origin(
+            (
+                item.x as f32,
+                item.y as f32,
+                item.width as f32,
+                item.height as f32,
+            ),
+            size,
+            (
+                self.dimensions.pixel_width as f32,
+                self.dimensions.pixel_height as f32,
+            ),
+            FLOAT_GAP,
+        );
+        let sb = self.sidebar_palette();
+        let bg = opaque(sb.row_fill);
+        self.paint_menu_surface(
+            layers,
+            euclid::rect(x, y, size.0, size.1),
+            bg,
+            sb.menu_border,
+        )?;
+        self.paint_text(
+            layers,
+            &text,
+            x + pad_x,
+            y + pad_y,
+            text_w + 0.5,
+            sb.text_active,
+            bg,
+            false,
         )
     }
 
@@ -20300,119 +20381,115 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
     }
 
     #[test]
-    fn fit_label_picks_the_widest_variant_that_fits() {
-        assert_eq!(fit_label(&WORKTREE_LABELS, 9), Some("Worktree"));
-        assert_eq!(fit_label(&WORKTREE_LABELS, 8), Some("Worktree"));
-        assert_eq!(fit_label(&WORKTREE_LABELS, 7), Some("Tree"));
-        assert_eq!(fit_label(&WORKTREE_LABELS, 3), Some("Wt"));
-        assert_eq!(fit_label(&WORKTREE_LABELS, 1), None);
-        assert_eq!(fit_label(&WORKTREE_LABELS, 0), None);
-    }
-
-    /// Content geometry for a Left sidebar of `width` with the scrollbar gutter
-    /// shown, mirroring `paint_sidebar`.
-    fn bottom_row_for_width(width: f32, cell_height: f32) -> SidebarBottomRowLayout {
-        let item_x = INSET;
-        let item_w = width - INSET * 2.;
-        let content_w = item_w - RESIZE_GRIP_W as f32 - SIDEBAR_SCROLLBAR_GUTTER_W;
-        sidebar_bottom_row_layout(
-            item_x,
-            item_w,
-            item_x,
-            content_w,
-            sidebar_status_dot_size(cell_height),
-            true,
-        )
+    fn ssh_button_names_the_host_a_click_connects_to() {
+        let label = |host: Option<&str>, cols| ssh_button_label(host, cols).map(Cow::into_owned);
+        // No default host: the generic ladder.
+        assert_eq!(label(None, 20).as_deref(), Some("SSH Connect"));
+        assert_eq!(label(None, 5).as_deref(), Some("SSH"));
+        assert_eq!(label(None, 2).as_deref(), Some(">_"));
+        // A default host is named: in full, then the bare name, elided when
+        // even that does not fit.
+        assert_eq!(label(Some("prod"), 20).as_deref(), Some("SSH · prod"));
+        assert_eq!(label(Some("prod"), 9).as_deref(), Some("prod"));
+        assert_eq!(
+            label(Some("production-db"), 12).as_deref(),
+            Some("production-…")
+        );
+        assert_eq!(label(Some("production-db"), 4).as_deref(), Some("pro…"));
+        // Too narrow to say which: the icon, never "SSH Connect", which
+        // would promise a list the click does not open.
+        assert_eq!(label(Some("prod"), 3).as_deref(), Some(">_"));
+        assert_eq!(label(Some("prod"), 1), None);
+        assert_eq!(label(Some("prod"), 0), None);
     }
 
     #[test]
-    fn worktree_and_agent_labels_fit_at_the_default_width() {
-        // Pins the arithmetic behind the default `sidebar_width_px`: at a 14px
-        // cell on a 2x display both full words must fit their halves. If this
-        // fails, the default width and the label ladder have drifted apart.
-        let cell_width = 14usize;
-        let layout = bottom_row_for_width(
-            config::Config::default_config().sidebar_width_px as f32,
-            32.,
-        );
+    fn fit_label_picks_the_widest_variant_that_fits() {
+        assert_eq!(fit_label(&NEW_TAB_LABELS, 12), Some("+ New Tab"));
+        assert_eq!(fit_label(&NEW_TAB_LABELS, 9), Some("+ New Tab"));
+        assert_eq!(fit_label(&NEW_TAB_LABELS, 8), Some("+ Tab"));
+        assert_eq!(fit_label(&NEW_TAB_LABELS, 4), Some("+"));
+        assert_eq!(fit_label(&NEW_TAB_LABELS, 1), Some("+"));
+        assert_eq!(fit_label(&NEW_TAB_LABELS, 0), None);
+    }
+
+    #[test]
+    fn agent_row_menu_puts_stop_last_under_a_divider() {
+        use AgentRowAction::*;
         assert_eq!(
-            fit_label(
-                &WORKTREE_LABELS,
-                sidebar_text_cols(layout.worktree_text_w, cell_width)
-            ),
-            Some("Worktree")
+            agent_row_menu_order(&[Focus, Stop, Log, CopyId]),
+            [(Focus, false), (Log, false), (CopyId, false), (Stop, true)]
+        );
+        // Nothing to set it apart from.
+        assert_eq!(agent_row_menu_order(&[Stop]), [(Stop, false)]);
+        assert_eq!(
+            agent_row_menu_order(&[Focus, Log]),
+            [(Focus, false), (Log, false)]
+        );
+        assert!(agent_row_menu_order(&[]).is_empty());
+    }
+
+    #[test]
+    fn footer_labels_fit_at_the_default_width() {
+        // Pins the arithmetic behind the default `sidebar_width_px`: at a 14px
+        // cell on a 2x display each button must still say what it opens. If
+        // this fails, the default width and the label ladders have drifted.
+        let cell_width = 14usize;
+        let width = config::Config::default_config().sidebar_width_px as f32;
+        let rows = tgz_footer::default_footer_rows();
+        let slot = |row: usize, item: SidebarFooterItem| {
+            tgz_footer::footer_row_layout(INSET, width - INSET * 2., 38., GAP, &rows[row])
+                .into_iter()
+                .find(|slot| slot.item == item)
+                .unwrap()
+        };
+        let dot = sidebar_status_dot_size(32.);
+        let agent_cols = sidebar_text_cols(
+            slot(1, SidebarFooterItem::Agent).w - FOOTER_SEGMENT_PAD * 2. - dot - ACTION_ICON_GAP,
+            cell_width,
         );
         let claude = default_agent_adapters().remove("claude").unwrap();
         let label = claude.label.clone().unwrap();
-        let rungs = [label.as_str(), "Cl"];
         assert_eq!(
-            fit_label(&rungs, sidebar_text_cols(layout.agent_text_w, cell_width)),
+            fit_label(&[label.as_str(), "Cl"], agent_cols),
             Some("Claude")
         );
+        let tab_cols = sidebar_text_cols(
+            slot(2, SidebarFooterItem::NewTab).w - FOOTER_SEGMENT_PAD * 2.,
+            cell_width,
+        );
+        assert_eq!(fit_label(&NEW_TAB_LABELS, tab_cols), Some("+ New Tab"));
     }
 
     #[test]
-    fn bottom_row_labels_step_down_on_a_one_x_display() {
-        // 1x halves the effective width, and the fixed paddings do not scale, so
-        // the halves are genuinely tight — the ladder is what keeps them legible
-        // instead of clipping mid-word.
-        let layout = bottom_row_for_width(200., 16.);
-        let cell_width = 7usize;
-        assert!(fit_label(
-            &WORKTREE_LABELS,
-            sidebar_text_cols(layout.worktree_text_w, cell_width)
-        )
-        .is_some());
-        assert!(fit_label(
-            &["Claude", "Cl"],
-            sidebar_text_cols(layout.agent_text_w, cell_width)
-        )
-        .is_some());
-    }
-
-    #[test]
-    fn bottom_row_halves_never_overlap() {
-        let mut width = 180.;
-        while width <= 800. {
-            for content_offset in [0., 36.] {
-                let item_x = INSET;
-                let item_w = width - INSET * 2.;
-                let content_x = item_x + content_offset;
-                let content_w = item_w - content_offset - RESIZE_GRIP_W as f32;
-                let layout =
-                    sidebar_bottom_row_layout(item_x, item_w, content_x, content_w, 10., true);
-                assert!(
-                    layout.worktree_fill_x + layout.worktree_fill_w <= layout.agent_fill_x + 0.001,
-                    "fills overlap at width {width}"
-                );
-                assert!(
-                    layout.worktree_text_x + layout.worktree_text_w <= layout.agent_fill_x + 0.001,
-                    "worktree text runs into the agent half at width {width}"
-                );
-                assert!(
-                    layout.agent_text_x + layout.agent_text_w <= item_x + item_w + 0.001,
-                    "agent text runs past the row at width {width}"
-                );
-                assert!(layout.agent_dot_x >= layout.agent_fill_x);
-            }
-            width += 4.;
+    fn every_footer_item_maps_to_its_button() {
+        for (item_type, item) in [
+            (
+                UIItemType::SidebarWorktreeButton,
+                SidebarFooterItem::Worktree,
+            ),
+            (
+                UIItemType::SidebarDiffPanelButton,
+                SidebarFooterItem::Changes,
+            ),
+            (
+                UIItemType::SidebarToolbeltToggle,
+                SidebarFooterItem::Toolbelt,
+            ),
+            (
+                UIItemType::SidebarSecureInputToggle,
+                SidebarFooterItem::SecureInput,
+            ),
+            (
+                UIItemType::SidebarAgentLaunchButton,
+                SidebarFooterItem::Agent,
+            ),
+            (UIItemType::SidebarSshLaunchButton, SidebarFooterItem::Ssh),
+            (UIItemType::SidebarNewTabButton, SidebarFooterItem::NewTab),
+        ] {
+            assert_eq!(footer_item_for(&item_type), Some(item));
         }
-    }
-
-    #[test]
-    fn bottom_row_gives_worktree_everything_without_an_agent() {
-        let layout = sidebar_bottom_row_layout(8., 264., 8., 228., 10., false);
-        assert_eq!(layout.worktree_fill_x, 8.);
-        assert_eq!(layout.worktree_fill_w, 264.);
-        assert_eq!(layout.agent_fill_w, 0.);
-        assert!(layout.worktree_text_w > 0.);
-    }
-
-    #[test]
-    fn bottom_row_fills_reach_the_row_edges() {
-        let layout = sidebar_bottom_row_layout(8., 384., 8., 348., 10., true);
-        assert_eq!(layout.worktree_fill_x, 8.);
-        assert_eq!(layout.agent_fill_x + layout.agent_fill_w, 8. + 384.);
+        assert_eq!(footer_item_for(&UIItemType::SidebarSearch), None);
     }
 
     #[test]
@@ -24049,6 +24126,116 @@ gemini is a constellation\n";
         assert_eq!(view.max_offset, 1);
         let view = dropdown_viewport(&[30., 30.], 1, 20.).unwrap();
         assert_eq!((view.first, view.end), (1, 2));
+    }
+
+    fn context_actions(
+        kind: SidebarContextMenuKind,
+        tab_count: usize,
+    ) -> Vec<SidebarContextAction> {
+        sidebar_context_menu_rows(kind, tab_count, false, false)
+            .into_iter()
+            .map(|row| row.action)
+            .collect()
+    }
+
+    #[test]
+    fn tab_context_menu_leaves_out_rows_that_would_close_nothing() {
+        use SidebarContextAction::*;
+        let tab = |tab_idx| SidebarContextMenuKind::Tab { tab_idx };
+        assert_eq!(
+            context_actions(tab(1), 3),
+            vec![
+                CopyMenu,
+                TabNavigator,
+                CloseTab,
+                CloseTabsAbove,
+                CloseTabsBelow,
+                CloseOtherTabs
+            ]
+        );
+        assert_eq!(
+            context_actions(tab(0), 3),
+            vec![
+                CopyMenu,
+                TabNavigator,
+                CloseTab,
+                CloseTabsBelow,
+                CloseOtherTabs
+            ]
+        );
+        assert_eq!(
+            context_actions(tab(2), 3),
+            vec![
+                CopyMenu,
+                TabNavigator,
+                CloseTab,
+                CloseTabsAbove,
+                CloseOtherTabs
+            ]
+        );
+        assert_eq!(
+            context_actions(tab(0), 1),
+            vec![CopyMenu, TabNavigator, CloseTab]
+        );
+        // The tab was closed while the menu stood open.
+        assert!(context_actions(tab(3), 3).is_empty());
+    }
+
+    #[test]
+    fn tab_context_menu_keeps_the_closing_rows_last_under_a_divider() {
+        let rows =
+            sidebar_context_menu_rows(SidebarContextMenuKind::Tab { tab_idx: 1 }, 3, false, false);
+        let first_close = rows
+            .iter()
+            .position(|row| row.action == SidebarContextAction::CloseTab)
+            .unwrap();
+        assert!(rows[first_close].divider_above);
+        assert!(rows[first_close..].iter().all(|row| matches!(
+            row.action,
+            SidebarContextAction::CloseTab
+                | SidebarContextAction::CloseTabsAbove
+                | SidebarContextAction::CloseTabsBelow
+                | SidebarContextAction::CloseOtherTabs
+        )));
+    }
+
+    #[test]
+    fn agent_section_context_menu_shows_its_settings_as_checkboxes() {
+        let rows = sidebar_context_menu_rows(SidebarContextMenuKind::AgentSection, 0, true, false);
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.action, row.checkbox))
+                .collect::<Vec<_>>(),
+            vec![
+                (SidebarContextAction::ToggleHerdView, Some(true)),
+                (
+                    SidebarContextAction::ToggleAgentSectionCollapsed,
+                    Some(false)
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_release_only_counts_on_the_fork_item_that_was_pressed() {
+        // Buttons that close, stop or delete must not fire from a drag that
+        // merely ends on them.
+        for item in [
+            UIItemType::SidebarPaneClose { pane_id: 1 },
+            UIItemType::SidebarAgentMenuRestoreLastWindow,
+            UIItemType::SidebarWorktreeButton,
+            UIItemType::SidebarContextMenuItem {
+                action: SidebarContextAction::CloseOtherTabs,
+            },
+        ] {
+            assert!(item.release_needs_matching_press(), "{item:?}");
+        }
+        // A Worktree row reads a bare release as a click on purpose, and
+        // upstream's items keep upstream's rules.
+        assert!(!UIItemType::FileTreeRow { index: 0 }.release_needs_matching_press());
+        assert!(!UIItemType::ScrollThumb.release_needs_matching_press());
+        assert!(!UIItemType::TabBar(TabBarItem::NewTabButton).release_needs_matching_press());
+        assert!(!UIItemType::CloseTab(0).release_needs_matching_press());
     }
 
     #[test]

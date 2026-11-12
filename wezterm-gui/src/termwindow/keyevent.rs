@@ -285,6 +285,13 @@ impl super::TermWindow {
                 }
             }
 
+            // An open menu takes the arrows, Enter and Esc before anything
+            // else does.
+            if self.dropdown_menu_key(keycode) {
+                context.invalidate();
+                return true;
+            }
+
             // Agent section keyboard navigation captures arrows/enter/space/esc
             // while active, before they reach the terminal or other bindings.
             if self.agent_section_nav_key(keycode) {

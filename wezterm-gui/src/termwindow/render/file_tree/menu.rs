@@ -231,7 +231,7 @@ impl crate::TermWindow {
                 item_type: UIItemType::FileTreeMenuItem(*action),
             })
             .collect();
-        self.paint_sidebar_dropdown(layers, x, y, MENU_W, true, &rows, None, None)
+        self.paint_sidebar_dropdown(layers, x, y, MENU_W, true, &rows, None, None, 0)
     }
 
     pub fn mouse_event_file_tree_menu_item(

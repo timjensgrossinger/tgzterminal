@@ -29,9 +29,6 @@ const SSH_HOSTS_WATCHDOG: Duration = Duration::from_secs(30);
 /// Recently used hosts kept at the top of the dropdown.
 pub(crate) const MAX_RECENT_HOSTS: usize = 8;
 
-/// The dropdown shows a "type to filter" hint once it has this many rows.
-const FILTER_HINT_MIN_ROWS: usize = 8;
-
 /// One connectable host.
 #[derive(Clone, Debug)]
 pub(crate) struct SshHost {
@@ -391,21 +388,43 @@ fn keep_tail(text: &str, cols: usize) -> String {
     format!("…{tail}")
 }
 
-/// The non-clickable first row of the dropdown, if it should have one: the
-/// filter being typed, or a hint that typing filters once the list is long.
+/// The search row that leads the dropdown: the text being typed, or a hint
+/// that typing searches. It is always there, so the search does not have to
+/// be discovered by typing into a menu that shows no sign of taking text.
 ///
 /// `max_cols` is the text width of a row. A query longer than that scrolls
 /// with the typing, so the characters just typed are always the ones shown.
-pub(crate) fn filter_row_label(query: &str, total: usize, max_cols: usize) -> Option<String> {
-    const PREFIX: &str = "Filter: ";
-    if !query.is_empty() {
-        let room = max_cols.saturating_sub(PREFIX.chars().count()).max(1);
-        Some(format!("{PREFIX}{}", keep_tail(query, room)))
-    } else if total >= FILTER_HINT_MIN_ROWS {
-        Some("Type to filter".to_string())
+pub(crate) fn search_row_label(query: &str, active: bool, max_cols: usize) -> String {
+    if query.is_empty() && !active {
+        "Search hosts…".to_string()
     } else {
-        None
+        // One column is the caret's.
+        format!("{}|", keep_tail(query, max_cols.saturating_sub(1).max(1)))
     }
+}
+
+/// The host a left-click on the SSH button connects to: the configured one
+/// when it names a row, else the most recently used. `None` leaves the
+/// button opening the menu.
+///
+/// `configured` may be the domain name (`SSH:web`), the alias (`web`) or the
+/// row's label, in any case. One that matches nothing falls through to the
+/// recent host rather than disabling the button; the button's label says
+/// which host it will open either way.
+pub(crate) fn default_entry<'a>(
+    entries: &'a [SshQuickLaunchEntry],
+    configured: Option<&str>,
+) -> Option<&'a SshQuickLaunchEntry> {
+    let configured = configured.map(str::trim).filter(|name| !name.is_empty());
+    configured
+        .and_then(|name| {
+            entries.iter().find(|entry| {
+                entry.domain_name.eq_ignore_ascii_case(name)
+                    || domain_alias(&entry.domain_name).eq_ignore_ascii_case(name)
+                    || entry.label.eq_ignore_ascii_case(name)
+            })
+        })
+        .or_else(|| entries.first().filter(|entry| entry.recent))
 }
 
 /// Text columns the dropdown needs to show every row of `entries` in full,
@@ -420,6 +439,19 @@ pub(crate) fn widest_row_cols(entries: &[SshQuickLaunchEntry]) -> usize {
 }
 
 impl TermWindow {
+    /// The domain name and label of the host a left-click on the SSH button
+    /// connects to, if there is one (see [`default_entry`]).
+    pub(crate) fn ssh_default_host(&self) -> Option<(String, String)> {
+        let entries = self.ssh_quick_launch_entries();
+        default_entry(&entries, self.config.sidebar_ssh_default_host.as_deref())
+            .map(|entry| (entry.domain_name.clone(), entry.label.clone()))
+    }
+
+    /// The label half of [`Self::ssh_default_host`], for the button's text.
+    pub(crate) fn ssh_default_host_label(&self) -> Option<String> {
+        self.ssh_default_host().map(|(_, label)| label)
+    }
+
     /// `ShowSshHostMenu`: open the dropdown at its sidebar button, or, when
     /// that button is not on screen (sidebar hidden, or no hosts yet), fall
     /// back to the launcher's fuzzy domain list.
@@ -435,6 +467,8 @@ impl TermWindow {
                     x,
                     y,
                     query: String::new(),
+                    // Opened to type into.
+                    search_active: true,
                     scroll_offset: 0,
                 });
                 if let Some(window) = self.window.as_ref() {
@@ -492,6 +526,7 @@ impl TermWindow {
                     && !c.is_control() =>
             {
                 menu.query.push(c);
+                menu.search_active = true;
                 menu.scroll_offset = 0;
             }
             _ => return false,
@@ -768,36 +803,59 @@ mod tests {
     }
 
     #[test]
-    fn filter_row_appears_for_a_query_or_a_long_list() {
-        assert_eq!(filter_row_label("", 3, 30), None);
-        assert_eq!(
-            filter_row_label("", FILTER_HINT_MIN_ROWS, 30).as_deref(),
-            Some("Type to filter")
-        );
-        assert_eq!(
-            filter_row_label("web", 3, 30).as_deref(),
-            Some("Filter: web")
-        );
+    fn search_field_swaps_its_placeholder_for_a_caret() {
+        // Untouched: the placeholder says what the field is for.
+        assert_eq!(search_row_label("", false, 30), "Search hosts…");
+        // Clicked into: an empty field with a caret, as the tab search.
+        assert_eq!(search_row_label("", true, 30), "|");
+        // Typed into, however it got there.
+        assert_eq!(search_row_label("web", true, 30), "web|");
+        assert_eq!(search_row_label("web", false, 30), "web|");
     }
 
     #[test]
-    fn a_long_filter_scrolls_with_the_typing() {
-        // 14 columns: "Filter: " takes 8, leaving 6 for the query.
-        assert_eq!(
-            filter_row_label("abcdef", 3, 14).as_deref(),
-            Some("Filter: abcdef")
-        );
-        assert_eq!(
-            filter_row_label("abcdefgh", 3, 14).as_deref(),
-            Some("Filter: …defgh")
-        );
-        assert_eq!(
-            filter_row_label("abcdefghi", 3, 14).as_deref(),
-            Some("Filter: …efghi")
-        );
+    fn a_long_search_scrolls_with_the_typing() {
+        // 7 columns: one for the caret, six for the query.
+        assert_eq!(search_row_label("abcdef", true, 7), "abcdef|");
+        assert_eq!(search_row_label("abcdefgh", true, 7), "…defgh|");
+        assert_eq!(search_row_label("abcdefghi", true, 7), "…efghi|");
         // Never wider than the row, however narrow that is.
-        assert_eq!(filter_row_label("abc", 3, 0).as_deref(), Some("Filter: …"));
+        assert_eq!(search_row_label("abc", true, 0), "…|");
         assert_eq!(keep_tail("abc", 3), "abc");
+    }
+
+    #[test]
+    fn the_configured_host_is_the_default_and_the_recent_one_the_fallback() {
+        let mut hosts = derived("web");
+        hosts.extend(derived("db"));
+        let fresh = build_entries(&hosts, &found, &[]);
+        // Nothing configured, nothing used yet: the button opens the menu.
+        assert!(default_entry(&fresh, None).is_none());
+        assert!(default_entry(&fresh, Some("  ")).is_none());
+        // By alias, by domain name, in any case.
+        for name in ["db", "SSH:db", "Db"] {
+            assert_eq!(
+                default_entry(&fresh, Some(name)).map(|e| e.domain_name.as_str()),
+                Some("SSH:db"),
+                "{name}"
+            );
+        }
+
+        let used = build_entries(&hosts, &found, &["SSH:db".to_string()]);
+        assert_eq!(
+            default_entry(&used, None).map(|e| e.domain_name.as_str()),
+            Some("SSH:db")
+        );
+        // The configured host outranks the recent one; a name that matches
+        // nothing falls back to it.
+        assert_eq!(
+            default_entry(&used, Some("web")).map(|e| e.domain_name.as_str()),
+            Some("SSH:web")
+        );
+        assert_eq!(
+            default_entry(&used, Some("gone")).map(|e| e.domain_name.as_str()),
+            Some("SSH:db")
+        );
     }
 
     #[test]

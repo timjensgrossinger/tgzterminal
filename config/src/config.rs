@@ -48,10 +48,33 @@ use wezterm_input_types::{
 };
 use wezterm_term::TerminalSize;
 
+/// A button of the sidebar footer; see `sidebar_footer`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, FromDynamic, ToDynamic)]
+pub enum SidebarFooterItem {
+    /// Worktree (file tree) toggle.
+    Worktree,
+    /// Changes panel toggle.
+    Changes,
+    /// Agent toolbelt toggle.
+    Toolbelt,
+    /// Secure Keyboard Entry lock (macOS).
+    SecureInput,
+    /// Agent launcher.
+    Agent,
+    /// SSH quick-launch.
+    Ssh,
+    /// New tab.
+    NewTab,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, FromDynamic, ToDynamic)]
 pub enum SidebarPosition {
     Left,
     Right,
+}
+
+fn default_sidebar_footer_max_per_row() -> usize {
+    5
 }
 
 impl Default for SidebarPosition {
@@ -2318,6 +2341,37 @@ pub struct Config {
     /// If true, show a slim scrollbar for the sidebar tab list when tabs overflow.
     #[dynamic(default = "default_true")]
     pub sidebar_scroll_bar: bool,
+
+    /// The host a left-click on the sidebar SSH button connects to: an
+    /// `ssh_domains` name or a `~/.ssh/config` alias. Unset, the button
+    /// connects to the host used most recently, and opens the host menu
+    /// when there is none yet. A right-click always opens the menu.
+    #[dynamic(default)]
+    pub sidebar_ssh_default_host: Option<String>,
+
+    /// The sidebar footer's buttons as rows, top to bottom; the buttons of
+    /// a row share it equally. Each name is a `SidebarFooterItem`
+    /// (`'Worktree'`, `'Changes'`, `'Toolbelt'`, `'SecureInput'`, `'Agent'`,
+    /// `'Ssh'`, `'NewTab'`); one that is left out is not shown. Unset, the
+    /// footer is the built-in layout, or the one arranged by dragging
+    /// ("Customize buttons…"); setting it here takes precedence and turns
+    /// dragging off.
+    #[dynamic(default)]
+    pub sidebar_footer: Option<Vec<Vec<SidebarFooterItem>>>,
+
+    /// Relative widths of the sidebar footer's buttons within their row,
+    /// by `SidebarFooterItem` name; a button that is not named weighs 1.
+    /// `{ NewTab = 2 }` makes New Tab twice as wide as each button beside
+    /// it. Like `sidebar_footer`, setting it takes precedence over what was
+    /// arranged by dragging.
+    #[dynamic(default)]
+    pub sidebar_footer_weights: HashMap<String, f64>,
+
+    /// Most buttons one row of the sidebar footer holds, 1 to 7. A longer
+    /// row in `sidebar_footer` continues on the next one; when dragging, a
+    /// full row takes no more.
+    #[dynamic(default = "default_sidebar_footer_max_per_row")]
+    pub sidebar_footer_max_per_row: usize,
 
     /// File browser pane behavior.
     #[dynamic(default)]

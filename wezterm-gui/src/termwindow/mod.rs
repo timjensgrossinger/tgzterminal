@@ -129,9 +129,11 @@ mod selection;
 pub mod shell_copy;
 pub mod spawn;
 pub mod tgz_alt_screen;
+pub(crate) mod tgz_footer;
 pub mod tgz_last_session;
 pub mod tgz_secret_mask;
 pub mod tgz_ssh_hosts;
+pub(crate) mod tgz_tooltip;
 pub mod tgz_ui_state;
 pub mod tgz_usage_menu;
 pub mod tgz_usage_relay;
@@ -645,6 +647,15 @@ pub enum UIItemType {
     /// Sidebar button in the agent section header that opens the sessions
     /// dropdown: the last window's sessions on top, recent sessions below.
     SidebarSessionsButton,
+    /// The boundary on a footer button's right while customizing: drag to
+    /// change how the row is shared.
+    SidebarFooterResize(config::SidebarFooterItem),
+    /// "Done" and "Reset" on the bar shown while customizing the footer.
+    SidebarFooterEdit(FooterEditAction),
+    /// The sidebar's "+": left click opens a tab, right click its menu.
+    /// Its own item rather than the top tab bar's `NewTabButton`, whose right
+    /// click opens the launcher overlay and stays as upstream has it.
+    SidebarNewTabButton,
     /// Chevron beside the sidebar new-tab button.
     SidebarNewTabMenuButton,
     /// A shell/domain row in the new-tab dropdown.
@@ -697,6 +708,60 @@ pub enum UIItemType {
         key: AgentKey,
         action: AgentRowAction,
     },
+    /// A row of a sidebar context menu (a tab row's, the Agents header's).
+    SidebarContextMenuItem {
+        action: SidebarContextAction,
+    },
+}
+
+/// What a row of a sidebar context menu does. The object it acts on is the
+/// open menu's [`SidebarContextMenuKind`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SidebarContextAction {
+    /// Swap this menu for the tab's copy menu.
+    CopyMenu,
+    /// Open the tab navigator overlay.
+    TabNavigator,
+    CloseTab,
+    CloseTabsAbove,
+    CloseTabsBelow,
+    CloseOtherTabs,
+    /// The launcher overlay, from the new-tab menu.
+    ShowLauncher,
+    /// Agents section: this project's agents only, or every project's.
+    ToggleHerdView,
+    /// Agents section: fold to its header, or unfold.
+    ToggleAgentSectionCollapsed,
+    /// Sidebar: rearrange the footer's buttons by dragging.
+    CustomizeFooter,
+}
+
+/// A button of the bar shown while the footer is being customized.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FooterEditAction {
+    /// Keep the arrangement and leave the mode.
+    Done,
+    /// Back to the built-in layout.
+    Reset,
+}
+
+/// The object a sidebar context menu was opened on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SidebarContextMenuKind {
+    Tab {
+        tab_idx: usize,
+    },
+    AgentSection,
+    /// The sidebar itself: a right click on the empty part of the tab list.
+    Sidebar,
+}
+
+/// An open sidebar context menu, anchored where it was asked for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SidebarContextMenuState {
+    pub x: usize,
+    pub y: usize,
+    pub kind: SidebarContextMenuKind,
 }
 
 /// What a button in an expanded agent row does.
@@ -881,6 +946,9 @@ pub struct SshLaunchMenuState {
     pub y: usize,
     /// Typed while the menu is open; rows that do not match are hidden.
     pub query: String,
+    /// The search field has been clicked or typed into: it shows a caret
+    /// instead of its placeholder, as the tab search does.
+    pub search_active: bool,
     /// First row painted once the list is taller than the dropdown cap.
     pub scroll_offset: usize,
 }
@@ -973,8 +1041,46 @@ impl UIItemType {
                 | Self::SidebarSshMenuItem { .. }
                 | Self::PaneCopyMenuItem { .. }
                 | Self::CloseTabMenuItem { .. }
+                | Self::SidebarContextMenuItem { .. }
         )
     }
+
+    /// Whether a left release over this item only counts when the press began
+    /// on the same item.
+    ///
+    /// Mouse capture ends before a release is hit-tested, so a release lands
+    /// on whatever is under the pointer: without this, a press in the terminal
+    /// that ends over Stop, a close button or "Move to Trash" fires it.
+    /// The exceptions are the upstream items, which keep upstream's handling,
+    /// and a Worktree row, which treats a bare release as a click on purpose.
+    pub(crate) fn release_needs_matching_press(&self) -> bool {
+        self.is_fork_chrome() && !matches!(self, Self::FileTreeRow { .. })
+    }
+
+    /// Whether the fork paints this item, as opposed to an upstream one (the
+    /// top tab bar, the pane scroll bar, a split divider). The fork's click
+    /// rules apply to its own chrome only; upstream items behave as upstream
+    /// wrote them.
+    pub(crate) fn is_fork_chrome(&self) -> bool {
+        !matches!(
+            self,
+            Self::TabBar(_)
+                | Self::CloseTab(_)
+                | Self::AboveScrollThumb
+                | Self::ScrollThumb
+                | Self::BelowScrollThumb
+                | Self::Split(_)
+        )
+    }
+}
+
+/// A sidebar menu that a key assignment can open.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ChromeMenu {
+    AgentLaunch,
+    NewTab,
+    Usage,
+    Sessions,
 }
 
 /// The agent row's right-click menu: laid out by the Agents section, painted
@@ -985,8 +1091,6 @@ pub(crate) struct AgentRowMenuLayout {
     pub x: f32,
     pub y: f32,
     pub width: f32,
-    pub row_h: f32,
-    pub pad: f32,
 }
 
 /// State for the agent section embedded in the sidebar.
@@ -1286,6 +1390,8 @@ pub struct TermWindow {
     sidebar_dropdown_scroll: Option<crate::termwindow::render::sidebar::SidebarDropdownScroll>,
     new_tab_menu: Option<AgentLaunchMenuState>,
     close_tab_menu: Option<CloseTabMenuState>,
+    /// The open right-click menu of a sidebar tab row or the Agents header.
+    sidebar_context_menu: Option<SidebarContextMenuState>,
     /// Sidebar SSH quick-launch dropdown anchor. `None` when closed.
     ssh_launch_menu: Option<SshLaunchMenuState>,
     /// The token usage popup, when open.
@@ -1323,6 +1429,24 @@ pub struct TermWindow {
     agent_herd_state: RefCell<AgentHerdState>,
     /// Where the agent row's right-click menu goes this frame.
     agent_row_menu_layout: Option<AgentRowMenuLayout>,
+    /// The icon control the pointer rests on, for its tooltip.
+    chrome_tooltip_hover: Option<tgz_tooltip::ChromeTooltipHover>,
+    /// The footer arrangement made by dragging; `None` is the built-in one.
+    sidebar_footer_custom: Option<tgz_footer::FooterRows>,
+    /// The buttons' relative widths as set by dragging their edges.
+    sidebar_footer_weights: tgz_footer::FooterWeights,
+    /// The footer is being customized: its buttons drag instead of acting.
+    sidebar_footer_edit: bool,
+    /// The footer's buttons as last painted, for the drag to aim at.
+    sidebar_footer_slots: Vec<tgz_footer::PaintedSlot>,
+    /// The rows of the open menus that can be picked, as last painted, for
+    /// keyboard navigation.
+    dropdown_key_rows: Vec<UIItem>,
+    /// The menu row the arrow keys have selected.
+    dropdown_key_selected: Option<UIItemType>,
+    /// The list scrolled under a key press: once repainted, select its last
+    /// (`true`) or first row.
+    dropdown_key_pending_edge: Option<bool>,
     /// Vendor session scan result. Filesystem work runs off the GUI thread.
     agent_herd_session_cache: Option<(Instant, Arc<Vec<crate::agent_herd::vendor::VendorSession>>)>,
     /// When the in-flight scan started, or `None` if none is. A timestamp
@@ -1856,6 +1980,7 @@ impl TermWindow {
             sidebar_dropdown_scroll: None,
             new_tab_menu: None,
             close_tab_menu: None,
+            sidebar_context_menu: None,
             ssh_launch_menu: None,
             usage_menu: None,
             usage_graph_days: 7,
@@ -1870,6 +1995,18 @@ impl TermWindow {
             pane_toolbelt_drag_start: None,
             agent_detection_cache: RefCell::new(HashMap::new()),
             agent_row_menu_layout: None,
+            chrome_tooltip_hover: None,
+            sidebar_footer_custom: tgz_ui_state::load_sidebar_footer()
+                .map(|names| tgz_footer::rows_from_names(&names)),
+            sidebar_footer_weights: tgz_ui_state::load_sidebar_footer_weights()
+                .into_iter()
+                .filter_map(|(name, weight)| Some((tgz_footer::item_from_name(&name)?, weight)))
+                .collect(),
+            sidebar_footer_edit: false,
+            sidebar_footer_slots: Vec::new(),
+            dropdown_key_rows: Vec::new(),
+            dropdown_key_selected: None,
+            dropdown_key_pending_edge: None,
             agent_herd_state: RefCell::new(AgentHerdState {
                 collapsed: tgz_ui_state::load_agent_section_collapsed().unwrap_or(false),
                 view: tgz_ui_state::load_agent_section_view()
@@ -3751,6 +3888,15 @@ impl TermWindow {
                 }
                 true
             }
+            // The row's menu: Stop, Logs and the rest, which otherwise need
+            // a right click. The menu then takes the arrows and Enter.
+            KeyCode::Char('m') => {
+                let key = self.agent_herd_state.borrow().selection.clone();
+                if let Some(key) = key {
+                    self.agent_herd_state.borrow_mut().context_menu = Some(key);
+                }
+                true
+            }
             KeyCode::Char('\u{1b}') => {
                 self.agent_herd_state.borrow_mut().nav_active = false;
                 true
@@ -5509,6 +5655,21 @@ done
             ShowSshHostMenu => {
                 self.show_ssh_host_menu();
             }
+            ToggleSidebarAutoHide => self.toggle_sidebar_auto_hide(),
+            FocusSidebarSearch => self.focus_sidebar_search(),
+            TogglePaneToolbelt => self.toggle_pane_toolbelt_hidden(),
+            LaunchDefaultAgent => {
+                if let Some(entry) = self.agent_launcher_default() {
+                    self.launch_agent(&entry, None, false);
+                }
+            }
+            LaunchAgent(id) => self.launch_agent_by_id(id, None, false),
+            ShowAgentLaunchMenu => self.show_chrome_menu(ChromeMenu::AgentLaunch),
+            ShowNewTabMenu => self.show_chrome_menu(ChromeMenu::NewTab),
+            ShowUsageMenu => self.show_chrome_menu(ChromeMenu::Usage),
+            ShowSessionsMenu => self.show_chrome_menu(ChromeMenu::Sessions),
+            ToggleAgentHerdView => self.toggle_agent_herd_view(),
+            CustomizeSidebarButtons => self.start_sidebar_footer_edit(),
             PasteFrom(source) => {
                 self.paste_from_clipboard(pane, *source);
             }
@@ -6023,6 +6184,21 @@ done
                     if !self.activate_sidebar_pane(target) {
                         self.activate_pane_by_id(target)?;
                     }
+                } else {
+                    // Say so: a key that does nothing looks like a key that
+                    // is not bound.
+                    wezterm_toast_notification::show(
+                        wezterm_toast_notification::ToastNotification {
+                            title: "Agents".to_string(),
+                            message: if queue.is_empty() {
+                                "No agent is waiting for you".to_string()
+                            } else {
+                                "The waiting agent is already in front of you".to_string()
+                            },
+                            url: None,
+                            timeout: Some(Duration::from_millis(1800)),
+                        },
+                    );
                 }
             }
         };
@@ -6248,7 +6424,7 @@ done
     /// Collect the tab_ids for indices in `range` (exclusive of the anchor),
     /// drop the mux window borrow, then remove them in descending order so
     /// earlier indices remain valid during the sweep.
-    fn close_tabs_in_range(&mut self, range: std::ops::Range<usize>) {
+    fn close_tabs_in_range(&mut self, range: std::ops::Range<usize>, anchor_tab_idx: usize) {
         let mux = Mux::get();
         let mux_window = match mux.get_window(self.mux_window_id) {
             Some(w) => w,
@@ -6261,9 +6437,45 @@ done
             }
         }
         drop(mux_window);
-        for tab_id in tab_ids.into_iter().rev() {
-            mux.remove_tab(tab_id);
+        self.close_tabs_confirming(tab_ids, anchor_tab_idx);
+    }
+
+    /// Close `tab_ids`, asking first when any of them would have asked had
+    /// it been closed on its own (a program is still running in it). One
+    /// question covers the batch.
+    fn close_tabs_confirming(&mut self, tab_ids: Vec<TabId>, anchor_tab_idx: usize) {
+        if tab_ids.is_empty() {
+            return;
         }
+        let mux = Mux::get();
+        let busy = tab_ids
+            .iter()
+            .filter(|tab_id| {
+                mux.get_tab(**tab_id)
+                    .is_some_and(|tab| !tab.can_close_without_prompting(CloseReason::Tab))
+            })
+            .count();
+        let total = tab_ids.len();
+        let close = move |_: &mut TermWindow| {
+            let mux = Mux::get();
+            // Descending, so earlier indices stay valid during the sweep.
+            for tab_id in tab_ids.into_iter().rev() {
+                mux.remove_tab(tab_id);
+            }
+        };
+        if busy == 0 {
+            close(self);
+            return;
+        }
+        let message = format!(
+            "Close {total} tab{}? {busy} of them {} still running something.",
+            if total == 1 { "" } else { "s" },
+            if busy == 1 { "is" } else { "are" },
+        );
+        // The question is asked over the active tab; put it on the one that
+        // stays, so the answer does not close the tab it was asked in.
+        self.activate_tab(anchor_tab_idx as isize).ok();
+        self.file_tree_confirm(message, close);
     }
 
     /// Close every tab above (idx < anchor). Preserves the anchor tab.
@@ -6271,7 +6483,7 @@ done
         if anchor_tab_idx == 0 {
             return;
         }
-        self.close_tabs_in_range(0..anchor_tab_idx);
+        self.close_tabs_in_range(0..anchor_tab_idx, anchor_tab_idx);
     }
 
     /// Close every tab below (idx > anchor). Preserves the anchor tab.
@@ -6285,7 +6497,7 @@ done
         if anchor_tab_idx + 1 >= len {
             return;
         }
-        self.close_tabs_in_range((anchor_tab_idx + 1)..len);
+        self.close_tabs_in_range((anchor_tab_idx + 1)..len, anchor_tab_idx);
     }
 
     /// Close every tab except the anchor. Preserves the anchor tab.
@@ -6312,9 +6524,7 @@ done
             }
         }
         drop(mux_window);
-        for tab_id in tab_ids.into_iter().rev() {
-            mux.remove_tab(tab_id);
-        }
+        self.close_tabs_confirming(tab_ids, anchor_tab_idx);
     }
 
     pub fn pane_state(&self, pane_id: PaneId) -> RefMut<'_, PaneState> {

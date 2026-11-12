@@ -50,16 +50,89 @@ physical-pixel choice) and is **not** persisted — restart returns to
 
 Two thresholds change the *layout* rather than just the text:
 
-- at 96px and below the search row and the auto-hide toggle are dropped;
-- at 180px and below the Worktree / agent-launcher row is dropped, and the tab
-  list reclaims the space.
+- at 96px and below the search row and the auto-hide toggle are dropped.
+
+The footer is three rows by default. **New Tab** takes the whole bottom
+row: it is the most used button, so it gets the largest target. Above it sits
+the **launch row**, split in halves — the agent launcher on the left, SSH on
+the right — so each touches a side edge; with no host to offer the agent
+launcher takes the row. On top sits the **view strip**: toggles for what is on
+show — Worktree (folder), Changes (`±`), the agent toolbelt (wrench) and
+Secure Keyboard Entry (lock) — lit while their panel or mode is on. The
+toggles share the row equally, and a sidebar wide enough for all of them adds
+a word beside each icon (`Files`, `Diff`, `Tools`, `Lock`). When the strip is
+too narrow for all of them the lock goes first, then the wrench.
+
+Resting the pointer on an icon for half a second names it, says what a
+right-click opens, and shows its shortcut when one is bound.
+
+#### Arranging the footer
+
+That layout is the default, not a fixed one. The footer is a list of rows, and
+the buttons of a row share it equally.
+
+**By dragging.** Right-click the empty part of the tab list and pick
+**Customize buttons…** (or run "Customize sidebar buttons" from the command
+palette, `CustomizeSidebarButtons`). A bar appears above the footer; while it
+is there the buttons drag instead of acting:
+
+- drag a button onto another to put it beside that one, in the same row or a
+  different one (a row holds five buttons, see `sidebar_footer_max_per_row`);
+- drag it above the footer to give it a row of its own (up to five rows);
+- drag the grip between two buttons to make the left one wider or narrower:
+  the buttons after it shrink to make room, down to a square, and when they
+  cannot shrink any more the row's last button moves to the row above;
+- a row that loses its last button disappears;
+- **Reset** restores the default, **Done** or `Esc` keeps the arrangement.
+
+The arrangement is remembered across restarts.
+
+**From Lua.** `sidebar_footer` fixes the layout in config, rows top to bottom:
+
+```lua
+config.sidebar_footer = {
+  { 'Agent', 'Ssh' },
+  { 'Worktree', 'Changes', 'NewTab' },
+}
+```
+
+Names: `Worktree`, `Changes`, `Toolbelt`, `SecureInput`, `Agent`, `Ssh`,
+`NewTab`. A button left out is not shown (its action stays in the command
+palette). A button with nothing to offer — `Ssh` with no host, `Changes` with
+the panel disabled — is skipped either way. While `sidebar_footer` is set it
+wins over a dragged arrangement, and Customize says so instead of starting.
+
+Widths are relative weights within a row; a button that is not named weighs 1:
+
+```lua
+-- New Tab twice as wide as each button it shares a row with.
+config.sidebar_footer_weights = { NewTab = 2 }
+-- At most three buttons to a row (default 5, 1 to 7).
+config.sidebar_footer_max_per_row = 3
+```
+
+Setting `sidebar_footer_weights` fixes the layout from Lua just as
+`sidebar_footer` does. `sidebar_footer_max_per_row` only sets the limit and
+leaves dragging on.
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `sidebar_footer` | unset | Footer rows, top to bottom; see above. |
+| `sidebar_footer_weights` | `{}` | Relative button widths within a row, by button name. |
+| `sidebar_footer_max_per_row` | `5` | Most buttons a footer row holds (1 to 7). |
+
+Every footer button follows the same rule: a left-click does the button's one
+action, a right-click (Ctrl+click on macOS) opens its menu of alternatives.
+
+On a tab row, Copy and `×` are drawn on the active row and on the row under
+the pointer; their click areas are there on every row.
 
 Everything else adapts by measuring: each label picks the widest variant that
-fits its box — `Worktree → Tree → Wt`, an adapter's `label → short_label`,
-`+ New Tab → + Tab → +` — and falls back to its icon or dot alone rather than
-rendering a clipped word. The default of 400 is the width at which both
-`Worktree` and a full adapter label fit their halves of the shared bottom row at
-a typical 14px cell, with headroom for wider monospace faces.
+fits its box — an adapter's `label → short_label`, `+ New Tab → + Tab → +`,
+`SSH · host → host → >_` — and falls back to its icon or dot alone rather than
+rendering a clipped word. The default of 400 is the width at which a full
+adapter label fits its half of the launch row at a typical 14px
+cell, with headroom for wider monospace faces.
 
 ### Pane rows
 
@@ -868,9 +941,8 @@ marker nor a prompt.
 ### Agent launcher
 
 `agent_ui.launcher` adds a sidebar button that starts a fresh agent session. It
-shares a row with the Worktree button (Worktree on the left, the agent on the
-right) and, when the sidebar is collapsed, takes the icon rail slot directly
-above `+`.
+is the left half of the launch row, just above New Tab, and, when
+the sidebar is collapsed, takes the icon rail slot directly above `+`.
 
 - Left-click launches the default agent.
 - Alt-click launches it into the *other* target — see `open_in` below.
@@ -890,8 +962,8 @@ directories — `~/.local/bin`, `~/bin`, `~/.claude/local`, `~/.bun/bin`,
 `/opt/homebrew/bin`, `/usr/local/bin` — because an app bundle launched from
 Finder or the Dock inherits launchd's minimal `PATH`, not the login shell's, and
 would otherwise miss `~/.local/bin/claude`. The resolved absolute path is what
-gets spawned, for the same reason. Nothing installed means no button at all, and
-the Worktree button keeps its original full width. `launch_command` is a plain
+gets spawned, for the same reason. With nothing installed the segment reads
+`Agents` and only opens its menu. `launch_command` is a plain
 argv with no `{...}` substitutions — the working directory is supplied by the
 launcher, not baked into the command. Built-in launch commands are `claude`,
 `codex`, `gemini`, `opencode`, `copilot`, `cursor-agent`, and `amp`.
@@ -1388,14 +1460,54 @@ activity log overlay — press `r` to refresh, `q`/Esc to close), `Copy Id`, and
 
 **Keyboard navigation:** bind `ActivateAgentSection` (e.g.
 `CTRL|SHIFT|a`) to enter navigation mode; `↑`/`↓` move the cursor,
-`Enter`/`←` focus the selected agent, `Space`/`→` expand it, `Esc` exits.
+`Enter`/`←` focus the selected agent, `Space`/`→` expand it, `m` opens the
+row's menu (Stop, Logs, Transcript, …), `Esc` exits.
+
+### Sidebar from the keyboard
+
+Everything the sidebar's buttons do has a key assignment, each one is in the
+command palette, and most have a default key (`CMD|SHIFT` on macOS, the same
+letters with `SUPER|SHIFT` elsewhere, where the desktop may claim some of them
+first). Your own `config.keys` entries win over these.
+
+| Action | Default | Does |
+|--------|---------|------|
+| `ToggleSidebarAutoHide` | `CMD|SHIFT|b` | Pins the sidebar open or lets it collapse to its rail. |
+| `FocusSidebarSearch` | `CMD|SHIFT|f` | Puts the keyboard in the tab search field. |
+| `TogglePaneToolbelt` | `CMD|SHIFT|l` | Shows or hides the agent toolbelt. |
+| `LaunchDefaultAgent` | `CMD|SHIFT|a` | Starts the default agent, as the agent button does. |
+| `LaunchAgent 'claude'` | none | Starts the agent with that adapter id. |
+| `ShowAgentLaunchMenu` | `CMD|SHIFT|g` | Opens the agent launch menu. |
+| `ShowNewTabMenu` | `CMD|SHIFT|n` | Opens the shell/domain menu of `+ New Tab`. |
+| `ShowSessionsMenu` | `CMD|SHIFT|r` | Opens the recent sessions menu. |
+| `ShowUsageMenu` | `CMD|SHIFT|u` | Opens the usage popup. |
+| `ToggleAgentHerdView` | `CMD|SHIFT|o` | Agents section: this project / all projects. |
+| `CustomizeSidebarButtons` | none | Rearrange the footer's buttons by dragging. |
+| `ShowSshHostMenu` | `CMD|SHIFT|h` | Opens the SSH host menu, ready to type a filter. |
+| `CycleWaitingAgent` | `CMD|SHIFT|j` | Jumps to the next waiting agent; says so when none is waiting. |
+| `ActivateAgentSection` | `CTRL|SHIFT|a` | Keyboard navigation of the Agents section. |
+| `OpenFileBrowser`, `ToggleDiffPanel`, `ToggleSecureKeyboardEntry` | none | The view strip's Worktree, Changes and lock toggles. |
+
+`LaunchAgent` takes an adapter id, so it has no default; bind it yourself:
+
+```lua
+config.keys = {
+  { key = 'c', mods = 'CMD|ALT', action = wezterm.action.LaunchAgent 'codex' },
+}
+```
+
+While any sidebar menu is open, `↑`/`↓` move over its rows, `Enter` picks the
+selected row and `Esc` closes the menu. A menu opened from the keyboard appears
+at the button that opens it with the mouse. A bound shortcut is also shown in
+that button's tooltip.
 
 ### New-tab dropdown
 
-`new_tab_menu` controls the chevron beside the sidebar's `+ New Tab` button,
-which opens a small picker of the shells and domains available on this machine.
-Clicking the `+` label itself still opens a tab as before, and right-clicking it
-still opens WezTerm's full launcher overlay.
+`new_tab_menu` controls the menu behind the sidebar's `+ New Tab` button: a
+small picker of the shells and domains available on this machine. A left-click
+on the button opens a tab as before; a right-click (or Ctrl+click on macOS)
+opens the picker, whose last row, `Launcher…`, opens WezTerm's full launcher
+overlay. There is no separate chevron button.
 
 The list is grouped, with a divider between groups:
 
@@ -1411,8 +1523,9 @@ The list is grouped, with a divider between groups:
   shell.
 
 Picking a row carries the current directory into the new tab using the same
-translation rules as the agent launcher above. The chevron is hidden entirely
-when the list would be empty.
+translation rules as the agent launcher above. When the list would be empty
+(or `new_tab_menu.enabled = false`), a right-click opens the launcher overlay
+directly.
 
 Telemetry field names are vendor-neutral. Provider names may be supplied by user
 configuration or pane metadata, but the public UI contract is based on generic
@@ -1561,10 +1674,9 @@ moved and switched off at runtime:
 - **Double-click** the dot or label to put it back where `toolbelt_position`
   places it (which also keeps clear of a floating Changes panel again).
 - The **wrench button** beside the Changes (`±`) button in the sidebar shows or
-  hides the strip. It sits on the Worktree row, in the collapsed rail, and on the
-  narrow new-tab row when that row has room for it (at the 140px drag floor it
-  does not; the rail and the wide row still offer it). Hiding the strip does not
-  touch the sidebar's Copy icon.
+  hides the strip. It sits in the footer's view strip and in the collapsed
+  rail; a strip too narrow for every toggle drops the lock first, then the
+  wrench. Hiding the strip does not touch the sidebar's Copy icon.
 
 There is one position for every agent pane, kept as the distance from the pane's
 top-right corner, so it carries across panes of different sizes. Both the
@@ -2093,10 +2205,28 @@ files here; open the panel in a project folder" (the number is the setting).
 
 ## SSH Quick-Launch (mosh / Eternal Terminal)
 
-TGZTerminal adds a standalone sidebar button (below the agent launcher)
-that opens a dropdown of pre-registered SSH connections. Each row spawns
-into a new tab. The list comes from `config.ssh_domains` — the same key
-upstream WezTerm uses — plus two new per-domain fields:
+TGZTerminal adds an SSH button to the sidebar's launch row (right of the agent launcher)
+for pre-registered SSH connections. Each connection opens in a new tab.
+
+- **Left-click** connects to the default host, and the button names it
+  (`SSH · prod`, or just `prod` where that does not fit). The default is `sidebar_ssh_default_host` when set, else
+  the host used most recently. With neither, the button reads `SSH Connect`
+  and a left-click opens the host menu.
+- **Right-click** (or Ctrl+click on macOS) always opens the host menu. Its
+  first row is a search field that stays in place while the hosts scroll:
+  type to narrow the list, Enter connects to the first match, Esc closes.
+
+```lua
+-- An ssh_domains name or a ~/.ssh/config alias, in any case.
+config.sidebar_ssh_default_host = "prod"
+```
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `sidebar_ssh_default_host` | string | unset | Host a left-click on the SSH button connects to. A name that matches no host falls back to the most recently used one. |
+
+The list comes from `config.ssh_domains` — the same key upstream WezTerm
+uses — plus two new per-domain fields:
 
 | Key (on `SshDomain`) | Type | Default | Meaning |
 |---|---|---|---|
@@ -2187,7 +2317,8 @@ and no sidecar binaries installed).
 
 ### Filtering, recents and the keyboard
 
-- **Type to filter.** While the dropdown is open, typing narrows it to the
+- **Type to search.** The dropdown's first row is a search field. While the
+  dropdown is open, typing narrows it to the
   rows containing every word you typed (in the host, its details or its
   badge, case-insensitively). `Backspace` edits, `Enter` connects to the
   first match, `Esc` closes. A list longer than 14 rows scrolls.
@@ -2341,8 +2472,8 @@ you are not left hunting for one.
 |---|---|
 | Search box | Appears when the sidebar is wider than 96px. The `Search tabs...` placeholder is hardcoded, and steps down to `Search...` / `Search` when the row is narrow. |
 | Auto-hide toggle button | Always drawn alongside the search row. Clicking it persists a value that then overrides `sidebar_auto_hide`. |
-| Worktree button | Appears when the sidebar is wider than 180px; its label ladder and its half of the shared row are computed, not configured. |
-| `+ New Tab` button and label | Always drawn. `new_tab_menu.enabled` controls only the chevron beside it, not the button. |
+| Worktree toggle | Always the first toggle of the footer's view strip, as a folder icon; lit while the panel is open. |
+| `+ New Tab` button and label | Always drawn. `new_tab_menu.enabled` controls only its right-click picker, not the button. |
 | Collapsed icon-rail composition | Derived from the auto-hide state and whether an agent CLI was discovered. Two-character badges come from an adapter's `short_label`. |
 | Toolbelt button labels, sizes and drop order | Hardcoded. When the strip is too narrow buttons are dropped in a fixed order (Input/Compose, then Details, Attach, Resume), and Stop is the last one standing. |
 | Per-toolbelt-button visibility | Toolbelt visibility is derived. Herd-row `Stop` is governed by `agent_ui.show_stop`; it appears when the agent can be interrupted. `Attach` / `Resume` / `Details` need their action templates *and* the control-action gate; `Input` / `Compose` follow `rich_input.enabled` and `rich_input.docked`. If a button is missing, it is a detection or a gate question — see *How an agent is identified*. |

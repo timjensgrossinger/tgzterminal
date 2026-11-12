@@ -1377,15 +1377,26 @@ impl crate::TermWindow {
                 }
                 context.invalidate();
             }
+            // Not undoable: every change shown so far stops being a change.
             Some(Ok(DiffPanelAction::ResetBaseline)) => {
-                if let Some(view) = self.diff_panel.views.get_mut(&tab_id) {
-                    if let Some(Scan::Changes(set)) = &view.scan {
-                        if set.source == ChangeSource::Snapshot {
-                            diff_panel::snapshot::reset(&snapshot_base(), &set.root);
+                self.file_tree_confirm(
+                    "Reset the Changes baseline? The files as they are now become \
+                     the starting point, and the changes listed so far are no longer shown."
+                        .to_string(),
+                    move |term_window| {
+                        if let Some(view) = term_window.diff_panel.views.get_mut(&tab_id) {
+                            if let Some(Scan::Changes(set)) = &view.scan {
+                                if set.source == ChangeSource::Snapshot {
+                                    diff_panel::snapshot::reset(&snapshot_base(), &set.root);
+                                }
+                            }
+                            view.scanned_at = None;
                         }
-                    }
-                    view.scanned_at = None;
-                }
+                        if let Some(window) = term_window.window.as_ref() {
+                            window.invalidate();
+                        }
+                    },
+                );
                 context.invalidate();
             }
             Some(Err(index)) => {

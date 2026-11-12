@@ -450,7 +450,7 @@ impl crate::TermWindow {
 
     /// Ask `message` in an overlay over the tab; `on_yes` runs on the GUI
     /// thread if the answer is yes.
-    pub(super) fn file_tree_confirm(
+    pub(crate) fn file_tree_confirm(
         &mut self,
         message: String,
         on_yes: impl FnOnce(&mut crate::TermWindow) + Send + Sync + 'static,
@@ -703,6 +703,9 @@ impl crate::TermWindow {
                 }
                 context.invalidate();
             }
+            // The scroll bar has no options of its own, and it is not the
+            // tree's empty area either.
+            WMEK::Press(MousePress::Right) => {}
             _ => self.mouse_event_file_tree(None, event, context),
         }
     }
