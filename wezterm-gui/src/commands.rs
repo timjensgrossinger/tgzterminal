@@ -2259,6 +2259,14 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             menubar: &["View"],
             icon: None,
         },
+        ShowSettings => CommandDef {
+            brief: "Settings".into(),
+            doc: "Opens the Settings tab; changes are written to your wezterm.lua".into(),
+            keys: vec![(Modifiers::SUPER, ",".into())],
+            args: &[ArgType::ActiveWindow],
+            menubar: &["Window"],
+            icon: Some("md_cog"),
+        },
         ShowSshHostMenu => CommandDef {
             brief: "Connect to SSH host".into(),
             doc: "Opens the sidebar's SSH quick-launch list; type to filter, \
@@ -2352,6 +2360,7 @@ fn compute_default_actions() -> Vec<KeyAssignment> {
         ActivateComposer,
         ToggleDockedInput,
         // ----------------- View
+        ShowSettings,
         ToggleSidebarAutoHide,
         CustomizeSidebarButtons,
         FocusSidebarSearch,

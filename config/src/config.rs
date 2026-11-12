@@ -49,7 +49,11 @@ use wezterm_input_types::{
 use wezterm_term::TerminalSize;
 
 /// A button of the sidebar footer; see `sidebar_footer`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, FromDynamic, ToDynamic)]
+///
+/// In Lua a button is a string: a plain name (`'Worktree'`, `'Usage'`), or
+/// `'agent:<adapter>'`, `'agent-tab:<adapter>'`, `'custom:<id>'` for the
+/// ones that name something.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SidebarFooterItem {
     /// Worktree (file tree) toggle.
     Worktree,
@@ -65,6 +69,187 @@ pub enum SidebarFooterItem {
     Ssh,
     /// New tab.
     NewTab,
+    /// Recent agent sessions.
+    Sessions,
+    /// Usage and limits.
+    Usage,
+    /// The Settings tab.
+    Settings,
+    /// The command palette.
+    CommandPalette,
+    /// Split the active pane, new pane on the right.
+    SplitRight,
+    /// Split the active pane, new pane below.
+    SplitDown,
+    /// The Tower tab (builds with Tower only).
+    Tower,
+    /// The host menu, narrowed to mosh hosts.
+    Mosh,
+    /// The host menu, narrowed to Eternal Terminal hosts.
+    Et,
+    /// `agent:<adapter>`: start that agent where the launcher would.
+    AgentLaunch(&'static str),
+    /// `agent-tab:<adapter>`: start that agent in a tab of its own.
+    AgentTab(&'static str),
+    /// `custom:<id>`: the `sidebar_buttons` entry of that name.
+    Custom(&'static str),
+}
+
+/// `text` as a string that lives as long as the process. Footer buttons
+/// that name an adapter or a custom button stay `Copy` this way; each
+/// distinct name is kept once, and there are only as many as the config and
+/// the installed agents mention.
+fn intern_footer_name(text: &str) -> &'static str {
+    static NAMES: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
+    let mut names = NAMES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(known) = names.iter().find(|known| **known == text) {
+        return known;
+    }
+    let leaked: &'static str = Box::leak(text.to_string().into_boxed_str());
+    names.push(leaked);
+    leaked
+}
+
+impl SidebarFooterItem {
+    /// The buttons without a name of their own to carry: the variant, as
+    /// Lua spells it, and the state-file spelling.
+    pub const PLAIN: [(Self, &'static str, &'static str); 16] = [
+        (Self::Worktree, "Worktree", "worktree"),
+        (Self::Changes, "Changes", "changes"),
+        (Self::Toolbelt, "Toolbelt", "toolbelt"),
+        (Self::SecureInput, "SecureInput", "lock"),
+        (Self::Agent, "Agent", "agent"),
+        (Self::Ssh, "Ssh", "ssh"),
+        (Self::NewTab, "NewTab", "new_tab"),
+        (Self::Sessions, "Sessions", "sessions"),
+        (Self::Usage, "Usage", "usage"),
+        (Self::Settings, "Settings", "settings"),
+        (Self::CommandPalette, "CommandPalette", "command_palette"),
+        (Self::SplitRight, "SplitRight", "split_right"),
+        (Self::SplitDown, "SplitDown", "split_down"),
+        (Self::Tower, "Tower", "tower"),
+        (Self::Mosh, "Mosh", "mosh"),
+        (Self::Et, "Et", "et"),
+    ];
+
+    /// The button's name in the state file, and in Lua for the ones that
+    /// name something.
+    pub fn name(&self) -> String {
+        match self {
+            Self::AgentLaunch(id) => format!("agent:{id}"),
+            Self::AgentTab(id) => format!("agent-tab:{id}"),
+            Self::Custom(id) => format!("custom:{id}"),
+            plain => Self::PLAIN
+                .iter()
+                .find(|(item, _, _)| item == plain)
+                .map(|(_, _, name)| name.to_string())
+                .unwrap_or_default(),
+        }
+    }
+
+    /// The button's name as a Lua config writes it.
+    pub fn lua_name(&self) -> String {
+        Self::PLAIN
+            .iter()
+            .find(|(item, _, _)| item == self)
+            .map(|(_, variant, _)| variant.to_string())
+            .unwrap_or_else(|| self.name())
+    }
+
+    /// A button by either spelling of its name; plain names in any case and
+    /// with or without underscores. `None` for a name nobody has.
+    pub fn from_name(name: &str) -> Option<Self> {
+        let name = name.trim();
+        for (prefix, make) in [
+            ("agent-tab:", Self::AgentTab as fn(&'static str) -> Self),
+            ("agent:", Self::AgentLaunch),
+            ("custom:", Self::Custom),
+        ] {
+            if let Some(id) = name.strip_prefix(prefix) {
+                let id = id.trim();
+                return (!id.is_empty()).then(|| make(intern_footer_name(id)));
+            }
+        }
+        let fold = |text: &str| -> String {
+            text.chars()
+                .filter(|c| *c != '_')
+                .flat_map(char::to_lowercase)
+                .collect()
+        };
+        let wanted = fold(name);
+        Self::PLAIN
+            .iter()
+            .find(|(_, variant, state)| fold(variant) == wanted || fold(state) == wanted)
+            .map(|(item, _, _)| *item)
+    }
+}
+
+impl FromDynamic for SidebarFooterItem {
+    fn from_dynamic(
+        value: &wezterm_dynamic::Value,
+        _options: wezterm_dynamic::FromDynamicOptions,
+    ) -> Result<Self, wezterm_dynamic::Error> {
+        match value {
+            wezterm_dynamic::Value::String(name) => Self::from_name(name).ok_or_else(|| {
+                wezterm_dynamic::Error::Message(format!(
+                    "`{name}` is not a sidebar footer button. Buttons are {}, \
+                     `agent:<adapter>`, `agent-tab:<adapter>` and `custom:<id>`",
+                    Self::PLAIN
+                        .iter()
+                        .map(|(_, variant, _)| format!("`{variant}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))
+            }),
+            other => Err(wezterm_dynamic::Error::NoConversion {
+                source_type: other.variant_name().to_string(),
+                dest_type: "SidebarFooterItem",
+            }),
+        }
+    }
+}
+
+impl ToDynamic for SidebarFooterItem {
+    fn to_dynamic(&self) -> wezterm_dynamic::Value {
+        wezterm_dynamic::Value::String(self.lua_name())
+    }
+}
+
+/// A button of your own for the sidebar footer; see `sidebar_buttons`.
+#[derive(Debug, Clone, Default, PartialEq, FromDynamic, ToDynamic)]
+pub struct SidebarButtonConfig {
+    /// The text on the button. Unset, the button shows its name.
+    #[dynamic(default)]
+    pub label: String,
+
+    /// One glyph drawn before the label, and alone when the button is too
+    /// narrow for text. A glyph of the bundled Symbols Nerd Font shows on
+    /// every platform.
+    #[dynamic(default)]
+    pub icon: Option<String>,
+
+    /// A command line, run in a new tab; split into words the way a shell
+    /// would, without running one.
+    #[dynamic(default)]
+    pub command: Option<String>,
+
+    /// Any key assignment, e.g. `wezterm.action.ShowLauncher`. Used when
+    /// there is no `command`.
+    #[dynamic(default)]
+    pub action: Option<KeyAssignment>,
+}
+
+impl SidebarButtonConfig {
+    /// Whether the button has anything to do; one that does not is not
+    /// offered.
+    pub fn is_usable(&self) -> bool {
+        self.command
+            .as_deref()
+            .is_some_and(|command| !command.trim().is_empty())
+            || self.action.is_some()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, FromDynamic, ToDynamic)]
@@ -2352,7 +2537,10 @@ pub struct Config {
     /// The sidebar footer's buttons as rows, top to bottom; the buttons of
     /// a row share it equally. Each name is a `SidebarFooterItem`
     /// (`'Worktree'`, `'Changes'`, `'Toolbelt'`, `'SecureInput'`, `'Agent'`,
-    /// `'Ssh'`, `'NewTab'`); one that is left out is not shown. Unset, the
+    /// `'Ssh'`, `'NewTab'`, `'Sessions'`, `'Usage'`, `'Settings'`,
+    /// `'CommandPalette'`, `'SplitRight'`, `'SplitDown'`, `'Tower'`,
+    /// `'Mosh'`, `'Et'`, `'agent:<adapter>'`, `'agent-tab:<adapter>'`,
+    /// `'custom:<id>'`); one that is left out is not shown. Unset, the
     /// footer is the built-in layout, or the one arranged by dragging
     /// ("Customize buttons…"); setting it here takes precedence and turns
     /// dragging off.
@@ -2366,6 +2554,12 @@ pub struct Config {
     /// arranged by dragging.
     #[dynamic(default)]
     pub sidebar_footer_weights: HashMap<String, f64>,
+
+    /// Buttons of your own for the sidebar footer, by id. One is placed
+    /// with "Customize buttons" and its `+`, or as `'custom:<id>'` in
+    /// `sidebar_footer`.
+    #[dynamic(default)]
+    pub sidebar_buttons: HashMap<String, SidebarButtonConfig>,
 
     /// Most buttons one row of the sidebar footer holds, 1 to 7. A longer
     /// row in `sidebar_footer` continues on the next one; when dragging, a
@@ -3154,6 +3348,26 @@ impl Config {
             lua: Some(lua),
             warnings,
         }))
+    }
+
+    /// Evaluate `text` the way the config file at `path` would be, without
+    /// adopting the result. The Settings tab calls this on an edited config
+    /// before it replaces the file, so a bad edit never reaches disk.
+    pub fn check_lua_text(path: &Path, text: &str) -> anyhow::Result<()> {
+        let lua = make_lua_context(path)?;
+        let (checked, _warnings) =
+            wezterm_dynamic::Error::capture_warnings(|| -> anyhow::Result<()> {
+                let value: mlua::Value = smol::block_on(
+                    lua.load(text.trim_start_matches('\u{FEFF}'))
+                        .set_name(path.to_string_lossy())
+                        .eval_async(),
+                )?;
+                let cfg = Config::from_lua(value, &lua)?;
+                cfg.check_consistency()?;
+                let _ = cfg.key_bindings();
+                Ok(())
+            });
+        checked
     }
 
     pub(crate) fn apply_overrides_obj_to<'l>(

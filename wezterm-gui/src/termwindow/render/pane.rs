@@ -64,6 +64,9 @@ impl crate::TermWindow {
         if crate::termwindow::tgz_tower::is_tower_pane(&pos.pane) {
             return crate::termwindow::tgz_tower::paint(self, pos, layers);
         }
+        if crate::termwindow::tgz_settings::is_settings_pane(&pos.pane) {
+            return self.paint_settings_pane(pos, layers);
+        }
         if self.config.use_box_model_render {
             return self.paint_pane_box_model(pos);
         }

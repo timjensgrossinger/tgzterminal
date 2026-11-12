@@ -2574,6 +2574,7 @@ pub(crate) fn footer_item_for(item_type: &UIItemType) -> Option<SidebarFooterIte
         UIItemType::SidebarAgentLaunchButton => SidebarFooterItem::Agent,
         UIItemType::SidebarSshLaunchButton => SidebarFooterItem::Ssh,
         UIItemType::SidebarNewTabButton => SidebarFooterItem::NewTab,
+        UIItemType::SidebarFooterAction(item) => *item,
         _ => return None,
     })
 }
@@ -4419,10 +4420,19 @@ pub(crate) fn sidebar_context_menu_rows(
             }
             rows
         }
-        SidebarContextMenuKind::Sidebar => vec![row(
-            SidebarContextAction::CustomizeFooter,
-            "Customize buttons\u{2026}",
-        )],
+        SidebarContextMenuKind::Sidebar => vec![
+            row(
+                SidebarContextAction::CustomizeFooter,
+                "Customize buttons\u{2026}",
+            ),
+            row(SidebarContextAction::ShowSettings, "Settings\u{2026}"),
+        ],
+        // Its rows are the buttons not placed yet, which only the window
+        // knows; see `paint_sidebar_context_menu`.
+        SidebarContextMenuKind::FooterAdd => Vec::new(),
+        SidebarContextMenuKind::FooterItem(_) => {
+            vec![row(SidebarContextAction::RemoveFooterItem, "Remove button")]
+        }
         SidebarContextMenuKind::AgentSection => vec![
             SidebarContextRow {
                 checkbox: Some(all_projects),
@@ -9894,7 +9904,9 @@ impl crate::TermWindow {
             }
         }
         let rows = match self.sidebar_footer_custom.as_ref() {
-            Some(rows) => tgz_footer::normalize_footer_rows_capped(rows, true, max_row),
+            // Not topped up with the buttons it lacks: one that is missing
+            // was taken out on purpose, and the `+` brings it back.
+            Some(rows) => tgz_footer::normalize_footer_rows_capped(rows, false, max_row),
             None => tgz_footer::default_footer_rows(),
         };
         // Widths from Lua fix the layout as much as rows from Lua do.
@@ -9921,18 +9933,94 @@ impl crate::TermWindow {
             .collect()
     }
 
+    /// Whether a footer button has something to offer right now: ssh with
+    /// no host, Changes with the panel disabled, an agent that is not
+    /// installed and a button of the user's with nothing to run do not.
+    pub(crate) fn sidebar_footer_item_available(&self, item: SidebarFooterItem) -> bool {
+        use SidebarFooterItem as I;
+        let has_transport = |wanted: config::SshTransport| {
+            self.ssh_quick_launch_entries()
+                .iter()
+                .any(|entry| entry.transport == wanted)
+        };
+        match item {
+            I::Worktree
+            | I::Agent
+            | I::NewTab
+            | I::Settings
+            | I::CommandPalette
+            | I::SplitRight
+            | I::SplitDown => true,
+            I::Changes => self.config.diff_panel.enabled,
+            I::Toolbelt => self.sidebar_toolbelt_toggle_shown(),
+            I::SecureInput => self.sidebar_secure_input_toggle_shown(),
+            I::Ssh => !self.ssh_quick_launch_entries().is_empty(),
+            I::Mosh => has_transport(config::SshTransport::Mosh),
+            I::Et => has_transport(config::SshTransport::Et),
+            I::Sessions | I::Usage => self.config.agent_ui.enabled,
+            I::Tower => self.tower_available(),
+            I::AgentLaunch(id) | I::AgentTab(id) => self
+                .agent_launcher_entries()
+                .iter()
+                .any(|entry| entry.adapter_id == id),
+            I::Custom(id) => self
+                .config
+                .sidebar_buttons
+                .get(id)
+                .is_some_and(|button| button.is_usable()),
+        }
+    }
+
+    /// What a button of the user's shows: its label, or its id when it has
+    /// none.
+    pub(crate) fn sidebar_custom_button_label(&self, id: &str) -> String {
+        self.config
+            .sidebar_buttons
+            .get(id)
+            .map(|button| button.label.trim())
+            .filter(|label| !label.is_empty())
+            .unwrap_or(id)
+            .to_string()
+    }
+
+    /// The buttons the `+` offers while customizing, with the name each
+    /// goes by there: the library, then a pair per installed agent, then
+    /// the user's own; without the ones already placed and the ones with
+    /// nothing to offer.
+    pub(crate) fn sidebar_footer_addable(&self) -> Vec<(SidebarFooterItem, String)> {
+        let mut all: Vec<(SidebarFooterItem, String)> = tgz_footer::library_items()
+            .filter_map(|item| Some((item, tgz_footer::library_name(item)?.to_string())))
+            .collect();
+        for entry in self.agent_launcher_entries().iter() {
+            let named = |prefix: &str| {
+                SidebarFooterItem::from_name(&format!("{prefix}{}", entry.adapter_id))
+            };
+            if let Some(item) = named("agent:") {
+                all.push((item, entry.label.clone()));
+            }
+            if let Some(item) = named("agent-tab:") {
+                all.push((item, format!("{} in a new tab", entry.label)));
+            }
+        }
+        let mut ids: Vec<&String> = self.config.sidebar_buttons.keys().collect();
+        ids.sort();
+        for id in ids {
+            if let Some(item) = SidebarFooterItem::from_name(&format!("custom:{id}")) {
+                all.push((item, self.sidebar_custom_button_label(id)));
+            }
+        }
+        let (rows, _) = self.sidebar_footer_full_rows();
+        all.into_iter()
+            .filter(|(item, _)| {
+                !rows.iter().any(|row| row.contains(item))
+                    && self.sidebar_footer_item_available(*item)
+            })
+            .collect()
+    }
+
     /// The footer rows to draw: the buttons with something to offer.
     pub(crate) fn sidebar_footer_visible_rows(&self) -> tgz_footer::FooterRows {
-        let has_ssh = !self.ssh_quick_launch_entries().is_empty();
-        let available = |item: SidebarFooterItem| match item {
-            SidebarFooterItem::Worktree | SidebarFooterItem::Agent | SidebarFooterItem::NewTab => {
-                true
-            }
-            SidebarFooterItem::Changes => self.config.diff_panel.enabled,
-            SidebarFooterItem::Toolbelt => self.sidebar_toolbelt_toggle_shown(),
-            SidebarFooterItem::SecureInput => self.sidebar_secure_input_toggle_shown(),
-            SidebarFooterItem::Ssh => has_ssh,
-        };
+        let available = |item: SidebarFooterItem| self.sidebar_footer_item_available(item);
         let (rows, _) = self.sidebar_footer_full_rows();
         let visible = tgz_footer::visible_footer_rows(&rows, available);
         if visible.is_empty() {
@@ -11991,7 +12079,32 @@ impl crate::TermWindow {
                 state.collapsed,
             )
         };
-        let specs = sidebar_context_menu_rows(menu.kind, tab_count, all_projects, collapsed);
+        let row = |action| SidebarContextRow {
+            action,
+            label: "",
+            divider_above: false,
+            checkbox: None,
+            opens_submenu: false,
+        };
+        let mut specs: Vec<(String, SidebarContextRow)> =
+            sidebar_context_menu_rows(menu.kind, tab_count, all_projects, collapsed)
+                .into_iter()
+                .map(|spec| (spec.label.to_string(), spec))
+                .collect();
+        if menu.kind == SidebarContextMenuKind::FooterAdd {
+            specs.extend(
+                self.sidebar_footer_addable()
+                    .into_iter()
+                    .map(|(item, label)| (label, row(SidebarContextAction::AddFooterItem(item)))),
+            );
+            specs.push((
+                "Custom button\u{2026}".to_string(),
+                SidebarContextRow {
+                    divider_above: !specs.is_empty(),
+                    ..row(SidebarContextAction::NewCustomButton)
+                },
+            ));
+        }
         if specs.is_empty() {
             self.sidebar_context_menu = None;
             return Ok(());
@@ -12002,8 +12115,8 @@ impl crate::TermWindow {
         let cell_w_logical = self.render_metrics.cell_size.width as f32 / dpi_scale;
         let longest_cols = specs
             .iter()
-            .map(|spec| {
-                unicode_column_width(spec.label, None) + if spec.checkbox.is_some() { 3 } else { 0 }
+            .map(|(label, spec)| {
+                unicode_column_width(label, None) + if spec.checkbox.is_some() { 3 } else { 0 }
             })
             .max()
             .unwrap_or(0) as f32;
@@ -12013,8 +12126,8 @@ impl crate::TermWindow {
 
         let rows: Vec<SidebarDropdownRow> = specs
             .into_iter()
-            .map(|spec| SidebarDropdownRow {
-                label: spec.label.to_string(),
+            .map(|(label, spec)| SidebarDropdownRow {
+                label,
                 dot_color: None,
                 checkbox: spec.checkbox,
                 divider_above: spec.divider_above,
@@ -12030,7 +12143,13 @@ impl crate::TermWindow {
 
         // The Agents section sits right above the footer: its menu grows
         // upward, over the tab list, rather than down over the buttons.
-        let downward = !matches!(menu.kind, SidebarContextMenuKind::AgentSection);
+        // So do the footer's own menus.
+        let downward = !matches!(
+            menu.kind,
+            SidebarContextMenuKind::AgentSection
+                | SidebarContextMenuKind::FooterAdd
+                | SidebarContextMenuKind::FooterItem(_)
+        );
         self.paint_sidebar_dropdown(
             layers,
             menu.x as f32,
@@ -15116,28 +15235,49 @@ impl crate::TermWindow {
                     // Agent: left launches the default agent, right opens the
                     // launcher menu. The button is there even with no adapter
                     // installed: the menu still offers "Resume session".
-                    SidebarFooterItem::Agent => {
-                        let (bg, fg, offset, hovered) = paint_create_segment(
-                            self,
-                            layers,
-                            UIItemType::SidebarAgentLaunchButton,
-                            (x, w),
-                            row_y,
-                        )?;
-                        let launcher_entry = self.agent_launcher_default();
+                    // A button for one named agent looks the same and starts
+                    // that agent, in a tab of its own when it says so.
+                    SidebarFooterItem::Agent
+                    | SidebarFooterItem::AgentLaunch(_)
+                    | SidebarFooterItem::AgentTab(_) => {
+                        let named = |id: &str| {
+                            self.agent_launcher_entries()
+                                .iter()
+                                .find(|entry| entry.adapter_id == id)
+                                .cloned()
+                        };
+                        let (item_type, launcher_entry, in_tab) = match slot.item {
+                            SidebarFooterItem::AgentLaunch(id) => {
+                                (UIItemType::SidebarFooterAction(slot.item), named(id), false)
+                            }
+                            SidebarFooterItem::AgentTab(id) => {
+                                (UIItemType::SidebarFooterAction(slot.item), named(id), true)
+                            }
+                            _ => (
+                                UIItemType::SidebarAgentLaunchButton,
+                                self.agent_launcher_default(),
+                                false,
+                            ),
+                        };
+                        let (bg, fg, offset, hovered) =
+                            paint_create_segment(self, layers, item_type, (x, w), row_y)?;
                         let dot_size = sidebar_status_dot_size(cell_height as f32);
                         let label_room =
                             (w - FOOTER_SEGMENT_PAD * 2. - dot_size - ACTION_ICON_GAP).max(0.);
                         let cols = sidebar_text_cols(label_room, cell_width);
                         // Widest label that actually fits, measured; none fits -> the dot
                         // alone stands for the agent.
-                        let label = match launcher_entry.as_ref() {
-                            Some(entry) => {
-                                fit_label(&[entry.label.as_str(), entry.short_label.as_str()], cols)
-                                    .map(str::to_string)
-                            }
-                            None => fit_label(&["Agents", "Agent"], cols).map(str::to_string),
+                        let candidates: Vec<String> = match launcher_entry.as_ref() {
+                            Some(entry) if in_tab => vec![
+                                format!("{} tab", entry.label),
+                                format!("{} tab", entry.short_label),
+                                entry.short_label.clone(),
+                            ],
+                            Some(entry) => vec![entry.label.clone(), entry.short_label.clone()],
+                            None => vec!["Agents".to_string(), "Agent".to_string()],
                         };
+                        let candidates: Vec<&str> = candidates.iter().map(String::as_str).collect();
+                        let label = fit_label(&candidates, cols).map(str::to_string);
                         let label_w = label.as_deref().map_or(0., label_px);
                         let group_w = dot_size
                             + if label.is_some() {
@@ -15231,6 +15371,94 @@ impl crate::TermWindow {
                             )?;
                         }
                     }
+                    // The rest of the library and the user's own buttons:
+                    // a glyph, a label when there is room, one action.
+                    other => {
+                        let custom = match other {
+                            SidebarFooterItem::Custom(id) => Some((
+                                self.config
+                                    .sidebar_buttons
+                                    .get(id)
+                                    .and_then(|button| button.icon.clone())
+                                    .filter(|icon| !icon.trim().is_empty()),
+                                self.sidebar_custom_button_label(id),
+                            )),
+                            _ => None,
+                        };
+                        let look = tgz_footer::action_look(other);
+                        let (glyph, labels): (Option<String>, Vec<&str>) = match (&custom, look) {
+                            (Some((icon, label)), _) => (icon.clone(), vec![label.as_str()]),
+                            (None, Some((glyph, labels))) => {
+                                (Some(glyph.to_string()), labels.to_vec())
+                            }
+                            (None, None) => (None, Vec::new()),
+                        };
+                        let (bg, fg, offset, _) = paint_create_segment(
+                            self,
+                            layers,
+                            UIItemType::SidebarFooterAction(other),
+                            (x, w),
+                            row_y,
+                        )?;
+                        let cell_w = cell_width as f32;
+                        let glyph_cols = glyph
+                            .as_deref()
+                            .map_or(0, |glyph| unicode_column_width(glyph, None).max(1));
+                        let glyph_w = glyph_cols as f32 * cell_w;
+                        let inner = (w - FOOTER_SEGMENT_PAD * 2.).max(0.);
+                        let label_room = if glyph.is_some() {
+                            inner - glyph_w - ACTION_ICON_GAP
+                        } else {
+                            inner
+                        };
+                        let cols = sidebar_text_cols(label_room.max(0.), cell_width);
+                        // A button with no glyph still has to say something:
+                        // as much of its label as there is room for.
+                        let label: Option<String> = match fit_label(&labels, cols) {
+                            Some(label) => Some(label.to_string()),
+                            None if glyph.is_none() => labels.first().and_then(|label| {
+                                let cut: String = label.chars().take(cols.max(1)).collect();
+                                (!cut.is_empty()).then_some(cut)
+                            }),
+                            None => None,
+                        };
+                        let label_w = label.as_deref().map_or(0., label_px);
+                        let group_w = glyph_w
+                            + label_w
+                            + if glyph.is_some() && label.is_some() {
+                                ACTION_ICON_GAP
+                            } else {
+                                0.
+                            };
+                        let mut text_x = x + ((w - group_w) * 0.5).max(0.);
+                        if let Some(glyph) = glyph.as_deref() {
+                            render_text(
+                                self,
+                                layers,
+                                glyph,
+                                &CellAttributes::default(),
+                                text_x,
+                                row_y + text_inset_y + offset,
+                                glyph_w + 0.5,
+                                fg,
+                                bg,
+                            )?;
+                            text_x += glyph_w + ACTION_ICON_GAP;
+                        }
+                        if let Some(label) = label.as_deref() {
+                            render_text(
+                                self,
+                                layers,
+                                label,
+                                &CellAttributes::default(),
+                                text_x,
+                                row_y + text_inset_y + offset,
+                                label_w + 0.5,
+                                fg,
+                                bg,
+                            )?;
+                        }
+                    }
                 }
             }
         }
@@ -15272,10 +15500,18 @@ impl crate::TermWindow {
             let cell_w = cell_width as f32;
             let done_w = (4. * cell_w + FOOTER_SEGMENT_PAD * 2.).min(item_w);
             let reset_w = 5. * cell_w + FOOTER_SEGMENT_PAD * 2.;
+            let add_w = (cell_w + FOOTER_SEGMENT_PAD * 2.).max(row_height as f32);
             let done_x = item_x + item_w - done_w;
-            let show_reset = item_w >= done_w + GAP + reset_w;
-            let reset_x = done_x - GAP - reset_w;
+            // `+` before Reset when the bar cannot hold both: adding a
+            // button has no other way in, Reset is a convenience.
+            let show_add = item_w >= done_w + GAP + add_w;
+            let add_x = done_x - GAP - add_w;
+            let show_reset = show_add && item_w >= done_w + GAP + add_w + GAP + reset_w;
+            let reset_x = add_x - GAP - reset_w;
             let mut buttons = vec![(FooterEditAction::Done, "Done", done_x, done_w)];
+            if show_add {
+                buttons.push((FooterEditAction::Add, "+", add_x, add_w));
+            }
             if show_reset {
                 buttons.push((FooterEditAction::Reset, "Reset", reset_x, reset_w));
             }
@@ -15300,7 +15536,13 @@ impl crate::TermWindow {
                     bg,
                 )?;
             }
-            let hint_right = if show_reset { reset_x } else { done_x } - GAP;
+            let hint_right = if show_reset {
+                reset_x
+            } else if show_add {
+                add_x
+            } else {
+                done_x
+            } - GAP;
             let hint_cols = sidebar_text_cols((hint_right - item_x - PAD_X).max(0.), cell_width);
             if let Some(hint) = fit_label(&["Drag to arrange", "Drag", ""], hint_cols) {
                 if !hint.is_empty() {

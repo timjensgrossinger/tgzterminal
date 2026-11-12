@@ -77,6 +77,11 @@ pub(crate) fn chrome_tooltip(item: &UIItemType) -> Option<ChromeTooltip> {
         ),
         UIItemType::SidebarSshLaunchButton => plain("SSH connect \u{00b7} right-click: hosts"),
         UIItemType::SidebarUsageButton => keyed("Usage and limits", KeyAssignment::ShowUsageMenu),
+        // Named after what they are in the `+` menu; a button of the user's
+        // or one for a named agent carries its own label.
+        UIItemType::SidebarFooterAction(item) => {
+            crate::termwindow::tgz_footer::library_name(*item).and_then(plain)
+        }
         UIItemType::SidebarSessionsButton => {
             keyed("Recent sessions", KeyAssignment::ShowSessionsMenu)
         }

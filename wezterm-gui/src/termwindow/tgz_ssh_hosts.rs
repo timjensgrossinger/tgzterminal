@@ -348,7 +348,10 @@ pub(crate) fn entry_row_label(entry: &SshQuickLaunchEntry) -> String {
 }
 
 /// The entries matching `query`: every whitespace-separated word must appear,
-/// case-insensitively, in the row's label, detail or transport badge.
+/// case-insensitively, in the row's label, detail or transport badge. A word
+/// that starts with a colon names a transport instead (`:mosh`, `:et`) and
+/// matches the badge as a whole, so `:et` does not find every host with
+/// "et" in its name.
 pub(crate) fn filter_entries<'a>(
     entries: &'a [SshQuickLaunchEntry],
     query: &str,
@@ -358,7 +361,10 @@ pub(crate) fn filter_entries<'a>(
         .iter()
         .filter(|entry| {
             let haystack = entry_row_label(entry).to_lowercase();
-            words.iter().all(|word| haystack.contains(word))
+            words.iter().all(|word| match word.strip_prefix(':') {
+                Some(badge) => entry.badge == badge,
+                None => haystack.contains(word),
+            })
         })
         .collect()
 }
@@ -658,6 +664,24 @@ mod tests {
             ]
         );
         assert_eq!(entries[1].argv, vec!["/usr/bin/et", "box:2022"]);
+    }
+
+    #[test]
+    fn a_colon_word_filters_by_transport_rather_than_by_text() {
+        let et = declared(SshDomain {
+            transport: SshTransport::Et,
+            ..domain("e", "box:2022")
+        });
+        // "internet" has "et" in it and is plain ssh.
+        let ssh = declared(domain("internet", "internet.example.com"));
+        let entries = build_entries(&[et, ssh], &found, &[]);
+        assert_eq!(filter_entries(&entries, "et").len(), 2);
+        let only: Vec<&str> = filter_entries(&entries, ":et ")
+            .iter()
+            .map(|entry| entry.badge)
+            .collect();
+        assert_eq!(only, vec!["et"]);
+        assert!(filter_entries(&entries, ":mosh").is_empty());
     }
 
     #[test]

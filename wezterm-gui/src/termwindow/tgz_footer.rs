@@ -9,6 +9,10 @@
 //!    in `tgz_ui_state`.
 //! 3. [`default_footer_rows`].
 //!
+//! Besides the buttons of the default footer there is a library of further
+//! ones ([`library_items`]): they are added with the `+` shown while
+//! customizing and taken away with a right click there.
+//!
 //! Everything here is pure; painting and the drag live in `render/sidebar.rs`
 //! and `mouseevent.rs`.
 
@@ -32,9 +36,9 @@ pub(crate) const MAX_FOOTER_ROWS: usize = 5;
 pub(crate) const MAX_ROW_ITEMS: usize = 5;
 
 /// The range `sidebar_footer_max_per_row` is held to: a row needs a button,
-/// and there are seven buttons in all.
+/// and past seven none of them is a target any more.
 pub(crate) fn clamp_max_row_items(configured: usize) -> usize {
-    configured.clamp(1, ALL_ITEMS.len())
+    configured.clamp(1, DEFAULT_ITEMS.len())
 }
 
 /// The weight of `item`; 1 when unset or nonsense.
@@ -47,17 +51,10 @@ pub(crate) fn weight_of(weights: &FooterWeights, item: Item) -> f32 {
 }
 
 /// An item by the name a person would write: the Lua variant (`NewTab`) or
-/// the state-file name (`new_tab`), in any case.
+/// the state-file name (`new_tab`), in any case; `agent:<adapter>`,
+/// `agent-tab:<adapter>` and `custom:<id>` as they are.
 pub(crate) fn item_from_loose_name(name: &str) -> Option<Item> {
-    let wanted: String = name
-        .chars()
-        .filter(|c| *c != '_')
-        .flat_map(char::to_lowercase)
-        .collect();
-    ALL_ITEMS.iter().copied().find(|item| {
-        let variant = format!("{item:?}").to_lowercase();
-        variant == wanted || item_name(*item).replace('_', "") == wanted
-    })
+    Item::from_name(name)
 }
 
 /// Share `total` among `weights` in proportion, with nobody below `min`:
@@ -98,7 +95,8 @@ pub(crate) fn distribute(total: f32, weights: &[f32], min: f32) -> Vec<f32> {
     }
 }
 
-const ALL_ITEMS: [Item; 7] = [
+/// The buttons of the footer as shipped.
+const DEFAULT_ITEMS: [Item; 7] = [
     Item::Worktree,
     Item::Changes,
     Item::Toolbelt,
@@ -136,37 +134,118 @@ pub(crate) fn toggle_label(item: Item) -> Option<&'static str> {
         Item::Changes => Some("Diff"),
         Item::Toolbelt => Some("Tools"),
         Item::SecureInput => Some("Lock"),
-        Item::Agent | Item::Ssh | Item::NewTab => None,
+        _ => None,
     }
+}
+
+/// How a library button without a toggle looks: its glyph (bundled Symbols
+/// Nerd Font, so it shows on every platform) and the labels to try, longest
+/// first. `None` for the buttons that are drawn their own way.
+pub(crate) fn action_look(item: Item) -> Option<(&'static str, &'static [&'static str])> {
+    Some(match item {
+        Item::Sessions => ("\u{f1da}", &["Sessions", "Recent"]),
+        Item::Usage => ("\u{f080}", &["Usage"]),
+        Item::Settings => ("\u{f013}", &["Settings", "Prefs"]),
+        Item::CommandPalette => ("\u{f002}", &["Commands", "Cmds"]),
+        Item::SplitRight => ("\u{f0db}", &["Split right", "Right"]),
+        Item::SplitDown => ("\u{f0c9}", &["Split down", "Down"]),
+        Item::Tower => ("\u{f0e8}", &["Tower"]),
+        Item::Mosh => ("\u{f0e7}", &["Mosh"]),
+        Item::Et => ("\u{f1e6}", &["ET"]),
+        _ => return None,
+    })
+}
+
+/// What the `+` menu calls a button of the library.
+pub(crate) fn library_name(item: Item) -> Option<&'static str> {
+    Some(match item {
+        Item::Worktree => "Worktree",
+        Item::Changes => "Changes",
+        Item::Toolbelt => "Agent toolbelt",
+        Item::SecureInput => "Secure Keyboard Entry",
+        Item::Agent => "Agent launcher",
+        Item::Ssh => "SSH",
+        Item::NewTab => "New tab",
+        Item::Sessions => "Recent sessions",
+        Item::Usage => "Usage and limits",
+        Item::Settings => "Settings",
+        Item::CommandPalette => "Command palette",
+        Item::SplitRight => "Split right",
+        Item::SplitDown => "Split down",
+        Item::Tower => "Tower",
+        Item::Mosh => "Mosh hosts",
+        Item::Et => "ET hosts",
+        Item::AgentLaunch(_) | Item::AgentTab(_) | Item::Custom(_) => return None,
+    })
+}
+
+/// Every button that needs no name: the default footer's, then the rest of
+/// the library.
+pub(crate) fn library_items() -> impl Iterator<Item = Item> {
+    Item::PLAIN.iter().map(|(item, _, _)| *item)
+}
+
+/// The buttons of `candidates` that `rows` does not hold yet, in order.
+pub(crate) fn unplaced(rows: &[Vec<Item>], candidates: &[Item]) -> Vec<Item> {
+    candidates
+        .iter()
+        .copied()
+        .filter(|item| !rows.iter().any(|row| row.contains(item)))
+        .collect()
+}
+
+/// `rows` with `item` added: to the top row while it has room, else in a
+/// row of its own above it, else wherever there is room. Unchanged when the
+/// button is there already or the footer is full.
+pub(crate) fn footer_add(rows: &[Vec<Item>], item: Item, max_row: usize) -> FooterRows {
+    let max_row = max_row.max(1);
+    let mut out = rows.to_vec();
+    if out.iter().any(|row| row.contains(&item)) {
+        return out;
+    }
+    let top_len = out.first().map(Vec::len);
+    match top_len {
+        None => out.push(vec![item]),
+        Some(len) if len < max_row => out[0].push(item),
+        Some(_) if out.len() < MAX_FOOTER_ROWS => out.insert(0, vec![item]),
+        Some(_) => {
+            if let Some(row) = out.iter_mut().find(|row| row.len() < max_row) {
+                row.push(item);
+            }
+        }
+    }
+    out
+}
+
+/// `rows` without `item`, and without the row that leaves empty. The last
+/// button stays: a footer of nothing could not be customized back.
+pub(crate) fn footer_remove(rows: &[Vec<Item>], item: Item) -> FooterRows {
+    if rows.iter().map(Vec::len).sum::<usize>() <= 1 {
+        return rows.to_vec();
+    }
+    rows.iter()
+        .map(|row| {
+            row.iter()
+                .copied()
+                .filter(|other| *other != item)
+                .collect::<Vec<_>>()
+        })
+        .filter(|row| !row.is_empty())
+        .collect()
 }
 
 /// Name of an item in the state file.
-pub(crate) fn item_name(item: Item) -> &'static str {
-    match item {
-        Item::Worktree => "worktree",
-        Item::Changes => "changes",
-        Item::Toolbelt => "toolbelt",
-        Item::SecureInput => "lock",
-        Item::Agent => "agent",
-        Item::Ssh => "ssh",
-        Item::NewTab => "new_tab",
-    }
+pub(crate) fn item_name(item: Item) -> String {
+    item.name()
 }
 
 pub(crate) fn item_from_name(name: &str) -> Option<Item> {
-    ALL_ITEMS
-        .iter()
-        .copied()
-        .find(|item| item_name(*item) == name)
+    Item::from_name(name)
 }
 
 pub(crate) fn rows_to_names(rows: &FooterRows) -> Vec<Vec<String>> {
     rows.iter()
-        .map(|row| {
-            row.iter()
-                .map(|item| item_name(*item).to_string())
-                .collect()
-        })
+        .map(|row| row.iter().map(|item| item_name(*item)).collect())
         .collect()
 }
 
@@ -182,10 +261,10 @@ pub(crate) fn rows_from_names(names: &[Vec<String>]) -> FooterRows {
 /// Make `rows` well formed: each button once (its first place wins), no empty
 /// rows, at most [`MAX_FOOTER_ROWS`] (the overflow joins the last row).
 ///
-/// `append_missing` adds the buttons that are not placed at all to the first
-/// row. That is for an arrangement made by dragging, where nothing can be
-/// removed, so a button this build added must not be lost. A Lua list is
-/// taken at its word: what it leaves out is not shown.
+/// `append_missing` adds the default footer's buttons that are not placed at
+/// all to the first row. Neither source asks for that any more: a Lua list
+/// is taken at its word, and an arrangement made by hand may have had a
+/// button removed on purpose.
 #[cfg(test)]
 pub(crate) fn normalize_footer_rows(rows: &[Vec<Item>], append_missing: bool) -> FooterRows {
     normalize_footer_rows_capped(rows, append_missing, MAX_ROW_ITEMS)
@@ -221,7 +300,7 @@ pub(crate) fn normalize_footer_rows_capped(
         }
     }
     if append_missing {
-        let missing: Vec<Item> = ALL_ITEMS
+        let missing: Vec<Item> = DEFAULT_ITEMS
             .iter()
             .copied()
             .filter(|item| !seen.contains(item))
@@ -577,13 +656,13 @@ mod tests {
         // Dragged: the rest joins the first row.
         let full = normalize_footer_rows(&rows, true);
         assert_eq!(full.len(), 2);
-        for item in ALL_ITEMS.iter() {
+        for item in DEFAULT_ITEMS.iter() {
             assert_eq!(full.iter().flatten().filter(|i| *i == item).count(), 1);
         }
         // Nothing at all still yields every button.
         assert_eq!(
             normalize_footer_rows(&[], true).concat().len(),
-            ALL_ITEMS.len()
+            DEFAULT_ITEMS.len()
         );
         assert_eq!(
             normalize_footer_rows(&default_footer_rows(), true),
@@ -593,10 +672,10 @@ mod tests {
 
     #[test]
     fn rows_beyond_the_cap_join_the_last_row() {
-        let rows: Vec<Vec<Item>> = ALL_ITEMS.iter().map(|item| vec![*item]).collect();
+        let rows: Vec<Vec<Item>> = DEFAULT_ITEMS.iter().map(|item| vec![*item]).collect();
         let capped = normalize_footer_rows(&rows, false);
         assert_eq!(capped.len(), MAX_FOOTER_ROWS);
-        assert_eq!(capped.concat().len(), ALL_ITEMS.len());
+        assert_eq!(capped.concat().len(), DEFAULT_ITEMS.len());
     }
 
     #[test]
@@ -776,14 +855,14 @@ mod tests {
             vec![Agent, Worktree, Changes, Toolbelt, SecureInput]
         );
         // A longer list is cut into rows of five.
-        let long = vec![ALL_ITEMS.to_vec()];
+        let long = vec![DEFAULT_ITEMS.to_vec()];
         let rows = normalize_footer_rows(&long, false);
         assert_eq!(rows.iter().map(Vec::len).collect::<Vec<_>>(), [5, 2]);
     }
 
     #[test]
     fn the_row_cap_is_adjustable() {
-        let long = vec![ALL_ITEMS.to_vec()];
+        let long = vec![DEFAULT_ITEMS.to_vec()];
         let rows = normalize_footer_rows_capped(&long, false, 3);
         assert_eq!(rows.iter().map(Vec::len).collect::<Vec<_>>(), [3, 3, 1]);
         let all = normalize_footer_rows_capped(&long, false, 7);
@@ -892,5 +971,65 @@ mod tests {
         let moved = footer_move(&full, SecureInput, FooterTarget::NewTopRow);
         assert_eq!(moved[0], vec![SecureInput]);
         assert_eq!(moved.len(), MAX_FOOTER_ROWS);
+    }
+
+    #[test]
+    fn named_buttons_round_trip_and_keep_their_name_as_written() {
+        for name in ["agent:claude", "agent-tab:Codex", "custom:deploy_prod"] {
+            let item = item_from_name(name).expect(name);
+            assert_eq!(item_name(item), name);
+        }
+        assert_eq!(item_from_name("agent:"), None);
+        assert_eq!(item_from_name("custom:  "), None);
+        assert_eq!(
+            item_from_loose_name("CommandPalette"),
+            Some(Item::CommandPalette)
+        );
+        assert_eq!(item_from_name("split_right"), Some(Item::SplitRight));
+        // The same name is the same button, wherever it was read from.
+        assert_eq!(
+            item_from_name("agent:claude"),
+            item_from_name("agent:claude")
+        );
+    }
+
+    #[test]
+    fn every_plain_button_has_a_name_in_the_add_menu() {
+        for item in library_items() {
+            assert!(library_name(item).is_some(), "{item:?}");
+            // Drawn as a toggle, drawn its own way, or drawn from its look.
+            assert!(
+                is_toggle(item)
+                    || action_look(item).is_some()
+                    || matches!(item, Item::Agent | Item::Ssh | Item::NewTab),
+                "{item:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_button_is_added_on_top_and_only_once() {
+        let rows = default_footer_rows();
+        let added = footer_add(&rows, Item::Usage, 5);
+        assert_eq!(added[0].last(), Some(&Item::Usage));
+        assert_eq!(footer_add(&added, Item::Usage, 5), added);
+        // A full top row: the button starts a row above it.
+        let full = footer_add(&rows, Item::Usage, 4);
+        assert_eq!(full[0], vec![Item::Usage]);
+        assert_eq!(full.len(), rows.len() + 1);
+        assert_eq!(
+            unplaced(&added, &[Item::Usage, Item::Settings, Item::Agent]),
+            vec![Item::Settings]
+        );
+    }
+
+    #[test]
+    fn a_button_is_removed_with_its_empty_row_but_never_the_last_one() {
+        let rows = default_footer_rows();
+        let without = footer_remove(&rows, Item::NewTab);
+        assert_eq!(without.len(), rows.len() - 1);
+        assert!(!without.concat().contains(&Item::NewTab));
+        let one = vec![vec![Item::Agent]];
+        assert_eq!(footer_remove(&one, Item::Agent), one);
     }
 }

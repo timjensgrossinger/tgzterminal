@@ -132,6 +132,7 @@ pub mod tgz_alt_screen;
 pub(crate) mod tgz_footer;
 pub mod tgz_last_session;
 pub mod tgz_secret_mask;
+pub(crate) mod tgz_settings;
 pub mod tgz_ssh_hosts;
 pub(crate) mod tgz_tooltip;
 pub mod tgz_ui_state;
@@ -578,6 +579,8 @@ pub enum UIItemType {
     /// The Worktree panel's surface: swallows clicks and the wheel.
     FileTreeBody,
     FileTreeButton(FileTreeAction),
+    /// A control of the Settings tab.
+    Settings(tgz_settings::SettingsHit),
     /// A row of the Worktree panel: a folder toggles, a file is selected and
     /// opened on a second click.
     FileTreeRow {
@@ -650,8 +653,13 @@ pub enum UIItemType {
     /// The boundary on a footer button's right while customizing: drag to
     /// change how the row is shared.
     SidebarFooterResize(config::SidebarFooterItem),
-    /// "Done" and "Reset" on the bar shown while customizing the footer.
+    /// "Done", "Reset" and `+` on the bar shown while customizing the
+    /// footer.
     SidebarFooterEdit(FooterEditAction),
+    /// A footer button from the library that has no item of its own: one
+    /// that runs an action (Usage, Settings, a split), starts a named agent,
+    /// or is a button of the user's (`sidebar_buttons`).
+    SidebarFooterAction(config::SidebarFooterItem),
     /// The sidebar's "+": left click opens a tab, right click its menu.
     /// Its own item rather than the top tab bar's `NewTabButton`, whose right
     /// click opens the launcher overlay and stays as upstream has it.
@@ -734,6 +742,15 @@ pub enum SidebarContextAction {
     ToggleAgentSectionCollapsed,
     /// Sidebar: rearrange the footer's buttons by dragging.
     CustomizeFooter,
+    /// Sidebar: open the Settings tab.
+    ShowSettings,
+    /// Footer, while customizing: place this button of the library.
+    AddFooterItem(config::SidebarFooterItem),
+    /// Footer, while customizing: take the button the menu was opened on
+    /// out of the footer.
+    RemoveFooterItem,
+    /// Footer, while customizing: go and define a button of your own.
+    NewCustomButton,
 }
 
 /// A button of the bar shown while the footer is being customized.
@@ -743,6 +760,8 @@ pub enum FooterEditAction {
     Done,
     /// Back to the built-in layout.
     Reset,
+    /// Open the list of buttons that are not in the footer yet.
+    Add,
 }
 
 /// The object a sidebar context menu was opened on.
@@ -754,6 +773,10 @@ pub enum SidebarContextMenuKind {
     AgentSection,
     /// The sidebar itself: a right click on the empty part of the tab list.
     Sidebar,
+    /// The `+` of the bar shown while customizing the footer.
+    FooterAdd,
+    /// A footer button, right-clicked while customizing.
+    FooterItem(config::SidebarFooterItem),
 }
 
 /// An open sidebar context menu, anchored where it was asked for.
@@ -5670,6 +5693,7 @@ done
             ShowSessionsMenu => self.show_chrome_menu(ChromeMenu::Sessions),
             ToggleAgentHerdView => self.toggle_agent_herd_view(),
             CustomizeSidebarButtons => self.start_sidebar_footer_edit(),
+            ShowSettings => self.show_settings(),
             PasteFrom(source) => {
                 self.paste_from_clipboard(pane, *source);
             }

@@ -3,6 +3,73 @@
 These options are specific to the `tgzterminal` rebuild and preserve upstream
 WezTerm compatibility unless noted.
 
+## Settings tab
+
+`CMD|,` (action `ShowSettings`, also in the command palette and in the menu
+of a right click on the empty tab list) opens Settings as a tab. It covers the
+fork's settings and a few basics (font, font size, line height, colour scheme,
+window opacity), grouped as Appearance, Sidebar, Agents, Worktree, Changes,
+Input and Privacy. A last section, Shortcuts, lists the fork's key bindings as
+they are bound right now; it is read-only, since bindings are changed with
+`config.keys`.
+
+Font and colour scheme open a list: every installed font family (gathered in
+the background the first time), or every colour scheme, yours and the
+built-in ones, with "None" on top. Type to filter, names that start with what
+you typed come first. A font the system does not list can still be entered by
+name.
+
+From the keyboard:
+
+| Key | Does |
+|-----|------|
+| `Up` / `Down`, `PageUp` / `PageDown` | Move between rows. |
+| `Left` / `Right` | Off / On, previous / next choice, less / more. |
+| `Enter` or `Space` | Flip a switch; open a text field or a list. |
+| `Tab` / `Shift+Tab` | Next / previous section. |
+| `Esc` | Leave the row, or cancel what is being typed. |
+| in a list: `Up` / `Down`, `PageUp` / `PageDown`, `Enter` | Move the highlight; take it. |
+
+Your `wezterm.lua` stays the one place a setting lives. A change is written
+to it right away:
+
+- A setting the file already sets as a plain value is rewritten where it
+  stands, whether that is `config.font_size = 16` or a field of the returned
+  table (`font_size = 16.0,`, also nested, e.g. `rich_input = { dock_rows = 3 }`).
+  Comments and layout are kept. A font keeps its options: only the family
+  name inside `wezterm.font("...", { ... })` changes.
+- A setting the file does not mention is recorded in a marked block just
+  before the final `return`:
+
+  ```lua
+  -- >>> TGZTerminal settings (managed by the Settings tab, edit freely)
+  config.diff_panel = config.diff_panel or {}
+  config.diff_panel.long_lines = 'Scroll'
+  config.sidebar_footer_max_per_row = 4
+  -- <<< TGZTerminal settings
+
+  return config
+  ```
+
+  A file that ends in `return { ... }` is changed once to
+  `local config = { ... }`, the block, and `return config`. Lines you add to
+  the block yourself are kept.
+- A setting the file computes (a function call, a condition, a value assigned
+  twice, an assignment inside an `if`) is shown with the line it is on and
+  cannot be changed from the tab; the button opens the file.
+
+Nothing is written unless the edited file still loads: it is evaluated first,
+and a failure is shown in the tab instead. The first change of a run keeps the
+file as it was in `<name>.tgz-bak` beside it. A linked dotfile is written
+through the link. With no config file at all, the first change creates
+`wezterm.lua` in the config directory. A file that ends in neither
+`return <name>` nor `return { ... }` (for example `return require 'mine'`) is
+shown read-only.
+
+Not in the tab on purpose: `agent_ui.enable_control_actions`, and settings the
+sidebar switches at runtime (`sidebar_auto_hide`), whose per-window state would
+hide what the file says.
+
 ## Sidebar
 
 ```lua
@@ -83,9 +150,48 @@ is there the buttons drag instead of acting:
   the buttons after it shrink to make room, down to a square, and when they
   cannot shrink any more the row's last button moves to the row above;
 - a row that loses its last button disappears;
+- **+** lists the buttons that are not in the footer; pick one to add it;
+- right-click a button and pick **Remove button** to take it out (the last
+  one stays);
 - **Reset** restores the default, **Done** or `Esc` keeps the arrangement.
 
 The arrangement is remembered across restarts.
+
+**More buttons.** Besides the seven of the default footer, **+** offers:
+
+| Button | Lua name | Does |
+|--------|----------|------|
+| Recent sessions | `Sessions` | Opens the sessions menu at the button. |
+| Usage and limits | `Usage` | Opens the usage popup at the button. |
+| Settings | `Settings` | Opens the Settings tab. |
+| Command palette | `CommandPalette` | Opens the command palette. |
+| Split right / down | `SplitRight`, `SplitDown` | Splits the active pane. |
+| Mosh hosts, ET hosts | `Mosh`, `Et` | The host menu, filtered to that transport (`:mosh`, `:et` in its search field). Offered when such a host exists. |
+| Tower | `Tower` | Opens Tower, in builds that have it and with `tower.enabled`. |
+| *agent* | `agent:<adapter>` | Starts that agent where the launcher would. One per installed agent. |
+| *agent* in a new tab | `agent-tab:<adapter>` | Starts that agent in a tab of its own, whatever `open_in` says. |
+| your own | `custom:<id>` | A button from `sidebar_buttons`, below. |
+
+**Your own buttons.** `sidebar_buttons` defines buttons by id:
+
+```lua
+config.sidebar_buttons = {
+  deploy = { label = 'Deploy', icon = '\u{f135}', command = 'make deploy' },
+  launcher = { label = 'Launcher', action = wezterm.action.ShowLauncher },
+}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `label` | Text on the button; the id when unset. |
+| `icon` | One glyph before the label, shown alone when the button is narrow. Glyphs of the bundled Symbols Nerd Font show on every platform. |
+| `command` | A command line run in a new tab. It is split into words the way a shell would, but no shell runs it: write `sh -c '...'` for pipes or variables. |
+| `action` | Any key assignment; used when there is no `command`. |
+
+A button needs a `command` or an `action` to be offered. Defining it does not
+place it: add it with **+**, or name it `'custom:deploy'` in `sidebar_footer`.
+The Settings tab's **Buttons** section edits four of them (`custom1` to
+`custom4`: label, command, icon); **+ → Custom button…** goes there.
 
 **From Lua.** `sidebar_footer` fixes the layout in config, rows top to bottom:
 
@@ -97,7 +203,7 @@ config.sidebar_footer = {
 ```
 
 Names: `Worktree`, `Changes`, `Toolbelt`, `SecureInput`, `Agent`, `Ssh`,
-`NewTab`. A button left out is not shown (its action stays in the command
+`NewTab`, and the ones in the table above. A button left out is not shown (its action stays in the command
 palette). A button with nothing to offer — `Ssh` with no host, `Changes` with
 the panel disabled — is skipped either way. While `sidebar_footer` is set it
 wins over a dragged arrangement, and Customize says so instead of starting.
@@ -120,6 +226,7 @@ leaves dragging on.
 | `sidebar_footer` | unset | Footer rows, top to bottom; see above. |
 | `sidebar_footer_weights` | `{}` | Relative button widths within a row, by button name. |
 | `sidebar_footer_max_per_row` | `5` | Most buttons a footer row holds (1 to 7). |
+| `sidebar_buttons` | `{}` | Buttons of your own, by id; see above. |
 
 Every footer button follows the same rule: a left-click does the button's one
 action, a right-click (Ctrl+click on macOS) opens its menu of alternatives.
@@ -1483,6 +1590,7 @@ first). Your own `config.keys` entries win over these.
 | `ShowUsageMenu` | `CMD|SHIFT|u` | Opens the usage popup. |
 | `ToggleAgentHerdView` | `CMD|SHIFT|o` | Agents section: this project / all projects. |
 | `CustomizeSidebarButtons` | none | Rearrange the footer's buttons by dragging. |
+| `ShowSettings` | `CMD|,` | Opens the Settings tab. |
 | `ShowSshHostMenu` | `CMD|SHIFT|h` | Opens the SSH host menu, ready to type a filter. |
 | `CycleWaitingAgent` | `CMD|SHIFT|j` | Jumps to the next waiting agent; says so when none is waiting. |
 | `ActivateAgentSection` | `CTRL|SHIFT|a` | Keyboard navigation of the Agents section. |

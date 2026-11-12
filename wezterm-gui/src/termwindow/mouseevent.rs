@@ -69,6 +69,7 @@ impl super::TermWindow {
             | UIItemType::FileTreeResize { .. }
             | UIItemType::FileTreeBody
             | UIItemType::FileTreeButton(_)
+            | UIItemType::Settings(_)
             | UIItemType::FileTreeRow { .. }
             | UIItemType::FileTreeScrollThumb
             | UIItemType::FileTreeScrollTrack
@@ -103,6 +104,7 @@ impl super::TermWindow {
             | UIItemType::SidebarNewTabButton
             | UIItemType::SidebarFooterEdit(_)
             | UIItemType::SidebarFooterResize(_)
+            | UIItemType::SidebarFooterAction(_)
             | UIItemType::SidebarNewTabMenuItem { .. }
             | UIItemType::SidebarSshLaunchButton
             | UIItemType::SidebarSshMenuItem { .. }
@@ -141,6 +143,7 @@ impl super::TermWindow {
             | UIItemType::FileTreeResize { .. }
             | UIItemType::FileTreeBody
             | UIItemType::FileTreeButton(_)
+            | UIItemType::Settings(_)
             | UIItemType::FileTreeRow { .. }
             | UIItemType::FileTreeScrollThumb
             | UIItemType::FileTreeScrollTrack
@@ -175,6 +178,7 @@ impl super::TermWindow {
             | UIItemType::SidebarNewTabButton
             | UIItemType::SidebarFooterEdit(_)
             | UIItemType::SidebarFooterResize(_)
+            | UIItemType::SidebarFooterAction(_)
             | UIItemType::SidebarNewTabMenuItem { .. }
             | UIItemType::SidebarSshLaunchButton
             | UIItemType::SidebarSshMenuItem { .. }
@@ -506,6 +510,7 @@ impl super::TermWindow {
                     if matches!(
                         item.item_type,
                         UIItemType::SidebarSessionsButton
+                            | UIItemType::SidebarFooterAction(config::SidebarFooterItem::Sessions)
                             | UIItemType::SidebarAgentMenuResume
                             | UIItemType::SidebarAgentMenuResumeSession { .. }
                             | UIItemType::SidebarAgentMenuRestoreLastWindow
@@ -594,7 +599,11 @@ impl super::TermWindow {
                 Some(item)
                     if matches!(
                         item.item_type,
-                        UIItemType::SidebarContextMenuItem { .. } | UIItemType::SidebarDropdownBody
+                        UIItemType::SidebarContextMenuItem { .. }
+                            | UIItemType::SidebarDropdownBody
+                            | UIItemType::SidebarFooterEdit(
+                                crate::termwindow::FooterEditAction::Add
+                            )
                     )
             );
             if !on_context_menu {
@@ -610,6 +619,7 @@ impl super::TermWindow {
                     if matches!(
                         item.item_type,
                         UIItemType::SidebarUsageButton
+                            | UIItemType::SidebarFooterAction(config::SidebarFooterItem::Usage)
                             | UIItemType::SidebarUsageMenuRow { .. }
                             | UIItemType::SidebarDropdownBody
                     )
@@ -627,6 +637,9 @@ impl super::TermWindow {
                     if matches!(
                         item.item_type,
                         UIItemType::SidebarSshLaunchButton
+                            | UIItemType::SidebarFooterAction(
+                                config::SidebarFooterItem::Mosh | config::SidebarFooterItem::Et
+                            )
                             | UIItemType::SidebarSshMenuItem { .. }
                             | UIItemType::SidebarDropdownBody
                             | UIItemType::SidebarDropdownScrollTrack
@@ -794,7 +807,8 @@ impl super::TermWindow {
             | UIItemType::SidebarSecureInputToggle
             | UIItemType::SidebarAgentLaunchButton
             | UIItemType::SidebarSshLaunchButton
-            | UIItemType::SidebarNewTabButton => {
+            | UIItemType::SidebarNewTabButton
+            | UIItemType::SidebarFooterAction(_) => {
                 self.drag_sidebar_footer_item(item, start_event, event, context);
             }
             UIItemType::SidebarFooterResize(footer_item) => {
@@ -832,8 +846,23 @@ impl super::TermWindow {
         if self.sidebar_footer_edit
             && crate::termwindow::render::sidebar::footer_item_for(&item.item_type).is_some()
         {
-            if event.kind == WMEK::Press(MousePress::Left) {
-                self.dragging.replace((item, event));
+            match event.kind {
+                WMEK::Press(MousePress::Left) => {
+                    self.dragging.replace((item, event));
+                }
+                // The button's options, of which there is one: out of the
+                // footer.
+                WMEK::Press(MousePress::Right) => {
+                    if let Some(footer_item) =
+                        crate::termwindow::render::sidebar::footer_item_for(&item.item_type)
+                    {
+                        self.open_sidebar_context_menu(
+                            SidebarContextMenuKind::FooterItem(footer_item),
+                            &event,
+                        );
+                    }
+                }
+                _ => {}
             }
             context.set_cursor(Some(CursorIcon::Grab));
             context.invalidate();
@@ -957,6 +986,23 @@ impl super::TermWindow {
                                 Default::default(),
                             );
                         }
+                        // A second click on `+` puts its list away again.
+                        crate::termwindow::FooterEditAction::Add => {
+                            let open = matches!(
+                                self.sidebar_context_menu.take(),
+                                Some(SidebarContextMenuState {
+                                    kind: SidebarContextMenuKind::FooterAdd,
+                                    ..
+                                })
+                            );
+                            if !open {
+                                self.sidebar_context_menu = Some(SidebarContextMenuState {
+                                    x: item.x,
+                                    y: item.y,
+                                    kind: SidebarContextMenuKind::FooterAdd,
+                                });
+                            }
+                        }
                     }
                 }
                 context.invalidate();
@@ -981,6 +1027,12 @@ impl super::TermWindow {
             }
             UIItemType::FileTreeButton(action) => {
                 self.mouse_event_file_tree(Some(Ok(action)), event, context);
+            }
+            UIItemType::Settings(hit) => {
+                context.set_cursor(Some(CursorIcon::Pointer));
+                if event.kind == WMEK::Release(MousePress::Left) {
+                    self.settings_click(hit);
+                }
             }
             UIItemType::FileTreeRow { index } => {
                 self.mouse_event_file_tree_row(item, index, event, context);
@@ -1139,6 +1191,14 @@ impl super::TermWindow {
             }
             UIItemType::SidebarContextMenuItem { action } => {
                 self.mouse_event_sidebar_context_menu_item(action, event, context);
+            }
+            UIItemType::SidebarFooterAction(footer_item) => {
+                context.set_cursor(Some(CursorIcon::Default));
+                if event.kind == WMEK::Release(MousePress::Left) {
+                    self.pressed_ui_item = None;
+                    self.perform_sidebar_footer_action(footer_item, &item, &pane);
+                }
+                context.invalidate();
             }
             UIItemType::PaneToolbeltButton { pane_id, action } => {
                 self.mouse_event_pane_toolbelt_button(pane_id, action, event, context);
@@ -2042,6 +2102,139 @@ impl super::TermWindow {
         }
     }
 
+    /// A click on a footer button of the library: open the menu it stands
+    /// for at the button, or run its action on the active pane.
+    fn perform_sidebar_footer_action(
+        &mut self,
+        footer_item: config::SidebarFooterItem,
+        button: &UIItem,
+        pane: &Arc<dyn Pane>,
+    ) {
+        use config::keyassignment::{KeyAssignment, SpawnCommand, SpawnTabDomain};
+        use config::SidebarFooterItem as I;
+        let (x, y) = (button.x, button.y);
+        let split = || SpawnCommand {
+            domain: SpawnTabDomain::CurrentPaneDomain,
+            ..Default::default()
+        };
+        let assignment = match footer_item {
+            // The menus toggle: the press left an open one alone.
+            I::Sessions => {
+                let was_open = self.sessions_menu.is_some();
+                self.close_floating_menus();
+                if !was_open {
+                    self.kick_agent_session_scan();
+                    self.sessions_menu = Some(AgentLaunchMenuState {
+                        x,
+                        y,
+                        expanded: None,
+                        scroll_offset: 0,
+                        pinned_top: None,
+                    });
+                }
+                return;
+            }
+            I::Usage => {
+                let was_open = self.usage_menu.is_some();
+                self.close_floating_menus();
+                if !was_open {
+                    self.usage_menu =
+                        Some(crate::termwindow::tgz_usage_menu::UsageMenuState { x, y });
+                }
+                return;
+            }
+            I::Mosh | I::Et => {
+                let was_open = self.ssh_launch_menu.is_some();
+                self.close_floating_menus();
+                if !was_open {
+                    // The host menu, already narrowed to the transport; the
+                    // filter is there to be typed over.
+                    let query = if footer_item == I::Mosh {
+                        ":mosh "
+                    } else {
+                        ":et "
+                    };
+                    self.ssh_launch_menu = Some(SshLaunchMenuState {
+                        x,
+                        y,
+                        query: query.to_string(),
+                        search_active: true,
+                        scroll_offset: 0,
+                    });
+                }
+                return;
+            }
+            I::AgentLaunch(id) => {
+                self.launch_agent_by_id(id, None, false);
+                return;
+            }
+            I::AgentTab(id) => {
+                self.launch_agent_by_id(id, Some(config::AgentLaunchTarget::NewTab), false);
+                return;
+            }
+            I::Tower => {
+                #[cfg(tgz_tower)]
+                if self.tower_available() {
+                    super::tgz_tower::open(self);
+                }
+                return;
+            }
+            I::Settings => KeyAssignment::ShowSettings,
+            I::CommandPalette => KeyAssignment::ActivateCommandPalette,
+            I::SplitRight => KeyAssignment::SplitHorizontal(split()),
+            I::SplitDown => KeyAssignment::SplitVertical(split()),
+            I::Custom(id) => {
+                let Some(custom) = self.config.sidebar_buttons.get(id).cloned() else {
+                    return;
+                };
+                match custom
+                    .command
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|command| !command.is_empty())
+                {
+                    Some(command) => match shlex::split(command) {
+                        Some(args) if !args.is_empty() => {
+                            KeyAssignment::SpawnCommandInNewTab(SpawnCommand {
+                                args: Some(args),
+                                domain: SpawnTabDomain::CurrentPaneDomain,
+                                ..Default::default()
+                            })
+                        }
+                        _ => {
+                            wezterm_toast_notification::show(
+                                wezterm_toast_notification::ToastNotification {
+                                    title: "Sidebar button".to_string(),
+                                    message: format!(
+                                        "The command of `{id}` has a quote that is never closed"
+                                    ),
+                                    url: None,
+                                    timeout: Some(Duration::from_millis(4000)),
+                                },
+                            );
+                            return;
+                        }
+                    },
+                    None => match custom.action {
+                        Some(action) => action,
+                        None => return,
+                    },
+                }
+            }
+            // These have items and handlers of their own.
+            I::Worktree
+            | I::Changes
+            | I::Toolbelt
+            | I::SecureInput
+            | I::Agent
+            | I::Ssh
+            | I::NewTab => return,
+        };
+        if let Err(err) = self.perform_key_assignment(pane, &assignment) {
+            log::error!("sidebar button {footer_item:?}: {err:#}");
+        }
+    }
+
     /// Start customizing the footer: its buttons then drag instead of
     /// acting, until "Done" or Esc. Refused, with the reason, while the
     /// layout comes from Lua.
@@ -2088,7 +2281,7 @@ impl super::TermWindow {
         crate::termwindow::tgz_ui_state::save_sidebar_footer_weights(
             self.sidebar_footer_weights
                 .iter()
-                .map(|(item, weight)| (tgz_footer::item_name(*item).to_string(), *weight))
+                .map(|(item, weight)| (tgz_footer::item_name(*item), *weight))
                 .collect(),
         );
         if let Some(window) = self.window.as_ref() {
@@ -3501,6 +3694,31 @@ impl super::TermWindow {
             }
             (SidebarContextMenuKind::Sidebar, SidebarContextAction::CustomizeFooter) => {
                 self.start_sidebar_footer_edit();
+            }
+            (SidebarContextMenuKind::Sidebar, SidebarContextAction::ShowSettings) => {
+                self.show_settings();
+            }
+            (SidebarContextMenuKind::FooterAdd, SidebarContextAction::AddFooterItem(added)) => {
+                use crate::termwindow::tgz_footer;
+                let (rows, _) = self.sidebar_footer_full_rows();
+                let next = tgz_footer::footer_add(&rows, added, self.sidebar_footer_max_per_row());
+                tgz_footer::settle_weight(&mut self.sidebar_footer_weights, &next, added);
+                self.sidebar_footer_custom = Some(next);
+            }
+            (SidebarContextMenuKind::FooterAdd, SidebarContextAction::NewCustomButton) => {
+                self.finish_sidebar_footer_edit();
+                self.show_settings_section(
+                    crate::termwindow::tgz_settings::catalog::Section::Buttons,
+                );
+            }
+            (
+                SidebarContextMenuKind::FooterItem(removed),
+                SidebarContextAction::RemoveFooterItem,
+            ) => {
+                use crate::termwindow::tgz_footer;
+                let (rows, _) = self.sidebar_footer_full_rows();
+                self.sidebar_footer_custom = Some(tgz_footer::footer_remove(&rows, removed));
+                self.sidebar_footer_weights.remove(&removed);
             }
             // A row that does not belong to the menu it was painted in.
             _ => {}

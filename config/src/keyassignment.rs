@@ -716,6 +716,8 @@ pub enum KeyAssignment {
     ToggleAgentHerdView,
     /// Rearrange the sidebar footer's buttons by dragging (TGZTerminal).
     CustomizeSidebarButtons,
+    /// Open the Settings tab (TGZTerminal).
+    ShowSettings,
 }
 impl_lua_conversion_dynamic!(KeyAssignment);
 
