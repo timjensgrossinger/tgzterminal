@@ -1719,7 +1719,7 @@ impl crate::TermWindow {
             ("\u{f002}", FileTreeAction::Filter),
             ("\u{f06e}", FileTreeAction::Preview),
         ] {
-            let label_w = cell_w;
+            let label_w = self.chrome_text_width(label, false).max(cell_w);
             let button_w = (label_w + 10. * dpi_scale).max(button_h);
             let button_x = right - button_w;
             if button_x < card.origin.x + pad_x + 6. * cell_w {
@@ -1740,11 +1740,11 @@ impl crate::TermWindow {
                     layers,
                     1,
                     euclid::rect(button_x, button_y, button_w, button_h),
-                    5. * dpi_scale,
+                    (10. * dpi_scale).min(button_h * 0.5),
                     button_bg,
                 )?;
             }
-            self.diff_panel_text(
+            self.paint_chrome_text(
                 layers,
                 label,
                 button_x + (button_w - label_w) * 0.5,
@@ -1755,7 +1755,6 @@ impl crate::TermWindow {
                 } else {
                     contrast_label_color(button_bg, sb.text_meta)
                 },
-                button_bg,
                 false,
             )?;
             self.ui_items.push(UIItem {
@@ -1780,14 +1779,13 @@ impl crate::TermWindow {
             })
             .unwrap_or_else(|| "Worktree".to_string());
         let title_x = card.origin.x + pad_x;
-        self.diff_panel_text(
+        self.paint_chrome_text(
             layers,
             &title,
             title_x,
             text_y,
             (right - title_x).max(0.),
             sb.text_active,
-            surface,
             true,
         )?;
         let mut divider_y = header_y + header_h;
@@ -1818,32 +1816,42 @@ impl crate::TermWindow {
                 (card.size.width - pad_x * 1.2).max(1.),
                 row_h,
             );
-            let field_bg = opaque(lerp_rgba(surface, sb.text_meta, 0.12));
-            self.sidebar_rounded_fill(layers, 1, field, 6. * dpi_scale, field_bg)?;
+            // The sidebar's search field: same fill, same rounding, and the
+            // same lift towards the accent while it has the keyboard.
+            let field_bg = opaque(if focused {
+                lerp_rgba(lerp_rgba(surface, sb.text_meta, 0.12), accent, 0.18)
+            } else {
+                lerp_rgba(surface, sb.text_meta, 0.12)
+            });
+            self.sidebar_rounded_fill(
+                layers,
+                1,
+                field,
+                (10. * dpi_scale).min(row_h * 0.5),
+                field_bg,
+            )?;
             let field_text_y = field.origin.y + (row_h - cell_h) * 0.5;
             let inner_x = field.origin.x + 8. * dpi_scale;
-            self.diff_panel_text(
+            let icon_w = self.chrome_text_width("\u{f002}", false).max(cell_w);
+            self.paint_chrome_text(
                 layers,
                 "\u{f002}",
                 inner_x,
                 field_text_y,
-                cell_w,
+                icon_w,
                 sb.text_meta,
-                field_bg,
                 false,
             )?;
-            let count_w = count.chars().count() as f32 * cell_w;
-            let query_x = inner_x + cell_w * 2.;
-            let query_room = (field.max_x() - 8. * dpi_scale - count_w - cell_w - query_x).max(0.);
+            let count_w = self.chrome_text_width(&count, false).ceil();
+            let query_x = inner_x + icon_w + 6. * dpi_scale;
+            let query_room =
+                (field.max_x() - 8. * dpi_scale - count_w - 6. * dpi_scale - query_x).max(0.);
             let shown = if query.is_empty() {
                 "Filter files".to_string()
             } else {
-                crate::diff_panel::view::elide_start(
-                    &query,
-                    (query_room / cell_w).floor().max(0.) as usize,
-                )
+                self.chrome_elide_start(&query, (query_room - 2. * dpi_scale).max(0.), false)
             };
-            self.diff_panel_text(
+            self.paint_chrome_text(
                 layers,
                 &shown,
                 query_x,
@@ -1854,14 +1862,13 @@ impl crate::TermWindow {
                 } else {
                     sb.text_active
                 },
-                field_bg,
                 false,
             )?;
             if focused {
                 let caret_x = if query.is_empty() {
                     query_x
                 } else {
-                    query_x + shown.chars().count() as f32 * cell_w
+                    query_x + self.chrome_text_width(&shown, false)
                 };
                 self.filled_rectangle(
                     layers,
@@ -1871,14 +1878,13 @@ impl crate::TermWindow {
                 )?;
             }
             if count_w > 0. {
-                self.diff_panel_text(
+                self.paint_chrome_text(
                     layers,
                     &count,
                     field.max_x() - 8. * dpi_scale - count_w,
                     field_text_y,
-                    count_w,
+                    count_w + 1.,
                     sb.text_meta,
-                    field_bg,
                     false,
                 )?;
             }
@@ -1971,14 +1977,13 @@ impl crate::TermWindow {
         };
 
         if let Some(status) = status {
-            self.diff_panel_text(
+            self.paint_chrome_text(
                 layers,
                 &status,
                 card.origin.x + pad_x,
                 body_top + (row_h - cell_h) * 0.5,
                 (card.size.width - pad_x * 2.).max(0.),
                 sb.text_meta,
-                surface,
                 false,
             )?;
         }
@@ -1989,6 +1994,9 @@ impl crate::TermWindow {
                 .max(1.);
         let indent = (12. * dpi_scale).max(cell_w);
         let chevron_w = (14. * dpi_scale).max(cell_w);
+        // A file's icon, and the gap between it and the name.
+        let icon_w = (18. * dpi_scale).max(cell_w);
+        let icon_gap = 5. * dpi_scale;
         let folder_color = lerp_rgba(sb.text_meta, accent, 0.45);
         let ansi = {
             let palette = self.palette();
@@ -2042,7 +2050,13 @@ impl crate::TermWindow {
             };
             let behind = fill.unwrap_or(surface);
             if let Some(fill) = fill {
-                self.sidebar_rounded_fill(layers, 1, row_rect, 5. * dpi_scale, fill)?;
+                self.sidebar_rounded_fill(
+                    layers,
+                    1,
+                    row_rect,
+                    (6. * dpi_scale).min(row_h * 0.5),
+                    fill,
+                )?;
             }
             if is_selected && is_cursor {
                 self.sidebar_pill_fill(
@@ -2094,14 +2108,13 @@ impl crate::TermWindow {
             } else {
                 sb.text_meta
             };
-            self.diff_panel_text(
+            self.paint_chrome_text(
                 layers,
                 row_icon(row),
                 icon_x,
                 text_y,
-                cell_w,
+                icon_w,
                 icon_color,
-                behind,
                 false,
             )?;
 
@@ -2120,15 +2133,15 @@ impl crate::TermWindow {
                         lerp_rgba(color, behind, 0.25),
                     )?;
                 } else {
-                    marks_left -= cell_w;
-                    self.diff_panel_text(
+                    let letter_w = self.chrome_text_width(badge.letter(), true).ceil();
+                    marks_left -= letter_w;
+                    self.paint_chrome_text(
                         layers,
                         badge.letter(),
                         marks_left,
                         text_y,
-                        cell_w,
+                        letter_w + 1.,
                         color,
-                        behind,
                         true,
                     )?;
                 }
@@ -2151,7 +2164,7 @@ impl crate::TermWindow {
                 marks_left -= 6. * dpi_scale;
             }
 
-            let name_x = icon_x + cell_w * 2.;
+            let name_x = icon_x + icon_w + icon_gap;
             let mut name = row.name.clone();
             match row.state {
                 RowState::Loading => name.push_str(" \u{2026}"),
@@ -2174,7 +2187,6 @@ impl crate::TermWindow {
                 None => base_fg,
             };
             let name_room = (marks_left - name_x - 2. * dpi_scale).max(0.);
-            let cols = (name_room / cell_w).floor().max(0.) as usize;
             let chars: Vec<char> = name.chars().collect();
             let field = editing
                 .as_ref()
@@ -2186,7 +2198,8 @@ impl crate::TermWindow {
                 let field_w = (row_x + row_w - field_x - 4. * dpi_scale).max(1.);
                 let field_rect =
                     euclid::rect(field_x, y + 2. * dpi_scale, field_w, row_h - 4. * dpi_scale);
-                self.sidebar_rounded_fill(layers, 1, field_rect, 4. * dpi_scale, accent)?;
+                let field_radius = (6. * dpi_scale).min(field_rect.size.height * 0.5);
+                self.sidebar_rounded_fill(layers, 1, field_rect, field_radius, accent)?;
                 let field_bg = opaque(lerp_rgba(surface, sb.text_meta, 0.10));
                 self.sidebar_rounded_fill(
                     layers,
@@ -2197,16 +2210,24 @@ impl crate::TermWindow {
                         (field_rect.size.width - stroke * 2.).max(1.),
                         (field_rect.size.height - stroke * 2.).max(1.),
                     ),
-                    (4. * dpi_scale - stroke).max(0.),
+                    (field_radius - stroke).max(0.),
                     field_bg,
                 )?;
                 let room = (field_w - 8. * dpi_scale).max(0.);
-                let fit = (room / cell_w).floor().max(1.) as usize;
-                // Keep the caret in view: show the end of a long name.
-                let skip = cursor.saturating_sub(fit.saturating_sub(1));
-                let shown: String = text.chars().skip(skip).take(fit).collect();
+                // Keep the caret in view: leading characters give way until
+                // what stands before the caret fits.
+                let typed: Vec<char> = text.chars().collect();
+                let cursor = cursor.min(typed.len());
+                let before = |skip: usize| -> String { typed[skip..cursor].iter().collect() };
+                let mut skip = 0;
+                while skip < cursor
+                    && self.chrome_text_width(&before(skip), false) > room - 4. * dpi_scale
+                {
+                    skip += 1;
+                }
+                let shown: String = typed[skip..].iter().collect();
                 let placeholder = text.is_empty();
-                self.diff_panel_text(
+                self.paint_chrome_text(
                     layers,
                     if placeholder {
                         if row.kind == EntryKind::Dir {
@@ -2225,11 +2246,10 @@ impl crate::TermWindow {
                     } else {
                         sb.text_active
                     },
-                    field_bg,
                     false,
                 )?;
                 if focused && !busy {
-                    let caret_x = name_x + (cursor - skip) as f32 * cell_w;
+                    let caret_x = name_x + self.chrome_text_width(&before(skip), false);
                     self.filled_rectangle(
                         layers,
                         2,
@@ -2237,20 +2257,21 @@ impl crate::TermWindow {
                         accent,
                     )?;
                 }
-            } else if row.highlight.is_empty() || chars.len() > cols {
-                self.diff_panel_text(layers, &name, name_x, text_y, name_room, fg, behind, false)?;
+            } else if row.highlight.is_empty() || self.chrome_text_width(&name, false) > name_room {
+                self.paint_chrome_text(layers, &name, name_x, text_y, name_room, fg, false)?;
             } else {
+                // Each run starts where the text before it ends.
                 for (start, end, marked) in highlight_runs(chars.len(), &row.highlight) {
+                    let lead: String = chars[..start].iter().collect();
                     let piece: String = chars[start..end].iter().collect();
-                    let width = (end - start) as f32 * cell_w;
-                    self.diff_panel_text(
+                    let width = self.chrome_text_width(&piece, marked);
+                    self.paint_chrome_text(
                         layers,
                         &piece,
-                        name_x + start as f32 * cell_w,
+                        name_x + self.chrome_text_width(&lead, false),
                         text_y,
-                        width,
+                        width + 1.,
                         if marked { accent } else { fg },
-                        behind,
                         marked,
                     )?;
                 }

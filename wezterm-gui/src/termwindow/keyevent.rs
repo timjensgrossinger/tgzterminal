@@ -610,6 +610,40 @@ impl super::TermWindow {
         }
     }
 
+    /// Keys while a tab group's name is being typed in the search field.
+    fn tab_group_edit_key_input(
+        &mut self,
+        key: ::termwiz::input::KeyCode,
+        modifiers: Modifiers,
+        context: &dyn WindowOps,
+    ) -> bool {
+        use ::termwiz::input::KeyCode as KC;
+        match key {
+            KC::Escape => {
+                self.tab_group_edit = None;
+            }
+            KC::Backspace => {
+                if let Some(edit) = self.tab_group_edit.as_mut() {
+                    edit.text.pop();
+                }
+            }
+            KC::Enter => self.commit_tab_group_edit(),
+            KC::Char(c)
+                if !modifiers.intersects(Modifiers::CTRL | Modifiers::ALT | Modifiers::SUPER)
+                    && !c.is_control() =>
+            {
+                if let Some(edit) = self.tab_group_edit.as_mut() {
+                    if edit.text.chars().count() < 40 {
+                        edit.text.push(c);
+                    }
+                }
+            }
+            _ => return false,
+        }
+        context.invalidate();
+        true
+    }
+
     fn sidebar_search_key_input(
         &mut self,
         key: ::termwiz::input::KeyCode,
@@ -731,8 +765,34 @@ impl super::TermWindow {
                     }
                 }
 
+                // A dialog or the tab palette has the whole keyboard.
+                if self.chrome_dialog.is_some() {
+                    if window_key.key_is_down {
+                        self.chrome_dialog_key(&key);
+                    }
+                    return;
+                }
+                if self.tab_palette.is_some() {
+                    if window_key.key_is_down {
+                        self.tab_palette_key(&key, modifiers);
+                    }
+                    return;
+                }
+
+                if self.tab_group_edit.is_some() && window_key.key_is_down {
+                    if self.tab_group_edit_key_input(key.clone(), modifiers, context) {
+                        return;
+                    }
+                }
+
                 if self.sidebar_search.is_some() && window_key.key_is_down {
                     if self.sidebar_search_key_input(key, modifiers, context) {
+                        return;
+                    }
+                }
+
+                if self.sessions_menu.is_some() && window_key.key_is_down {
+                    if self.sessions_menu_key_input(key.clone(), modifiers, context) {
                         return;
                     }
                 }

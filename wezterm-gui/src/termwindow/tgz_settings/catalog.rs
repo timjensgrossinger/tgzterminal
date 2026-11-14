@@ -10,7 +10,8 @@ use super::lua_edit::LuaValue;
 use config::{
     AgentLaunchTarget, AgentRingColors, Config, DiffPanelLongLines, DiffPanelMode,
     DiffPanelPosition, DiffPanelRaisedMode, FileBrowserEditorPlacement, FileBrowserUi,
-    PaneToolbeltPosition, SidebarPosition, SidebarTabDensity, SidebarTabTitleSource, SidebarTheme,
+    PaneToolbeltPosition, SidebarPosition, SidebarTabDensity, SidebarTabGrouping,
+    SidebarTabTitleSource, SidebarTheme,
 };
 use std::convert::TryFrom;
 
@@ -348,6 +349,13 @@ pub(crate) static CATALOG: &[Setting] = &[
         "Auto follows your colours when you set any.",
         SidebarTheme,
         sidebar_theme
+    ),
+    choice!(
+        Sidebar,
+        "Tab groups",
+        "Auto puts a new tab under its project folder. Manual groups only by hand. Off is one flat list.",
+        SidebarTabGrouping,
+        sidebar_tab_grouping
     ),
     choice!(
         Sidebar,

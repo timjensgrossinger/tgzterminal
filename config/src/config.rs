@@ -252,6 +252,24 @@ impl SidebarButtonConfig {
     }
 }
 
+/// How the sidebar groups its tabs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromDynamic, ToDynamic)]
+pub enum SidebarTabGrouping {
+    /// A new tab joins the group of the project folder it starts in. It
+    /// stays there when it changes folder; tabs can still be moved by hand.
+    Auto,
+    /// Tabs are only grouped by hand.
+    Manual,
+    /// One flat list, no group headers.
+    Off,
+}
+
+impl Default for SidebarTabGrouping {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, FromDynamic, ToDynamic)]
 pub enum SidebarPosition {
     Left,
@@ -260,6 +278,16 @@ pub enum SidebarPosition {
 
 fn default_sidebar_footer_max_per_row() -> usize {
     5
+}
+
+/// Points, like the other chrome font sizes: 13 px on a 72-dpi-per-1x mac,
+/// about the same on the 96-dpi baseline everywhere else.
+fn default_sidebar_font_size() -> f64 {
+    if cfg!(target_os = "macos") {
+        13.0
+    } else {
+        10.0
+    }
 }
 
 impl Default for SidebarPosition {
@@ -2566,6 +2594,22 @@ pub struct Config {
     /// full row takes no more.
     #[dynamic(default = "default_sidebar_footer_max_per_row")]
     pub sidebar_footer_max_per_row: usize,
+
+    /// Whether and how the sidebar groups its tabs; see `SidebarTabGrouping`.
+    #[dynamic(default)]
+    pub sidebar_tab_grouping: SidebarTabGrouping,
+
+    /// Font of the sidebar's own text: labels, menus, tooltips. Unset, it is
+    /// the window frame font (`window_frame.font`), which defaults to the
+    /// bundled Roboto. The terminal font stays the fallback, so icon glyphs
+    /// keep resolving.
+    #[dynamic(default)]
+    pub sidebar_font: Option<TextStyle>,
+
+    /// Size of `sidebar_font` in points. It follows the display's DPI but not
+    /// the terminal font size, so zooming the terminal leaves the sidebar alone.
+    #[dynamic(default = "default_sidebar_font_size")]
+    pub sidebar_font_size: f64,
 
     /// File browser pane behavior.
     #[dynamic(default)]

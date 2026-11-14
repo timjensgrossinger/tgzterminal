@@ -207,6 +207,7 @@ impl SessionSource for OpenCodeDetector {
                         activity,
                         input_tokens: None,
                         output_tokens: None,
+                        context_percent: None,
                         cost: None,
                     });
                 }
@@ -436,6 +437,7 @@ fn collect_database_sessions(home: &Path) -> Vec<VendorSession> {
             let cost = (cost > 0.0).then(|| format!("${cost:.4}"));
             let activity = opencode_activity(&conn, schema, &session_id);
             let turn = opencode_turn_state(&conn, schema, &session_id);
+            let context_percent = opencode_context_percent(&conn, schema, home, &session_id);
             Some(VendorSession {
                 origin: SessionOrigin::Host,
                 home: None,
@@ -461,6 +463,7 @@ fn collect_database_sessions(home: &Path) -> Vec<VendorSession> {
                 activity,
                 input_tokens: u64_count(input_tokens),
                 output_tokens: u64_count(output_tokens),
+                context_percent,
                 cost,
             })
         })
@@ -513,6 +516,91 @@ fn is_pending_question(part: &serde_json::Value) -> bool {
                 .and_then(|status| status.as_str()),
             Some("pending") | Some("running")
         )
+}
+
+/// What the model's context held on an assistant message, with the provider
+/// and model it ran on: everything sent, cached or not, plus the reply.
+pub(crate) fn context_from_message(message: &serde_json::Value) -> Option<(u64, String, String)> {
+    if message.get("role")?.as_str()? != "assistant" {
+        return None;
+    }
+    let tokens = message.get("tokens")?;
+    let count =
+        |value: Option<&serde_json::Value>| value.and_then(serde_json::Value::as_u64).unwrap_or(0);
+    let cache = tokens.get("cache");
+    let used = count(tokens.get("input"))
+        + count(tokens.get("output"))
+        + count(cache.and_then(|cache| cache.get("read")))
+        + count(cache.and_then(|cache| cache.get("write")));
+    if used == 0 {
+        return None;
+    }
+    Some((
+        used,
+        message.get("providerID")?.as_str()?.to_string(),
+        message.get("modelID")?.as_str()?.to_string(),
+    ))
+}
+
+/// A model's context window from OpenCode's own model catalogue.
+pub(crate) fn context_limit(
+    models: &serde_json::Value,
+    provider: &str,
+    model: &str,
+) -> Option<u64> {
+    models
+        .get(provider)?
+        .get("models")?
+        .get(model)?
+        .get("limit")?
+        .get("context")?
+        .as_u64()
+        .filter(|limit| *limit > 0)
+}
+
+/// OpenCode's model catalogue (`~/.cache/opencode/models.json`), parsed once
+/// per version of the file: it is several megabytes.
+fn model_catalogue(home: &Path) -> Option<std::sync::Arc<serde_json::Value>> {
+    type Cached = (PathBuf, SystemTime, std::sync::Arc<serde_json::Value>);
+    static CATALOGUE: std::sync::Mutex<Option<Cached>> = std::sync::Mutex::new(None);
+    let path = home.join(".cache").join("opencode").join("models.json");
+    let modified = std::fs::metadata(&path).ok()?.modified().ok()?;
+    let mut cached = CATALOGUE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some((known, at, models)) = cached.as_ref() {
+        if *known == path && *at == modified {
+            return Some(std::sync::Arc::clone(models));
+        }
+    }
+    let models: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).ok()?).ok()?;
+    let models = std::sync::Arc::new(models);
+    *cached = Some((path, modified, std::sync::Arc::clone(&models)));
+    Some(models)
+}
+
+/// How full the context window of a session is, from its newest assistant
+/// message and the catalogue's limit for that model. Only the layout this
+/// was checked against (the `message` table) is read.
+fn opencode_context_percent(
+    conn: &Connection,
+    schema: OpencodeSchema,
+    home: &Path,
+    session_id: &str,
+) -> Option<u8> {
+    if schema != OpencodeSchema::Legacy {
+        return None;
+    }
+    let (used, provider, model) = newest_rows(
+        conn,
+        "SELECT data FROM message WHERE session_id = ?1 \
+         ORDER BY time_created DESC LIMIT 6",
+        session_id,
+    )
+    .iter()
+    .find_map(context_from_message)?;
+    let limit = context_limit(&*model_catalogue(home)?, &provider, &model)?;
+    super::usage::context_percent(used, limit)
 }
 
 fn newest_rows(conn: &Connection, sql: &str, session_id: &str) -> Vec<serde_json::Value> {
@@ -1089,6 +1177,38 @@ fn clean_title(title: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_use_comes_from_the_assistant_message_and_the_catalogue() {
+        let message = serde_json::json!({
+            "role": "assistant",
+            "providerID": "openrouter",
+            "modelID": "some/model",
+            "tokens": { "input": 1000, "output": 200, "reasoning": 50,
+                        "cache": { "read": 30000, "write": 800 } },
+        });
+        assert_eq!(
+            context_from_message(&message),
+            Some((32_000, "openrouter".to_string(), "some/model".to_string()))
+        );
+        let user = serde_json::json!({ "role": "user" });
+        assert_eq!(context_from_message(&user), None);
+        let empty = serde_json::json!({
+            "role": "assistant", "providerID": "p", "modelID": "m",
+            "tokens": { "input": 0, "output": 0, "cache": { "read": 0, "write": 0 } },
+        });
+        assert_eq!(context_from_message(&empty), None);
+
+        let models = serde_json::json!({
+            "openrouter": { "models": { "some/model": { "limit": { "context": 128000, "output": 8000 } } } },
+        });
+        assert_eq!(
+            context_limit(&models, "openrouter", "some/model"),
+            Some(128_000)
+        );
+        assert_eq!(context_limit(&models, "openrouter", "other"), None);
+        assert_eq!(context_limit(&models, "nobody", "some/model"), None);
+    }
 
     fn write(path: &Path, contents: &str) {
         if let Some(parent) = path.parent() {

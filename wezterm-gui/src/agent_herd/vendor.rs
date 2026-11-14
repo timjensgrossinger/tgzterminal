@@ -165,6 +165,8 @@ pub struct VendorSession {
     pub activity: Option<HerdActivity>,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+    /// How full the model's context window is, in percent, when known.
+    pub context_percent: Option<u8>,
     pub cost: Option<String>,
     /// Is this a session a human is typing into?
     ///

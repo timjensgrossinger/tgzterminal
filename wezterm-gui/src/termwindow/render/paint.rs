@@ -374,6 +374,11 @@ impl crate::TermWindow {
         self.settle_dropdown_key_selection();
         self.paint_chrome_tooltip(&mut layers)
             .context("paint_chrome_tooltip")?;
+        // Last, over everything: they take the whole window.
+        self.paint_tab_palette(&mut layers)
+            .context("paint_tab_palette")?;
+        self.paint_chrome_dialog(&mut layers)
+            .context("paint_chrome_dialog")?;
         Ok(())
     }
 

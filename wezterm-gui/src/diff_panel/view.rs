@@ -197,20 +197,6 @@ pub fn display_chars(text: &str) -> usize {
     text.chars().map(|c| if c == '\t' { 4 } else { 1 }).sum()
 }
 
-/// `text` cut to `cols` characters, keeping its end: for a path, the file
-/// name matters more than the directories leading to it.
-pub fn elide_start(text: &str, cols: usize) -> String {
-    let len = text.chars().count();
-    if len <= cols {
-        return text.to_string();
-    }
-    if cols <= 1 {
-        return "\u{2026}".repeat(cols);
-    }
-    let tail: String = text.chars().skip(len - (cols - 1)).collect();
-    format!("\u{2026}{tail}")
-}
-
 /// The scroll offset after a wheel movement of `delta` notches (positive is
 /// up), kept within what there is to scroll.
 pub fn scrolled(offset: usize, delta: isize, total: usize, visible: usize) -> usize {
@@ -399,14 +385,6 @@ mod tests {
     fn control_characters_never_reach_the_cells() {
         assert_eq!(display_text("\tif x {\r"), "    if x { ");
         assert_eq!(display_text("a\u{1b}[31mb"), "a [31mb");
-    }
-
-    #[test]
-    fn long_paths_keep_their_file_name() {
-        assert_eq!(elide_start("src/a.rs", 20), "src/a.rs");
-        assert_eq!(elide_start("very/deep/dir/file.rs", 8), "\u{2026}file.rs");
-        assert_eq!(elide_start("abc", 1), "\u{2026}");
-        assert_eq!(elide_start("abc", 0), "");
     }
 
     #[test]

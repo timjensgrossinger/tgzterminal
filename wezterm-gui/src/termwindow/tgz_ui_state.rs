@@ -33,6 +33,11 @@ struct TgzUiState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     ssh_recent_hosts: Option<Vec<String>>,
 
+    /// Names of the tab groups the user made in the sidebar, in order. Which
+    /// tab is in which group is not kept: tabs do not outlive the window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tab_groups: Option<Vec<String>>,
+
     /// Tab indices whose pane children are expanded in the sidebar. Stored as
     /// a plain list because a tab index is the only identity the sidebar row
     /// model has; indices shift when tabs are reordered or closed, so on
@@ -148,6 +153,18 @@ pub fn save_sidebar_expanded_tabs(tabs: &HashSet<usize>) {
 /// Recently used SSH quick-launch hosts, most recent first; empty when unset.
 pub fn load_ssh_recent_hosts() -> Vec<String> {
     read_state().ssh_recent_hosts.unwrap_or_default()
+}
+
+/// The tab groups the user made, in order.
+pub fn load_tab_groups() -> Vec<String> {
+    read_state().tab_groups.unwrap_or_default()
+}
+
+/// Persist the names of the user's tab groups. Best-effort.
+pub fn save_tab_groups(names: &[String]) {
+    let mut state = read_state();
+    state.tab_groups = Some(names.to_vec());
+    write_state(&state);
 }
 
 /// Persist the recently used SSH quick-launch hosts. Best-effort.
@@ -511,6 +528,7 @@ mod tests {
             sidebar_footer_weights: None,
             agent_launcher_project_root: Some(true),
             ssh_recent_hosts: None,
+            tab_groups: None,
             sidebar_expanded_tabs: Some(vec![0, 2]),
             agent_section_collapsed: None,
             agent_section_view: None,
@@ -587,6 +605,7 @@ mod tests {
             sidebar_footer_weights: None,
             agent_launcher_project_root: Some(true),
             ssh_recent_hosts: None,
+            tab_groups: None,
             sidebar_expanded_tabs: Some(vec![0]),
             agent_section_collapsed: None,
             agent_section_view: None,

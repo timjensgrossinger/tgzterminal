@@ -54,6 +54,30 @@ pub struct UsageTotals {
     pub output_tokens: Option<u64>,
     /// When the transcript's first record was written.
     pub started_at: Option<SystemTime>,
+    /// Tokens the model's context held on the latest turn, cache reads
+    /// included: how full the context window is, not what was billed.
+    pub context_tokens: Option<u64>,
+    /// Size of that window, when the transcript says (Codex does).
+    pub context_window: Option<u64>,
+}
+
+/// Claude's context window when nothing reports it: the standard size, or the
+/// extended one once a turn has already held more than the standard size.
+pub fn claude_window_guess(context_tokens: u64) -> u64 {
+    if context_tokens > 200_000 {
+        1_000_000
+    } else {
+        200_000
+    }
+}
+
+/// How full a context window is, in whole percent, capped at 100.
+pub fn context_percent(context_tokens: u64, window: u64) -> Option<u8> {
+    if window == 0 {
+        return None;
+    }
+    let percent = (context_tokens as f64 / window as f64 * 100.0).round();
+    Some(percent.clamp(0.0, 100.0) as u8)
 }
 
 #[derive(Clone, Debug, Default)]
@@ -66,6 +90,8 @@ struct UsageState {
     seen: bool,
     model: Option<String>,
     started_at: Option<SystemTime>,
+    context_tokens: Option<u64>,
+    context_window: Option<u64>,
 }
 
 impl UsageState {
@@ -75,6 +101,8 @@ impl UsageState {
             input_tokens: self.seen.then_some(self.input),
             output_tokens: self.seen.then_some(self.output),
             started_at: self.started_at,
+            context_tokens: self.context_tokens,
+            context_window: self.context_window,
         }
     }
 }
@@ -82,6 +110,10 @@ impl UsageState {
 #[derive(Deserialize)]
 struct ClaudeRecord {
     message: Option<ClaudeMessage>,
+    /// A subagent's turn written into its parent's transcript: its context
+    /// is not the session's.
+    #[serde(rename = "isSidechain")]
+    is_sidechain: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -95,6 +127,7 @@ struct ClaudeMessage {
 struct ClaudeUsage {
     input_tokens: Option<u64>,
     cache_creation_input_tokens: Option<u64>,
+    cache_read_input_tokens: Option<u64>,
     output_tokens: Option<u64>,
 }
 
@@ -121,6 +154,12 @@ fn fold_claude_record(line: &str, state: &mut UsageState) {
     };
     let input = usage.input_tokens.unwrap_or(0) + usage.cache_creation_input_tokens.unwrap_or(0);
     let output = usage.output_tokens.unwrap_or(0);
+    // What the model was sent for this turn is what its context holds now.
+    // The newest turn wins; a made-up message reports nothing and is skipped.
+    let context = input + usage.cache_read_input_tokens.unwrap_or(0);
+    if context > 0 && record.is_sidechain != Some(true) {
+        state.context_tokens = Some(context);
+    }
     // An early record of a message can carry a partial output count, and a
     // later one can repeat it, so the largest report is the one kept.
     let (old_input, old_output) = state.per_message.get(&id).copied().unwrap_or((0, 0));
@@ -152,6 +191,8 @@ struct CodexPayload {
 #[derive(Deserialize)]
 struct CodexTokenInfo {
     total_token_usage: Option<CodexTokenUsage>,
+    last_token_usage: Option<CodexTokenUsage>,
+    model_context_window: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -195,7 +236,21 @@ fn fold_codex_record(line: &str, state: &mut UsageState) {
         return;
     }
     // `info` is null on the events that only report rate limits.
-    let Some(total) = payload.info.and_then(|info| info.total_token_usage) else {
+    let Some(info) = payload.info else {
+        return;
+    };
+    if let Some(last) = &info.last_token_usage {
+        // Codex counts cached tokens inside `input_tokens`, so this is the
+        // whole turn: everything sent plus what came back.
+        let context = last.input_tokens.unwrap_or(0) + last.output_tokens.unwrap_or(0);
+        if context > 0 {
+            state.context_tokens = Some(context);
+        }
+    }
+    if let Some(window) = info.model_context_window.filter(|window| *window > 0) {
+        state.context_window = Some(window);
+    }
+    let Some(total) = info.total_token_usage else {
         return;
     };
     // Codex counts cached tokens inside `input_tokens`.
@@ -286,6 +341,55 @@ pub fn totals_for(transcript: &Path, format: UsageFormat) -> Option<UsageTotals>
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn claude_context_is_the_newest_main_turn_with_cache_reads() {
+        let side = serde_json::json!({
+            "type": "assistant",
+            "isSidechain": true,
+            "message": { "id": "s", "model": "m",
+                "usage": { "input_tokens": 5, "cache_read_input_tokens": 10, "output_tokens": 1 } },
+        })
+        .to_string();
+        let totals = fold_all(
+            UsageFormat::Claude,
+            &[
+                claude_line("a", "m", 2, 100, 7),
+                claude_line("b", "m", 3, 400, 9),
+                side,
+            ],
+        );
+        // 3 + 400 written + 900_000 read; the subagent's turn does not count.
+        assert_eq!(totals.context_tokens, Some(900_403));
+        assert_eq!(totals.context_window, None);
+    }
+
+    #[test]
+    fn codex_context_comes_with_its_window() {
+        let line = serde_json::json!({
+            "timestamp": "2026-08-30T00:20:00.000Z",
+            "type": "event_msg",
+            "payload": { "type": "token_count", "info": {
+                "total_token_usage": { "input_tokens": 9000, "cached_input_tokens": 8000, "output_tokens": 50 },
+                "last_token_usage": { "input_tokens": 40_000, "cached_input_tokens": 39_000, "output_tokens": 800 },
+                "model_context_window": 272_000,
+            } },
+        })
+        .to_string();
+        let totals = fold_all(UsageFormat::Codex, &[line]);
+        assert_eq!(totals.context_tokens, Some(40_800));
+        assert_eq!(totals.context_window, Some(272_000));
+        assert_eq!(context_percent(40_800, 272_000), Some(15));
+    }
+
+    #[test]
+    fn context_percent_is_capped_and_needs_a_window() {
+        assert_eq!(context_percent(50, 0), None);
+        assert_eq!(context_percent(300_000, 200_000), Some(100));
+        assert_eq!(context_percent(0, 200_000), Some(0));
+        assert_eq!(claude_window_guess(150_000), 200_000);
+        assert_eq!(claude_window_guess(200_001), 1_000_000);
+    }
 
     fn claude_line(id: &str, model: &str, input: u64, cache_write: u64, output: u64) -> String {
         serde_json::json!({

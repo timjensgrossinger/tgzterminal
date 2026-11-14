@@ -224,8 +224,59 @@ pub fn relay_script(sample: &str, original: Option<&str>) -> String {
          if printf '%s' \"$input\" > \"$tmp\" 2>/dev/null; then\n\
          \x20 mv -f \"$tmp\" \"$sample\" 2>/dev/null || rm -f \"$tmp\"\n\
          fi\n\
+         {SESSION_BLOCK}\
          {show}"
     )
+}
+
+/// Marks a relay script that keeps a sample per session.
+const SESSION_MARKER: &str = "$sample.d";
+
+/// Keeps each session's newest payload in a file of its own, beside the
+/// shared sample. Several sessions take turns overwriting the shared one, so
+/// a reader that polls would miss most of them.
+const SESSION_BLOCK: &str = r#"sid=$(printf '%s' "$input" | sed -n 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([A-Za-z0-9_-]*\)".*/\1/p' | head -n 1)
+if [ -n "$sid" ] && mkdir -p "$sample.d" 2>/dev/null; then
+  if printf '%s' "$input" > "$sample.d/$sid.$$" 2>/dev/null; then
+    mv -f "$sample.d/$sid.$$" "$sample.d/$sid.json" 2>/dev/null || rm -f "$sample.d/$sid.$$"
+  fi
+fi
+"#;
+
+/// Brings a relay script written by an earlier build up to date: one that
+/// does not keep per-session samples yet gets that block added, everything
+/// else in it left as it is. `None` when there is nothing to change.
+pub fn upgrade_script_text(script: &str) -> Option<String> {
+    if script.contains(SESSION_MARKER) {
+        return None;
+    }
+    // After the block that saves the shared sample, which ends at its `fi`.
+    let saved = script.find("mv -f \"$tmp\" \"$sample\"")?;
+    let end = script[saved..].find("\nfi\n")? + saved + "\nfi\n".len();
+    let mut upgraded = String::with_capacity(script.len() + SESSION_BLOCK.len());
+    upgraded.push_str(&script[..end]);
+    upgraded.push_str(SESSION_BLOCK);
+    upgraded.push_str(&script[end..]);
+    Some(upgraded)
+}
+
+fn upgrade_script(paths: &RelayPaths) {
+    static DONE: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+    {
+        let mut done = DONE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if done.contains(&paths.script) {
+            return;
+        }
+        done.push(paths.script.clone());
+    }
+    let Ok(script) = std::fs::read_to_string(&paths.script) else {
+        return;
+    };
+    if let Some(upgraded) = upgrade_script_text(&script) {
+        if let Err(err) = write_atomic(&paths.script, upgraded.as_bytes(), Some(0o755)) {
+            log::warn!("usage relay: could not update the relay script: {err:#}");
+        }
+    }
 }
 
 fn is_connected(settings: &Value, script: &str) -> bool {
@@ -526,6 +577,9 @@ fn toast(title: &str, message: String) {
 /// silent.
 pub fn ensure(paths: &RelayPaths, wanted: bool) -> RelayStatus {
     let status = refresh_status(paths);
+    if wanted && status == RelayStatus::Connected {
+        upgrade_script(paths);
+    }
     let claude_installed = paths.settings.parent().is_some_and(Path::is_dir);
     let Some(attach) = relay_change(wanted, status, claude_installed) else {
         return status;
@@ -610,6 +664,96 @@ pub fn tick(roots: &[SessionRoot], wanted: bool, poll_quota: bool) {
         ensure(&paths, wanted);
         if poll_quota {
             quota::poll_claude_sample(&paths.sample);
+            // This machine's own sample is also watched between scans; one
+            // inside WSL is not, since asking a share twice a second is what
+            // keeps a distro awake.
+            if root.origin == SessionOrigin::Host {
+                watch_sample(&paths.sample);
+            }
+        }
+    }
+}
+
+/// How often the watched samples are looked at between herd scans.
+const SAMPLE_WATCH_INTERVAL: Duration = Duration::from_millis(400);
+
+/// Samples the watcher looks at, and whether its thread has been started.
+static WATCHED_SAMPLES: LazyLock<Mutex<Vec<PathBuf>>> = LazyLock::new(Default::default);
+static SAMPLE_WATCHER: std::sync::Once = std::sync::Once::new();
+
+/// Keep `sample` fresh between herd scans.
+///
+/// A scan reads every vendor's store and takes seconds, and the sample was
+/// only read as part of one, so the context figure on a tab row trailed
+/// Claude's own by about that long. The watcher costs one `stat` per sample
+/// per tick and reads only after Claude Code rewrote it.
+fn watch_sample(sample: &Path) {
+    {
+        let mut watched = WATCHED_SAMPLES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !watched.iter().any(|seen| seen == sample) {
+            watched.push(sample.to_path_buf());
+        }
+    }
+    SAMPLE_WATCHER.call_once(|| {
+        let spawned = std::thread::Builder::new()
+            .name("claude-sample-watch".into())
+            .spawn(|| {
+                let mut seen: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
+                loop {
+                    std::thread::sleep(SAMPLE_WATCH_INTERVAL);
+                    let watched = WATCHED_SAMPLES
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clone();
+                    let mut changed = false;
+                    for path in watched {
+                        let Some(modified) = std::fs::metadata(&path)
+                            .ok()
+                            .and_then(|metadata| metadata.modified().ok())
+                        else {
+                            continue;
+                        };
+                        if !sample_is_new(&mut seen, &path, modified) {
+                            continue;
+                        }
+                        quota::poll_claude_sample(&path);
+                        changed = true;
+                    }
+                    if changed {
+                        promise::spawn::spawn_into_main_thread(async {
+                            use ::window::WindowOps;
+                            for gui_window in crate::frontend::front_end().gui_windows() {
+                                gui_window.window.invalidate();
+                            }
+                        })
+                        .detach();
+                    }
+                }
+            });
+        if let Err(err) = spawned {
+            log::warn!("failed to start the Claude sample watcher: {err:#}");
+        }
+    });
+}
+
+/// Whether `modified` is a write of `path` the watcher has not handled yet;
+/// remembers it when so.
+fn sample_is_new(
+    seen: &mut Vec<(PathBuf, std::time::SystemTime)>,
+    path: &Path,
+    modified: std::time::SystemTime,
+) -> bool {
+    match seen.iter_mut().find(|(known, _)| known == path) {
+        Some((_, at)) if *at == modified => false,
+        Some((_, at)) => {
+            *at = modified;
+            true
+        }
+        None => {
+            seen.push((path.to_path_buf(), modified));
+            true
         }
     }
 }
@@ -617,6 +761,20 @@ pub fn tick(roots: &[SessionRoot], wanted: bool, poll_quota: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_sample_is_new_once_per_write() {
+        let mut seen = Vec::new();
+        let path = Path::new("/data/sample.json");
+        let first = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        let second = first + Duration::from_secs(1);
+        assert!(sample_is_new(&mut seen, path, first));
+        assert!(!sample_is_new(&mut seen, path, first));
+        assert!(sample_is_new(&mut seen, path, second));
+        assert!(!sample_is_new(&mut seen, path, second));
+        assert!(sample_is_new(&mut seen, Path::new("/other.json"), first));
+        assert_eq!(seen.len(), 2);
+    }
 
     fn paths(dir: &Path) -> RelayPaths {
         RelayPaths {
@@ -738,6 +896,53 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn an_older_relay_script_gains_the_per_session_block_once() {
+        let old = relay_script("/tmp/sample.json", Some("cat")).replace(SESSION_BLOCK, "");
+        assert!(!old.contains(SESSION_MARKER));
+        let upgraded = upgrade_script_text(&old).unwrap();
+        assert_eq!(upgraded, relay_script("/tmp/sample.json", Some("cat")));
+        assert_eq!(upgrade_script_text(&upgraded), None);
+        // A script that is not ours is left alone.
+        assert_eq!(upgrade_script_text("#!/bin/sh\necho hi\n"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relay_script_keeps_a_sample_per_session() {
+        use std::io::Write;
+        let temp = tempfile::tempdir().unwrap();
+        let sample = temp.path().join("sample.json");
+        let script = temp.path().join("relay.sh");
+        std::fs::write(
+            &script,
+            relay_script(&sample.to_string_lossy(), Some("cat >/dev/null")),
+        )
+        .unwrap();
+        for (session, percent) in [("abc-1", 10), ("def-2", 20), ("abc-1", 30)] {
+            let payload = format!(
+                r#"{{"session_id":"{session}","context_window":{{"used_percentage":{percent}}}}}"#
+            );
+            let mut child = std::process::Command::new("sh")
+                .arg(&script)
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(payload.as_bytes())
+                .unwrap();
+            assert!(child.wait().unwrap().success());
+        }
+        let dir = temp.path().join("sample.json.d");
+        let read = |name: &str| std::fs::read_to_string(dir.join(name)).unwrap();
+        assert!(read("abc-1.json").contains("\"used_percentage\":30"));
+        assert!(read("def-2.json").contains("\"used_percentage\":20"));
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
+    }
+
     #[test]
     fn relay_script_saves_the_payload_and_runs_the_original() {
         let temp = tempfile::tempdir().unwrap();

@@ -473,6 +473,8 @@ struct FontConfigInner {
     pane_select_font: RefCell<Option<Rc<LoadedFont>>>,
     char_select_font: RefCell<Option<Rc<LoadedFont>>>,
     command_palette_font: RefCell<Option<Rc<LoadedFont>>>,
+    /// Chrome fonts by (size in hundredths of a point, weight); see `ui_font`.
+    ui_fonts: RefCell<HashMap<(u32, FontWeight), Rc<LoadedFont>>>,
     fallback_channel: RefCell<Option<Sender<FallbackResolveInfo>>>,
 }
 
@@ -494,6 +496,7 @@ impl FontConfigInner {
             pane_select_font: RefCell::new(None),
             char_select_font: RefCell::new(None),
             command_palette_font: RefCell::new(None),
+            ui_fonts: RefCell::new(HashMap::new()),
             font_scale: RefCell::new(1.0),
             dpi: RefCell::new(dpi),
             config: RefCell::new(config.clone()),
@@ -512,6 +515,7 @@ impl FontConfigInner {
         self.pane_select_font.borrow_mut().take();
         self.char_select_font.borrow_mut().take();
         self.command_palette_font.borrow_mut().take();
+        self.ui_fonts.borrow_mut().clear();
         self.metrics.borrow_mut().take();
         *self.font_dirs.borrow_mut() = Arc::new(FontDatabase::with_font_dirs(config)?);
         Ok(())
@@ -650,6 +654,86 @@ impl FontConfigInner {
             pixel_geometry: config.display_pixel_geometry,
         });
 
+        Ok(loaded)
+    }
+
+    /// A font for chrome text at `size_pt` points and `weight`: the
+    /// `sidebar_font`, else the window frame font, else the bundled Roboto,
+    /// with the terminal fonts as fallback. Sized by DPI only, never by the
+    /// terminal's font scale.
+    fn ui_font(
+        &self,
+        myself: &Rc<Self>,
+        size_pt: f64,
+        weight: FontWeight,
+    ) -> anyhow::Result<Rc<LoadedFont>> {
+        let key = ((size_pt * 100.0).round().max(0.0) as u32, weight);
+        if let Some(entry) = self.ui_fonts.borrow().get(&key) {
+            return Ok(Rc::clone(entry));
+        }
+
+        let config = self.config.borrow();
+        let text_style = match config
+            .sidebar_font
+            .as_ref()
+            .or(config.window_frame.font.as_ref())
+        {
+            Some(style) => {
+                let mut style = style.clone();
+                if weight != FontWeight::REGULAR {
+                    for font in style.font.iter_mut().filter(|f| !f.is_fallback) {
+                        font.weight = weight;
+                    }
+                }
+                style
+            }
+            None => {
+                let mut fonts = vec![FontAttributes {
+                    family: "Roboto".to_string(),
+                    weight,
+                    ..Default::default()
+                }];
+                for font in &config.font.font {
+                    let mut font = font.clone();
+                    font.is_fallback = true;
+                    fonts.push(font);
+                }
+                TextStyle {
+                    foreground: None,
+                    font: fonts,
+                }
+            }
+        };
+
+        let font_size = size_pt;
+        let dpi = *self.dpi.borrow() as u32;
+        let pixel_size = (font_size * dpi as f64 / 72.0) as u16;
+
+        let attributes = text_style.font_with_fallback();
+        let (handles, _loaded) = self.resolve_font_helper_impl(&attributes, pixel_size)?;
+        let shaper = new_shaper(&*config, &handles)?;
+        let metrics = shaper.metrics(font_size, dpi).with_context(|| {
+            format!(
+                "obtaining metrics for font_size={} @ dpi {}",
+                font_size, dpi
+            )
+        })?;
+
+        let loaded = Rc::new(LoadedFont {
+            rasterizers: RefCell::new(HashMap::new()),
+            handles: RefCell::new(handles),
+            shaper: RefCell::new(shaper),
+            metrics,
+            font_size,
+            dpi,
+            font_config: Rc::downgrade(myself),
+            pending_fallback: Arc::new(Mutex::new(vec![])),
+            text_style,
+            id: alloc_font_id(),
+            tried_glyphs: RefCell::new(HashSet::new()),
+            pixel_geometry: config.display_pixel_geometry,
+        });
+        self.ui_fonts.borrow_mut().insert(key, Rc::clone(&loaded));
         Ok(loaded)
     }
 
@@ -955,6 +1039,7 @@ impl FontConfigInner {
         self.fonts.borrow_mut().clear();
         self.metrics.borrow_mut().take();
         self.title_font.borrow_mut().take();
+        self.ui_fonts.borrow_mut().clear();
 
         (prior_font, prior_dpi)
     }
@@ -1069,6 +1154,11 @@ impl FontConfiguration {
 
     pub fn command_palette_font(&self) -> anyhow::Result<Rc<LoadedFont>> {
         self.inner.command_palette_font(&self.inner)
+    }
+
+    /// Font for chrome text; see `FontConfigInner::ui_font`.
+    pub fn ui_font(&self, size_pt: f64, weight: FontWeight) -> anyhow::Result<Rc<LoadedFont>> {
+        self.inner.ui_font(&self.inner, size_pt, weight)
     }
 
     pub fn pane_select_font(&self) -> anyhow::Result<Rc<LoadedFont>> {

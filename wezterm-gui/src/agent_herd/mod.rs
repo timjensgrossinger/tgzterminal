@@ -475,6 +475,8 @@ pub struct HerdAgent {
     pub activity: Option<HerdActivity>,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+    /// How full the model's context window is, in percent, when known.
+    pub context_percent: Option<u8>,
     pub cost: Option<String>,
     /// Whether row actions resolved successfully for its bound pane.
     pub can_attach: bool,
@@ -639,6 +641,8 @@ pub struct PaneAgentRow {
     pub pids: HashSet<u32>,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+    /// How full the model's context window is, in percent, when known.
+    pub context_percent: Option<u8>,
     pub cost: Option<String>,
     pub activity: Option<HerdActivity>,
     pub can_attach: bool,
@@ -882,6 +886,9 @@ pub fn join_sessions_with_panes(
             output_tokens: session
                 .output_tokens
                 .or_else(|| pane.and_then(|p| p.output_tokens)),
+            context_percent: session
+                .context_percent
+                .or_else(|| pane.and_then(|p| p.context_percent)),
             cost: session
                 .cost
                 .clone()
@@ -933,6 +940,7 @@ pub fn join_sessions_with_panes(
             activity: row.activity,
             input_tokens: row.input_tokens,
             output_tokens: row.output_tokens,
+            context_percent: row.context_percent,
             cost: row.cost,
             can_attach: row.can_attach,
             can_open_logs: row.can_open_logs,
@@ -1246,6 +1254,7 @@ mod tests {
             pids: pids.iter().copied().collect(),
             input_tokens: None,
             output_tokens: None,
+            context_percent: None,
             cost: None,
             activity: None,
             can_attach: true,
@@ -1276,6 +1285,7 @@ mod tests {
             activity: None,
             input_tokens: None,
             output_tokens: None,
+            context_percent: None,
             cost: None,
         }
     }
@@ -1300,6 +1310,7 @@ mod tests {
             activity: None,
             input_tokens: None,
             output_tokens: None,
+            context_percent: None,
             cost: None,
             can_attach: true,
             can_open_logs: true,

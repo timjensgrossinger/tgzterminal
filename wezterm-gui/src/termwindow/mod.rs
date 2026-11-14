@@ -8,9 +8,8 @@ use crate::colorease::ColorEase;
 use crate::frontend::{front_end, try_front_end};
 use crate::inputmap::InputMap;
 use crate::overlay::{
-    confirm_close_pane, confirm_close_tab, confirm_close_window, confirm_quit_program, launcher,
-    start_overlay, start_overlay_pane, CopyModeParams, CopyOverlay, LauncherArgs, LauncherFlags,
-    QuickSelectOverlay,
+    confirm_close_pane, confirm_quit_program, launcher, start_overlay, start_overlay_pane,
+    CopyModeParams, CopyOverlay, LauncherArgs, LauncherFlags, QuickSelectOverlay,
 };
 use crate::resize_increment_calculator::ResizeIncrementCalculator;
 use crate::scripting::guiwin::GuiWin;
@@ -134,8 +133,10 @@ pub mod tgz_last_session;
 pub mod tgz_secret_mask;
 pub(crate) mod tgz_settings;
 pub mod tgz_ssh_hosts;
+pub(crate) mod tgz_tab_groups;
 pub(crate) mod tgz_tooltip;
 pub mod tgz_ui_state;
+pub(crate) mod tgz_ui_text;
 pub mod tgz_usage_menu;
 pub mod tgz_usage_relay;
 // Untracked, opt-in experimental tab view; see `experimental_tab_views` in build.rs.
@@ -526,6 +527,20 @@ pub enum UIItemType {
         tab_idx: usize,
         active: bool,
     },
+    /// The dimmed area behind the tab palette or a dialog.
+    ModalBackdrop,
+    /// A row of the tab palette.
+    TabPaletteRow {
+        tab_idx: usize,
+    },
+    /// A button of the close dialog.
+    DialogButton {
+        confirm: bool,
+    },
+    /// Header of a tab group; a click folds or unfolds the group.
+    SidebarGroupHeader {
+        group_idx: usize,
+    },
     /// Chevron on a split tab's row that shows or hides its pane children.
     SidebarTabExpand {
         tab_idx: usize,
@@ -639,6 +654,8 @@ pub enum UIItemType {
     /// The "Reopen last window" button: restores the previous run's agent
     /// sessions into new tabs of this window.
     SidebarAgentMenuRestoreLastWindow,
+    /// The search field that leads the sessions dropdown.
+    SidebarSessionsSearch,
     /// Background of a scrollable sidebar dropdown, behind its rows: catches
     /// the wheel over padding and dividers, and keeps a click there from
     /// dismissing the menu.
@@ -751,6 +768,50 @@ pub enum SidebarContextAction {
     RemoveFooterItem,
     /// Footer, while customizing: go and define a button of your own.
     NewCustomButton,
+    /// Tab: open the list of groups to move it to.
+    MoveToGroupMenu,
+    /// Move the tab into the group with this index.
+    MoveToGroup(usize),
+    /// Name a new group; from a tab's menu the tab moves into it.
+    NewGroup,
+    RenameGroup,
+    /// Remove a group the user made; its tabs are sorted by folder again.
+    DeleteGroup,
+    /// Sort automatically placed tabs by the folder they are in now.
+    RegroupByFolder,
+    CloseGroupTabs,
+}
+
+/// The tab palette: a filter and the row the keyboard is on.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct TabPalette {
+    pub query: String,
+    pub selected: usize,
+}
+
+/// A question asked over the whole window before something is closed.
+pub(crate) struct ChromeDialog {
+    pub title: String,
+    pub body: String,
+    /// What would be stopped: `(name, detail)` per row.
+    pub lines: Vec<(String, String)>,
+    pub confirm_label: String,
+    pub on_confirm: Option<Box<dyn FnOnce(&mut TermWindow) + Send + Sync>>,
+}
+
+/// The name being typed for a tab group, shown in the search field.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TabGroupEdit {
+    pub text: String,
+    pub target: TabGroupEditTarget,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum TabGroupEditTarget {
+    /// A new group; `tab` moves into it once it is named.
+    New { tab: Option<mux::tab::TabId> },
+    /// The group of this name gets a new one.
+    Rename(String),
 }
 
 /// A button of the bar shown while the footer is being customized.
@@ -777,6 +838,14 @@ pub enum SidebarContextMenuKind {
     FooterAdd,
     /// A footer button, right-clicked while customizing.
     FooterItem(config::SidebarFooterItem),
+    /// A tab group's header.
+    Group {
+        group_idx: usize,
+    },
+    /// The groups a tab can move to, opened from the tab's menu.
+    MoveToGroup {
+        tab_idx: usize,
+    },
 }
 
 /// An open sidebar context menu, anchored where it was asked for.
@@ -874,6 +943,17 @@ impl UIItem {
             && y >= self.y as isize
             && y <= (self.y + self.height) as isize
     }
+}
+
+/// What a tab row shows about the agent in it, from the herd scan.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct HerdTabInfo {
+    pub name: String,
+    pub session_id: Option<String>,
+    pub model: Option<String>,
+    pub context_percent: Option<u8>,
+    /// Labels of its subagents that are working right now.
+    pub subagents: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1048,6 +1128,9 @@ impl UIItemType {
         matches!(
             self,
             Self::FileTreeMenuItem(_)
+                | Self::ModalBackdrop
+                | Self::TabPaletteRow { .. }
+                | Self::DialogButton { .. }
                 | Self::SidebarAgentAction { .. }
                 | Self::SidebarAgentMenuItem { .. }
                 | Self::SidebarAgentMenuProjectRootToggle
@@ -1056,6 +1139,7 @@ impl UIItemType {
                 | Self::SidebarAgentMenuResume
                 | Self::SidebarAgentMenuResumeSession { .. }
                 | Self::SidebarAgentMenuRestoreLastWindow
+                | Self::SidebarSessionsSearch
                 | Self::SidebarDropdownBody
                 | Self::SidebarDropdownScrollTrack
                 | Self::SidebarDropdownScrollThumb
@@ -1408,6 +1492,12 @@ pub struct TermWindow {
     /// Reuses `AgentLaunchMenuState`; `expanded` is always `None` because both
     /// of its groups are already flat.
     sessions_menu: Option<AgentLaunchMenuState>,
+    /// Typed while the sessions dropdown is open; sessions that do not match
+    /// are hidden. Emptied whenever the dropdown is found closed.
+    sessions_menu_query: String,
+    /// The sessions search field was clicked or typed into: it shows a caret
+    /// instead of its placeholder.
+    sessions_menu_search_active: bool,
     /// Scroll geometry of whichever session dropdown was painted last, when
     /// its rows overflow. Written by paint, read by the mouse handlers.
     sidebar_dropdown_scroll: Option<crate::termwindow::render::sidebar::SidebarDropdownScroll>,
@@ -1462,6 +1552,23 @@ pub struct TermWindow {
     sidebar_footer_edit: bool,
     /// The footer's buttons as last painted, for the drag to aim at.
     sidebar_footer_slots: Vec<tgz_footer::PaintedSlot>,
+    /// Which group each sidebar tab is in; see `tgz_tab_groups`.
+    tab_groups: RefCell<tgz_tab_groups::TabGroups>,
+    /// The tab palette, while open.
+    tab_palette: Option<TabPalette>,
+    /// The close dialog, while it waits for an answer.
+    chrome_dialog: Option<ChromeDialog>,
+    /// A group name being typed; takes the keyboard while it is `Some`.
+    tab_group_edit: Option<TabGroupEdit>,
+    /// A reorder of the mux tabs to match the groups is queued.
+    tab_group_sync_pending: Cell<bool>,
+    /// Project root per folder, for placing new tabs: `(looked up at, root)`.
+    tab_group_roots: RefCell<HashMap<PathBuf, (Instant, Option<PathBuf>)>>,
+    /// Session name and context use per agent pane, before the Agents
+    /// section's project filter: tab rows of every project need them.
+    herd_tab_info: RefCell<HashMap<PaneId, HerdTabInfo>>,
+    /// Shaped chrome text, by font and string; see `tgz_ui_text`.
+    ui_text_cache: RefCell<tgz_ui_text::UiTextCache>,
     /// The rows of the open menus that can be picked, as last painted, for
     /// keyboard navigation.
     dropdown_key_rows: Vec<UIItem>,
@@ -1697,12 +1804,25 @@ impl TermWindow {
                     front_end().forget_known_window(window);
                     return;
                 }
+                let _ = tab;
                 let window = self.window.clone().unwrap();
-                let (overlay, future) = start_overlay(self, &tab, move |tab_id, term| {
-                    confirm_close_window(term, mux_window_id, window, tab_id)
-                });
-                self.assign_overlay(tab.tab_id(), overlay);
-                promise::spawn::spawn(future).detach();
+                let tab_ids = self.mux_tab_ids();
+                let lines = self.busy_tab_lines(&tab_ids);
+                let total = tab_ids.len();
+                self.confirm_close(
+                    "Close window?".to_string(),
+                    format!(
+                        "It has {total} tab{}; some are still running something. Closing stops them.",
+                        if total == 1 { "" } else { "s" },
+                    ),
+                    lines,
+                    "Close window".to_string(),
+                    move |_| {
+                        Mux::get().kill_window(mux_window_id);
+                        window.close();
+                        front_end().forget_known_window(&window);
+                    },
+                );
 
                 // Don't close right now; let the close happen from
                 // the confirmation overlay
@@ -2000,6 +2120,8 @@ impl TermWindow {
             copy_flash: None,
             agent_launch_menu: None,
             sessions_menu: None,
+            sessions_menu_query: String::new(),
+            sessions_menu_search_active: false,
             sidebar_dropdown_scroll: None,
             new_tab_menu: None,
             close_tab_menu: None,
@@ -2027,6 +2149,20 @@ impl TermWindow {
                 .collect(),
             sidebar_footer_edit: false,
             sidebar_footer_slots: Vec::new(),
+            tab_groups: RefCell::new({
+                let mut groups = tgz_tab_groups::TabGroups::default();
+                for name in tgz_ui_state::load_tab_groups() {
+                    groups.create_custom(&name);
+                }
+                groups
+            }),
+            tab_group_edit: None,
+            tab_palette: None,
+            chrome_dialog: None,
+            tab_group_sync_pending: Cell::new(false),
+            tab_group_roots: RefCell::new(HashMap::new()),
+            herd_tab_info: RefCell::new(HashMap::new()),
+            ui_text_cache: RefCell::new(tgz_ui_text::UiTextCache::default()),
             dropdown_key_rows: Vec::new(),
             dropdown_key_selected: None,
             dropdown_key_pending_edge: None,
@@ -2505,6 +2641,7 @@ impl TermWindow {
             TermWindowNotif::InvalidateShapeCache => {
                 self.shape_generation += 1;
                 self.shape_cache.borrow_mut().clear();
+                self.ui_text_cache.borrow_mut().clear();
                 self.invalidate_modal();
                 window.invalidate();
             }
@@ -3966,6 +4103,14 @@ impl TermWindow {
     }
 
     fn show_tab_navigator(&mut self) {
+        // The fork's own palette: same job, drawn like the sidebar.
+        self.open_tab_palette();
+    }
+
+    /// Upstream's launcher-based navigator, kept for reference and for a
+    /// build that wants it back.
+    #[allow(dead_code)]
+    fn show_upstream_tab_navigator(&mut self) {
         let mux = Mux::get();
         let active_tab_idx = match mux.get_window(self.mux_window_id) {
             Some(mux_window) => mux_window.get_active_tab_idx(),
@@ -6273,6 +6418,72 @@ done
         }
     }
     /// Show or hide a tab's pane rows in the sidebar, and remember the choice.
+    /// Ids of this window's tabs, in mux order (index = tab index).
+    pub(crate) fn mux_tab_ids(&self) -> Vec<mux::tab::TabId> {
+        let mux = Mux::get();
+        let Some(window) = mux.get_window(self.mux_window_id) else {
+            return vec![];
+        };
+        let ids = window.iter_tabs().map(|tab| tab.tab_id()).collect();
+        ids
+    }
+
+    /// Finishes typing a group name: makes or renames the group and
+    /// remembers the user's groups.
+    pub(crate) fn commit_tab_group_edit(&mut self) {
+        let Some(edit) = self.tab_group_edit.take() else {
+            return;
+        };
+        let name = edit.text.trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+        let mut groups = self.tab_groups.borrow_mut();
+        match edit.target {
+            TabGroupEditTarget::New { tab } => {
+                // An existing name is fine here: the tab joins that group.
+                groups.create_custom(&name);
+                if let Some(tab) = tab {
+                    groups.move_tab(tab, &tgz_tab_groups::GroupId::Custom(name));
+                }
+            }
+            TabGroupEditTarget::Rename(old) => {
+                groups.rename_custom(&old, &name);
+            }
+        }
+        tgz_ui_state::save_tab_groups(&groups.custom_names());
+    }
+
+    /// Reorders the mux tabs so every sidebar group is one contiguous run,
+    /// keeping the active tab active. Tab numbers then match the rows shown.
+    pub(crate) fn apply_tab_group_order(&mut self) {
+        self.tab_group_sync_pending.set(false);
+        let mux = Mux::get();
+        let Some(mut window) = mux.get_window_mut(self.mux_window_id) else {
+            return;
+        };
+        let ids: Vec<mux::tab::TabId> = window.iter_tabs().map(|tab| tab.tab_id()).collect();
+        let desired = self.tab_groups.borrow().desired_order(&ids);
+        let moves = tgz_tab_groups::reorder_moves(&ids, &desired);
+        if moves.is_empty() {
+            return;
+        }
+        let active = ids.get(window.get_active_tab_idx()).copied();
+        for (from, to) in moves {
+            let tab = window.remove_tab_idx(from);
+            window.insert_tab_at_idx(to, &tab);
+        }
+        if let Some(idx) = active.and_then(|id| desired.iter().position(|tab| *tab == id)) {
+            window.set_active_tab_idx_without_saving(idx);
+        }
+        drop(window);
+        self.update_title();
+        self.update_scrollbar();
+        if let Some(window) = self.window.as_ref() {
+            window.invalidate();
+        }
+    }
+
     pub fn toggle_sidebar_tab_expanded(&mut self, tab_idx: usize) {
         if !self.sidebar_expanded_tabs.remove(&tab_idx) {
             self.sidebar_expanded_tabs.insert(tab_idx);
@@ -6375,12 +6586,14 @@ done
 
         let pane_id = pane.pane_id();
         if confirm && !pane.can_close_without_prompting(CloseReason::Pane) {
-            let window = self.window.clone().unwrap();
-            let (overlay, future) = start_overlay_pane(self, &pane, move |pane_id, term| {
-                confirm_close_pane(pane_id, term, mux_window_id, window)
-            });
-            self.assign_overlay_for_pane(pane_id, overlay);
-            promise::spawn::spawn(future).detach();
+            let _ = mux_window_id;
+            self.confirm_close(
+                "Close pane?".to_string(),
+                "It is still running something. Closing stops it.".to_string(),
+                vec![(pane.get_title(), String::new())],
+                "Close pane".to_string(),
+                move |_| Mux::get().remove_pane(pane_id),
+            );
         } else {
             mux.remove_pane(pane_id);
         }
@@ -6410,16 +6623,23 @@ done
         // must never be a silent no-op: that used to leave a stuck pane with
         // no way to close it from the sidebar at all.
         if confirm && (is_last_tab || !tab.can_close_without_prompting(CloseReason::Tab)) {
-            if self.activate_tab(tab_idx as isize).is_err() {
-                return;
-            }
-
-            let window = self.window.clone().unwrap();
-            let (overlay, future) = start_overlay(self, &tab, move |tab_id, term| {
-                confirm_close_tab(tab_id, term, mux_window_id, window)
-            });
-            self.assign_overlay(tab_id, overlay);
-            promise::spawn::spawn(future).detach();
+            let _ = mux_window_id;
+            let busy = !tab.can_close_without_prompting(CloseReason::Tab);
+            let lines = self.busy_tab_lines(&[tab_id]);
+            self.confirm_close(
+                "Close tab?".to_string(),
+                match (busy, is_last_tab) {
+                    (true, true) => "It is still running something, and the window closes with it.",
+                    (true, false) => "It is still running something. Closing stops it.",
+                    (false, _) => "It is the last tab: the window closes with it.",
+                }
+                .to_string(),
+                lines,
+                "Close tab".to_string(),
+                move |_| {
+                    Mux::get().remove_tab(tab_id);
+                },
+            );
         } else {
             mux.remove_tab(tab_id);
         }
@@ -6434,12 +6654,17 @@ done
         let tab_id = tab.tab_id();
         let mux_window_id = self.mux_window_id;
         if confirm && !tab.can_close_without_prompting(CloseReason::Tab) {
-            let window = self.window.clone().unwrap();
-            let (overlay, future) = start_overlay(self, &tab, move |tab_id, term| {
-                confirm_close_tab(tab_id, term, mux_window_id, window)
-            });
-            self.assign_overlay(tab_id, overlay);
-            promise::spawn::spawn(future).detach();
+            let _ = mux_window_id;
+            let lines = self.busy_tab_lines(&[tab_id]);
+            self.confirm_close(
+                "Close tab?".to_string(),
+                "It is still running something. Closing stops it.".to_string(),
+                lines,
+                "Close tab".to_string(),
+                move |_| {
+                    Mux::get().remove_tab(tab_id);
+                },
+            );
         } else {
             mux.remove_tab(tab_id);
         }
@@ -6480,6 +6705,7 @@ done
             })
             .count();
         let total = tab_ids.len();
+        let tab_ids_for_lines = tab_ids.clone();
         let close = move |_: &mut TermWindow| {
             let mux = Mux::get();
             // Descending, so earlier indices stay valid during the sweep.
@@ -6491,15 +6717,20 @@ done
             close(self);
             return;
         }
-        let message = format!(
-            "Close {total} tab{}? {busy} of them {} still running something.",
-            if total == 1 { "" } else { "s" },
-            if busy == 1 { "is" } else { "are" },
+        let plural = if total == 1 { "" } else { "s" };
+        let lines = self.busy_tab_lines(&tab_ids_for_lines);
+        let _ = anchor_tab_idx;
+        self.confirm_close(
+            format!("Close {total} tab{plural}?"),
+            format!(
+                "{busy} of them {} still running something. Closing stops {}.",
+                if busy == 1 { "is" } else { "are" },
+                if busy == 1 { "it" } else { "them" },
+            ),
+            lines,
+            format!("Close {total} tab{plural}"),
+            close,
         );
-        // The question is asked over the active tab; put it on the one that
-        // stays, so the answer does not close the tab it was asked in.
-        self.activate_tab(anchor_tab_idx as isize).ok();
-        self.file_tree_confirm(message, close);
     }
 
     /// Close every tab above (idx < anchor). Preserves the anchor tab.

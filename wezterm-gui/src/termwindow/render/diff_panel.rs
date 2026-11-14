@@ -1601,6 +1601,9 @@ impl crate::TermWindow {
         let radius = RADIUS * dpi_scale;
         let stroke = dpi_scale.max(1.);
         let grip = GRIP * dpi_scale;
+        // The gap between two pieces of a chrome label (a letter and a name,
+        // a name and its counts).
+        let sp = (6. * dpi_scale).round();
 
         // The card floats inside the panel's box, clear of the window edge,
         // the terminal beside it and whatever lies below.
@@ -1748,8 +1751,8 @@ impl crate::TermWindow {
             None => {}
         }
         for (label, action) in buttons {
-            let label_w = label.chars().count() as f32 * cell_w;
-            let button_w = (label_w + 10. * dpi_scale).max(button_h);
+            let label_w = self.chrome_text_width(label, false);
+            let button_w = (label_w + 14. * dpi_scale).max(button_h);
             let button_x = right - button_w;
             if button_x < card.origin.x + pad_x {
                 break;
@@ -1765,18 +1768,17 @@ impl crate::TermWindow {
                     layers,
                     1,
                     euclid::rect(button_x, button_y, button_w, button_h),
-                    5. * dpi_scale,
+                    (10. * dpi_scale).min(button_h * 0.5),
                     button_bg,
                 )?;
             }
-            self.diff_panel_text(
+            self.paint_chrome_text(
                 layers,
                 label,
                 button_x + (button_w - label_w) * 0.5,
                 button_y + (button_h - cell_h) * 0.5,
-                label_w,
+                label_w + 1.,
                 contrast_label_color(button_bg, sb.text_active),
-                button_bg,
                 false,
             )?;
             self.ui_items.push(UIItem {
@@ -1790,45 +1792,42 @@ impl crate::TermWindow {
         }
         if let Some((added, removed)) = totals.filter(|totals| *totals != (0, 0)) {
             for (text, color) in [(format!("-{removed}"), red), (format!("+{added}"), green)] {
-                let width = text.chars().count() as f32 * cell_w;
+                let width = self.chrome_text_width(&text, false);
                 if right - width > card.origin.x + pad_x + 8. * cell_w {
-                    self.diff_panel_text(
+                    self.paint_chrome_text(
                         layers,
                         &text,
                         right - width,
                         text_y,
-                        width,
+                        width + 1.,
                         lerp_rgba(color, sb.text_active, 0.25),
-                        surface,
                         false,
                     )?;
-                    right -= width + cell_w;
+                    right -= width + sp;
                 }
             }
         }
         let title = "Changes";
         let title_x = card.origin.x + pad_x;
-        let title_w = title.len() as f32 * cell_w;
-        self.diff_panel_text(
+        let title_w = self.chrome_text_width(title, true);
+        self.paint_chrome_text(
             layers,
             title,
             title_x,
             text_y,
             (right - title_x).max(0.),
             sb.text_active,
-            surface,
             true,
         )?;
-        let source_x = title_x + title_w + cell_w;
+        let source_x = title_x + title_w + sp * 1.5;
         if !source.is_empty() && right - source_x >= 3. * cell_w {
-            self.diff_panel_text(
+            self.paint_chrome_text(
                 layers,
                 &source,
                 source_x,
                 text_y,
                 right - source_x,
                 sb.text_meta,
-                surface,
                 false,
             )?;
         }
@@ -1853,14 +1852,13 @@ impl crate::TermWindow {
         let mut body_y = divider_y + stroke;
         if !summary.is_empty() {
             let summary_h = (cell_h + 8. * dpi_scale).ceil();
-            self.diff_panel_text(
+            self.paint_chrome_text(
                 layers,
                 &summary,
                 body_x + pad_x - stroke,
                 body_y + (summary_h - cell_h) * 0.5,
                 (card.size.width - pad_x * 2.).max(0.),
                 sb.text_idle,
-                surface,
                 false,
             )?;
             body_y += summary_h;
@@ -1869,6 +1867,8 @@ impl crate::TermWindow {
             let chip_h = (cell_h + 6. * dpi_scale).ceil();
             let chip_gap = 6. * dpi_scale;
             let chip_pad = 8. * dpi_scale;
+            // Rounded squares like every other control, not pills.
+            let chip_radius = (6. * dpi_scale).min(chip_h * 0.5);
             let strip_x = body_x + pad_x - stroke;
             let strip_w = (card.size.width - pad_x * 2.).max(0.);
             // letter, space, name, then " +a" and " -r" when non-zero.
@@ -1882,19 +1882,25 @@ impl crate::TermWindow {
                 }
                 parts
             };
+            let fresh_w = self.chrome_text_width("\u{2022}", true) + sp;
             let widths: Vec<f32> = chips
                 .iter()
-                .map(|(_, name, added, removed, fresh)| {
-                    let count_cols: usize = counts(*added, *removed)
+                .map(|(status, name, added, removed, fresh)| {
+                    let count_w: f32 = counts(*added, *removed)
                         .iter()
-                        .map(|(text, _)| text.chars().count() + 1)
+                        .map(|(text, _)| self.chrome_text_width(text, false) + sp)
                         .sum();
-                    let cols = 2 + name.chars().count() + count_cols + usize::from(*fresh) * 2;
-                    cols as f32 * cell_w + chip_pad * 2.
+                    (self.chrome_text_width(status.letter(), true)
+                        + sp
+                        + self.chrome_text_width(name, false)
+                        + count_w
+                        + if *fresh { fresh_w } else { 0. }
+                        + chip_pad * 2.)
+                        .ceil()
                 })
                 .collect();
             // Room for "+999 · less", the widest the marker gets.
-            let more_w = 11. * cell_w + chip_pad * 2.;
+            let more_w = self.chrome_text_width("+999 \u{00b7} less", false).ceil() + chip_pad * 2.;
             // Opened, the index shows every file, short only of leaving the
             // diffs a few rows to stand on.
             let max_rows = if chips_expanded {
@@ -1922,65 +1928,62 @@ impl crate::TermWindow {
                     layers,
                     1,
                     euclid::rect(chip_x, chip_y, chip_w, chip_h),
-                    chip_h * 0.5,
+                    chip_radius,
                     bg,
                 )?;
                 let ty = chip_y + (chip_h - cell_h) * 0.5;
                 let right_limit = chip_x + chip_w - chip_pad;
                 let mut tx = chip_x + chip_pad;
                 if *fresh {
-                    self.diff_panel_text(layers, "\u{2022}", tx, ty, cell_w, amber, bg, true)?;
-                    tx += cell_w * 2.;
+                    self.paint_chrome_text(layers, "\u{2022}", tx, ty, fresh_w - sp, amber, true)?;
+                    tx += fresh_w;
                 }
                 let status_color = match status {
                     FileStatus::Added => green,
                     FileStatus::Deleted | FileStatus::Conflicted => red,
                     FileStatus::Modified | FileStatus::Renamed => amber,
                 };
-                self.diff_panel_text(
+                let letter_w = self.chrome_text_width(status.letter(), true);
+                self.paint_chrome_text(
                     layers,
                     status.letter(),
                     tx,
                     ty,
-                    cell_w,
+                    letter_w + 1.,
                     lerp_rgba(status_color, sb.text_active, 0.25),
-                    bg,
                     true,
                 )?;
-                tx += cell_w * 2.;
+                tx += letter_w + sp;
                 let count_parts = counts(*added, *removed);
                 let count_w: f32 = count_parts
                     .iter()
-                    .map(|(text, _)| (text.chars().count() + 1) as f32 * cell_w)
+                    .map(|(text, _)| self.chrome_text_width(text, false) + sp)
                     .sum();
                 let name_w = (right_limit - count_w - tx).max(0.);
-                let name_cols = sidebar_text_cols(name_w, cell_w as usize);
-                self.diff_panel_text(
+                self.paint_chrome_text(
                     layers,
-                    &view::elide_start(name, name_cols),
+                    &self.chrome_elide_start(name, name_w, false),
                     tx,
                     ty,
-                    name_w,
+                    name_w + 1.,
                     sb.text_active,
-                    bg,
                     false,
                 )?;
-                tx = right_limit - count_w + cell_w;
+                tx = right_limit - count_w + sp;
                 for (text, color) in count_parts {
-                    let width = text.chars().count() as f32 * cell_w;
-                    if tx + width <= right_limit + 0.5 {
-                        self.diff_panel_text(
+                    let width = self.chrome_text_width(&text, false);
+                    if tx + width <= right_limit + 1. {
+                        self.paint_chrome_text(
                             layers,
                             &text,
                             tx,
                             ty,
-                            width,
+                            width + 1.,
                             lerp_rgba(color, sb.text_active, 0.25),
-                            bg,
                             false,
                         )?;
                     }
-                    tx += width + cell_w;
+                    tx += width + sp;
                 }
                 self.ui_items.push(UIItem {
                     x: chip_x as usize,
@@ -2026,14 +2029,14 @@ impl crate::TermWindow {
                 };
                 let marker_x = strip_x + x;
                 let marker_y = body_y + row as f32 * (chip_h + chip_gap);
-                let label_w = label.chars().count() as f32 * cell_w;
+                let label_w = self.chrome_text_width(&label, false).ceil();
                 let marker_w = (label_w + chip_pad * 2.).min((strip_w - x).max(0.));
                 // Outlined rather than filled: it is a control, not a file.
                 self.sidebar_rounded_fill(
                     layers,
                     1,
                     euclid::rect(marker_x, marker_y, marker_w, chip_h),
-                    chip_h * 0.5,
+                    chip_radius,
                     opaque(lerp_rgba(sb.surface, sb.text_meta, 0.5)),
                 )?;
                 self.sidebar_rounded_fill(
@@ -2045,17 +2048,16 @@ impl crate::TermWindow {
                         (marker_w - stroke * 2.).max(1.),
                         (chip_h - stroke * 2.).max(1.),
                     ),
-                    (chip_h * 0.5 - stroke).max(0.),
+                    (chip_radius - stroke).max(0.),
                     bg,
                 )?;
-                self.diff_panel_text(
+                self.paint_chrome_text(
                     layers,
                     &label,
                     marker_x + chip_pad,
                     marker_y + (chip_h - cell_h) * 0.5,
-                    (marker_w - chip_pad * 2.).max(0.),
+                    (marker_w - chip_pad * 2.).max(0.) + 1.,
                     sb.text_idle,
-                    bg,
                     false,
                 )?;
                 self.ui_items.push(UIItem {
@@ -2221,14 +2223,13 @@ impl crate::TermWindow {
                 if y + cell_h > body_y + body_h {
                     break;
                 }
-                self.diff_panel_text(
+                self.paint_chrome_text(
                     layers,
                     text,
                     body_x + pad_x,
                     y,
                     (body_w - pad_x * 2.).max(0.),
                     sb.text_meta,
-                    surface,
                     false,
                 )?;
                 y += row_h;
@@ -2258,88 +2259,100 @@ impl crate::TermWindow {
                     } else {
                         file_bg
                     };
-                    self.filled_rectangle(layers, 1, euclid::rect(body_x, y, body_w, row_h), bg)?;
-                    let mut x = body_x + inset;
-                    self.diff_panel_text(
+                    // A file's row is a control like a sidebar row: rounded,
+                    // and clear of the card's edge.
+                    let row_inset = (3. * dpi_scale).round();
+                    self.sidebar_rounded_fill(
                         layers,
-                        if collapsed { "\u{25b8}" } else { "\u{25be}" },
+                        1,
+                        euclid::rect(
+                            body_x + row_inset,
+                            y,
+                            (body_w - row_inset * 2.).max(1.),
+                            row_h,
+                        ),
+                        (6. * dpi_scale).min(row_h * 0.5),
+                        bg,
+                    )?;
+                    let mut x = body_x + inset + row_inset;
+                    let chevron = if collapsed { "\u{25b8}" } else { "\u{25be}" };
+                    let chevron_w = self.chrome_text_width(chevron, false).max(cell_w);
+                    self.paint_chrome_text(
+                        layers,
+                        chevron,
                         x,
                         y + text_dy,
-                        cell_w,
+                        chevron_w,
                         sb.text_meta,
-                        bg,
                         false,
                     )?;
-                    x += cell_w * 2.;
+                    x += chevron_w + sp;
                     let status_color = match status {
                         FileStatus::Added => green,
                         FileStatus::Deleted | FileStatus::Conflicted => red,
                         FileStatus::Modified | FileStatus::Renamed => amber,
                     };
-                    self.diff_panel_text(
+                    let letter_w = self.chrome_text_width(status.letter(), true);
+                    self.paint_chrome_text(
                         layers,
                         status.letter(),
                         x,
                         y + text_dy,
-                        cell_w,
+                        letter_w + 1.,
                         lerp_rgba(status_color, sb.text_active, 0.25),
-                        bg,
                         true,
                     )?;
-                    x += cell_w * 2.;
-                    let mut row_right = body_x + body_w - inset;
+                    x += letter_w + sp;
+                    let mut row_right = body_x + body_w - inset - row_inset;
                     for (count, sign, color) in [(removed, '-', red), (added, '+', green)] {
                         if count == 0 {
                             continue;
                         }
                         let text = format!("{sign}{count}");
-                        let width = text.chars().count() as f32 * cell_w;
+                        let width = self.chrome_text_width(&text, false);
                         if row_right - width < x + 6. * cell_w {
                             continue;
                         }
-                        self.diff_panel_text(
+                        self.paint_chrome_text(
                             layers,
                             &text,
                             row_right - width,
                             y + text_dy,
-                            width,
+                            width + 1.,
                             lerp_rgba(color, sb.text_active, 0.25),
-                            bg,
                             false,
                         )?;
-                        row_right -= width + cell_w;
+                        row_right -= width + sp;
                     }
                     // Who touched it, dimmed, while the path keeps room for
                     // its file name.
                     if !agents.is_empty() {
-                        let room = sidebar_text_cols((row_right - x).max(0.), cell_w as usize);
-                        let cols = agents.chars().count().min(24).min(room.saturating_sub(16));
-                        if cols >= 4 {
-                            let text = truncate_to_cols(&agents, cols);
-                            let width = text.chars().count() as f32 * cell_w;
-                            self.diff_panel_text(
+                        let room = (row_right - x).max(0.);
+                        let width = self
+                            .chrome_text_width(&agents, false)
+                            .min(180. * dpi_scale)
+                            .min(room - 16. * cell_w);
+                        if width >= 4. * cell_w {
+                            self.paint_chrome_text(
                                 layers,
-                                &text,
+                                &agents,
                                 row_right - width,
                                 y + text_dy,
-                                width,
+                                width + 1.,
                                 sb.text_meta,
-                                bg,
                                 false,
                             )?;
-                            row_right -= width + cell_w;
+                            row_right -= width + sp;
                         }
                     }
                     let path_w = (row_right - x).max(0.);
-                    let path_cols = sidebar_text_cols(path_w, cell_w as usize);
-                    self.diff_panel_text(
+                    self.paint_chrome_text(
                         layers,
-                        &view::elide_start(&path, path_cols),
+                        &self.chrome_elide_start(&path, path_w, false),
                         x,
                         y + text_dy,
-                        path_w,
+                        path_w + 1.,
                         sb.text_active,
-                        bg,
                         false,
                     )?;
                     self.ui_items.push(UIItem {
@@ -2363,14 +2376,13 @@ impl crate::TermWindow {
                     )?;
                 }
                 PaintRow::Note(note) => {
-                    self.diff_panel_text(
+                    self.paint_chrome_text(
                         layers,
                         &note,
                         body_x + inset + cell_w * 4.,
                         y + text_dy,
                         (body_w - inset * 2. - cell_w * 4.).max(0.),
                         sb.text_meta,
-                        surface,
                         false,
                     )?;
                 }

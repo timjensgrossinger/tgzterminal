@@ -199,8 +199,8 @@ impl crate::TermWindow {
         let mut right = rect.max_x() - pad_x * 0.6;
         if badge.is_some() && rel.is_some() {
             let label = "Changes";
-            let label_w = label.len() as f32 * cell_w;
-            let button_w = label_w + 12. * dpi_scale;
+            let label_w = self.chrome_text_width(label, false).ceil();
+            let button_w = label_w + 16. * dpi_scale;
             let button_h = (cell_h + 4. * dpi_scale).min(header_h);
             let button_x = right - button_w;
             let button_y = header_y + (header_h - button_h) * 0.5;
@@ -214,17 +214,16 @@ impl crate::TermWindow {
                 layers,
                 1,
                 euclid::rect(button_x, button_y, button_w, button_h),
-                5. * dpi_scale,
+                (10. * dpi_scale).min(button_h * 0.5),
                 bg,
             )?;
-            self.diff_panel_text(
+            self.paint_chrome_text(
                 layers,
                 label,
                 button_x + (button_w - label_w) * 0.5,
                 button_y + (button_h - cell_h) * 0.5,
-                label_w,
+                label_w + 1.,
                 contrast_label_color(bg, sb.text_active),
-                bg,
                 false,
             )?;
             self.ui_items.push(UIItem {
@@ -243,33 +242,31 @@ impl crate::TermWindow {
             Some(Preview::Binary { bytes }) => human_size(*bytes),
             _ => String::new(),
         };
-        let summary_w = summary.chars().count() as f32 * cell_w;
+        let summary_w = self.chrome_text_width(&summary, false).ceil();
         if summary_w > 0. && right - summary_w > rect.origin.x + pad_x + 8. * cell_w {
-            self.diff_panel_text(
+            self.paint_chrome_text(
                 layers,
                 &summary,
                 right - summary_w,
                 text_y,
-                summary_w,
+                summary_w + 1.,
                 sb.text_meta,
-                surface,
                 false,
             )?;
-            right -= summary_w + cell_w;
+            right -= summary_w + 8. * dpi_scale;
         }
         let name = rel
             .as_deref()
             .map(|rel| rel.rsplit('/').next().unwrap_or(rel).to_string())
             .unwrap_or_else(|| "Preview".to_string());
         let name_x = rect.origin.x + pad_x;
-        self.diff_panel_text(
+        self.paint_chrome_text(
             layers,
             &name,
             name_x,
             text_y,
             (right - name_x).max(0.),
             sb.text_active,
-            surface,
             true,
         )?;
 
@@ -294,14 +291,13 @@ impl crate::TermWindow {
             Some(Preview::Text { .. }) => None,
         };
         if let Some(message) = message {
-            self.diff_panel_text(
+            self.paint_chrome_text(
                 layers,
                 &message,
                 rect.origin.x + pad_x,
                 body_top,
                 (rect.size.width - pad_x * 2.).max(0.),
                 sb.text_meta,
-                surface,
                 false,
             )?;
             return Ok(());

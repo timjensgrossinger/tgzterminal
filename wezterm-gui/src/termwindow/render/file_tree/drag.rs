@@ -631,10 +631,9 @@ impl crate::TermWindow {
             }
         }
 
-        let cell_w = self.render_metrics.cell_size.width as f32;
         let cell_h = self.render_metrics.cell_size.height as f32;
         let pad = 8. * dpi_scale;
-        let width = label.chars().count() as f32 * cell_w + pad * 2.;
+        let width = self.chrome_text_width(&label, false).ceil() + pad * 2.;
         let height = cell_h + 8. * dpi_scale;
         let ghost = euclid::rect(
             pointer.0 + 14. * dpi_scale,
@@ -648,7 +647,8 @@ impl crate::TermWindow {
         } else {
             accent
         };
-        self.sidebar_rounded_fill(layers, 1, ghost, 6. * dpi_scale, edge)?;
+        let ghost_radius = (10. * dpi_scale).min(height * 0.5);
+        self.sidebar_rounded_fill(layers, 1, ghost, ghost_radius, edge)?;
         let stroke = dpi_scale.max(1.);
         let inner = euclid::rect(
             ghost.origin.x + stroke,
@@ -656,15 +656,14 @@ impl crate::TermWindow {
             (ghost.size.width - stroke * 2.).max(1.),
             (ghost.size.height - stroke * 2.).max(1.),
         );
-        self.sidebar_rounded_fill(layers, 1, inner, 5. * dpi_scale, fill)?;
-        self.diff_panel_text(
+        self.sidebar_rounded_fill(layers, 1, inner, (ghost_radius - stroke).max(0.), fill)?;
+        self.paint_chrome_text(
             layers,
             &label,
             ghost.origin.x + pad,
             ghost.origin.y + (height - cell_h) * 0.5,
-            width - pad * 2.,
+            width - pad * 2. + 1.,
             sb.text_active,
-            fill,
             false,
         )?;
         Ok(())

@@ -1243,6 +1243,14 @@ impl crate::agent_herd::vendor::SessionSource for ClaudeDetector {
                         super::usage::totals_for(path, super::usage::UsageFormat::Claude)
                     })
                     .unwrap_or_default();
+                // The window size is Claude Code's own figure when a status
+                // line of this session has been seen, else a guess.
+                let reported_window = super::quota::claude_context_window(&s.session_id);
+                let context_percent = usage.context_tokens.and_then(|used| {
+                    let window =
+                        reported_window.unwrap_or_else(|| super::usage::claude_window_guess(used));
+                    super::usage::context_percent(used, window)
+                });
                 crate::agent_herd::vendor::VendorSession {
                     origin: SessionOrigin::Host,
                     home: None,
@@ -1267,6 +1275,7 @@ impl crate::agent_herd::vendor::SessionSource for ClaudeDetector {
                     activity,
                     input_tokens: usage.input_tokens,
                     output_tokens: usage.output_tokens,
+                    context_percent,
                     cost: None,
                 }
             })

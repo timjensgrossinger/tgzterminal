@@ -49,6 +49,10 @@ impl super::TermWindow {
                 self.update_title_post_status();
             }
             UIItemType::SidebarTab { .. }
+            | UIItemType::ModalBackdrop
+            | UIItemType::TabPaletteRow { .. }
+            | UIItemType::DialogButton { .. }
+            | UIItemType::SidebarGroupHeader { .. }
             | UIItemType::SidebarTabExpand { .. }
             | UIItemType::SidebarPaneRow { .. }
             | UIItemType::SidebarPaneClose { .. }
@@ -93,6 +97,7 @@ impl super::TermWindow {
             | UIItemType::SidebarAgentMenuResume
             | UIItemType::SidebarAgentMenuResumeSession { .. }
             | UIItemType::SidebarAgentMenuRestoreLastWindow
+            | UIItemType::SidebarSessionsSearch
             | UIItemType::SidebarDropdownBody
             | UIItemType::SidebarDropdownScrollTrack
             | UIItemType::SidebarDropdownScrollThumb
@@ -123,6 +128,10 @@ impl super::TermWindow {
         match item.item_type {
             UIItemType::TabBar(_) => {}
             UIItemType::SidebarTab { .. }
+            | UIItemType::ModalBackdrop
+            | UIItemType::TabPaletteRow { .. }
+            | UIItemType::DialogButton { .. }
+            | UIItemType::SidebarGroupHeader { .. }
             | UIItemType::SidebarTabExpand { .. }
             | UIItemType::SidebarPaneRow { .. }
             | UIItemType::SidebarPaneClose { .. }
@@ -167,6 +176,7 @@ impl super::TermWindow {
             | UIItemType::SidebarAgentMenuResume
             | UIItemType::SidebarAgentMenuResumeSession { .. }
             | UIItemType::SidebarAgentMenuRestoreLastWindow
+            | UIItemType::SidebarSessionsSearch
             | UIItemType::SidebarDropdownBody
             | UIItemType::SidebarDropdownScrollTrack
             | UIItemType::SidebarDropdownScrollThumb
@@ -514,6 +524,7 @@ impl super::TermWindow {
                             | UIItemType::SidebarAgentMenuResume
                             | UIItemType::SidebarAgentMenuResumeSession { .. }
                             | UIItemType::SidebarAgentMenuRestoreLastWindow
+                            | UIItemType::SidebarSessionsSearch
                             | UIItemType::SidebarDropdownBody
                             | UIItemType::SidebarDropdownScrollTrack
                             | UIItemType::SidebarDropdownScrollThumb
@@ -539,6 +550,7 @@ impl super::TermWindow {
                             | UIItemType::SidebarAgentMenuResume
                             | UIItemType::SidebarAgentMenuResumeSession { .. }
                             | UIItemType::SidebarAgentMenuRestoreLastWindow
+                            | UIItemType::SidebarSessionsSearch
                             | UIItemType::SidebarDropdownBody
                             | UIItemType::SidebarDropdownScrollTrack
                             | UIItemType::SidebarDropdownScrollThumb
@@ -949,6 +961,27 @@ impl super::TermWindow {
             UIItemType::SidebarTab { tab_idx, .. } => {
                 self.mouse_event_sidebar_tab(item, tab_idx, event, context);
             }
+            UIItemType::ModalBackdrop
+            | UIItemType::TabPaletteRow { .. }
+            | UIItemType::DialogButton { .. } => {
+                self.mouse_event_modal(&item.item_type, &event, context);
+            }
+            UIItemType::SidebarGroupHeader { group_idx } => {
+                if event.kind == WMEK::Press(MousePress::Right) {
+                    self.open_sidebar_context_menu(
+                        SidebarContextMenuKind::Group { group_idx },
+                        &event,
+                    );
+                }
+                if event.kind == WMEK::Release(MousePress::Left) {
+                    self.pressed_ui_item = None;
+                    let mut groups = self.tab_groups.borrow_mut();
+                    if let Some(id) = groups.groups().get(group_idx).map(|g| g.id.clone()) {
+                        groups.toggle_collapsed(&id);
+                    }
+                }
+                context.invalidate();
+            }
             UIItemType::SidebarTabExpand { tab_idx } => {
                 self.mouse_event_sidebar_tab_expand(tab_idx, event, context);
             }
@@ -1140,6 +1173,13 @@ impl super::TermWindow {
             }
             UIItemType::SidebarAgentMenuRestoreLastWindow => {
                 self.mouse_event_sidebar_agent_menu_restore_last_window(event, context);
+            }
+            UIItemType::SidebarSessionsSearch => {
+                if event.kind == WMEK::Release(MousePress::Left) {
+                    self.pressed_ui_item = None;
+                    self.sessions_menu_search_active = true;
+                }
+                context.invalidate();
             }
             UIItemType::SidebarDropdownBody => {
                 context.set_cursor(Some(CursorIcon::Default));
@@ -1786,6 +1826,7 @@ impl super::TermWindow {
                 | UIItemType::SidebarAgentMenuResume
                 | UIItemType::SidebarAgentMenuResumeSession { .. }
                 | UIItemType::SidebarAgentMenuRestoreLastWindow
+                | UIItemType::SidebarSessionsSearch
                 | UIItemType::SidebarSshMenuItem { .. }
                 | UIItemType::SidebarDropdownBody
                 | UIItemType::SidebarDropdownScrollTrack
@@ -1932,7 +1973,54 @@ impl super::TermWindow {
             })
             .next();
 
+        // Dropping on a group's header puts the tab into that group, which is
+        // the only way into a folded or an empty one. The mux order follows
+        // once the drag ends.
+        let grouping_on = self.config.sidebar_tab_grouping != config::SidebarTabGrouping::Off;
+        let header_idx = self
+            .ui_items
+            .iter()
+            .filter_map(|ui_item| match &ui_item.item_type {
+                UIItemType::SidebarGroupHeader { group_idx }
+                    if pointer_y >= ui_item.y as isize
+                        && pointer_y <= (ui_item.y + ui_item.height) as isize =>
+                {
+                    Some(*group_idx)
+                }
+                _ => None,
+            })
+            .next()
+            .filter(|_| grouping_on && target_idx.is_none());
+        if let Some(group_idx) = header_idx {
+            let ids = self.mux_tab_ids();
+            if let Some(dragged) = ids.get(current_idx).copied() {
+                let mut groups = self.tab_groups.borrow_mut();
+                if let Some(group) = groups.groups().get(group_idx).map(|g| g.id.clone()) {
+                    if groups.group_of(dragged) != Some(&group) {
+                        groups.move_tab(dragged, &group);
+                        drop(groups);
+                        context.invalidate();
+                    }
+                }
+            }
+        }
+
         if let Some(target_idx) = target_idx {
+            // Dragging onto a tab of another group joins that group: the
+            // mux order alone would be put back by the next group sync.
+            if target_idx != current_idx
+                && self.config.sidebar_tab_grouping != config::SidebarTabGrouping::Off
+            {
+                let ids = self.mux_tab_ids();
+                if let (Some(dragged), Some(target)) = (ids.get(current_idx), ids.get(target_idx)) {
+                    let mut groups = self.tab_groups.borrow_mut();
+                    if let Some(group) = groups.group_of(*target).cloned() {
+                        if groups.group_of(*dragged) != Some(&group) {
+                            groups.move_tab(*dragged, &group);
+                        }
+                    }
+                }
+            }
             if target_idx != current_idx && self.move_tab(target_idx).is_ok() {
                 item.item_type = UIItemType::SidebarTab {
                     tab_idx: target_idx,
@@ -3691,6 +3779,87 @@ impl super::TermWindow {
                 SidebarContextAction::ToggleAgentSectionCollapsed,
             ) => {
                 self.toggle_agent_section_collapsed();
+            }
+            (SidebarContextMenuKind::Tab { tab_idx }, SidebarContextAction::MoveToGroupMenu) => {
+                self.sidebar_context_menu = Some(SidebarContextMenuState {
+                    x: menu.x,
+                    y: menu.y,
+                    kind: SidebarContextMenuKind::MoveToGroup { tab_idx },
+                });
+            }
+            (
+                SidebarContextMenuKind::MoveToGroup { tab_idx },
+                SidebarContextAction::MoveToGroup(group_idx),
+            ) => {
+                if let Some(tab) = self.mux_tab_ids().get(tab_idx).copied() {
+                    let mut groups = self.tab_groups.borrow_mut();
+                    if let Some(id) = groups.groups().get(group_idx).map(|g| g.id.clone()) {
+                        groups.move_tab(tab, &id);
+                    }
+                }
+            }
+            (SidebarContextMenuKind::MoveToGroup { tab_idx }, SidebarContextAction::NewGroup) => {
+                self.sidebar_search = None;
+                self.tab_group_edit = Some(super::TabGroupEdit {
+                    text: String::new(),
+                    target: super::TabGroupEditTarget::New {
+                        tab: self.mux_tab_ids().get(tab_idx).copied(),
+                    },
+                });
+            }
+            (
+                SidebarContextMenuKind::Group { .. } | SidebarContextMenuKind::Sidebar,
+                SidebarContextAction::NewGroup,
+            ) => {
+                self.sidebar_search = None;
+                self.tab_group_edit = Some(super::TabGroupEdit {
+                    text: String::new(),
+                    target: super::TabGroupEditTarget::New { tab: None },
+                });
+            }
+            (SidebarContextMenuKind::Group { group_idx }, action) => {
+                let id = self
+                    .tab_groups
+                    .borrow()
+                    .groups()
+                    .get(group_idx)
+                    .map(|group| group.id.clone());
+                let Some(id) = id else {
+                    return;
+                };
+                match (action, &id) {
+                    (
+                        SidebarContextAction::RenameGroup,
+                        super::tgz_tab_groups::GroupId::Custom(name),
+                    ) => {
+                        self.sidebar_search = None;
+                        self.tab_group_edit = Some(super::TabGroupEdit {
+                            text: name.clone(),
+                            target: super::TabGroupEditTarget::Rename(name.clone()),
+                        });
+                    }
+                    (
+                        SidebarContextAction::DeleteGroup,
+                        super::tgz_tab_groups::GroupId::Custom(name),
+                    ) => {
+                        let mut groups = self.tab_groups.borrow_mut();
+                        groups.delete_custom(name);
+                        super::tgz_ui_state::save_tab_groups(&groups.custom_names());
+                    }
+                    (SidebarContextAction::RegroupByFolder, _) => {
+                        self.tab_groups.borrow_mut().regroup_by_folder();
+                    }
+                    (SidebarContextAction::CloseGroupTabs, _) => {
+                        let ids = self.mux_tab_ids();
+                        let tabs = self.tab_groups.borrow().tabs_of(&id, &ids);
+                        let anchor = tabs
+                            .first()
+                            .and_then(|tab| ids.iter().position(|id| id == tab))
+                            .unwrap_or(0);
+                        self.close_tabs_confirming(tabs, anchor);
+                    }
+                    _ => {}
+                }
             }
             (SidebarContextMenuKind::Sidebar, SidebarContextAction::CustomizeFooter) => {
                 self.start_sidebar_footer_edit();

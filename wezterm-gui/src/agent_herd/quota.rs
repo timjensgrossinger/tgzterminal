@@ -343,11 +343,181 @@ pub fn parse_claude_statusline(json: &str, sampled_at: SystemTime) -> Option<Ven
     })
 }
 
+#[derive(Deserialize)]
+struct StatuslineContext {
+    session_id: Option<String>,
+    cwd: Option<String>,
+    context_window: Option<StatuslineContextWindow>,
+}
+
+#[derive(Deserialize)]
+struct StatuslineContextWindow {
+    context_window_size: Option<u64>,
+    used_percentage: Option<f64>,
+}
+
+/// How full a session's context window is, as Claude Code's status line
+/// reported it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaudeContextSample {
+    pub session_id: String,
+    pub cwd: Option<PathBuf>,
+    pub used_percent: u8,
+}
+
+/// The context reading in a statusline payload, when it carries one.
+pub fn parse_claude_context_sample(json: &str) -> Option<ClaudeContextSample> {
+    let input: StatuslineContext = serde_json::from_str(json).ok()?;
+    let session_id = input.session_id.filter(|id| !id.is_empty())?;
+    let used = input
+        .context_window
+        .and_then(|window| window.used_percentage)
+        .filter(|used| used.is_finite())?;
+    Some(ClaudeContextSample {
+        session_id,
+        cwd: input.cwd.filter(|cwd| !cwd.is_empty()).map(PathBuf::from),
+        used_percent: used.round().clamp(0., 100.) as u8,
+    })
+}
+
+/// The newest reading per session, with the order they arrived in.
+static CLAUDE_CONTEXT_SAMPLES: std::sync::LazyLock<Mutex<Vec<ClaudeContextSample>>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn record_claude_context_sample(sample: ClaudeContextSample) {
+    let mut samples = CLAUDE_CONTEXT_SAMPLES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    samples.retain(|known| known.session_id != sample.session_id);
+    if samples.len() >= CONTEXT_WINDOW_CAP {
+        samples.remove(0);
+    }
+    samples.push(sample);
+}
+
+/// Claude Code's own reading of how full a session's context is: by session
+/// id when it is known, else the newest reading from a session in `cwd`
+/// that is not one of `claimed` (sessions known to be some other agent's).
+///
+/// This is what covers a session whose transcript cannot be read (transcript
+/// saving off, or not written yet), and with it a pane that could not be
+/// tied to a session at all.
+pub fn claude_context_percent(
+    session_id: Option<&str>,
+    cwd: Option<&Path>,
+    claimed: &std::collections::HashSet<String>,
+) -> Option<u8> {
+    let samples = CLAUDE_CONTEXT_SAMPLES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(found) =
+        session_id.and_then(|id| samples.iter().find(|sample| sample.session_id == id))
+    {
+        return Some(found.used_percent);
+    }
+    let cwd = cwd?;
+    samples
+        .iter()
+        .rev()
+        .find(|sample| sample.cwd.as_deref() == Some(cwd) && !claimed.contains(&sample.session_id))
+        .map(|sample| sample.used_percent)
+}
+
+/// The session a statusline payload is about and the size of its context
+/// window, when the payload carries both.
+pub fn parse_claude_context_window(json: &str) -> Option<(String, u64)> {
+    let input: StatuslineContext = serde_json::from_str(json).ok()?;
+    let session = input.session_id.filter(|id| !id.is_empty())?;
+    let size = input
+        .context_window
+        .and_then(|window| window.context_window_size)
+        .filter(|size| *size > 0)?;
+    Some((session, size))
+}
+
+/// Sessions whose window size is remembered; a payload names one session, and
+/// each session that renders a status line overwrites the last.
+const CONTEXT_WINDOW_CAP: usize = 256;
+
+static CLAUDE_CONTEXT_WINDOWS: std::sync::LazyLock<Mutex<HashMap<String, u64>>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn record_claude_context_window(session: String, size: u64) {
+    let mut windows = CLAUDE_CONTEXT_WINDOWS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if windows.len() >= CONTEXT_WINDOW_CAP && !windows.contains_key(&session) {
+        windows.clear();
+    }
+    windows.insert(session, size);
+}
+
+/// The context window size Claude Code itself reported for `session_id`, if
+/// a status line of that session has been seen.
+pub fn claude_context_window(session_id: &str) -> Option<u64> {
+    CLAUDE_CONTEXT_WINDOWS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(session_id)
+        .copied()
+}
+
+/// Per-session samples older than this are deleted when seen.
+const SESSION_SAMPLE_MAX_AGE: Duration = Duration::from_secs(2 * 24 * 60 * 60);
+
+/// Read the per-session samples the relay keeps beside the shared sample at
+/// `sample` (in `<sample>.d/`): each changed one updates that session's
+/// context reading. Old ones are removed.
+fn poll_claude_session_samples(sample: &Path) {
+    let mut dir = sample.as_os_str().to_owned();
+    dir.push(".d");
+    let Ok(entries) = std::fs::read_dir(PathBuf::from(dir)) else {
+        return;
+    };
+    let now = SystemTime::now();
+    for entry in entries.flatten().take(512) {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
+        if now
+            .duration_since(modified)
+            .is_ok_and(|age| age > SESSION_SAMPLE_MAX_AGE)
+        {
+            let _ = std::fs::remove_file(&path);
+            store().claude_sample_mtimes.remove(&path);
+            continue;
+        }
+        if store().claude_sample_mtimes.get(&path) == Some(&modified)
+            || metadata.len() > MAX_SAMPLE_BYTES
+        {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        store().claude_sample_mtimes.insert(path, modified);
+        if let Some((session, size)) = parse_claude_context_window(&text) {
+            record_claude_context_window(session, size);
+        }
+        if let Some(sample) = parse_claude_context_sample(&text) {
+            record_claude_context_sample(sample);
+        }
+    }
+}
+
 /// Read the Claude sample at `path` if it changed since the last read.
 /// Returns whether the store changed.
 ///
 /// Blocking file I/O: call it off the GUI thread.
 pub fn poll_claude_sample(path: &Path) -> bool {
+    poll_claude_session_samples(path);
     let Ok(metadata) = std::fs::metadata(path) else {
         return false;
     };
@@ -362,6 +532,12 @@ pub fn poll_claude_sample(path: &Path) -> bool {
     let Ok(text) = std::fs::read_to_string(path) else {
         return false;
     };
+    if let Some((session, size)) = parse_claude_context_window(&text) {
+        record_claude_context_window(session, size);
+    }
+    if let Some(sample) = parse_claude_context_sample(&text) {
+        record_claude_context_sample(sample);
+    }
     let mut store = store();
     store
         .claude_sample_mtimes
@@ -508,6 +684,56 @@ pub fn claude_sample_path(data_dir: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn statusline_context_reading_is_found_by_session_then_by_folder() {
+        let payload = r#"{"session_id":"ctx-test-1","cwd":"/src/ctx-test","context_window":{"context_window_size":1000000,"used_percentage":10.6}}"#;
+        let sample = parse_claude_context_sample(payload).unwrap();
+        assert_eq!(sample.used_percent, 11);
+        assert_eq!(sample.cwd, Some(PathBuf::from("/src/ctx-test")));
+        record_claude_context_sample(sample);
+        let nobody = std::collections::HashSet::new();
+        assert_eq!(
+            claude_context_percent(Some("ctx-test-1"), None, &nobody),
+            Some(11)
+        );
+        // A session we cannot name is found by the folder it runs in.
+        let folder = Path::new("/src/ctx-test");
+        assert_eq!(
+            claude_context_percent(None, Some(folder), &nobody),
+            Some(11)
+        );
+        assert_eq!(
+            claude_context_percent(Some("other"), Some(Path::new("/src/elsewhere")), &nobody),
+            None
+        );
+        // But not when that reading is known to be another agent's.
+        let claimed: std::collections::HashSet<String> =
+            std::iter::once("ctx-test-1".to_string()).collect();
+        assert_eq!(claude_context_percent(None, Some(folder), &claimed), None);
+        // No reading in the payload: nothing recorded.
+        assert_eq!(
+            parse_claude_context_sample(
+                r#"{"session_id":"x","context_window":{"used_percentage":null}}"#
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn statusline_context_window_needs_a_session_and_a_size() {
+        let payload = r#"{"session_id":"abc","context_window":{"context_window_size":1000000,"used_percentage":31}}"#;
+        assert_eq!(
+            parse_claude_context_window(payload),
+            Some(("abc".to_string(), 1_000_000))
+        );
+        assert_eq!(parse_claude_context_window(r#"{"session_id":"abc"}"#), None);
+        assert_eq!(
+            parse_claude_context_window(r#"{"context_window":{"context_window_size":200000}}"#),
+            None
+        );
+        assert_eq!(parse_claude_context_window("not json"), None);
+    }
 
     fn at(secs: u64) -> SystemTime {
         SystemTime::UNIX_EPOCH + Duration::from_secs(secs)

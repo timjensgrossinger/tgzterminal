@@ -94,10 +94,29 @@ config.sidebar_scroll_bar = true
 | `sidebar_position` | enum | `"Left"` | `"Left"`, `"Right"` |
 | `sidebar_theme` | enum | `"Auto"` (`"Brand"` in a build with a brand palette) | `"Auto"`, `"Modern"`, `"FollowColorScheme"`, `"Brand"`. `Auto` derives the sidebar from `colors.tab_bar` when the scheme defines it, else from `colors.background` + `colors.foreground`, else uses the fork's near-black palette. `Modern` pins that near-black palette regardless of the scheme. `Brand` pins the chrome of the brand this binary was compiled with: dark base tinted with `BRAND_NEUTRAL`, `BRAND_ACCENT` for active/focus, `BRAND_ATTENTION` for attention. Every variant is chrome only — terminal colours are never touched. See [Build flavours](#build-flavours). |
 | `sidebar_tab_density` | enum | `"Comfortable"` | `"Comfortable"`, `"Compact"`. `Compact` also suppresses the metadata sub-line entirely. |
+| `sidebar_tab_grouping` | enum | `"Auto"` | `"Auto"`: a new tab joins the group of the project folder (nearest `.git`) it starts in and stays there when it changes folder; tabs with no project sit under "Other". `"Manual"`: tabs are grouped only by hand. `"Off"`: one flat list, no headers. Drag a tab onto a tab or the header of another group to move it there, or use "Move to group" in the tab's right-click menu; click a header to fold the group. "New group…" (tab menu, header menu, or the empty part of the list) names a group of your own in the search field: Enter keeps it, Esc cancels. A header's right-click menu renames or deletes your own groups, re-sorts tabs by folder, and closes the group's tabs. Your groups' names are remembered across restarts; which tab was in which group is not. Groups are contiguous in the tab order, so `ActivateTab` numbers match the rows shown. |
+| `sidebar_font` | font | unset | Font of the sidebar's own text, e.g. `wezterm.font 'Inter'`. Unset: `window_frame.font`, which defaults to the bundled Roboto. The terminal font stays the fallback, so icon glyphs keep resolving. |
+| `sidebar_font_size` | number | `13` on macOS, `10` elsewhere | Size of `sidebar_font` in points. Follows the display's DPI, not the terminal font size. |
 | `sidebar_tab_title_source` | enum | `"Title"` | `"Title"`, `"Command"`, `"WorkingDirectory"`, `"GitBranch"` |
 | `sidebar_tab_metadata` | list of enum | `{ "GitBranch", "WorkingDirectory" }` | Elements: `"GitBranch"`, `"WorkingDirectory"` |
 | `sidebar_tab_hover_details` | bool | `false` | Shows the metadata sub-line on the active/hovered row — **and makes every row two text lines tall** whether or not you hover, so fewer tabs fit on screen. |
 | `sidebar_scroll_bar` | bool | `true` | Slim tab-list scrollbar when the list overflows. Reserves a 30px gutter, which narrows every row's text budget. |
+
+### Tab rows, tab palette and the close dialog
+
+Each tab row has two lines: what the tab is doing (an agent's session title, else the tab title), then who
+and in what state (`Claude · running · main`, or branch and folder for a plain tab). The ring on the left
+shows how full the agent's context window is, in percent; it turns while the agent runs, turns to the
+attention colour and pulses while it waits for you, and is grey when idle. The number needs a transcript
+that records usage (Claude, Codex); other agents show the ring without one. Subagents at work are listed
+under their tab.
+
+`ShowTabNavigator` opens a floating palette instead of the full-screen list: type to filter, Up/Down or Tab
+to move, Enter to switch, Esc or a click beside it to close.
+
+Closing a tab or pane that is still running something asks in a dialog that names what would be stopped.
+Enter and Esc keep it open; `y` or the named button closes. Closing the window itself still uses the
+terminal's own prompt.
 
 The tab list scrolls with the mouse wheel when there are more tabs than visible
 rows.

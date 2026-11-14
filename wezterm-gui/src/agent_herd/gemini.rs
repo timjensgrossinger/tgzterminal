@@ -93,6 +93,7 @@ impl SessionSource for GeminiDetector {
                         activity: None,
                         input_tokens: None,
                         output_tokens: None,
+                        context_percent: None,
                         cost: None,
                     });
                 }

@@ -12,7 +12,6 @@ use crate::termwindow::render::corners::{
     BOTTOM_LEFT_ROUNDED_CORNER, BOTTOM_RIGHT_ROUNDED_CORNER, TOP_LEFT_ROUNDED_CORNER,
     TOP_RIGHT_ROUNDED_CORNER,
 };
-use crate::termwindow::render::RenderScreenLineParams;
 use crate::termwindow::shell_copy::{shell_copy_toast_message, ShellCopyAction};
 use crate::termwindow::tgz_last_session::{
     self, LayoutTree, RestoreTab, SnapshotSession, SnapshotSplit, WindowAgents,
@@ -33,7 +32,6 @@ use config::{
 };
 use finl_unicode::grapheme_clusters::Graphemes;
 use mux::pane::{CachePolicy, Pane, PaneId, SpawnTitlePolicy};
-use mux::renderable::RenderableDimensions;
 use mux::tab::{PositionedPane, SplitDirection};
 use mux::Mux;
 use regex::RegexBuilder;
@@ -47,10 +45,12 @@ use std::time::{Duration, Instant, SystemTime};
 use std::{env, fs};
 use termwiz::cell::{grapheme_column_width, unicode_column_width, CellAttributes, Intensity};
 use termwiz::color::ColorAttribute;
-use termwiz::surface::{Line, SequenceNo, SEQ_ZERO};
+use termwiz::surface::{Line, SequenceNo};
 use url::Url;
 use window::color::LinearRgba;
 use window::{MousePress, RectF, WindowOps};
+
+mod modal;
 
 const INSET: f32 = 8.;
 const GAP: f32 = 4.;
@@ -297,6 +297,16 @@ fn dropdown_viewport(heights: &[f32], offset: usize, max_body: f32) -> Option<Dr
     })
 }
 
+/// Whether a session row's label matches what was typed into the sessions
+/// search: every word of the query appears somewhere in the label, in any
+/// order and case. An empty query matches everything.
+pub(crate) fn session_label_matches(label: &str, query: &str) -> bool {
+    let label = label.to_lowercase();
+    query
+        .split_whitespace()
+        .all(|word| label.contains(&word.to_lowercase()))
+}
+
 /// Keeps a dropdown's top edge where its first paint put it.
 ///
 /// The sessions menu opens with two rows and grows when the background scan
@@ -514,7 +524,10 @@ impl SidebarPalette {
     /// The accent the active rail is drawn in: midway between the ring's
     /// two stops.
     pub(crate) fn accent(&self) -> LinearRgba {
-        lerp_rgba(self.ring.a, self.ring.b, 0.5)
+        // One accent everywhere: the ring's cool colour, the one a running
+        // tab's ring turns in. A blend of both ring colours read as a third,
+        // unrelated colour.
+        self.ring.b
     }
 
     /// Fill of a quota bar: the accent while there is room, turning to the
@@ -677,6 +690,9 @@ const AGENT_PULSE_FRAME_INTERVAL: Duration = Duration::from_millis(33);
 /// moment. Deliberately unseeded per item, unlike the tab bar's
 /// `spinner_phase`, which exists to spread tabs apart.
 static AGENT_PULSE_EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+/// One turn of a running tab's ring.
+const TAB_RING_TURN_SECS: f32 = 1.1;
 
 /// Instant at which the pulse next needs a frame, snapped to the frame grid
 /// measured from [`AGENT_PULSE_EPOCH`].
@@ -2196,6 +2212,23 @@ fn trim_pane_toolbelt_buttons(buttons: &mut Vec<(&str, PaneToolbeltAction, f32)>
 /// therefore derive its cell count from the same pixel width it passes down.
 /// Returns 0 — draw nothing — for a region narrower than one cell, rather than
 /// forcing a cell that cannot fit.
+/// Roughly how many characters of chrome text fit into `pixel_width`.
+///
+/// The sidebar's labels are drawn in a proportional font whose characters
+/// are on average narrower than a terminal cell, so counting whole cells cut
+/// labels well before they ran out of room. This counts a little generously
+/// instead; a label that turns out too wide is still cut to the pixel, with
+/// an ellipsis, where it is drawn.
+pub(crate) fn chrome_text_cols(pixel_width: f32, cell_width: usize) -> usize {
+    if cell_width == 0 || !pixel_width.is_finite() || pixel_width < cell_width as f32 {
+        return 0;
+    }
+    (pixel_width / (cell_width as f32 * CHROME_CHAR_RATIO)) as usize
+}
+
+/// Average width of a chrome-font character relative to a terminal cell.
+const CHROME_CHAR_RATIO: f32 = 0.8;
+
 pub(crate) fn sidebar_text_cols(pixel_width: f32, cell_width: usize) -> usize {
     if cell_width == 0 || !pixel_width.is_finite() || pixel_width < cell_width as f32 {
         return 0;
@@ -3090,6 +3123,15 @@ fn pane_app_title(pane: &Arc<dyn Pane>, command: Option<&str>) -> Option<String>
 /// the scrollbar all speak in the same units.
 #[derive(Debug, Clone)]
 pub(crate) enum SidebarRow {
+    /// Header of a tab group; the tabs below it up to the next header are
+    /// its members.
+    GroupHeader {
+        group_idx: usize,
+        name: String,
+        collapsed: bool,
+        /// Agents in the group that are waiting on the user.
+        waiting: usize,
+    },
     Tab {
         tab_idx: usize,
         active: bool,
@@ -3100,6 +3142,9 @@ pub(crate) enum SidebarRow {
         pane_count: usize,
         expanded: bool,
     },
+    /// A subagent at work inside the tab above it. Not clickable: it has no
+    /// pane of its own.
+    Subagent { label: String },
     Pane {
         pane_id: PaneId,
         active: bool,
@@ -3123,6 +3168,8 @@ pub(crate) struct SidebarTabInput {
     title: String,
     metadata: Vec<String>,
     panes: Vec<SidebarRow>,
+    /// Labels of the subagents working in the tab right now.
+    subagents: Vec<String>,
 }
 
 /// Flatten tabs and their panes into the sidebar's row sequence.
@@ -3144,26 +3191,129 @@ fn assemble_sidebar_rows(
                 continue;
             }
         }
+        push_sidebar_tab_rows(&mut rows, tab, expanded_tabs);
+    }
 
-        // A tab matching the search keeps its pane children, so expanding a
-        // filtered result still shows what is inside it. A single-pane tab is
-        // never expandable: its one pane is what the tab row already describes.
-        let pane_count = tab.panes.len();
-        let expanded = pane_count > 1 && expanded_tabs.contains(&tab.tab_idx);
+    rows
+}
 
-        rows.push(SidebarRow::Tab {
-            tab_idx: tab.tab_idx,
-            active: tab.active,
-            title: tab.title,
-            metadata: tab.metadata,
-            pane_count,
-            expanded,
+fn push_sidebar_tab_rows(
+    rows: &mut Vec<SidebarRow>,
+    tab: SidebarTabInput,
+    expanded_tabs: &HashSet<usize>,
+) {
+    // A tab matching the search keeps its pane children, so expanding a
+    // filtered result still shows what is inside it. A single-pane tab is
+    // never expandable: its one pane is what the tab row already describes.
+    let pane_count = tab.panes.len();
+    let expanded = pane_count > 1 && expanded_tabs.contains(&tab.tab_idx);
+
+    rows.push(SidebarRow::Tab {
+        tab_idx: tab.tab_idx,
+        active: tab.active,
+        title: tab.title,
+        metadata: tab.metadata,
+        pane_count,
+        expanded,
+    });
+    rows.extend(
+        tab.subagents
+            .into_iter()
+            .map(|label| SidebarRow::Subagent { label }),
+    );
+    if expanded {
+        rows.extend(tab.panes);
+    }
+}
+
+/// The smallest scroll offset from which every remaining row fits into
+/// `avail` pixels, rows being `heights` tall with `gap` between them.
+fn sidebar_max_scroll_offset(heights: &[f32], avail: f32, gap: f32) -> usize {
+    let mut used = 0.;
+    for (idx, height) in heights.iter().enumerate().rev() {
+        let needed = used + height + if used > 0. { gap } else { 0. };
+        if needed > avail {
+            return idx + 1;
+        }
+        used = needed;
+    }
+    0
+}
+
+/// How many rows fit into `avail` pixels starting at `offset`.
+fn sidebar_rows_fitting(heights: &[f32], offset: usize, avail: f32, gap: f32) -> usize {
+    let mut used = 0.;
+    let mut count = 0;
+    for height in heights.iter().skip(offset) {
+        let needed = used + height + if used > 0. { gap } else { 0. };
+        if needed > avail {
+            break;
+        }
+        used = needed;
+        count += 1;
+    }
+    count
+}
+
+/// A tab group, gathered before row assembly.
+pub(crate) struct SidebarGroupInput {
+    group_idx: usize,
+    name: String,
+    collapsed: bool,
+    /// Shown even with no tabs in it: a group the user made.
+    keep_when_empty: bool,
+    /// Its tabs, by index, with whether an agent in each is waiting.
+    tabs: Vec<(usize, bool)>,
+}
+
+/// The grouped form of [`assemble_sidebar_rows`]: a header per group, then
+/// its tabs. A search shows only groups with a match and opens folded ones;
+/// a tab no group has claimed yet is listed after them rather than hidden.
+fn assemble_grouped_sidebar_rows(
+    tabs: Vec<SidebarTabInput>,
+    groups: Vec<SidebarGroupInput>,
+    expanded_tabs: &HashSet<usize>,
+    query: Option<&str>,
+) -> Vec<SidebarRow> {
+    let query = query.filter(|query| !query.is_empty());
+    let matches = |tab: &SidebarTabInput| {
+        query.map_or(true, |query| {
+            query_matches(&tab.title, &tab.metadata, query)
+        })
+    };
+    let mut by_idx: HashMap<usize, SidebarTabInput> =
+        tabs.into_iter().map(|tab| (tab.tab_idx, tab)).collect();
+    let mut rows = Vec::new();
+
+    for group in groups {
+        let waiting = group.tabs.iter().filter(|(_, waiting)| *waiting).count();
+        let members: Vec<SidebarTabInput> = group
+            .tabs
+            .iter()
+            .filter_map(|(idx, _)| by_idx.remove(idx))
+            .filter(|tab| matches(tab))
+            .collect();
+        if members.is_empty() && (query.is_some() || !group.keep_when_empty) {
+            continue;
+        }
+        rows.push(SidebarRow::GroupHeader {
+            group_idx: group.group_idx,
+            name: group.name,
+            collapsed: group.collapsed,
+            waiting,
         });
-        if expanded {
-            rows.extend(tab.panes);
+        if !group.collapsed || query.is_some() {
+            for tab in members {
+                push_sidebar_tab_rows(&mut rows, tab, expanded_tabs);
+            }
         }
     }
 
+    let mut rest: Vec<SidebarTabInput> = by_idx.into_values().collect();
+    rest.sort_by_key(|tab| tab.tab_idx);
+    for tab in rest.into_iter().filter(|tab| matches(tab)) {
+        push_sidebar_tab_rows(&mut rows, tab, expanded_tabs);
+    }
     rows
 }
 
@@ -4430,6 +4580,11 @@ pub(crate) fn sidebar_context_menu_rows(
         // Its rows are the buttons not placed yet, which only the window
         // knows; see `paint_sidebar_context_menu`.
         SidebarContextMenuKind::FooterAdd => Vec::new(),
+        // Group menus name groups, which only the window knows; see
+        // `paint_sidebar_context_menu` here too.
+        SidebarContextMenuKind::Group { .. } | SidebarContextMenuKind::MoveToGroup { .. } => {
+            Vec::new()
+        }
         SidebarContextMenuKind::FooterItem(_) => {
             vec![row(SidebarContextAction::RemoveFooterItem, "Remove button")]
         }
@@ -9740,13 +9895,25 @@ impl crate::TermWindow {
     }
 
     fn sidebar_row_height(&self) -> usize {
+        use crate::termwindow::tgz_ui_text::UiFont;
         let cell = self.render_metrics.cell_size.height as usize;
+        // The height of the sidebar's controls: the search field and the
+        // footer buttons. One line of chrome text with room around it.
+        let line = self.ui_line_height(UiFont::Regular);
         match self.config.sidebar_tab_density {
-            SidebarTabDensity::Comfortable if self.sidebar_metadata_rows_enabled() => {
-                (cell * 2 + 8).max(44)
-            }
-            SidebarTabDensity::Comfortable => (cell + 10).max(34),
-            SidebarTabDensity::Compact => (cell + 6).max(28),
+            SidebarTabDensity::Comfortable => ((line * 1.9).ceil() as usize).max(cell + 8),
+            SidebarTabDensity::Compact => ((line * 1.6).ceil() as usize).max(cell + 4),
+        }
+    }
+
+    /// Height of a tab row: two lines of chrome text, or one when compact.
+    fn sidebar_tab_row_height(&self) -> usize {
+        use crate::termwindow::tgz_ui_text::UiFont;
+        let first = self.ui_line_height(UiFont::Medium);
+        let second = self.ui_line_height(UiFont::Small);
+        match self.config.sidebar_tab_density {
+            SidebarTabDensity::Comfortable => (first + second + first * 0.75).ceil() as usize,
+            SidebarTabDensity::Compact => (first * 1.7).ceil() as usize,
         }
     }
 
@@ -9801,11 +9968,183 @@ impl crate::TermWindow {
                     title,
                     metadata,
                     panes: self.sidebar_pane_rows_for_tab_idx(tab_idx),
+                    subagents: self.sidebar_tab_subagents(tab_idx),
                 })
             })
             .collect();
 
-        assemble_sidebar_rows(tabs, &self.sidebar_expanded_tabs, query)
+        if self.config.sidebar_tab_grouping == config::SidebarTabGrouping::Off {
+            return assemble_sidebar_rows(tabs, &self.sidebar_expanded_tabs, query);
+        }
+        let ids = self.mux_tab_ids();
+        let focused_pane = self.focused_active_pane_id();
+        let groups = self.tab_groups.borrow();
+        let inputs: Vec<SidebarGroupInput> = groups
+            .layout(&ids)
+            .into_iter()
+            .filter_map(|(group_idx, members)| {
+                let group = groups.groups().get(group_idx)?;
+                let tabs = members
+                    .iter()
+                    .filter_map(|id| ids.iter().position(|candidate| candidate == id))
+                    .map(|tab_idx| {
+                        let waiting = self.sidebar_agent_row_for_tab_idx(tab_idx).is_some_and(
+                            |(pane_id, agent)| {
+                                let _ = (pane_id, focused_pane);
+                                matches!(agent.status, AgentStatus::WaitingForInput)
+                            },
+                        );
+                        (tab_idx, waiting)
+                    })
+                    .collect();
+                Some(SidebarGroupInput {
+                    group_idx,
+                    name: group.id.name(),
+                    collapsed: group.collapsed,
+                    keep_when_empty: matches!(
+                        group.id,
+                        crate::termwindow::tgz_tab_groups::GroupId::Custom(_)
+                    ),
+                    tabs,
+                })
+            })
+            .collect();
+        drop(groups);
+        assemble_grouped_sidebar_rows(tabs, inputs, &self.sidebar_expanded_tabs, query)
+    }
+
+    /// The project a folder belongs to, remembered for a few seconds so that
+    /// placing tabs does not walk the filesystem on every frame.
+    fn tab_group_root(&self, cwd: &Path) -> Option<PathBuf> {
+        const TTL: Duration = Duration::from_secs(10);
+        if let Some((at, root)) = self.tab_group_roots.borrow().get(cwd) {
+            if at.elapsed() < TTL {
+                return root.clone();
+            }
+        }
+        let root = project_root_off_thread(cwd);
+        let mut roots = self.tab_group_roots.borrow_mut();
+        if roots.len() > 256 {
+            roots.clear();
+        }
+        roots.insert(cwd.to_path_buf(), (Instant::now(), root.clone()));
+        root
+    }
+
+    /// Places tabs that have no group yet, forgets closed ones, and queues a
+    /// reorder of the mux tabs when the groups are not contiguous. Called once
+    /// per paint; the reorder itself runs outside the paint.
+    fn sync_tab_groups(&self) {
+        let grouping = self.config.sidebar_tab_grouping;
+        if grouping == config::SidebarTabGrouping::Off {
+            return;
+        }
+        let auto = grouping == config::SidebarTabGrouping::Auto;
+        let tabs: Vec<Arc<mux::tab::Tab>> = {
+            let mux = Mux::get();
+            let Some(window) = mux.get_window(self.mux_window_id) else {
+                return;
+            };
+            let tabs = window.iter_tabs().cloned().collect();
+            tabs
+        };
+        let ids: Vec<mux::tab::TabId> = tabs.iter().map(|tab| tab.tab_id()).collect();
+        let pending: Vec<&Arc<mux::tab::Tab>> = {
+            let groups = self.tab_groups.borrow();
+            tabs.iter()
+                .filter(|tab| groups.needs_root(tab.tab_id()))
+                .collect()
+        };
+        let placed: Vec<(mux::tab::TabId, Option<PathBuf>)> = pending
+            .into_iter()
+            .map(|tab| {
+                let root = tab
+                    .get_active_pane()
+                    .and_then(|pane| pane_working_dir(&pane))
+                    .and_then(|cwd| self.tab_group_root(&cwd));
+                (tab.tab_id(), root)
+            })
+            .collect();
+        let mut groups = self.tab_groups.borrow_mut();
+        for (tab, root) in placed {
+            groups.assign(tab, root.as_deref(), auto);
+        }
+        groups.prune(&ids);
+        let out_of_order = groups.desired_order(&ids) != ids;
+        drop(groups);
+
+        let dragging_tab = matches!(
+            self.dragging.as_ref().map(|(item, _)| &item.item_type),
+            Some(UIItemType::SidebarTab { .. })
+        );
+        if out_of_order && !dragging_tab && !self.tab_group_sync_pending.replace(true) {
+            if let Some(window) = self.window.as_ref() {
+                window.notify(TermWindowNotif::Apply(Box::new(|term_window| {
+                    term_window.apply_tab_group_order();
+                })));
+            }
+        }
+    }
+
+    /// Labels of the subagents working right now in the agent of this tab.
+    fn sidebar_tab_subagents(&self, tab_idx: usize) -> Vec<String> {
+        if !self.config.agent_ui.section.enabled {
+            return vec![];
+        }
+        let Some((pane_id, _)) = self.sidebar_agent_row_for_tab_idx(tab_idx) else {
+            return vec![];
+        };
+        self.herd_tab_info
+            .borrow()
+            .get(&pane_id)
+            .map(|info| info.subagents.clone())
+            .unwrap_or_default()
+    }
+
+    /// Height of a group header row.
+    fn sidebar_header_row_height(&self) -> usize {
+        let line = self.ui_line_height(crate::termwindow::tgz_ui_text::UiFont::SmallMedium);
+        (line * 1.8).ceil() as usize
+    }
+
+    /// Height of the one-line rows under a tab: its panes and subagents.
+    fn sidebar_child_row_height(&self) -> usize {
+        let line = self.ui_line_height(crate::termwindow::tgz_ui_text::UiFont::Regular);
+        let cell = self.render_metrics.cell_size.height as f32;
+        (line * 1.6).max(cell + 4.).ceil() as usize
+    }
+
+    /// Height of each row of the expanded list, in order.
+    fn sidebar_row_heights(&self, rows: &[SidebarRow]) -> Vec<f32> {
+        let tab = self.sidebar_tab_row_height() as f32;
+        let header = self.sidebar_header_row_height() as f32;
+        let child = self.sidebar_child_row_height() as f32;
+        rows.iter()
+            .map(|row| match row {
+                SidebarRow::GroupHeader { .. } => header,
+                SidebarRow::Tab { .. } => tab,
+                SidebarRow::Subagent { .. } | SidebarRow::Pane { .. } => child,
+            })
+            .collect()
+    }
+
+    /// The herd's name and context use for the agent in `pane_id`.
+    fn sidebar_herd_tab_info(
+        &self,
+        pane_id: PaneId,
+        vendor_label: &str,
+    ) -> (Option<String>, Option<u8>) {
+        let info = self.herd_tab_info.borrow();
+        let Some(info) = info.get(&pane_id) else {
+            return (None, None);
+        };
+        let name = herd_session_name(
+            &info.name,
+            info.session_id.as_deref(),
+            vendor_label,
+            info.model.as_deref(),
+        );
+        (name, info.context_percent)
     }
 
     /// Number of rows the list scrolls over.
@@ -9909,6 +10248,9 @@ impl crate::TermWindow {
             Some(rows) => tgz_footer::normalize_footer_rows_capped(rows, false, max_row),
             None => tgz_footer::default_footer_rows(),
         };
+        // However it was dragged, New Tab keeps the bottom edge to itself.
+        // A footer written in Lua is taken as written.
+        let rows = tgz_footer::pin_new_tab_last(rows);
         // Widths from Lua fix the layout as much as rows from Lua do.
         (rows, !self.config.sidebar_footer_weights.is_empty())
     }
@@ -10086,7 +10428,16 @@ impl crate::TermWindow {
         }
         let list_height =
             (self.sidebar_tab_list_bottom(top, height, row_height) - list_top).max(0.);
-        ((list_height + GAP) / (row_height + GAP)).floor() as usize
+        if self.config.sidebar_auto_hide && !self.sidebar_auto_hide_open {
+            // The rail: one tile per tab, all the same height.
+            return ((list_height + GAP) / (row_height + GAP)).floor() as usize;
+        }
+        // Rows differ in height, so "how many fit" depends on where the list
+        // is scrolled to. What every caller wants from this number is the
+        // scroll range, `total - capacity`, so that is what it encodes.
+        let rows = self.sidebar_rows();
+        let heights = self.sidebar_row_heights(&rows);
+        rows.len() - sidebar_max_scroll_offset(&heights, list_height, GAP)
     }
 
     /// Set the open session dropdown's scroll offset; true when it moved.
@@ -10472,15 +10823,11 @@ impl crate::TermWindow {
         color: LinearRgba,
     ) -> anyhow::Result<()> {
         let stroke = (side * COPY_CHECK_STROKE_RATIO).max(COPY_CHECK_STROKE_MIN_PX);
-        for (px, py) in check_stroke_points(progress, side, stroke) {
-            self.filled_rectangle(
-                layers,
-                2,
-                euclid::rect(x + px - stroke * 0.5, y + py - stroke * 0.5, stroke, stroke),
-                color,
-            )?;
-        }
-        Ok(())
+        // In sixteenths, so the stroke that draws itself in is a handful of
+        // cached shapes rather than a new one per frame.
+        let progress = (progress.clamp(0., 1.) * 16.).round() / 16.;
+        let points = crate::termwindow::tgz_ui_text::partial_path(&COPY_CHECK_PATH, progress);
+        self.paint_stroke(layers, 2, x, y, side, stroke, &points, color)
     }
 
     fn sidebar_copy_glyph_ink_center(&self) -> Option<(f32, f32)> {
@@ -10802,7 +11149,7 @@ impl crate::TermWindow {
             )),
             _ => None,
         };
-        match self.config.sidebar_theme {
+        let mut resolved = match self.config.sidebar_theme {
             SidebarTheme::Modern => SidebarPalette::modern(ring),
             SidebarTheme::Brand => SidebarPalette::brand(ring),
             SidebarTheme::Auto | SidebarTheme::FollowColorScheme => {
@@ -10811,7 +11158,11 @@ impl crate::TermWindow {
                     None => from_window().unwrap_or_else(|| SidebarPalette::modern(ring)),
                 }
             }
-        }
+        };
+        // Controls are filled shapes, not outlined boxes: the outline takes
+        // the resting fill's colour and so disappears into it.
+        resolved.row_border = resolved.search_fill;
+        resolved
     }
 
     /// Which sidebar animations `agent_ui` allows. Focus deliberately does not
@@ -11097,7 +11448,7 @@ impl crate::TermWindow {
         };
 
         let cell_width = self.render_metrics.cell_size.width as usize;
-        let cell_height = self.render_metrics.cell_size.height as usize;
+        let _cell_height = self.render_metrics.cell_size.height as usize;
         let cell_w_f = self.render_metrics.cell_size.width as f32;
         let cell_h_f = self.render_metrics.cell_size.height as f32;
         // DPI-scaled geometry: the strip/button boxes must be derived from the
@@ -11277,10 +11628,10 @@ impl crate::TermWindow {
             )?;
         }
 
-        let palette = self.palette().clone();
+        let _palette = self.palette().clone();
         let gl_state = self.render_state.as_ref().unwrap();
-        let white_space = gl_state.util_sprites.white_space.texture_coords();
-        let filled_box = gl_state.util_sprites.filled_box.texture_coords();
+        let _white_space = gl_state.util_sprites.white_space.texture_coords();
+        let _filled_box = gl_state.util_sprites.filled_box.texture_coords();
         let render_text = |this: &mut Self,
                            layers: &mut TripleLayerQuadAllocator,
                            text: &str,
@@ -11291,63 +11642,8 @@ impl crate::TermWindow {
                            default_bg: LinearRgba,
                            bold: bool|
          -> anyhow::Result<()> {
-            let cols = sidebar_text_cols(pixel_width, cell_width);
-            if cols == 0 {
-                return Ok(());
-            }
-            let text = truncate_to_cols(text, cols);
-            let mut attrs = CellAttributes::default();
-            attrs.set_foreground(ColorAttribute::TrueColorWithDefaultFallback(fg.to_srgb()));
-            if bold {
-                attrs.set_intensity(Intensity::Bold);
-            }
-            let mut line = Line::from_text(text, &attrs, 1, None);
-            line.resize(cols, SEQ_ZERO);
-            this.render_screen_line(
-                RenderScreenLineParams {
-                    top_pixel_y: y,
-                    left_pixel_x: x,
-                    pixel_width,
-                    stable_line_idx: None,
-                    line: &line,
-                    selection: 0..0,
-                    cursor: &Default::default(),
-                    palette: &palette,
-                    dims: &RenderableDimensions {
-                        cols,
-                        physical_top: 0,
-                        scrollback_rows: 0,
-                        scrollback_top: 0,
-                        viewport_rows: 1,
-                        dpi: this.terminal_size.dpi,
-                        pixel_height: cell_height as usize,
-                        pixel_width: pixel_width as usize,
-                        reverse_video: false,
-                    },
-                    config: &this.config,
-                    cursor_border_color: LinearRgba::default(),
-                    foreground: fg,
-                    pane: None,
-                    is_active: true,
-                    selection_fg: LinearRgba::default(),
-                    selection_bg: LinearRgba::default(),
-                    cursor_fg: LinearRgba::default(),
-                    cursor_bg: LinearRgba::default(),
-                    cursor_is_default_color: true,
-                    white_space,
-                    filled_box,
-                    window_is_transparent: true,
-                    default_bg,
-                    style: None,
-                    font: None,
-                    use_pixel_positioning: this.config.experimental_pixel_positioning,
-                    render_metrics: this.render_metrics,
-                    shape_key: None,
-                    password_input: false,
-                },
-                layers,
-            )
-            .map(|_| ())
+            let _ = default_bg;
+            this.paint_chrome_text(layers, text, x, y, pixel_width, fg, bold)
         };
 
         let button_start_x = tool_x + tool_w - pad_x - button_area;
@@ -11554,11 +11850,33 @@ impl crate::TermWindow {
         layers: &mut TripleLayerQuadAllocator,
     ) -> anyhow::Result<()> {
         let Some(menu) = self.sessions_menu.clone() else {
+            // Every way of closing the menu ends here, so this is where its
+            // search is forgotten.
+            if !self.sessions_menu_query.is_empty() {
+                self.sessions_menu_query.clear();
+            }
+            self.sessions_menu_search_active = false;
             return Ok(());
         };
 
+        let query = self.sessions_menu_query.clone();
         let mut rows: Vec<SidebarDropdownRow> = Vec::new();
-        let restore_candidates = self.agent_restore_candidates();
+        // The search row leads the menu and stays put while the sessions
+        // scroll under it. Its label is set once the width is known.
+        rows.push(SidebarDropdownRow {
+            label: String::new(),
+            dot_color: None,
+            checkbox: None,
+            divider_above: false,
+            indent: false,
+            trailing_chevron: false,
+            widget: None,
+            inert: true,
+            item_type: UIItemType::SidebarSessionsSearch,
+        });
+        let restore_candidates = self
+            .agent_restore_candidates()
+            .filter(|_| query.trim().is_empty());
         let has_restore_row = restore_candidates.is_some();
         let resume_limit = self.agent_resume_menu_limit();
         if let Some(candidates) = restore_candidates {
@@ -11580,8 +11898,20 @@ impl crate::TermWindow {
             // they hang under an expander and are indented to show it. Here they
             // are a top-level group, so drop the indent and put the divider on
             // the first of them -- but only if something sits above it.
-            let needs_divider = !rows.is_empty();
-            for (index, row) in self.agent_resume_session_rows().into_iter().enumerate() {
+            let needs_divider = rows.len() > 1;
+            let matching = self
+                .agent_resume_session_rows()
+                .into_iter()
+                // A placeholder ("Scanning…") is not a session; it stays
+                // only while nothing is being searched for.
+                .filter(|row| {
+                    if row.inert {
+                        query.trim().is_empty()
+                    } else {
+                        session_label_matches(&row.label, &query)
+                    }
+                });
+            for (index, row) in matching.enumerate() {
                 rows.push(SidebarDropdownRow {
                     indent: false,
                     divider_above: needs_divider && index == 0,
@@ -11590,7 +11920,21 @@ impl crate::TermWindow {
             }
         }
 
-        if rows.is_empty() {
+        if rows.len() == 1 && !query.trim().is_empty() {
+            rows.push(SidebarDropdownRow {
+                label: "No sessions match".to_string(),
+                dot_color: None,
+                checkbox: None,
+                divider_above: false,
+                indent: false,
+                trailing_chevron: false,
+                widget: None,
+                inert: true,
+                item_type: UIItemType::SidebarAgentMenuResume,
+            });
+        }
+
+        if rows.len() == 1 {
             // Nothing to restore and nothing on disk. An empty panel would look
             // broken, so say why.
             rows.push(SidebarDropdownRow {
@@ -11618,11 +11962,18 @@ impl crate::TermWindow {
             .unwrap_or(0);
         let needed_cols = (longest_cols as f32 * cell_w + 64.0 * dpi) / dpi;
         let menu_w = AGENT_RESUME_MENU_W.max(needed_cols);
+        rows[0].label = if query.is_empty() && !self.sessions_menu_search_active {
+            "Search sessions\u{2026}".to_string()
+        } else {
+            // The caret follows the typing; a query too long for the field
+            // is cut at its start by the row's own ellipsis rule.
+            format!("{query}|")
+        };
         // The restore row is there at once, the sessions arrive with the scan.
         // Pinned, so their arrival cannot move the restore row away from a
         // pointer already on its way to it.
         let expected_rows = rows.len().max(
-            usize::from(has_restore_row)
+            1 + usize::from(has_restore_row)
                 + if resume_limit > 0 {
                     resume_limit + 1
                 } else {
@@ -11644,12 +11995,73 @@ impl crate::TermWindow {
             &rows,
             Some(menu.scroll_offset),
             Some(&mut pin),
-            0,
+            1,
         );
         if let Some(menu) = self.sessions_menu.as_mut() {
             menu.pinned_top = pin.top;
         }
         painted
+    }
+
+    /// Keys typed while the sessions dropdown is open edit its search.
+    /// Returns true when the key was consumed.
+    pub(crate) fn sessions_menu_key_input(
+        &mut self,
+        key: ::termwiz::input::KeyCode,
+        modifiers: ::window::Modifiers,
+        context: &dyn WindowOps,
+    ) -> bool {
+        use ::termwiz::input::KeyCode as KC;
+        use ::window::Modifiers;
+        if self.sessions_menu.is_none() {
+            return false;
+        }
+        match key {
+            KC::Escape => {
+                // First the search, then the menu.
+                if self.sessions_menu_query.is_empty() {
+                    self.sessions_menu = None;
+                } else {
+                    self.sessions_menu_query.clear();
+                }
+            }
+            KC::Backspace => {
+                self.sessions_menu_query.pop();
+            }
+            KC::Enter => {
+                let query = self.sessions_menu_query.clone();
+                let first = self
+                    .agent_resume_session_rows()
+                    .into_iter()
+                    .filter(|row| !row.inert && session_label_matches(&row.label, &query))
+                    .find_map(|row| match row.item_type {
+                        UIItemType::SidebarAgentMenuResumeSession {
+                            index,
+                            adapter_id,
+                            session_id,
+                        } => Some((index, adapter_id, session_id)),
+                        _ => None,
+                    });
+                if let Some((index, adapter_id, session_id)) = first {
+                    self.sessions_menu = None;
+                    self.agent_launch_menu = None;
+                    self.resume_agent_session(index, &adapter_id, &session_id, None);
+                }
+            }
+            KC::Char(c)
+                if !modifiers.intersects(Modifiers::CTRL | Modifiers::ALT | Modifiers::SUPER)
+                    && !c.is_control() =>
+            {
+                self.sessions_menu_query.push(c);
+                self.sessions_menu_search_active = true;
+            }
+            _ => return false,
+        }
+        if let Some(menu) = self.sessions_menu.as_mut() {
+            menu.scroll_offset = 0;
+        }
+        context.invalidate();
+        true
     }
 
     pub fn paint_agent_launch_menu(
@@ -12105,6 +12517,92 @@ impl crate::TermWindow {
                 },
             ));
         }
+        let grouping_on = self.config.sidebar_tab_grouping != config::SidebarTabGrouping::Off;
+        match menu.kind {
+            SidebarContextMenuKind::Tab { .. } if grouping_on && !specs.is_empty() => {
+                // After Copy and the navigator, before the closing rows.
+                let at = specs.len().min(2);
+                specs.insert(
+                    at,
+                    (
+                        "Move to group".to_string(),
+                        SidebarContextRow {
+                            opens_submenu: true,
+                            ..row(SidebarContextAction::MoveToGroupMenu)
+                        },
+                    ),
+                );
+            }
+            SidebarContextMenuKind::Sidebar if grouping_on => {
+                specs.insert(
+                    0,
+                    (
+                        "New group\u{2026}".to_string(),
+                        row(SidebarContextAction::NewGroup),
+                    ),
+                );
+            }
+            SidebarContextMenuKind::MoveToGroup { tab_idx } if grouping_on => {
+                let groups = self.tab_groups.borrow();
+                let current = self
+                    .mux_tab_ids()
+                    .get(tab_idx)
+                    .and_then(|tab| groups.group_of(*tab).cloned());
+                for (idx, group) in groups.groups().iter().enumerate() {
+                    if Some(&group.id) != current.as_ref() {
+                        specs.push((group.id.name(), row(SidebarContextAction::MoveToGroup(idx))));
+                    }
+                }
+                specs.push((
+                    "New group\u{2026}".to_string(),
+                    SidebarContextRow {
+                        divider_above: !specs.is_empty(),
+                        ..row(SidebarContextAction::NewGroup)
+                    },
+                ));
+            }
+            SidebarContextMenuKind::Group { group_idx } if grouping_on => {
+                let is_custom = self
+                    .tab_groups
+                    .borrow()
+                    .groups()
+                    .get(group_idx)
+                    .is_some_and(|group| {
+                        matches!(
+                            group.id,
+                            crate::termwindow::tgz_tab_groups::GroupId::Custom(_)
+                        )
+                    });
+                if is_custom {
+                    specs.push((
+                        "Rename group\u{2026}".to_string(),
+                        row(SidebarContextAction::RenameGroup),
+                    ));
+                }
+                specs.push((
+                    "New group\u{2026}".to_string(),
+                    row(SidebarContextAction::NewGroup),
+                ));
+                specs.push((
+                    "Regroup by folder".to_string(),
+                    row(SidebarContextAction::RegroupByFolder),
+                ));
+                specs.push((
+                    "Close tabs in group".to_string(),
+                    SidebarContextRow {
+                        divider_above: true,
+                        ..row(SidebarContextAction::CloseGroupTabs)
+                    },
+                ));
+                if is_custom {
+                    specs.push((
+                        "Delete group".to_string(),
+                        row(SidebarContextAction::DeleteGroup),
+                    ));
+                }
+            }
+            _ => {}
+        }
         if specs.is_empty() {
             self.sidebar_context_menu = None;
             return Ok(());
@@ -12513,7 +13011,15 @@ impl crate::TermWindow {
             })
             .collect();
         let window_h = self.dimensions.pixel_height as f32;
-        let cap_body = (DROPDOWN_MAX_VISIBLE_ROWS as f32 * row_h)
+        // Room for the capped number of rows *and* a divider: a divider in
+        // view would otherwise push the last row out and leave a blank strip
+        // in its place.
+        let divider_room = if rows.iter().any(|row| row.divider_above) {
+            divider_band
+        } else {
+            0.
+        };
+        let cap_body = (DROPDOWN_MAX_VISIBLE_ROWS as f32 * row_h + divider_room)
             .min(window_h - FLOAT_GAP * 2. - menu_pad)
             .max(row_h);
         // A pinned menu decides its side once, from the height it will grow
@@ -12584,10 +13090,10 @@ impl crate::TermWindow {
             sb.menu_border,
         )?;
 
-        let palette = self.palette().clone();
+        let _palette = self.palette().clone();
         let gl_state = self.render_state.as_ref().unwrap();
-        let white_space = gl_state.util_sprites.white_space.texture_coords();
-        let filled_box = gl_state.util_sprites.filled_box.texture_coords();
+        let _white_space = gl_state.util_sprites.white_space.texture_coords();
+        let _filled_box = gl_state.util_sprites.filled_box.texture_coords();
         let render_text = |this: &mut Self,
                            layers: &mut TripleLayerQuadAllocator,
                            text: &str,
@@ -12597,60 +13103,8 @@ impl crate::TermWindow {
                            fg: LinearRgba,
                            default_bg: LinearRgba|
          -> anyhow::Result<()> {
-            let cols = sidebar_text_cols(pixel_width, cell_width as usize);
-            if cols == 0 {
-                return Ok(());
-            }
-            let text = truncate_to_cols(text, cols);
-            let mut attrs = CellAttributes::default();
-            attrs.set_foreground(ColorAttribute::TrueColorWithDefaultFallback(fg.to_srgb()));
-            let mut line = Line::from_text(text, &attrs, 1, None);
-            line.resize(cols, SEQ_ZERO);
-            this.render_screen_line(
-                RenderScreenLineParams {
-                    top_pixel_y: y,
-                    left_pixel_x: x,
-                    pixel_width,
-                    stable_line_idx: None,
-                    line: &line,
-                    selection: 0..0,
-                    cursor: &Default::default(),
-                    palette: &palette,
-                    dims: &RenderableDimensions {
-                        cols,
-                        physical_top: 0,
-                        scrollback_rows: 0,
-                        scrollback_top: 0,
-                        viewport_rows: 1,
-                        dpi: this.terminal_size.dpi,
-                        pixel_height: cell_height as usize,
-                        pixel_width: pixel_width as usize,
-                        reverse_video: false,
-                    },
-                    config: &this.config,
-                    cursor_border_color: LinearRgba::default(),
-                    foreground: fg,
-                    pane: None,
-                    is_active: true,
-                    selection_fg: LinearRgba::default(),
-                    selection_bg: LinearRgba::default(),
-                    cursor_fg: LinearRgba::default(),
-                    cursor_bg: LinearRgba::default(),
-                    cursor_is_default_color: true,
-                    white_space,
-                    filled_box,
-                    window_is_transparent: true,
-                    default_bg,
-                    style: None,
-                    font: None,
-                    use_pixel_positioning: this.config.experimental_pixel_positioning,
-                    render_metrics: this.render_metrics,
-                    shape_key: None,
-                    password_input: false,
-                },
-                layers,
-            )
-            .map(|_| ())
+            let _ = default_bg;
+            this.paint_chrome_text(layers, text, x, y, pixel_width, fg, false)
         };
 
         // Behind the rows (hit-testing walks `ui_items` newest first), for
@@ -13299,10 +13753,10 @@ impl crate::TermWindow {
         // Title width runs from the label column to the (reduced) close reserve
         // on the right.
         let text_w = (content_w - PAD_X * 2. - ACTIVE_TEXT_GAP - close_reserve).max(0.);
-        let palette = self.palette().clone();
+        let _palette = self.palette().clone();
         let gl_state = self.render_state.as_ref().unwrap();
-        let white_space = gl_state.util_sprites.white_space.texture_coords();
-        let filled_box = gl_state.util_sprites.filled_box.texture_coords();
+        let _white_space = gl_state.util_sprites.white_space.texture_coords();
+        let _filled_box = gl_state.util_sprites.filled_box.texture_coords();
 
         // Takes the text and its pixel budget, and derives the cell count from
         // that budget itself. Callers cannot pass a mismatched `cols` because
@@ -13319,63 +13773,8 @@ impl crate::TermWindow {
                            fg: LinearRgba,
                            default_bg: LinearRgba|
          -> anyhow::Result<()> {
-            let cols = sidebar_text_cols(pixel_width, cell_width);
-            if cols == 0 {
-                return Ok(());
-            }
-            let mut line = Line::from_text(truncate_to_cols(text, cols), attrs, 1, None);
-            line.resize(cols, SEQ_ZERO);
-            this.render_screen_line(
-                RenderScreenLineParams {
-                    top_pixel_y: y,
-                    left_pixel_x: x,
-                    pixel_width,
-                    stable_line_idx: None,
-                    line: &line,
-                    selection: 0..0,
-                    cursor: &Default::default(),
-                    palette: &palette,
-                    dims: &RenderableDimensions {
-                        cols,
-                        physical_top: 0,
-                        scrollback_rows: 0,
-                        scrollback_top: 0,
-                        viewport_rows: 1,
-                        dpi: this.terminal_size.dpi,
-                        pixel_height: cell_height,
-                        pixel_width: pixel_width as usize,
-                        reverse_video: false,
-                    },
-                    config: &this.config,
-                    cursor_border_color: LinearRgba::default(),
-                    foreground: fg,
-                    pane: None,
-                    is_active: true,
-                    selection_fg: LinearRgba::default(),
-                    selection_bg: LinearRgba::default(),
-                    cursor_fg: LinearRgba::default(),
-                    cursor_bg: LinearRgba::default(),
-                    cursor_is_default_color: true,
-                    white_space,
-                    filled_box,
-                    // Rail icons draw over a rounded pill fill; a default-bg
-                    // glyph cell must stay transparent so the pill shows
-                    // through. With `false`, render_screen_line resolves the
-                    // default bg to palette.background and paints it opaque,
-                    // leaving a dark cell-sized band inside the pill (visible
-                    // once the DPI-scaled rail grew wider than the glyph cell).
-                    window_is_transparent: true,
-                    default_bg,
-                    style: None,
-                    font: None,
-                    use_pixel_positioning: this.config.experimental_pixel_positioning,
-                    render_metrics: this.render_metrics,
-                    shape_key: None,
-                    password_input: false,
-                },
-                layers,
-            )
-            .map(|_| ())
+            let _ = (attrs, default_bg);
+            this.paint_chrome_text(layers, text, x, y, pixel_width, fg, false)
         };
 
         // Hand-drawn "sidebar panel" icon for the auto-hide toggle: a rounded
@@ -13467,7 +13866,7 @@ impl crate::TermWindow {
             };
             // Icon alone, or icon and label as one centred group.
             let label_w = label.map_or(0., |l| {
-                unicode_column_width(l, None) as f32 * cell_width as f32
+                this.ui_text_width(crate::termwindow::tgz_ui_text::UiFont::Regular, l)
             });
             let group_w = cell_width as f32
                 + if label.is_some() {
@@ -13737,16 +14136,26 @@ impl crate::TermWindow {
                 let ring_stroke = (2. * dpi_scale).max(2.);
                 let tile_hairline = dpi_scale.max(1.);
                 match anim.ring_treatment() {
-                    AgentRowRing::Spin(phase) => self.paint_agent_working_ring(
-                        layers,
-                        1,
-                        tile_rect,
-                        (RING_RADIUS * dpi_scale).min(rail_side * 0.5),
-                        sb.ring,
-                        tab_bg,
-                        ring_stroke,
-                        phase,
-                    )?,
+                    AgentRowRing::Spin(_) => {
+                        // The same round, one-colour ring a running tab's
+                        // row has, drawn around the tile's icon.
+                        self.sidebar_rounded_fill(layers, 1, tile_rect, rail_radius, faded_tab_bg)?;
+                        self.schedule_sidebar_frame(next_agent_pulse_frame_due());
+                        let phase = (AGENT_PULSE_EPOCH.elapsed().as_secs_f32()
+                            / TAB_RING_TURN_SECS)
+                            .fract();
+                        let inset = (2. * dpi_scale).round();
+                        self.paint_ring(
+                            layers,
+                            2,
+                            rail_x + inset,
+                            rail_y + tab_offset + inset,
+                            rail_side - inset * 2.,
+                            ring_stroke,
+                            Some(lerp_rgba(surface, active_fg, 0.20)),
+                            &[(sb.ring.b, phase, 0.30)],
+                        )?;
+                    }
                     AgentRowRing::Waiting => self.paint_agent_waiting_glow(
                         layers,
                         1,
@@ -14174,7 +14583,7 @@ impl crate::TermWindow {
             // 3px from the pill edge instead of the intended inset.
             let search_text_w = (search_x + search_w - PAD_X - search_text_x).max(0.);
 
-            let focused = self.sidebar_search.is_some();
+            let focused = self.sidebar_search.is_some() || self.tab_group_edit.is_some();
             let search_hovered = hovered_item.as_ref() == Some(&UIItemType::SidebarSearch);
             let search_pressed = search_hovered && left_pressed;
             let search_bg = if focused {
@@ -14205,7 +14614,9 @@ impl crate::TermWindow {
                         search_rect.height() + 2.,
                     ),
                     search_radius + dpi_scale,
-                    accent.mul_alpha(0.45),
+                    // Blended, not translucent: the corner sprites of a
+                    // rounded fill do not carry alpha.
+                    lerp_rgba(surface, accent, 0.55),
                 )?;
             }
             self.sidebar_bordered_fill(
@@ -14218,17 +14629,32 @@ impl crate::TermWindow {
                 sb.row_border,
             )?;
 
-            let search_cols = sidebar_text_cols(search_text_w, cell_width);
             // A typed query keeps its *tail*, so the caret you are typing at
             // stays visible. The placeholder steps down through shorter forms
             // and is dropped entirely rather than shown as a truncated stub.
-            let search_text = match &self.sidebar_search {
-                Some(state) if state.query.is_empty() => Some("|".to_string()),
-                Some(state) => {
-                    let full = format!("{}|", state.query);
-                    Some(truncate_to_cols_from_end(&full, search_cols).to_string())
+            let search_font = crate::termwindow::tgz_ui_text::UiFont::Regular;
+            // While a group is being named the field is that prompt.
+            let typing = match &self.tab_group_edit {
+                Some(edit) => Some(format!("Group name: {}", edit.text)),
+                None => self
+                    .sidebar_search
+                    .as_ref()
+                    .map(|state| state.query.clone()),
+            };
+            let search_text = match &typing {
+                Some(typed) => {
+                    let mut full = format!("{typed}|");
+                    while full.chars().count() > 1
+                        && self.ui_text_width(search_font, &full) > search_text_w
+                    {
+                        full.remove(0);
+                    }
+                    Some(full)
                 }
-                None => fit_label(&SEARCH_PLACEHOLDER_LABELS, search_cols).map(str::to_string),
+                None => SEARCH_PLACEHOLDER_LABELS
+                    .iter()
+                    .find(|label| self.ui_text_width(search_font, label) <= search_text_w)
+                    .map(|label| label.to_string()),
             };
             let search_fg = if focused || search_hovered {
                 hover_fg
@@ -14236,16 +14662,16 @@ impl crate::TermWindow {
                 inactive_fg.mul_alpha(0.62)
             };
             if let Some(search_text) = &search_text {
-                render_text(
-                    self,
+                let line_height = self.ui_line_height(search_font);
+                self.paint_ui_text(
                     layers,
+                    search_font,
                     search_text,
-                    &CellAttributes::default(),
                     search_text_x,
-                    y + search_offset + (row_height as f32 - cell_height as f32) * 0.5,
+                    y + search_offset + (row_height as f32 - line_height) * 0.5,
                     search_text_w,
                     search_fg,
-                    search_bg,
+                    crate::termwindow::tgz_ui_text::Align::Left,
                 )?;
             }
             self.ui_items.push(UIItem {
@@ -14288,6 +14714,7 @@ impl crate::TermWindow {
         if self.config.agent_ui.section.enabled {
             self.update_agent_herd_state();
         }
+        self.sync_tab_groups();
         let rows = self.sidebar_rows();
 
         let tab_list_top = y;
@@ -14297,17 +14724,26 @@ impl crate::TermWindow {
         // dpi_scale applied.
         let tab_row_radius = (RADIUS * dpi_scale).min(row_height as f32 * 0.5);
         let ring_radius = (RING_RADIUS * dpi_scale).min(row_height as f32 * 0.5);
-        let ring_stroke = sidebar_ring_stroke(dpi_scale);
+        let _ring_stroke = sidebar_ring_stroke(dpi_scale);
         let hairline = dpi_scale.max(1.);
         let new_tab_y = top + height - INSET - row_height as f32;
         let tab_list_bottom = self.sidebar_tab_list_bottom(top, height, row_height as f32);
         let tab_list_height = (tab_list_bottom - tab_list_top).max(0.);
-        let row_stride = row_height as f32 + GAP;
-        let visible_rows = ((tab_list_height + GAP) / row_stride).floor().max(0.) as usize;
-        let max_offset = rows.len().saturating_sub(visible_rows);
+        let row_heights = self.sidebar_row_heights(&rows);
+        let tab_row_height = self.sidebar_tab_row_height();
+        let header_row_height = self.sidebar_header_row_height();
+        let child_row_height = self.sidebar_child_row_height();
+        let max_offset = sidebar_max_scroll_offset(&row_heights, tab_list_height, GAP);
         if self.sidebar_scroll_offset > max_offset {
             self.sidebar_scroll_offset = max_offset;
         }
+        let visible_rows = sidebar_rows_fitting(
+            &row_heights,
+            self.sidebar_scroll_offset,
+            tab_list_height,
+            GAP,
+        );
+        let list_scrolls = max_offset > 0;
 
         self.ui_items.push(UIItem {
             x: content_x as usize,
@@ -14317,15 +14753,11 @@ impl crate::TermWindow {
             item_type: UIItemType::SidebarTabList,
         });
 
-        let total_tabs = rows.len();
+        let _total_tabs = rows.len();
         // The scrollbar gutter only earns its width while the list can scroll.
         // Reserving it always parked every row's Copy and close controls 30px
         // short of the edge -- dead space the title could have had.
-        let reclaimed = if total_tabs > visible_rows {
-            0.
-        } else {
-            scrollbar_gutter
-        };
+        let reclaimed = if list_scrolls { 0. } else { scrollbar_gutter };
         let row_content_x = match self.config.sidebar_position {
             SidebarPosition::Left => content_x,
             SidebarPosition::Right => content_x - reclaimed,
@@ -14347,6 +14779,121 @@ impl crate::TermWindow {
                     pane_count,
                     expanded,
                 } => (tab_idx, active, title, metadata, pane_count, expanded),
+                SidebarRow::GroupHeader {
+                    group_idx,
+                    name,
+                    collapsed,
+                    waiting,
+                } => {
+                    use crate::termwindow::tgz_ui_text::{Align, UiFont};
+                    let row_height = header_row_height;
+                    let header_type = UIItemType::SidebarGroupHeader { group_idx };
+                    let header_hovered = hovered_item.as_ref() == Some(&header_type);
+                    let font = UiFont::SmallMedium;
+                    // The label sits low in its row, close to the tabs it
+                    // heads, so the space above it separates the groups.
+                    let text_y = y + row_height as f32 - self.ui_line_height(font) - 3. * dpi_scale;
+                    let fg = if header_hovered {
+                        hover_fg
+                    } else {
+                        inactive_fg.mul_alpha(0.74)
+                    };
+                    let chevron_w = 14. * dpi_scale;
+                    self.paint_ui_text(
+                        layers,
+                        font,
+                        if collapsed { "\u{203a}" } else { "\u{2304}" },
+                        row_text_x,
+                        text_y,
+                        chevron_w,
+                        fg.mul_alpha(0.8),
+                        Align::Left,
+                    )?;
+                    let note = if waiting > 0 {
+                        format!("{waiting} waiting")
+                    } else {
+                        String::new()
+                    };
+                    let note_w = if note.is_empty() {
+                        0.
+                    } else {
+                        self.ui_text_width(UiFont::Small, &note) + 8. * dpi_scale
+                    };
+                    let name_w = (row_text_w - chevron_w - note_w).max(0.);
+                    self.paint_ui_text(
+                        layers,
+                        font,
+                        &name,
+                        row_text_x + chevron_w,
+                        text_y,
+                        name_w,
+                        fg,
+                        Align::Left,
+                    )?;
+                    if !note.is_empty() && row_text_w > chevron_w + note_w {
+                        self.paint_ui_text(
+                            layers,
+                            UiFont::Small,
+                            &note,
+                            row_text_x + chevron_w + name_w,
+                            text_y,
+                            note_w,
+                            sb.attention,
+                            Align::Right,
+                        )?;
+                    }
+                    self.ui_items.push(UIItem {
+                        x: row_content_x as usize,
+                        y: y as usize,
+                        width: row_content_w.max(0.) as usize,
+                        height: row_height,
+                        item_type: header_type,
+                    });
+                    y += row_height as f32 + GAP;
+                    continue;
+                }
+                SidebarRow::Subagent { label } => {
+                    use crate::termwindow::tgz_ui_text::{Align, UiFont};
+                    let row_height = child_row_height;
+                    // Under the tab's text column, with a small ring of its
+                    // own that turns like the tab's.
+                    let ring_side = (12. * dpi_scale).round();
+                    let indent = 28. * dpi_scale + 10. * dpi_scale;
+                    let ring_x = row_text_x + indent;
+                    let ring_y = y + (row_height as f32 - ring_side) * 0.5;
+                    let animate = self.sidebar_animation_gates().dot_pulse;
+                    let phase = if animate {
+                        self.schedule_sidebar_frame(next_agent_pulse_frame_due());
+                        (AGENT_PULSE_EPOCH.elapsed().as_secs_f32() / TAB_RING_TURN_SECS).fract()
+                    } else {
+                        0.
+                    };
+                    self.paint_ring(
+                        layers,
+                        2,
+                        ring_x,
+                        ring_y,
+                        ring_side,
+                        (1.5 * dpi_scale).max(1.),
+                        Some(lerp_rgba(surface, active_fg, 0.20)),
+                        &[(sb.ring.b, phase, 0.30)],
+                    )?;
+                    let label_x = ring_x + ring_side + 8. * dpi_scale;
+                    let label_w = (row_text_x + row_text_w - label_x).max(0.);
+                    let line_h = self.ui_line_height(UiFont::Small);
+                    self.paint_ui_text(
+                        layers,
+                        UiFont::Small,
+                        &label,
+                        label_x,
+                        y + (row_height as f32 - line_h) * 0.5,
+                        label_w,
+                        inactive_fg.mul_alpha(0.70),
+                        Align::Left,
+                    )?;
+                    y += row_height as f32 + GAP;
+                    continue;
+                }
                 SidebarRow::Pane {
                     pane_id,
                     active,
@@ -14354,6 +14901,7 @@ impl crate::TermWindow {
                     is_remote,
                     agent,
                 } => {
+                    let row_height = child_row_height;
                     let row_type = UIItemType::SidebarPaneRow { pane_id };
                     let close_type = UIItemType::SidebarPaneClose { pane_id };
                     let row_hovered = hovered_item.as_ref() == Some(&row_type);
@@ -14399,18 +14947,9 @@ impl crate::TermWindow {
                         surface
                     };
                     let treatment = anim.ring_treatment();
-                    if let AgentRowRing::Spin(phase) = treatment {
-                        self.paint_agent_working_ring(
-                            layers,
-                            1,
-                            row_rect,
-                            ring_radius,
-                            sb.ring,
-                            ring_behind,
-                            ring_stroke,
-                            phase,
-                        )?;
-                    } else {
+                    // A working pane is marked by its status dot, as a tab is
+                    // by its ring: no outline runs around the row.
+                    {
                         if row_filled {
                             self.sidebar_rounded_fill(layers, 1, row_rect, tab_row_radius, row_bg)?;
                         }
@@ -14468,7 +15007,7 @@ impl crate::TermWindow {
                     // gap the rail sits in, so it can never land on the rail.
                     let badge = agent
                         .as_ref()
-                        .filter(|_| anim.shows_status_dot())
+                        .filter(|_| anim.shows_status_dot() || anim.spin.is_some())
                         .map(|state| {
                             let size = sidebar_status_dot_size(cell_height as f32);
                             let color = agent_status_dot_accent(
@@ -14511,7 +15050,7 @@ impl crate::TermWindow {
                     // when one is cut instead of letting `render_text` drop the
                     // tail silently.
                     let label =
-                        truncate_with_ellipsis(&label, sidebar_text_cols(label_w, cell_width));
+                        truncate_with_ellipsis(&label, chrome_text_cols(label_w, cell_width));
                     render_text(
                         self,
                         layers,
@@ -14600,6 +15139,7 @@ impl crate::TermWindow {
                     continue;
                 }
             };
+            let row_height = tab_row_height;
             let tab_type = UIItemType::SidebarTab { tab_idx, active };
             let close_type = UIItemType::SidebarCloseTab(tab_idx);
             let tab_hovered = hovered_item.as_ref() == Some(&tab_type);
@@ -14642,7 +15182,13 @@ impl crate::TermWindow {
                 .as_ref()
                 .map(|(pane_id, state)| self.agent_row_animation(*pane_id, &state.status))
                 .unwrap_or_else(AgentRowAnimation::still);
+            let agent_pane_id = agent_row.as_ref().map(|(pane_id, _)| *pane_id);
             let agent = agent_row.map(|(_, state)| state);
+            // Waiting on you: the amber ring, for as long as it waits,
+            // whether or not you are looking at it.
+            let agent_waits_unseen = agent
+                .as_ref()
+                .is_some_and(|state| matches!(state.status, AgentStatus::WaitingForInput));
             let slide_x = anim.slide_x();
             // Scales whatever alpha the colour already carried, so a settled row
             // (`enter == 1.0`) is bit-identical to what it was before.
@@ -14662,44 +15208,12 @@ impl crate::TermWindow {
             };
             let row_bg = fade(row_bg);
             let treatment = anim.ring_treatment();
-            if let AgentRowRing::Spin(phase) = treatment {
-                self.paint_agent_working_ring(
-                    layers,
-                    1,
-                    row_rect,
-                    ring_radius,
-                    sb.ring,
-                    ring_behind,
-                    ring_stroke,
-                    phase,
-                )?;
-            } else {
-                if row_filled {
-                    self.sidebar_rounded_fill(layers, 1, row_rect, tab_row_radius, row_bg)?;
-                }
-                match treatment {
-                    AgentRowRing::Waiting => self.paint_agent_waiting_glow(
-                        layers,
-                        1,
-                        row_rect,
-                        ring_radius,
-                        sb.ring,
-                        ring_behind,
-                        hairline,
-                    )?,
-                    AgentRowRing::Resolve(intensity) => self.paint_agent_resolve_ring(
-                        layers,
-                        1,
-                        row_rect,
-                        ring_radius,
-                        sb.ring,
-                        ring_behind,
-                        hairline,
-                        intensity,
-                    )?,
-                    AgentRowRing::None | AgentRowRing::Spin(_) => {}
-                }
+            if row_filled {
+                self.sidebar_rounded_fill(layers, 1, row_rect, tab_row_radius, row_bg)?;
             }
+            // On a tab row only the round ring carries status: no outline
+            // runs around the row, not even the one-shot of a finished turn.
+            let _ = (ring_behind, hairline);
             if drop_flash_alpha > 0. {
                 let flash_x = match self.config.sidebar_position {
                     SidebarPosition::Left => item_x + 2.,
@@ -14712,27 +15226,6 @@ impl crate::TermWindow {
                     active_fg.mul_alpha(0.18 * drop_flash_alpha),
                 )?;
             }
-            // The rail sits just inside the row's left edge, which is where the
-            // throbber ring also runs. Drawn together, the static rail reads as
-            // a detached dot the rotating ring keeps sliding past, so the ring
-            // owns the row while it spins — it already marks the row as active.
-            if active && anim.spin.is_none() {
-                let rail_h = (row_height as f32 * 0.55).max(cell_height as f32 * 0.6);
-                let rail_y = y + row_offset + (row_height as f32 - rail_h) * 0.5;
-                let rail_x = match self.config.sidebar_position {
-                    SidebarPosition::Left => item_x + 2.,
-                    SidebarPosition::Right => item_x + item_w - ACTIVE_RAIL_W - 2.,
-                };
-                let breathe = self.sidebar_rail_breathe();
-                self.paint_active_rail(
-                    layers,
-                    2,
-                    euclid::rect(rail_x + slide_x, rail_y, ACTIVE_RAIL_W, rail_h),
-                    sb.ring,
-                    row_bg,
-                    breathe,
-                )?;
-            }
 
             // Split tabs get a chevron that shows or hides their pane rows.
             // Single-pane tabs keep the layout they always had — there is
@@ -14743,29 +15236,51 @@ impl crate::TermWindow {
             // width both step past the chevron and the status dot. Deriving
             // only the width from them is what painted the leading "N: " index
             // on top of the chevron and the dot.
-            let cols = sidebar_row_columns(
-                row_text_x,
-                row_text_w,
-                cell_width as f32,
-                cell_height as f32,
-                pane_count > 1,
-                agent.is_some(),
-            );
+            use crate::termwindow::tgz_ui_text::{Align, UiFont};
+            // One composition for the whole row: chevron (split tabs only),
+            // ring, then two lines of text that give way to Copy and close.
+            let chevron_x = row_text_x;
+            let chevron_w = if pane_count > 1 {
+                cell_width as f32 + CHEVRON_GAP
+            } else {
+                0.
+            };
+            // Whole pixels and an even side: the ring is a sprite and the
+            // number is centred on it, so half a pixel either way shows.
+            let ring_side =
+                ((28. * dpi_scale).min(row_height as f32 - 8.).max(8.) * 0.5).round() * 2.;
+            let ring_x = (row_text_x + chevron_w + slide_x).round();
+            let ring_y = (y + row_offset + (row_height as f32 - ring_side) * 0.5).round();
+            // In a narrow sidebar the title comes first: a tab with no agent
+            // gives up its prompt mark, and Copy goes before the title does.
+            let narrow = row_text_w - chevron_w < 150. * dpi_scale;
+            let show_mark = agent.is_some() || !narrow;
+            let mark_w = if show_mark {
+                ring_side + 10. * dpi_scale
+            } else {
+                0.
+            };
+            let title_x = row_text_x + chevron_w + mark_w;
+            let avail_w = (row_text_x + row_text_w - title_x).max(0.);
             // Decided before the title is painted, and always — a zone that
             // appeared on hover would reflow the title under the pointer.
             let copy_type = UIItemType::SidebarTabCopy { tab_idx };
             let copy_hovered = hovered_item.as_ref() == Some(&copy_type);
             let copy_pressed =
                 left_pressed && copy_hovered && self.pressed_ui_item.as_ref() == Some(&copy_type);
-            let copy_w = sidebar_tab_copy_zone_w(cols.text_w, cell_width as f32);
-            let title_w = (cols.text_w - copy_w).max(0.);
+            let copy_w = if avail_w >= CLOSE_ZONE_W + 64. * dpi_scale {
+                sidebar_tab_copy_zone_w(avail_w, cell_width as f32)
+            } else {
+                0.
+            };
+            let title_w = (avail_w - copy_w).max(0.);
             if pane_count > 1 {
                 render_text(
                     self,
                     layers,
                     if expanded { "⌄" } else { "›" },
                     &CellAttributes::default(),
-                    cols.chevron_x + slide_x,
+                    chevron_x + slide_x,
                     y + row_offset + (row_height as f32 - cell_height as f32) * 0.5,
                     cell_width as f32,
                     if expand_hovered {
@@ -14777,74 +15292,137 @@ impl crate::TermWindow {
                 )?;
             }
 
-            if let Some(agent) = agent.as_ref().filter(|_| anim.shows_status_dot()) {
-                let badge_size = sidebar_status_dot_size(cell_height as f32);
-                let badge_y = y + row_offset + (row_height as f32 - badge_size) * 0.5;
-                let badge_base = if active {
-                    accent
-                } else {
-                    inactive_fg.mul_alpha(0.58)
-                };
-                let badge_color = agent_status_dot_accent(
-                    &agent.status,
-                    badge_base,
-                    row_bg,
-                    self.agent_dot_pulse(agent),
-                    sb.ring.pulse,
-                    sb.ring.waiting,
-                );
-                self.sidebar_pill_fill(
-                    layers,
-                    2,
-                    euclid::rect(cols.badge_x + slide_x, badge_y, badge_size, badge_size),
-                    badge_size * 0.5,
-                    fade(badge_color),
-                )?;
+            let lit = active || tab_hovered || close_hovered || copy_hovered;
+            let (herd_name, context_percent) = match (agent.as_ref(), agent_pane_id) {
+                (Some(state), Some(pane_id)) => {
+                    self.sidebar_herd_tab_info(pane_id, state.kind.label())
+                }
+                _ => (None, None),
+            };
+            let ring_stroke_px = (2.5 * dpi_scale).max(2.);
+            let ring_track = fade(lerp_rgba(surface, active_fg, 0.20));
+            match agent.as_ref() {
+                Some(state) => {
+                    let waiting = agent_waits_unseen;
+                    let running =
+                        matches!(state.status, AgentStatus::Running | AgentStatus::Streaming);
+                    let (track, arcs) = if waiting {
+                        // Blocked on you: the whole ring in the attention
+                        // colour, breathing while animation is allowed. The
+                        // colour is blended, not made translucent, so the
+                        // ring stays one clean line.
+                        let pulse = self.agent_dot_pulse(state).unwrap_or(1.).clamp(0., 1.);
+                        let color = lerp_rgba(ring_track, sb.attention, 0.35 + 0.65 * pulse);
+                        (None, vec![(fade(color), 0., 1.)])
+                    } else if running {
+                        // The one thing that moves on a running row: an arc
+                        // in one colour. Without animation it stands still
+                        // at twelve.
+                        let phase = if anim.spin.is_some() {
+                            self.schedule_sidebar_frame(next_agent_pulse_frame_due());
+                            (AGENT_PULSE_EPOCH.elapsed().as_secs_f32() / TAB_RING_TURN_SECS).fract()
+                        } else {
+                            0.
+                        };
+                        (Some(ring_track), vec![(fade(sb.ring.b), phase, 0.30)])
+                    } else {
+                        (Some(ring_track), vec![])
+                    };
+                    self.paint_ring(
+                        layers,
+                        2,
+                        ring_x,
+                        ring_y,
+                        ring_side,
+                        ring_stroke_px,
+                        track,
+                        &arcs,
+                    )?;
+                    if let Some(percent) = context_percent {
+                        self.paint_ui_text_centered(
+                            layers,
+                            UiFont::Micro,
+                            &percent.to_string(),
+                            ring_x + ring_side * 0.5,
+                            ring_y + ring_side * 0.5,
+                            fade(if waiting { sb.attention } else { inactive_fg }),
+                        )?;
+                    }
+                }
+                None if !show_mark => {}
+                None => {
+                    // No agent: a prompt mark where the ring would be.
+                    self.paint_ui_text_centered(
+                        layers,
+                        UiFont::Small,
+                        ">_",
+                        ring_x + ring_side * 0.5,
+                        ring_y + ring_side * 0.5,
+                        fade(inactive_fg.mul_alpha(0.55)),
+                    )?;
+                }
             }
 
-            let display_title = if title.trim_start().starts_with(&format!("{}:", tab_idx + 1)) {
-                title
-            } else {
-                format!("{}: {}", tab_idx + 1, title)
+            // Line 1 says what the tab is doing, line 2 who is doing it and
+            // in what state. A tab with no agent keeps its title and puts
+            // branch and folder below.
+            let (line1, line2) = match agent.as_ref() {
+                Some(state) => {
+                    let mut parts = vec![state.kind.label().to_string()];
+                    match state.status {
+                        AgentStatus::Unknown => {}
+                        AgentStatus::WaitingForInput if !agent_waits_unseen => {
+                            parts.push("ready".to_string())
+                        }
+                        _ => parts.push(state.status.label().to_string()),
+                    }
+                    if let Some(first) = metadata.first() {
+                        parts.push(first.clone());
+                    }
+                    (herd_name.unwrap_or(title), parts.join(" · "))
+                }
+                None => (title, metadata.join(" · ")),
             };
-            let metadata_text = metadata.join(" · ");
-            let show_metadata = !metadata_text.is_empty()
-                && self.sidebar_metadata_rows_enabled()
-                && (active || tab_hovered || close_hovered);
-            let (primary_offset, metadata_offset) =
-                sidebar_row_text_offsets(row_height as f32, cell_height as f32, show_metadata);
-            let primary_y = y + row_offset + primary_offset;
-
-            render_text(
-                self,
+            let line1_h = self.ui_line_height(UiFont::Medium);
+            let line2_h = self.ui_line_height(UiFont::Small);
+            let show_line2 = !line2.is_empty() && row_height as f32 >= line1_h + line2_h + 2.;
+            let block_h = if show_line2 {
+                line1_h + line2_h
+            } else {
+                line1_h
+            };
+            let text_top = y + row_offset + (row_height as f32 - block_h) * 0.5;
+            self.paint_ui_text(
                 layers,
-                &display_title,
-                &CellAttributes::default(),
-                cols.text_x + slide_x,
-                primary_y,
+                UiFont::Medium,
+                &line1,
+                title_x + slide_x,
+                text_top,
                 title_w,
-                fade(if active || tab_hovered || close_hovered || copy_hovered {
+                fade(if lit {
                     inactive_fg
                 } else {
-                    inactive_fg.mul_alpha(0.78)
+                    inactive_fg.mul_alpha(0.82)
                 }),
-                row_bg,
+                Align::Left,
             )?;
-            if let Some(metadata_offset) = metadata_offset {
-                render_text(
-                    self,
+            if show_line2 {
+                let waiting = agent_waits_unseen;
+                self.paint_ui_text(
                     layers,
-                    &metadata_text,
-                    &CellAttributes::default(),
-                    cols.text_x + slide_x,
-                    y + row_offset + metadata_offset,
+                    UiFont::Small,
+                    &line2,
+                    title_x + slide_x,
+                    text_top + line1_h,
                     title_w,
-                    fade(if active || tab_hovered || close_hovered || copy_hovered {
-                        inactive_fg.mul_alpha(0.60)
+                    fade(if waiting {
+                        sb.attention
+                    } else if lit {
+                        inactive_fg.mul_alpha(0.66)
                     } else {
-                        inactive_fg.mul_alpha(0.42)
+                        inactive_fg.mul_alpha(0.50)
                     }),
-                    row_bg,
+                    Align::Left,
                 )?;
             }
             self.ui_items.push(UIItem {
@@ -14859,9 +15437,9 @@ impl crate::TermWindow {
             // not to the tab underneath it.
             if pane_count > 1 {
                 self.ui_items.push(UIItem {
-                    x: cols.chevron_x as usize,
+                    x: chevron_x as usize,
                     y: y as usize,
-                    width: cols.chevron_w as usize,
+                    width: chevron_w as usize,
                     height: row_height,
                     item_type: expand_type,
                 });
@@ -14875,8 +15453,11 @@ impl crate::TermWindow {
             // between them. Their zones stay reserved and clickable on every
             // row, so the title never reflows and the pointer finds them
             // from any direction.
-            let show_row_controls =
-                active || tab_hovered || close_hovered || copy_hovered || expand_hovered;
+            // Copy and close are on every row: the tab you want to copy from
+            // or close is often not the one you are looking at. They are
+            // quieter on rows that are neither active nor under the pointer.
+            let row_lit = active || tab_hovered || close_hovered || copy_hovered || expand_hovered;
+            let show_row_controls = true;
             if show_row_controls {
                 let close_bg = if close_pressed {
                     lerp_rgba(surface, active_fg, 0.38)
@@ -14908,25 +15489,24 @@ impl crate::TermWindow {
                         close_bg,
                     )?;
                 }
-                let close_glyph_x = close_x + close_geometry.glyph_dx;
-                render_text(
-                    self,
+                let close_h = self.ui_line_height(UiFont::Regular);
+                self.paint_ui_text(
                     layers,
-                    "×",
-                    &CellAttributes::default(),
-                    close_glyph_x,
-                    y + row_offset
-                        + (row_height as f32 - cell_height as f32) * 0.5
-                        + close_glyph_offset,
-                    cell_width as f32,
+                    UiFont::Regular,
+                    "\u{00d7}",
+                    close_x + close_geometry.button_dx,
+                    y + row_offset + (row_height as f32 - close_h) * 0.5 + close_glyph_offset,
+                    close_geometry.side,
                     if close_hovered {
                         hover_fg
                     } else if active {
                         active_fg
-                    } else {
+                    } else if row_lit {
                         inactive_fg.mul_alpha(0.78)
+                    } else {
+                        inactive_fg.mul_alpha(0.45)
                     },
-                    LinearRgba::default(),
+                    Align::Center,
                 )?;
             }
             self.ui_items.push(UIItem {
@@ -14951,83 +15531,52 @@ impl crate::TermWindow {
                         copy_w,
                     );
                     let copy_glyph_offset = if copy_pressed { 1. } else { 0. };
-                    // A bordered box at rest, not only on hover: without an edge
-                    // there was no telling where the button begins, or whether
-                    // the pointer was on it. The outline is two fills, the outer
-                    // one showing as a ring around the inner.
-                    {
-                        let box_x = copy_x + copy_geometry.button_dx;
-                        let box_y = y
-                            + row_offset
-                            + (row_height as f32 - copy_geometry.side) * 0.5
-                            + copy_glyph_offset;
-                        let side = copy_geometry.side;
-                        let radius = side * 0.38;
-                        let ring = (1. * dpi_scale).max(1.);
-                        let (ring_mix, fill_mix) = if copy_pressed {
-                            (0.62, 0.38)
-                        } else if copy_hovered {
-                            (0.56, 0.26)
-                        } else {
-                            (0.34, 0.10)
-                        };
+                    // A plain icon, like the close control beside it: a soft
+                    // disc appears under the pointer, nothing is boxed at rest.
+                    let box_x = copy_x + copy_geometry.button_dx;
+                    let box_y = y
+                        + row_offset
+                        + (row_height as f32 - copy_geometry.side) * 0.5
+                        + copy_glyph_offset;
+                    if copy_hovered || copy_pressed {
                         self.sidebar_rounded_fill(
                             layers,
                             1,
-                            euclid::rect(box_x, box_y, side, side),
-                            radius,
-                            lerp_rgba(surface, active_fg, ring_mix),
-                        )?;
-                        self.sidebar_rounded_fill(
-                            layers,
-                            1,
-                            euclid::rect(
-                                box_x + ring,
-                                box_y + ring,
-                                (side - ring * 2.).max(1.),
-                                (side - ring * 2.).max(1.),
-                            ),
-                            (radius - ring).max(0.),
-                            lerp_rgba(surface, active_fg, fill_mix),
+                            euclid::rect(box_x, box_y, copy_geometry.side, copy_geometry.side),
+                            copy_geometry.side * 0.38,
+                            lerp_rgba(surface, active_fg, if copy_pressed { 0.38 } else { 0.22 }),
                         )?;
                     }
-                    // Full strength: a dimmed icon reads as disabled.
-                    // Centre the glyph's *ink* on the hover box; the cell-based
-                    // placement is the fallback when the glyph cannot be measured.
-                    let (copy_glyph_x, copy_glyph_y) = match self.sidebar_copy_glyph_ink_center() {
-                        Some((ink_x, ink_y)) => (
-                            copy_x + copy_geometry.button_dx + copy_geometry.side * 0.5 - ink_x,
-                            y + row_offset + row_height as f32 * 0.5 - ink_y,
-                        ),
-                        None => (
-                            copy_x + copy_geometry.glyph_dx,
-                            y + row_offset + (row_height as f32 - cell_height as f32) * 0.5,
-                        ),
-                    };
-                    // Brighter than the title beside it on an idle row: the icon
-                    // is small, and at the title's grey it sank into its box.
                     let copy_fg = if copy_hovered {
                         hover_fg
                     } else if active {
                         active_fg
+                    } else if row_lit {
+                        lerp_rgba(inactive_fg, active_fg, 0.35)
                     } else {
-                        lerp_rgba(inactive_fg, active_fg, 0.55)
+                        inactive_fg.mul_alpha(0.45)
                     };
                     // Right after a copy the glyph gives way to a checkmark in
                     // the same colour, which draws itself in and fades back.
                     let check = self.copy_check_for_tab_idx(tab_idx);
-                    let icon_alpha = check.map_or(1., |frame| frame.icon_alpha);
+                    // One or the other, never both: the icon comes back
+                    // only once the check is gone.
+                    let icon_alpha = match check {
+                        Some(frame) if frame.check_alpha > 0. => 0.,
+                        Some(frame) => frame.icon_alpha,
+                        None => 1.,
+                    };
                     if icon_alpha > 0. {
-                        render_text(
-                            self,
+                        let icon_h = self.ui_line_height(UiFont::Regular);
+                        self.paint_ui_text(
                             layers,
+                            UiFont::Regular,
                             SIDEBAR_COPY_GLYPH,
-                            &CellAttributes::default(),
-                            copy_glyph_x,
-                            copy_glyph_y + copy_glyph_offset,
-                            cell_width as f32,
+                            box_x,
+                            box_y + (copy_geometry.side - icon_h) * 0.5,
+                            copy_geometry.side,
                             copy_fg.mul_alpha(icon_alpha),
-                            LinearRgba::default(),
+                            Align::Center,
                         )?;
                     }
                     if let Some(frame) = check.filter(|frame| frame.check_alpha > 0.) {
@@ -15055,7 +15604,7 @@ impl crate::TermWindow {
             y += row_height as f32 + GAP;
         }
 
-        if self.config.sidebar_scroll_bar && total_tabs > visible_rows && tab_list_height > 0. {
+        if self.config.sidebar_scroll_bar && list_scrolls && tab_list_height > 0. {
             let geometry = self
                 .sidebar_scroll_geometry()
                 .unwrap_or(SidebarScrollGeometry {
@@ -15150,9 +15699,6 @@ impl crate::TermWindow {
             Ok((bg, fg, offset, hovered))
         };
         let text_inset_y = (row_height as f32 - cell_height as f32) * 0.5;
-        // Pixel width of a label, with a hair to spare so the column count
-        // derived from it never rounds the last character away.
-        let label_px = |label: &str| unicode_column_width(label, None) as f32 * cell_width as f32;
 
         for (row_idx, row) in footer_rows.iter().enumerate() {
             let row_y = footer_top_y + row_idx as f32 * footer_stride;
@@ -15259,12 +15805,12 @@ impl crate::TermWindow {
                                 false,
                             ),
                         };
-                        let (bg, fg, offset, hovered) =
+                        let (bg, fg, offset, _hovered) =
                             paint_create_segment(self, layers, item_type, (x, w), row_y)?;
                         let dot_size = sidebar_status_dot_size(cell_height as f32);
                         let label_room =
                             (w - FOOTER_SEGMENT_PAD * 2. - dot_size - ACTION_ICON_GAP).max(0.);
-                        let cols = sidebar_text_cols(label_room, cell_width);
+                        let cols = chrome_text_cols(label_room, cell_width);
                         // Widest label that actually fits, measured; none fits -> the dot
                         // alone stands for the agent.
                         let candidates: Vec<String> = match launcher_entry.as_ref() {
@@ -15278,7 +15824,12 @@ impl crate::TermWindow {
                         };
                         let candidates: Vec<&str> = candidates.iter().map(String::as_str).collect();
                         let label = fit_label(&candidates, cols).map(str::to_string);
-                        let label_w = label.as_deref().map_or(0., label_px);
+                        let label_w = label.as_deref().map_or(0., |label| {
+                            self.ui_text_width(
+                                crate::termwindow::tgz_ui_text::UiFont::Regular,
+                                label,
+                            )
+                        });
                         let group_w = dot_size
                             + if label.is_some() {
                                 ACTION_ICON_GAP + label_w
@@ -15287,8 +15838,8 @@ impl crate::TermWindow {
                             };
                         let group_x = x + ((w - group_w) * 0.5).max(0.);
                         let dot_color = match launcher_entry.as_ref() {
-                            Some(entry) if hovered => entry.color,
-                            Some(entry) => entry.color.mul_alpha(0.88),
+                            // The vendor's own colour, at full strength.
+                            Some(entry) => entry.color,
                             None => inactive_fg.mul_alpha(0.5),
                         };
                         self.sidebar_rounded_fill(
@@ -15319,27 +15870,43 @@ impl crate::TermWindow {
                     }
                     // Tab: left opens a tab, right the shell/domain picker.
                     SidebarFooterItem::NewTab => {
-                        let (bg, fg, offset, _) = paint_create_segment(
+                        use crate::termwindow::tgz_ui_text::{Align, UiFont};
+                        let (_, _, offset, hovered) = paint_create_segment(
                             self,
                             layers,
                             UIItemType::SidebarNewTabButton,
                             (x, w),
                             row_y,
                         )?;
-                        let cols =
-                            sidebar_text_cols((w - FOOTER_SEGMENT_PAD * 2.).max(0.), cell_width);
-                        if let Some(label) = fit_label(&NEW_TAB_LABELS, cols) {
-                            let label_w = label_px(label);
-                            render_text(
-                                self,
+                        // The one filled button of the sidebar: it is what
+                        // the bottom edge is for.
+                        let fill = if hovered {
+                            lerp_rgba(sb.ring.b, active_fg, 0.16)
+                        } else {
+                            sb.ring.b
+                        };
+                        self.sidebar_rounded_fill(
+                            layers,
+                            1,
+                            euclid::rect(x, row_y + offset, w, row_height as f32),
+                            footer_radius.min(w * 0.5),
+                            fill,
+                        )?;
+                        let room = (w - FOOTER_SEGMENT_PAD * 2.).max(0.);
+                        let label = NEW_TAB_LABELS
+                            .iter()
+                            .find(|label| self.ui_text_width(UiFont::Medium, label) <= room);
+                        if let Some(label) = label {
+                            let line_h = self.ui_line_height(UiFont::Medium);
+                            self.paint_ui_text(
                                 layers,
+                                UiFont::Medium,
                                 label,
-                                &CellAttributes::default(),
-                                x + ((w - label_w) * 0.5).max(0.),
-                                row_y + text_inset_y + offset,
-                                label_w + 0.5,
-                                fg,
-                                bg,
+                                x,
+                                row_y + (row_height as f32 - line_h) * 0.5 + offset,
+                                w,
+                                contrast_label_color(fill, surface),
+                                Align::Center,
                             )?;
                         }
                     }
@@ -15354,10 +15921,13 @@ impl crate::TermWindow {
                             row_y,
                         )?;
                         let cols =
-                            sidebar_text_cols((w - FOOTER_SEGMENT_PAD * 2.).max(0.), cell_width);
+                            chrome_text_cols((w - FOOTER_SEGMENT_PAD * 2.).max(0.), cell_width);
                         let ssh_default = self.ssh_default_host_label();
                         if let Some(label) = ssh_button_label(ssh_default.as_deref(), cols) {
-                            let label_w = label_px(&label);
+                            let label_w = self.ui_text_width(
+                                crate::termwindow::tgz_ui_text::UiFont::Regular,
+                                &label,
+                            );
                             render_text(
                                 self,
                                 layers,
@@ -15411,7 +15981,7 @@ impl crate::TermWindow {
                         } else {
                             inner
                         };
-                        let cols = sidebar_text_cols(label_room.max(0.), cell_width);
+                        let cols = chrome_text_cols(label_room.max(0.), cell_width);
                         // A button with no glyph still has to say something:
                         // as much of its label as there is room for.
                         let label: Option<String> = match fit_label(&labels, cols) {
@@ -15422,7 +15992,12 @@ impl crate::TermWindow {
                             }),
                             None => None,
                         };
-                        let label_w = label.as_deref().map_or(0., label_px);
+                        let label_w = label.as_deref().map_or(0., |label| {
+                            self.ui_text_width(
+                                crate::termwindow::tgz_ui_text::UiFont::Regular,
+                                label,
+                            )
+                        });
                         let group_w = glyph_w
                             + label_w
                             + if glyph.is_some() && label.is_some() {
@@ -15523,7 +16098,8 @@ impl crate::TermWindow {
                     (x, w),
                     bar_y,
                 )?;
-                let label_w = label_px(label);
+                let label_w =
+                    self.ui_text_width(crate::termwindow::tgz_ui_text::UiFont::Regular, label);
                 render_text(
                     self,
                     layers,
@@ -15543,10 +16119,11 @@ impl crate::TermWindow {
             } else {
                 done_x
             } - GAP;
-            let hint_cols = sidebar_text_cols((hint_right - item_x - PAD_X).max(0.), cell_width);
+            let hint_cols = chrome_text_cols((hint_right - item_x - PAD_X).max(0.), cell_width);
             if let Some(hint) = fit_label(&["Drag to arrange", "Drag", ""], hint_cols) {
                 if !hint.is_empty() {
-                    let hint_w = label_px(hint);
+                    let hint_w =
+                        self.ui_text_width(crate::termwindow::tgz_ui_text::UiFont::Regular, hint);
                     render_text(
                         self,
                         layers,
@@ -15685,6 +16262,7 @@ impl crate::TermWindow {
                     pids: foreground_process_pids(&pane),
                     input_tokens: agent.input_tokens,
                     output_tokens: agent.output_tokens,
+                    context_percent: None,
                     cost: agent.cost,
                     activity: agent.activity,
                     can_attach: agent.actions.attach,
@@ -15735,6 +16313,7 @@ impl crate::TermWindow {
                 pids: HashSet::new(),
                 input_tokens: None,
                 output_tokens: None,
+                context_percent: None,
                 cost: None,
                 activity: None,
                 can_attach: false,
@@ -15752,6 +16331,68 @@ impl crate::TermWindow {
         // Before project scoping: the snapshot is about this window, not about
         // whatever project the active pane happens to sit in.
         self.record_agent_window_sessions(&agents, &tab_panes);
+
+        // Also before project scoping: every tab row shows its agent's name
+        // and context use, whichever project the Agents section is showing.
+        {
+            let mut info = self.herd_tab_info.borrow_mut();
+            info.clear();
+            // Sessions already tied to an agent: a pane with no session of
+            // its own must not borrow one of their readings.
+            let claimed: HashSet<String> = agents
+                .iter()
+                .filter_map(|agent| agent.session_id.clone())
+                .collect();
+            for agent in &agents {
+                if let Some(pane_id) = agent.pane_id {
+                    info.insert(
+                        pane_id,
+                        crate::termwindow::HerdTabInfo {
+                            name: agent.name.clone(),
+                            session_id: agent.session_id.clone(),
+                            model: agent.model.clone(),
+                            // Claude Code's own figure from its status
+                            // line first: it is read within a moment of
+                            // being written, and covers a session whose
+                            // transcript is not saved. The transcript's
+                            // figure arrives with the next herd scan.
+                            context_percent: (agent.provider == "claude")
+                                .then(|| {
+                                    // A pane that was not tied to a session
+                                    // reports no folder either: ask the pane
+                                    // itself.
+                                    let cwd = agent.cwd.clone().or_else(|| {
+                                        Mux::get()
+                                            .get_pane(pane_id)
+                                            .and_then(|pane| pane_working_dir(&pane))
+                                    });
+                                    crate::agent_herd::quota::claude_context_percent(
+                                        agent.session_id.as_deref(),
+                                        cwd.as_deref(),
+                                        &claimed,
+                                    )
+                                })
+                                .flatten()
+                                .or(agent.context_percent),
+                            subagents: agent
+                                .subagents
+                                .iter()
+                                .filter(|sub| {
+                                    crate::agent_herd::subagent_is_working(sub, SystemTime::now())
+                                })
+                                .map(|sub| {
+                                    if sub.description.trim().is_empty() {
+                                        sub.agent_type.clone()
+                                    } else {
+                                        sub.description.clone()
+                                    }
+                                })
+                                .collect(),
+                        },
+                    );
+                }
+            }
+        }
 
         let view = self.agent_herd_state.borrow().view;
         let current_project = self.current_project_root();
@@ -16249,6 +16890,72 @@ impl crate::TermWindow {
     }
 
     /// Render a single line of text as GPU quads.
+    /// Draws a label that used to be a row of terminal cells in the chrome
+    /// font instead. `y` is still the top of a cell-high line box, so callers
+    /// that centre a cell keep working; a single glyph (an icon, a chevron)
+    /// is centred in the width it was given, as it was in its cell.
+    pub(crate) fn paint_chrome_text(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        text: &str,
+        x: f32,
+        y: f32,
+        pixel_width: f32,
+        fg: LinearRgba,
+        bold: bool,
+    ) -> anyhow::Result<()> {
+        use crate::termwindow::tgz_ui_text::{Align, UiFont};
+        let font = if bold {
+            UiFont::Medium
+        } else {
+            UiFont::Regular
+        };
+        let cell_height = self.render_metrics.cell_size.height as f32;
+        let line_height = self.ui_line_height(font);
+        let mut chars = text.chars();
+        let single = chars.next().is_some() && chars.next().is_none();
+        let top = y + (cell_height - line_height) * 0.5;
+        if single {
+            // An icon is drawn whole or not at all: it was given one cell,
+            // and in this font it may be a little wider than that.
+            let width = self.ui_text_width(font, text);
+            self.paint_ui_text(
+                layers,
+                font,
+                text,
+                x + (pixel_width - width) * 0.5,
+                top,
+                width + 1.,
+                fg,
+                Align::Left,
+            )?;
+            return Ok(());
+        }
+        self.paint_ui_text(layers, font, text, x, top, pixel_width, fg, Align::Left)?;
+        Ok(())
+    }
+
+    /// Width of `text` as [`Self::paint_chrome_text`] draws it, in pixels.
+    pub(crate) fn chrome_text_width(&self, text: &str, bold: bool) -> f32 {
+        use crate::termwindow::tgz_ui_text::UiFont;
+        self.ui_text_width(
+            if bold {
+                UiFont::Medium
+            } else {
+                UiFont::Regular
+            },
+            text,
+        )
+    }
+
+    /// `text` cut at its start so that it fits `max_px` in the chrome font:
+    /// a path keeps its file name. See `tgz_ui_text::elide_start_px`.
+    pub(crate) fn chrome_elide_start(&self, text: &str, max_px: f32, bold: bool) -> String {
+        crate::termwindow::tgz_ui_text::elide_start_px(text, max_px, |piece| {
+            self.chrome_text_width(piece, bold)
+        })
+    }
+
     fn paint_text(
         &mut self,
         layers: &mut TripleLayerQuadAllocator,
@@ -16260,87 +16967,8 @@ impl crate::TermWindow {
         bg: LinearRgba,
         bold: bool,
     ) -> anyhow::Result<()> {
-        let cell_height = self.render_metrics.cell_size.height as f32;
-        // Whole cells only: `render_screen_line` does not clip, so a partly
-        // visible cell overhangs the region it was told to paint into.
-        let cols = sidebar_text_cols(
-            pixel_width,
-            self.render_metrics.cell_size.width.max(0) as usize,
-        );
-        if cols == 0 || text.is_empty() {
-            return Ok(());
-        }
-        let text = truncate_to_cols(text, cols);
-        let mut attrs = CellAttributes::default();
-        attrs.set_foreground(ColorAttribute::TrueColorWithDefaultFallback(fg.to_srgb()));
-        attrs.set_background(ColorAttribute::TrueColorWithDefaultFallback(bg.to_srgb()));
-        if bold {
-            attrs.set_intensity(Intensity::Bold);
-        }
-        let mut line = Line::from_text(text, &attrs, 1, None);
-        // Pad/clip the cell vector to the region so a shorter string cannot
-        // leave stale cells and a longer one cannot spill past `pixel_width`.
-        line.resize(cols, SEQ_ZERO);
-        let palette = self.palette().clone();
-        let white_space = self
-            .render_state
-            .as_ref()
-            .map(|s| s.util_sprites.white_space.texture_coords())
-            .unwrap_or_default();
-        let filled_box = self
-            .render_state
-            .as_ref()
-            .map(|s| s.util_sprites.filled_box.texture_coords())
-            .unwrap_or_default();
-        let config = &self.config;
-        let render_metrics = self.render_metrics;
-        let dimensions_dpi = self.dimensions.dpi as u32;
-        let experimental_pixel_positioning = config.experimental_pixel_positioning;
-        self.render_screen_line(
-            RenderScreenLineParams {
-                top_pixel_y: y,
-                left_pixel_x: x,
-                pixel_width,
-                stable_line_idx: None,
-                line: &line,
-                selection: 0..0,
-                cursor: &Default::default(),
-                palette: &palette,
-                dims: &RenderableDimensions {
-                    cols,
-                    physical_top: 0,
-                    scrollback_rows: 0,
-                    scrollback_top: 0,
-                    viewport_rows: 1,
-                    dpi: dimensions_dpi,
-                    pixel_height: cell_height as usize,
-                    pixel_width: pixel_width as usize,
-                    reverse_video: false,
-                },
-                config,
-                cursor_border_color: LinearRgba::default(),
-                foreground: fg,
-                pane: None,
-                is_active: true,
-                selection_fg: LinearRgba::default(),
-                selection_bg: LinearRgba::default(),
-                cursor_fg: LinearRgba::default(),
-                cursor_bg: LinearRgba::default(),
-                cursor_is_default_color: true,
-                white_space,
-                filled_box,
-                window_is_transparent: true,
-                default_bg: bg,
-                style: None,
-                font: None,
-                use_pixel_positioning: experimental_pixel_positioning,
-                render_metrics,
-                shape_key: None,
-                password_input: false,
-            },
-            layers,
-        )?;
-        Ok(())
+        let _ = bg;
+        self.paint_chrome_text(layers, text, x, y, pixel_width, fg, bold)
     }
 
     /// Paint the agent herd section above the sidebar's bottom controls.
@@ -16789,7 +17417,7 @@ impl crate::TermWindow {
             // composite instead of erasing, so overlapping regions double-strike.
             let name_x = dot_x + 10.0 * dpi;
             let content_right = section_x + section_w - pad;
-            let content_cols = sidebar_text_cols((content_right - name_x).max(0.), cell_w_cols);
+            let content_cols = chrome_text_cols((content_right - name_x).max(0.), cell_w_cols);
             let tokens = if self.config.agent_ui.section.show_tokens {
                 herd_agent_tokens(agent)
             } else {
@@ -16855,7 +17483,7 @@ impl crate::TermWindow {
 
                 let detail_x = name_x;
                 let detail_w = (section_x + section_w - pad - detail_x).max(0.);
-                let detail_cols = sidebar_text_cols(detail_w, cell_w_cols);
+                let detail_cols = chrome_text_cols(detail_w, cell_w_cols);
                 let mut detail_line_y = detail_y + pad;
 
                 // Status + model line. "detached" is part of the status because
@@ -17067,7 +17695,7 @@ impl crate::TermWindow {
                                 label.push_str(&format!(" — {}", last.display_text()));
                             }
                             let budget = (detail_w - indent_w - 8.0 * dpi).max(0.);
-                            let budget_cols = sidebar_text_cols(budget, cell_w_cols);
+                            let budget_cols = chrome_text_cols(budget, cell_w_cols);
                             self.paint_text(
                                 layers,
                                 &truncate_with_ellipsis(&label, budget_cols),
@@ -17841,6 +18469,7 @@ fn sidebar_rounded_corner_radius(rect: RectF, radius: f32) -> f32 {
 mod tests {
     use super::*;
     use config::{AgentAnimationsConfig, RgbaColor};
+    use termwiz::surface::SEQ_ZERO;
 
     /// The glyph sits in the middle of the pill. Regression guard: this used to
     /// centre on the cell *height*, which in a fixed-pitch font left the glyph
@@ -19364,6 +19993,94 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
         assert!(sidebar_rounded_corner_radius(normal_rect, 2.0) >= 1.0);
     }
 
+    #[test]
+    fn scroll_range_and_visible_rows_follow_row_heights() {
+        // header 20, tab 40, tab 40, child 24, header 20, tab 40; gap 4.
+        let heights = [20., 40., 40., 24., 20., 40.];
+        // Everything fits: 184 + 5 gaps = 204.
+        assert_eq!(sidebar_max_scroll_offset(&heights, 204., 4.), 0);
+        assert_eq!(sidebar_rows_fitting(&heights, 0, 204., 4.), 6);
+        // One pixel short: the first row has to scroll away.
+        assert_eq!(sidebar_max_scroll_offset(&heights, 203., 4.), 1);
+        // From the top, 100 px hold the header and one tab (64) but not two.
+        assert_eq!(sidebar_rows_fitting(&heights, 0, 100., 4.), 2);
+        // The last three rows need 24 + 20 + 40 + 2 gaps = 92.
+        assert_eq!(sidebar_max_scroll_offset(&heights, 92., 4.), 3);
+        assert_eq!(sidebar_rows_fitting(&heights, 3, 92., 4.), 3);
+        assert_eq!(sidebar_max_scroll_offset(&[], 10., 4.), 0);
+        // Nothing fits at all: scroll to past the end, show nothing.
+        assert_eq!(sidebar_max_scroll_offset(&heights, 10., 4.), 6);
+        assert_eq!(sidebar_rows_fitting(&heights, 0, 10., 4.), 0);
+    }
+
+    fn group_input(idx: usize, name: &str, tabs: &[(usize, bool)]) -> SidebarGroupInput {
+        SidebarGroupInput {
+            group_idx: idx,
+            name: name.to_string(),
+            collapsed: false,
+            keep_when_empty: false,
+            tabs: tabs.to_vec(),
+        }
+    }
+
+    /// `H:<name>:<waiting>` for a header, `T<idx>` for a tab, `P` for a pane.
+    fn row_shape(rows: &[SidebarRow]) -> Vec<String> {
+        rows.iter()
+            .map(|row| match row {
+                SidebarRow::GroupHeader { name, waiting, .. } => format!("H:{name}:{waiting}"),
+                SidebarRow::Tab { tab_idx, .. } => format!("T{tab_idx}"),
+                SidebarRow::Pane { .. } => "P".to_string(),
+                SidebarRow::Subagent { .. } => "S".to_string(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn grouped_rows_put_each_tab_under_its_header() {
+        let tabs = vec![
+            tab_input(0, "api", &[1]),
+            tab_input(1, "web", &[2]),
+            tab_input(2, "notes", &[3]),
+            tab_input(3, "late", &[4]),
+        ];
+        let groups = vec![
+            group_input(0, "backend", &[(0, false), (2, true)]),
+            group_input(1, "frontend", &[(1, false)]),
+        ];
+        let rows = assemble_grouped_sidebar_rows(tabs, groups, &HashSet::new(), None);
+        // Tab 3 has no group yet: it is listed after the groups, not hidden.
+        assert_eq!(
+            row_shape(&rows),
+            ["H:backend:1", "T0", "T2", "H:frontend:0", "T1", "T3"]
+        );
+    }
+
+    #[test]
+    fn a_folded_group_shows_its_header_only_until_a_search_matches_inside() {
+        let make = || {
+            let mut backend = group_input(0, "backend", &[(0, false)]);
+            backend.collapsed = true;
+            let mut mine = group_input(1, "mine", &[]);
+            mine.keep_when_empty = true;
+            (
+                vec![tab_input(0, "api", &[1]), tab_input(1, "web", &[2])],
+                vec![backend, mine, group_input(2, "frontend", &[(1, false)])],
+            )
+        };
+        let (tabs, groups) = make();
+        let rows = assemble_grouped_sidebar_rows(tabs, groups, &HashSet::new(), None);
+        // The user's own empty group keeps its header; "backend" is folded.
+        assert_eq!(
+            row_shape(&rows),
+            ["H:backend:0", "H:mine:0", "H:frontend:0", "T1"]
+        );
+
+        let (tabs, groups) = make();
+        let rows = assemble_grouped_sidebar_rows(tabs, groups, &HashSet::new(), Some("api"));
+        // A search opens the folded group and drops groups with no match.
+        assert_eq!(row_shape(&rows), ["H:backend:0", "T0"]);
+    }
+
     fn tab_input(tab_idx: usize, title: &str, pane_ids: &[PaneId]) -> SidebarTabInput {
         SidebarTabInput {
             tab_idx,
@@ -19371,6 +20088,7 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
             title: title.to_string(),
             metadata: Vec::new(),
             panes: pane_ids.iter().copied().map(pane_row).collect(),
+            subagents: vec![],
         }
     }
 
@@ -19409,6 +20127,7 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
             activity: None,
             input_tokens: None,
             output_tokens: None,
+            context_percent: None,
             cost: None,
         }
     }
@@ -19454,6 +20173,7 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
             pids: std::iter::once(4242u32).collect(),
             input_tokens: None,
             output_tokens: None,
+            context_percent: None,
             cost: None,
             activity: None,
             can_attach: true,
@@ -19555,6 +20275,7 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
             activity: None,
             input_tokens: None,
             output_tokens: None,
+            context_percent: None,
             cost: None,
             can_attach: true,
             can_open_logs: true,
@@ -24308,6 +25029,17 @@ gemini is a constellation\n";
         assert!(SidebarScrollGeometry::new(0., 100., 10, 10, 0, 10.).is_none());
         assert!(SidebarScrollGeometry::new(0., 100., 0, 10, 0, 10.).is_none());
         assert!(SidebarScrollGeometry::new(0., 0., 1, 10, 0, 10.).is_none());
+    }
+
+    #[test]
+    fn session_search_matches_words_in_any_order_and_case() {
+        let label = "[fix-ssh] tgzterminal \u{b7} Sidebar redesign";
+        assert!(session_label_matches(label, ""));
+        assert!(session_label_matches(label, "  "));
+        assert!(session_label_matches(label, "sidebar"));
+        assert!(session_label_matches(label, "REDESIGN tgz"));
+        assert!(session_label_matches(label, "fix-ssh side"));
+        assert!(!session_label_matches(label, "sidebar codex"));
     }
 
     #[test]

@@ -106,6 +106,32 @@ const DEFAULT_ITEMS: [Item; 7] = [
     Item::NewTab,
 ];
 
+/// Puts New Tab alone on the last row, wherever it was. The button sits on
+/// the bottom edge with nothing beside it, so reaching for it never hits a
+/// neighbour. A footer without New Tab is left as it is.
+pub(crate) fn pin_new_tab_last(mut rows: FooterRows) -> FooterRows {
+    if !rows.iter().any(|row| row.contains(&Item::NewTab)) {
+        return rows;
+    }
+    for row in rows.iter_mut() {
+        row.retain(|item| *item != Item::NewTab);
+    }
+    rows.retain(|row| !row.is_empty());
+    // Its own row must not push the footer past the row limit.
+    while rows.len() >= MAX_FOOTER_ROWS {
+        let Some(last) = rows.pop() else { break };
+        match rows.last_mut() {
+            Some(previous) => previous.extend(last),
+            None => {
+                rows.push(last);
+                break;
+            }
+        }
+    }
+    rows.push(vec![Item::NewTab]);
+    rows
+}
+
 /// The footer as shipped: the view toggles on top, the agent and ssh
 /// launchers as halves below, New Tab across the bottom edge.
 pub(crate) fn default_footer_rows() -> FooterRows {
@@ -637,6 +663,41 @@ pub(crate) fn footer_move_capped(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_tab_is_pinned_alone_on_the_last_row() {
+        let rows = vec![
+            vec![Item::NewTab, Item::Worktree],
+            vec![Item::Agent, Item::Ssh],
+        ];
+        assert_eq!(
+            pin_new_tab_last(rows),
+            vec![
+                vec![Item::Worktree],
+                vec![Item::Agent, Item::Ssh],
+                vec![Item::NewTab]
+            ]
+        );
+        // Already there: unchanged. Not in the footer: not added.
+        assert_eq!(
+            pin_new_tab_last(default_footer_rows()),
+            default_footer_rows()
+        );
+        let without = vec![vec![Item::Agent]];
+        assert_eq!(pin_new_tab_last(without.clone()), without);
+        // At the row limit the two rows above it merge to make room.
+        let full: FooterRows = vec![
+            vec![Item::Worktree],
+            vec![Item::Changes],
+            vec![Item::Toolbelt],
+            vec![Item::Agent],
+            vec![Item::Ssh, Item::NewTab],
+        ];
+        let pinned = pin_new_tab_last(full);
+        assert_eq!(pinned.len(), MAX_FOOTER_ROWS);
+        assert_eq!(pinned.last(), Some(&vec![Item::NewTab]));
+        assert_eq!(pinned[3], vec![Item::Agent, Item::Ssh]);
+    }
     use Item::*;
 
     #[test]

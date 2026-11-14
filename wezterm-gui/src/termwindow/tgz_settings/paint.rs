@@ -26,9 +26,14 @@ use std::time::{Duration, Instant};
 /// somebody may be editing it by hand in the meantime.
 const STATUS_TTL: Duration = Duration::from_secs(2);
 
-const NAV_COLS: f32 = 14.;
-const CONTROL_COLS: f32 = 34.;
-const MAX_CONTENT_COLS: f32 = 100.;
+/// Layout, in pixels at 96 dpi. Widths come from the chrome font's own
+/// measurements, never from terminal columns: the tab reads the same
+/// whatever the terminal font is.
+const NAV_MIN_W: f32 = 132.;
+const CONTROL_W: f32 = 320.;
+const MAX_CONTENT_W: f32 = 820.;
+/// Space on each side of a label inside its box.
+const SEGMENT_PAD: f32 = 10.;
 
 pub(crate) fn is_settings_pane(pane: &Arc<dyn Pane>) -> bool {
     pane.downcast_ref::<SettingsPane>().is_some()
@@ -71,8 +76,9 @@ struct Segment {
     label: String,
     selected: bool,
     hit: Option<SettingsHit>,
-    /// Columns to reserve; the label's own width when 0.
-    cols: usize,
+    /// Width to reserve for the label, in pixels; the label's own when
+    /// that is wider.
+    min_px: f32,
     dim: bool,
 }
 
@@ -82,31 +88,20 @@ impl Segment {
             label: label.into(),
             selected: false,
             hit: Some(hit),
-            cols: 0,
+            min_px: 0.,
             dim: false,
         }
     }
 
-    fn label(label: impl Into<String>, cols: usize) -> Self {
+    fn label(label: impl Into<String>, min_px: f32) -> Self {
         Self {
             label: label.into(),
             selected: false,
             hit: None,
-            cols,
+            min_px,
             dim: false,
         }
     }
-}
-
-fn display_cols(text: &str) -> usize {
-    termwiz::cell::unicode_column_width(text, None)
-}
-
-/// The end of `text` that fits `cols`, so the caret of a long entry stays
-/// in view.
-fn tail_cols(text: &str, cols: usize) -> String {
-    let chars: Vec<char> = text.chars().collect();
-    chars[chars.len().saturating_sub(cols)..].iter().collect()
 }
 
 fn tilde(path: &std::path::Path) -> String {
@@ -183,6 +178,22 @@ fn pane_rects(tw: &TermWindow, pos: &PositionedPane) -> anyhow::Result<(RectF, R
 }
 
 impl TermWindow {
+    /// Text of the Settings tab, in the chrome font like the sidebar's.
+    /// Takes what the cell-based painter took, so call sites read the same.
+    fn settings_text(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+        text: &str,
+        x: f32,
+        y: f32,
+        pixel_width: f32,
+        fg: LinearRgba,
+        _bg: LinearRgba,
+        bold: bool,
+    ) -> anyhow::Result<()> {
+        self.paint_chrome_text(layers, text, x, y, pixel_width, fg, bold)
+    }
+
     /// Focus this window's Settings tab, creating it when there is none.
     pub(crate) fn show_settings(&mut self) {
         if let Err(err) = self.show_settings_impl() {
@@ -293,18 +304,23 @@ impl TermWindow {
         let sb = self.sidebar_palette();
         let accent = sb.accent();
         let dpi_scale = (self.dimensions.dpi as f32 / 96.).clamp(1., 2.5);
-        let cell_w = self.render_metrics.cell_size.width as f32;
         let cell_h = self.render_metrics.cell_size.height as f32;
         let height = (cell_h + 6. * dpi_scale).ceil();
-        let radius = 5. * dpi_scale;
+        // The sidebar's control radius, so both read as one product.
+        let radius = (10. * dpi_scale).min(height * 0.5);
         let hovered = self
             .last_ui_item
             .as_ref()
             .map(|item| item.item_type.clone());
 
+        let seg_pad = (SEGMENT_PAD * dpi_scale).round();
         let widths: Vec<f32> = segments
             .iter()
-            .map(|s| (display_cols(&s.label).max(s.cols) as f32 + 2.) * cell_w)
+            .map(|s| {
+                (self.chrome_text_width(&s.label, false).max(s.min_px) + seg_pad * 2.)
+                    .max(height)
+                    .ceil()
+            })
             .collect();
         let total: f32 = widths.iter().sum();
         let left = right - total;
@@ -344,16 +360,16 @@ impl TermWindow {
             } else {
                 sb.text_active
             };
-            let label_w = (width - 2. * cell_w).max(cell_w);
-            let label_cols = display_cols(&segment.label) as f32 * cell_w;
-            // Centred in its box, on a whole cell.
-            let inset = (((label_w - label_cols) * 0.5) / cell_w).floor().max(0.) * cell_w;
-            self.diff_panel_text(
+            let label_px = self.chrome_text_width(&segment.label, false);
+            // Centred in its box; a label too long for it starts at the
+            // padding and is cut at the far one.
+            let inset = ((width - label_px) * 0.5).max(seg_pad).round();
+            self.settings_text(
                 layers,
                 &segment.label,
-                x + cell_w + inset,
+                x + inset,
                 y + (height - cell_h) * 0.5,
-                label_w - inset,
+                (width - inset - seg_pad).max(1.) + 1.,
                 fg,
                 fill,
                 false,
@@ -386,9 +402,10 @@ impl TermWindow {
 
         let sb = self.sidebar_palette();
         let accent = sb.accent();
-        let ground = self.palette().background.to_linear();
+        // The sidebar's and the panels' ground, so the tab is one more
+        // surface of the same chrome and not a terminal with boxes on it.
+        let ground = opaque(sb.surface);
         let dpi_scale = (self.dimensions.dpi as f32 / 96.).clamp(1., 2.5);
-        let cell_w = self.render_metrics.cell_size.width as f32;
         let cell_h = self.render_metrics.cell_size.height as f32;
         self.filled_rectangle(layers, 0, background, ground)?;
 
@@ -421,21 +438,22 @@ impl TermWindow {
             }
         }
 
-        let pad = 2. * cell_w;
+        let pad = (20. * dpi_scale).round();
+        let unit = (8. * dpi_scale).round();
         let left = area.origin.x + pad;
         let right = area.max_x() - pad;
-        if right - left < 24. * cell_w || area.size.height < 6. * cell_h {
+        if right - left < 300. * dpi_scale || area.size.height < 6. * cell_h {
             return Ok(());
         }
 
         // Header: the tab's name, and the file everything is written to.
         let header_y = area.origin.y + (cell_h * 0.5).floor();
-        self.diff_panel_text(
+        self.settings_text(
             layers,
             TITLE,
             left,
             header_y,
-            10. * cell_w,
+            self.chrome_text_width(TITLE, true) + 2.,
             sb.text_active,
             ground,
             true,
@@ -447,7 +465,13 @@ impl TermWindow {
         let footer_y = area.max_y() - cell_h * 1.5;
 
         // Sections.
-        let nav_w = NAV_COLS * cell_w;
+        let nav_w = Section::ALL
+            .iter()
+            .map(|section| self.chrome_text_width(section.label(), true))
+            .fold(0., f32::max)
+            .ceil()
+            .max(NAV_MIN_W * dpi_scale - unit * 3.)
+            + unit * 3.;
         let nav_row_h = (cell_h + 8. * dpi_scale).ceil();
         let hovered = self
             .last_ui_item
@@ -472,16 +496,16 @@ impl TermWindow {
                     layers,
                     0,
                     euclid::rect(left, y, nav_w, nav_row_h),
-                    5. * dpi_scale,
+                    (10. * dpi_scale).min(nav_row_h * 0.5),
                     fill,
                 )?;
             }
-            self.diff_panel_text(
+            self.settings_text(
                 layers,
                 section.label(),
-                left + cell_w,
+                left + unit * 1.5,
                 y + (nav_row_h - cell_h) * 0.5,
-                nav_w - 2. * cell_w,
+                nav_w - unit * 3. + 1.,
                 if active { sb.text_active } else { sb.text_idle },
                 fill,
                 active,
@@ -496,8 +520,8 @@ impl TermWindow {
         }
 
         let section = state.current_section();
-        let content_x = left + nav_w + 3. * cell_w;
-        let content_w = (right - content_x).min(MAX_CONTENT_COLS * cell_w);
+        let content_x = left + nav_w + unit * 3.;
+        let content_w = (right - content_x).min(MAX_CONTENT_W * dpi_scale);
         let content_right = content_x + content_w;
         let body_h = footer_y - cell_h * 0.5 - body_top;
 
@@ -524,18 +548,18 @@ impl TermWindow {
                     Some(keys) => (keys.as_str(), sb.text_active),
                     None => ("not bound", sb.text_meta),
                 };
-                let keys_w = display_cols(keys) as f32 * cell_w;
-                self.diff_panel_text(
+                let keys_w = self.chrome_text_width(keys, false).ceil() + 1.;
+                self.settings_text(
                     layers,
                     brief,
                     content_x,
                     y,
-                    (content_w - keys_w - 2. * cell_w).max(cell_w),
+                    (content_w - keys_w - unit * 2.).max(unit),
                     sb.text_idle,
                     ground,
                     false,
                 )?;
-                self.diff_panel_text(
+                self.settings_text(
                     layers,
                     keys,
                     content_right - keys_w,
@@ -551,7 +575,7 @@ impl TermWindow {
             } else {
                 "Change these with config.keys in the config file."
             };
-            self.diff_panel_text(
+            self.settings_text(
                 layers,
                 footer,
                 content_x,
@@ -566,17 +590,19 @@ impl TermWindow {
 
         // Settings of the chosen section.
         let rows = in_section(section);
-        let control_w = (CONTROL_COLS * cell_w).min(content_w * 0.55);
-        let label_w = (content_w - control_w - 2. * cell_w).max(8. * cell_w);
+        let control_w = (CONTROL_W * dpi_scale).min(content_w * 0.55);
+        let label_w = (content_w - control_w - unit * 2.).max(unit * 8.);
         let row_h = (cell_h * 2. + 12. * dpi_scale).ceil();
         let visible = ((body_h / row_h).floor() as usize).max(1);
         state.visible_rows = visible;
         state.max_scroll = rows.len().saturating_sub(visible);
         state.scroll = state.scroll.min(state.max_scroll);
         let control_h = (cell_h + 6. * dpi_scale).ceil();
-        let max_control_cols = ((control_w / cell_w) as usize).saturating_sub(2);
-        let field_cols = max_control_cols.saturating_sub(2).max(8);
-        let field_w = (field_cols as f32 + 2.) * cell_w;
+        let seg_pad = (SEGMENT_PAD * dpi_scale).round();
+        // A text field is as wide as a control may be; its text has that
+        // less the padding.
+        let field_w = control_w.max(unit * 12.).round();
+        let field_text_w = field_w - seg_pad * 2.;
         let control_y_of =
             |slot: usize| body_top + slot as f32 * row_h + (cell_h * 2. - control_h) * 0.5;
 
@@ -645,25 +671,28 @@ impl TermWindow {
             };
             if focused {
                 let band: RectF = euclid::rect(
-                    content_x - cell_w,
+                    content_x - unit * 1.5,
                     y - 5. * dpi_scale,
-                    content_w + 2. * cell_w,
+                    content_w + unit * 3.,
                     cell_h * 2. + 10. * dpi_scale,
                 );
-                self.sidebar_rounded_fill(layers, 0, band, 6. * dpi_scale, row_bg)?;
-                self.filled_rectangle(
+                self.sidebar_rounded_fill(layers, 0, band, 10. * dpi_scale, row_bg)?;
+                // The selection bar of a sidebar row.
+                let bar_w = (3. * dpi_scale).round();
+                self.sidebar_pill_fill(
                     layers,
                     0,
                     euclid::rect(
-                        band.origin.x,
-                        band.origin.y + 6. * dpi_scale,
-                        (3. * dpi_scale).round(),
-                        band.size.height - 12. * dpi_scale,
+                        band.origin.x + 2. * dpi_scale,
+                        band.origin.y + band.size.height * 0.25,
+                        bar_w,
+                        band.size.height * 0.5,
                     ),
+                    bar_w * 0.5,
                     accent,
                 )?;
             }
-            self.diff_panel_text(
+            self.settings_text(
                 layers,
                 setting.label,
                 content_x,
@@ -673,16 +702,20 @@ impl TermWindow {
                 row_bg,
                 false,
             )?;
-            self.diff_panel_text(
-                layers,
-                setting.help,
-                content_x,
-                y + cell_h,
-                label_w,
-                sb.text_meta,
-                row_bg,
-                false,
-            )?;
+            {
+                use crate::termwindow::tgz_ui_text::{Align, UiFont};
+                let help_h = self.ui_line_height(UiFont::Small);
+                self.paint_ui_text(
+                    layers,
+                    UiFont::Small,
+                    setting.help,
+                    content_x,
+                    y + cell_h + (cell_h - help_h) * 0.5,
+                    label_w,
+                    sb.text_meta,
+                    Align::Left,
+                )?;
+            }
 
             let control_y = control_y_of(slot);
             let editing_this = state
@@ -710,14 +743,14 @@ impl TermWindow {
                 vec![
                     Segment {
                         dim: true,
-                        ..Segment::label(value_text(setting, &value), 0)
+                        ..Segment::label(value_text(setting, &value), 0.)
                     },
                     Segment::button(format!("set in code, line {line}"), SettingsHit::OpenFile),
                 ]
             } else if !editable {
                 vec![Segment {
                     dim: true,
-                    ..Segment::label(value_text(setting, &value), 0)
+                    ..Segment::label(value_text(setting, &value), 0.)
                 }]
             } else {
                 match (setting.kind, &value) {
@@ -733,8 +766,11 @@ impl TermWindow {
                     ],
                     (Kind::Choice(variants), Value::Text(current)) => {
                         let variants = variants();
-                        let cols: usize = variants.iter().map(|v| display_cols(v) + 2).sum();
-                        if cols <= max_control_cols {
+                        let needed: f32 = variants
+                            .iter()
+                            .map(|v| (self.chrome_text_width(v, false) + seg_pad * 2.).ceil())
+                            .sum();
+                        if needed <= control_w {
                             variants
                                 .iter()
                                 .enumerate()
@@ -744,17 +780,23 @@ impl TermWindow {
                                 })
                                 .collect()
                         } else {
-                            let widest = variants.iter().map(|v| display_cols(v)).max();
+                            let widest = variants
+                                .iter()
+                                .map(|v| self.chrome_text_width(v, false))
+                                .fold(0., f32::max);
                             vec![
                                 Segment::button("\u{2039}", SettingsHit::Step(*index, -1)),
-                                Segment::label(current.clone(), widest.unwrap_or(0)),
+                                Segment::label(current.clone(), widest.ceil()),
                                 Segment::button("\u{203a}", SettingsHit::Step(*index, 1)),
                             ]
                         }
                     }
                     (Kind::Int { .. } | Kind::Float { .. }, _) => vec![
                         Segment::button("\u{2212}", SettingsHit::Step(*index, -1)),
-                        Segment::label(value_text(setting, &value), 5),
+                        Segment::label(
+                            value_text(setting, &value),
+                            self.chrome_text_width("00000", false).ceil(),
+                        ),
                         Segment::button("+", SettingsHit::Step(*index, 1)),
                     ],
                     (Kind::Text | Kind::Font | Kind::Scheme, Value::Text(current)) => {
@@ -767,22 +809,34 @@ impl TermWindow {
                             Some((buffer, true)) if buffer.is_empty() => {
                                 ("| type to filter".to_string(), true)
                             }
+                            // The end of a long entry stays in view, with
+                            // room for the caret after it.
                             Some((buffer, _)) => (
-                                format!("{}|", tail_cols(&buffer, field_cols.saturating_sub(1))),
+                                format!(
+                                    "{}|",
+                                    self.chrome_elide_start(
+                                        &buffer,
+                                        field_text_w - self.chrome_text_width("|", false) - 1.,
+                                        false,
+                                    )
+                                ),
                                 false,
                             ),
                             None if current.is_empty() => ("not set".to_string(), true),
-                            None => (tail_cols(current, field_cols), false),
+                            None => (
+                                self.chrome_elide_start(current, field_text_w - 1., false),
+                                false,
+                            ),
                         };
                         vec![Segment {
                             label,
                             selected: false,
                             hit: Some(SettingsHit::Field(*index)),
-                            cols: field_cols,
+                            min_px: field_text_w,
                             dim,
                         }]
                     }
-                    _ => vec![Segment::label(value_text(setting, &value), 0)],
+                    _ => vec![Segment::label(value_text(setting, &value), 0.)],
                 }
             };
             let control_left =
@@ -811,7 +865,7 @@ impl TermWindow {
                 layers,
                 0,
                 popup.rect,
-                6. * dpi_scale,
+                8. * dpi_scale,
                 opaque(lerp_rgba(ground, sb.text_meta, 0.45)),
             )?;
             self.sidebar_rounded_fill(
@@ -823,19 +877,19 @@ impl TermWindow {
                     popup.rect.size.width - stroke * 2.,
                     popup.rect.size.height - stroke * 2.,
                 ),
-                (6. * dpi_scale - stroke).max(0.),
+                (8. * dpi_scale - stroke).max(0.),
                 surface,
             )?;
             let inner_x = popup.rect.origin.x + popup_pad;
             let inner_w = popup.rect.size.width - popup_pad * 2.;
             let top = popup.rect.origin.y + popup_pad;
             if let Some(note) = popup.note {
-                self.diff_panel_text(
+                self.settings_text(
                     layers,
                     note,
-                    inner_x + cell_w * 0.5,
+                    inner_x + unit,
                     top + (item_h - cell_h) * 0.5,
-                    inner_w - cell_w,
+                    inner_w - unit * 2.,
                     sb.text_meta,
                     surface,
                     false,
@@ -856,16 +910,16 @@ impl TermWindow {
                         layers,
                         0,
                         euclid::rect(inner_x, y, inner_w, item_h),
-                        4. * dpi_scale,
+                        (6. * dpi_scale).min(item_h * 0.5),
                         fill,
                     )?;
                 }
-                self.diff_panel_text(
+                self.settings_text(
                     layers,
                     item,
-                    inner_x + cell_w * 0.5,
+                    inner_x + unit,
                     y + (item_h - cell_h) * 0.5,
-                    inner_w - cell_w,
+                    inner_w - unit * 2.,
                     contrast_label_color(fill, sb.text_active),
                     fill,
                     false,
@@ -900,7 +954,7 @@ impl TermWindow {
             None => "Changes are saved to the config file as you make them.".to_string(),
         };
         let is_error = state.message.as_ref().is_some_and(|(_, error)| *error) || !editable;
-        self.diff_panel_text(
+        self.settings_text(
             layers,
             &footer,
             content_x,
