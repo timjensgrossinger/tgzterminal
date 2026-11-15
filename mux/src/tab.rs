@@ -589,6 +589,17 @@ impl Tab {
         self.inner.lock().rotate_clockwise()
     }
 
+    /// Gives every split an equal share of its space (TGZTerminal).
+    pub fn balance_panes(&self) {
+        self.inner.lock().balance_panes()
+    }
+
+    /// Rearranges the existing panes as `layout` (TGZTerminal). Returns
+    /// false, changing nothing, when the tab is too small to hold them.
+    pub fn apply_layout(&self, layout: config::keyassignment::PaneLayout) -> bool {
+        self.inner.lock().apply_layout(layout)
+    }
+
     pub fn iter_splits(&self) -> Vec<PositionedSplit> {
         self.inner.lock().iter_splits()
     }
@@ -998,6 +1009,48 @@ impl TabInner {
             }
         }
         Mux::try_get().map(|mux| mux.notify(MuxNotification::TabResized(self.id)));
+    }
+
+    fn balance_panes(&mut self) {
+        self.set_zoomed(false);
+        let size = self.size;
+        if let Some(root) = self.pane.as_mut() {
+            crate::tgz_layout::balance(root, &size);
+            apply_sizes_from_splits(root, &size);
+        }
+        Mux::try_get().map(|mux| mux.notify(MuxNotification::TabResized(self.id)));
+    }
+
+    fn apply_layout(&mut self, layout: config::keyassignment::PaneLayout) -> bool {
+        self.set_zoomed(false);
+        let size = self.size;
+        let active = self.get_active_pane();
+        let mut panes: Vec<Arc<dyn Pane>> = self
+            .iter_panes_ignoring_zoom()
+            .into_iter()
+            .map(|p| p.pane)
+            .collect();
+        if panes.is_empty() || !crate::tgz_layout::layout_fits(layout, panes.len(), &size) {
+            return false;
+        }
+        if layout.active_pane_first() {
+            if let Some(idx) = panes.iter().position(|p| is_pane(p, &active.as_ref())) {
+                let main = panes.remove(idx);
+                panes.insert(0, main);
+            }
+        }
+        let active_idx = panes
+            .iter()
+            .position(|p| is_pane(p, &active.as_ref()))
+            .unwrap_or(0);
+
+        let root = crate::tgz_layout::build_layout(layout, panes, &size);
+        apply_sizes_from_splits(&root, &size);
+        self.pane.replace(root);
+        self.active = active_idx;
+        self.recency.tag(active_idx);
+        Mux::try_get().map(|mux| mux.notify(MuxNotification::TabResized(self.id)));
+        true
     }
 
     fn iter_panes_impl(&mut self, respect_zoom_state: bool) -> Vec<PositionedPane> {

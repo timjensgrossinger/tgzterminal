@@ -585,6 +585,8 @@ impl super::TermWindow {
                             | UIItemType::SidebarNewTabMenuItem { .. }
                             | UIItemType::SidebarContextMenuItem {
                                 action: SidebarContextAction::ShowLauncher
+                                    | SidebarContextAction::ShowPaneLayouts
+                                    | SidebarContextAction::OpenUserPaneLayout(_)
                             }
                             | UIItemType::SidebarDropdownBody
                     )
@@ -623,6 +625,9 @@ impl super::TermWindow {
                             | UIItemType::SidebarDropdownBody
                             | UIItemType::SidebarFooterEdit(
                                 crate::termwindow::FooterEditAction::Add
+                            )
+                            | UIItemType::SidebarFooterAction(
+                                config::SidebarFooterItem::Layouts
                             )
                     )
             );
@@ -2297,6 +2302,24 @@ impl super::TermWindow {
             I::CommandPalette => KeyAssignment::ActivateCommandPalette,
             I::SplitRight => KeyAssignment::SplitHorizontal(split()),
             I::SplitDown => KeyAssignment::SplitVertical(split()),
+            I::Layouts => {
+                let was_open = matches!(
+                    self.sidebar_context_menu,
+                    Some(SidebarContextMenuState {
+                        kind: SidebarContextMenuKind::PaneLayouts,
+                        ..
+                    })
+                );
+                self.close_floating_menus();
+                if !was_open {
+                    self.sidebar_context_menu = Some(SidebarContextMenuState {
+                        x,
+                        y,
+                        kind: SidebarContextMenuKind::PaneLayouts,
+                    });
+                }
+                return;
+            }
             I::Custom(id) => {
                 let Some(custom) = self.config.sidebar_buttons.get(id).cloned() else {
                     return;
@@ -3777,6 +3800,20 @@ impl super::TermWindow {
             self.do_new_tab_button_click(MousePress::Right);
             return;
         }
+        if action == SidebarContextAction::ShowPaneLayouts {
+            self.new_tab_menu = None;
+            self.show_pane_layout_menu();
+            return;
+        }
+        // From the new-tab menu or the Layouts menu, it does the same.
+        if let SidebarContextAction::OpenUserPaneLayout(idx) = action {
+            self.new_tab_menu = None;
+            self.sidebar_context_menu = None;
+            if let Some(name) = self.config.tgz_layouts.get(idx).map(|def| def.name.clone()) {
+                self.open_user_pane_layout(&name);
+            }
+            return;
+        }
         let Some(menu) = self.sidebar_context_menu.take() else {
             return;
         };
@@ -3888,6 +3925,15 @@ impl super::TermWindow {
                     }
                     _ => {}
                 }
+            }
+            (SidebarContextMenuKind::PaneLayouts, SidebarContextAction::BalancePanes) => {
+                self.balance_panes();
+            }
+            (
+                SidebarContextMenuKind::PaneLayouts,
+                SidebarContextAction::ApplyPaneLayout(layout),
+            ) => {
+                self.apply_pane_layout(layout);
             }
             (SidebarContextMenuKind::Sidebar, SidebarContextAction::CustomizeFooter) => {
                 self.start_sidebar_footer_edit();

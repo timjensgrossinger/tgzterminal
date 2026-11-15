@@ -14,6 +14,7 @@ mod kill_pane;
 mod list;
 mod list_clients;
 mod move_pane_to_new_tab;
+mod pane_layout;
 mod proxy;
 mod rename_workspace;
 mod send_text;
@@ -170,6 +171,14 @@ Outputs the pane-id for the newly created pane on success"
     /// Zoom, unzoom, or toggle zoom state
     #[command(name = "zoom-pane", rename_all = "kebab")]
     ZoomPane(zoom_pane::ZoomPane),
+
+    /// Rearrange a tab's panes as a preset layout
+    #[command(name = "apply-layout", rename_all = "kebab")]
+    ApplyLayout(pane_layout::ApplyLayout),
+
+    /// Give every split in a tab an equal share of its space
+    #[command(name = "balance-panes", rename_all = "kebab")]
+    BalancePanes(pane_layout::BalancePanes),
 }
 
 async fn run_cli_async(opts: &crate::Opt, cli: CliCommand) -> anyhow::Result<()> {
@@ -207,6 +216,8 @@ async fn run_cli_async(opts: &crate::Opt, cli: CliCommand) -> anyhow::Result<()>
         CliSubCommand::SetWindowTitle(cmd) => cmd.run(client).await,
         CliSubCommand::RenameWorkspace(cmd) => cmd.run(client).await,
         CliSubCommand::ZoomPane(cmd) => cmd.run(client).await,
+        CliSubCommand::ApplyLayout(cmd) => cmd.run(client).await,
+        CliSubCommand::BalancePanes(cmd) => cmd.run(client).await,
     }
 }
 

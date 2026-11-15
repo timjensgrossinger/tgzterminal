@@ -1390,4 +1390,5 @@ impl Client {
         GetPaneDirectionResponse
     );
     rpc!(adjust_pane_size, AdjustPaneSize, UnitResponse);
+    rpc!(apply_pane_layout, ApplyPaneLayout, UnitResponse);
 }

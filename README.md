@@ -64,6 +64,7 @@ config since 2019, it still works exactly the same. We just added furniture to t
 | 🔭 | **Agents section** | A section inside the sidebar listing every agent this terminal can see, grouped by project, with what each one is *doing right now* (`now: Bash cargo check`), expandable rows carrying its recent tool calls, subagents, and token/cost telemetry. Agents needing attention can sort to the top so they aren't buried under healthy rows. Reads each vendor's own session store, including OpenCode's SQLite database. | "Is it still working, or is it waiting on me?" answered without switching to the pane and squinting at the last twenty lines — and the `now:` label downgrades itself to `last:` rather than lie about a stale transcript. |
 | 🧰 | **Agent toolbelt** | Per-pane strip with a live status dot plus context actions — Copy conversation · Stop · Attach · Resume · open logs · compose input. | The nuclear-launch-codes buttons (Stop/Resume/Attach) are locked behind a config flag and real evidence, not vibes — see below. |
 | ➕ | **New-tab dropdown** | Right-clicking `+ New Tab` opens a grouped picker of what this machine actually has: discovered shells (`/etc/shells`, or PowerShell / PowerShell 7 / cmd / Git Bash on Windows), every registered domain including each WSL distro, and your own `launch_menu` entries. | Opening a tab in a specific distro or on a specific host stops being a `wezterm cli` invocation you have to remember. |
+| 🧩 | **Pane layouts** | A **Layouts** footer button and `Cmd+Opt+L` open a menu of presets — Columns, Rows, Main left, Main top, Grid, Agent + shells — plus **Balance panes**. A preset rearranges the panes the tab already has, adds shells in the current directory when it needs more, and never closes anything. iTerm2/cmux-style keys on top of upstream's: `Cmd+D` / `Cmd+Shift+D` split right / down, `Cmd+Opt+Arrows` move focus, `Cmd+Ctrl+Arrows` resize, `Cmd+Shift+Return` zoom, `Cmd+Opt+=` balance. Your own bindings still win; `tgz_pane_keys = false` drops ours. Define layouts of your own with a command per pane (see [Pane layouts](#pane-layouts)), and drive it all from scripts with `cli apply-layout` / `cli balance-panes`. | "Agent on the left, a shell and a log on the right" is one click instead of three splits and a minute of dragging dividers. |
 | 📁 | **File-browser pane** | Lightweight worktree browser that also works inside SSH sessions. | You can look at a file tree on a box three hops away without giving up your terminal identity. |
 | ⌨️ | **Rich input composer** | On-demand bottom-anchored modal plus a persistent Warp-style docked input strip. Both insert plain text references only and submit visible text as ordinary bracketed-paste input. | Multi-line prompts stop looking like you're arguing with `readline`. |
 | 🪟 | **WSL-aware paths** | Launching across a domain boundary carries the working directory with it: Windows→WSL hands the path to `wsl.exe --cd`, WSL→Windows becomes `C:\…` or a `\\wsl.localhost\…` UNC path, and a path with no meaning in the target is dropped instead of guessed. | The agent starts in the repo you were looking at, not in `/home/you` or `C:\Windows\System32`. |
@@ -434,6 +435,40 @@ config.new_tab_menu = { enabled = true, show_shells = true, show_domains = true 
 config.rich_input = { enabled = true, docked = true }
 
 return config
+```
+
+### Pane layouts
+
+Presets rearrange the tab you're in; layouts of your own open a new tab with a command
+per pane. Both live in the **Layouts** footer button (`Cmd+Opt+L`), and your own also
+appear in the right-click `+ New Tab` menu and the command palette.
+
+```lua
+config.tgz_layouts = {
+  {
+    name = 'Review',
+    layout = 'AgentPlusShell',   -- any preset; the first pane takes the main slot
+    cwd = 'ProjectRoot',         -- or 'ActivePane' (the default)
+    panes = {                    -- each is a SpawnCommand; {} is a plain shell
+      { args = { 'claude' } },
+      { args = { 'lazygit' } },
+      {},
+    },
+  },
+}
+
+-- Bind one to a key, or a preset to the tab you're in:
+-- { key = 'r', mods = 'CMD|ALT', action = wezterm.action.OpenPaneLayout 'Review' }
+-- { key = 'g', mods = 'CMD|ALT', action = wezterm.action.ApplyPaneLayout 'Grid' }
+config.tgz_pane_keys = true      -- Cmd+D and friends; false keeps upstream's keys only
+```
+
+From a script or another tool:
+
+```sh
+tgzterminal cli apply-layout main-left   # the calling pane takes the main slot
+tgzterminal cli apply-layout grid --no-fill   # don't add shells to fill the grid
+tgzterminal cli balance-panes
 ```
 
 Built-in adapters (Claude, Codex, Gemini, OpenCode, Copilot, Antigravity, Cursor, Amp)

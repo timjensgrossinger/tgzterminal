@@ -170,7 +170,18 @@ impl CommandDef {
                 }
                 None
             }
-            Some(def) => {
+            Some(mut def) => {
+                if is_built_in {
+                    // The coarse resize steps exist only for `tgz_pane_keys`;
+                    // upstream's Ctrl+Alt+Shift+Arrows stay on the one-cell
+                    // steps.
+                    if matches!(action, AdjustPaneSize(_, 5)) {
+                        def.keys.clear();
+                    }
+                    if config.tgz_pane_keys {
+                        def.keys.extend(tgz_pane_keys(&action));
+                    }
+                }
                 let keys = if is_built_in && config.disable_default_key_bindings {
                     vec![]
                 } else {
@@ -205,6 +216,15 @@ impl CommandDef {
         let mut result = Self::expanded_commands(config);
 
         // Generate some stuff based on the config
+        for def in &config.tgz_layouts {
+            if let Some(command) = Self::expand_action(
+                KeyAssignment::OpenPaneLayout(def.name.clone()),
+                config,
+                false,
+            ) {
+                result.push(command);
+            }
+        }
         for cmd in &config.launch_menu {
             let label = match cmd.label.as_ref() {
                 Some(label) => label.to_string(),
@@ -897,6 +917,40 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             args: &[ArgType::ActivePane],
             menubar: &["Edit"],
             icon: Some("md_content_copy"),
+        },
+        BalancePanes => CommandDef {
+            brief: "Balance panes".into(),
+            doc: "Gives every split in the active tab an equal share of its space".into(),
+            keys: vec![],
+            args: &[ArgType::ActivePane],
+            menubar: &["Window"],
+            icon: Some("md_view_column"),
+        },
+        ApplyPaneLayout(layout) => CommandDef {
+            brief: format!("Pane layout: {}", layout.label()).into(),
+            doc: "Rearranges the active tab's panes, adding shells when the \
+                  layout needs more panes than the tab has"
+                .into(),
+            keys: vec![],
+            args: &[ArgType::ActivePane],
+            menubar: &["Window", "Pane Layout"],
+            icon: Some("md_view_dashboard"),
+        },
+        OpenPaneLayout(name) => CommandDef {
+            brief: format!("Open layout: {name}").into(),
+            doc: "Opens this tgz_layouts entry in a new tab".into(),
+            keys: vec![],
+            args: &[ArgType::ActiveWindow],
+            menubar: &[],
+            icon: Some("md_view_dashboard"),
+        },
+        ShowPaneLayoutMenu => CommandDef {
+            brief: "Pane layouts…".into(),
+            doc: "Opens the menu of pane layout presets".into(),
+            keys: vec![],
+            args: &[ArgType::ActiveWindow],
+            menubar: &[],
+            icon: Some("md_view_dashboard"),
         },
         CycleWaitingAgent => CommandDef {
             brief: "Cycle to next waiting agent".into(),
@@ -2302,6 +2356,44 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
     })
 }
 
+/// The keys `tgz_pane_keys` adds to the upstream ones: the pane shortcuts
+/// of iTerm2 and cmux. Kept apart from the `CommandDef`s so switching them
+/// off leaves upstream's keys exactly as they were.
+fn tgz_pane_keys(action: &KeyAssignment) -> Vec<(Modifiers, String)> {
+    let cmd_alt = Modifiers::SUPER.union(Modifiers::ALT);
+    let cmd_ctrl = Modifiers::SUPER.union(Modifiers::CTRL);
+    let cmd_shift = Modifiers::SUPER.union(Modifiers::SHIFT);
+    let arrow = |direction: &PaneDirection| match direction {
+        PaneDirection::Left => Some("LeftArrow"),
+        PaneDirection::Right => Some("RightArrow"),
+        PaneDirection::Up => Some("UpArrow"),
+        PaneDirection::Down => Some("DownArrow"),
+        PaneDirection::Next | PaneDirection::Prev => None,
+    };
+    let key = |mods, label: &str| vec![(mods, label.to_string())];
+    match action {
+        SplitHorizontal(SpawnCommand {
+            domain: SpawnTabDomain::CurrentPaneDomain,
+            ..
+        }) => key(Modifiers::SUPER, "d"),
+        SplitVertical(SpawnCommand {
+            domain: SpawnTabDomain::CurrentPaneDomain,
+            ..
+        }) => key(cmd_shift, "d"),
+        ActivatePaneDirection(direction) => arrow(direction)
+            .map(|label| key(cmd_alt, label))
+            .unwrap_or_default(),
+        // Five cells a press: one is too slow to be worth a chord.
+        AdjustPaneSize(direction, 5) => arrow(direction)
+            .map(|label| key(cmd_ctrl, label))
+            .unwrap_or_default(),
+        TogglePaneZoomState => key(cmd_shift, "Return"),
+        BalancePanes => key(cmd_alt, "="),
+        ShowPaneLayoutMenu => key(cmd_alt, "l"),
+        _ => vec![],
+    }
+}
+
 /// Returns a list of key assignment actions that should be
 /// included in the default key assignments and command palette.
 fn compute_default_actions() -> Vec<KeyAssignment> {
@@ -2413,6 +2505,14 @@ fn compute_default_actions() -> Vec<KeyAssignment> {
         }),
         RotatePanes(RotationDirection::Clockwise),
         RotatePanes(RotationDirection::CounterClockwise),
+        BalancePanes,
+        ShowPaneLayoutMenu,
+        ApplyPaneLayout(PaneLayout::EvenColumns),
+        ApplyPaneLayout(PaneLayout::EvenRows),
+        ApplyPaneLayout(PaneLayout::MainLeft),
+        ApplyPaneLayout(PaneLayout::MainTop),
+        ApplyPaneLayout(PaneLayout::Grid),
+        ApplyPaneLayout(PaneLayout::AgentPlusShell),
         ActivateTab(0),
         ActivateTab(1),
         ActivateTab(2),
@@ -2442,6 +2542,10 @@ fn compute_default_actions() -> Vec<KeyAssignment> {
         AdjustPaneSize(PaneDirection::Right, 1),
         AdjustPaneSize(PaneDirection::Up, 1),
         AdjustPaneSize(PaneDirection::Down, 1),
+        AdjustPaneSize(PaneDirection::Left, 5),
+        AdjustPaneSize(PaneDirection::Right, 5),
+        AdjustPaneSize(PaneDirection::Up, 5),
+        AdjustPaneSize(PaneDirection::Down, 5),
         ActivatePaneDirection(PaneDirection::Left),
         ActivatePaneDirection(PaneDirection::Right),
         ActivatePaneDirection(PaneDirection::Up),
@@ -2461,4 +2565,74 @@ fn compute_default_actions() -> Vec<KeyAssignment> {
         // ----------------- Misc
         OpenLinkAtMouseCursor,
     ];
+}
+
+#[cfg(test)]
+mod tgz_pane_keys_test {
+    use super::*;
+    use std::collections::HashMap;
+
+    type KeyMap = HashMap<(Modifiers, KeyCode), KeyAssignment>;
+
+    /// First registration wins, as in `InputMap::new`.
+    fn insert_all(map: &mut KeyMap, keys: Vec<(Modifiers, KeyCode)>, action: &KeyAssignment) {
+        for key in keys {
+            map.entry(key).or_insert_with(|| action.clone());
+        }
+    }
+
+    /// What the defaults bind without the pane keys: upstream's own.
+    fn upstream(config: &ConfigHandle) -> KeyMap {
+        let mut map = HashMap::new();
+        for action in compute_default_actions() {
+            let Some(mut def) = derive_command_from_key_assignment(&action) else {
+                continue;
+            };
+            if matches!(action, AdjustPaneSize(_, 5)) {
+                def.keys.clear();
+            }
+            insert_all(&mut map, def.permute_keys(config), &action);
+        }
+        map
+    }
+
+    fn code(label: &str) -> KeyCode {
+        DeferredKeyCode::try_from(label)
+            .unwrap()
+            .resolve(config::KeyMapPreference::Mapped)
+            .clone()
+    }
+
+    /// Every pane key reaches its own action: none is shadowed by an
+    /// upstream default, and none shadows one.
+    #[test]
+    fn pane_keys_do_not_collide() {
+        let config = ConfigHandle::default_config();
+        assert!(config.tgz_pane_keys);
+        let mut with = HashMap::new();
+        for (mods, code, action) in CommandDef::default_key_assignments(&config) {
+            with.entry((mods, code)).or_insert(action);
+        }
+        let without = upstream(&config);
+
+        let mut checked = 0;
+        for action in compute_default_actions() {
+            for (mods, label) in tgz_pane_keys(&action) {
+                let key = (mods, code(&label));
+                assert_eq!(with.get(&key), Some(&action), "{mods:?}+{label}");
+                assert!(
+                    !without.contains_key(&key),
+                    "{mods:?}+{label} is upstream's"
+                );
+                checked += 1;
+            }
+        }
+        // Two splits, four focus moves, four resizes, zoom, balance, menu.
+        assert_eq!(checked, 13);
+
+        // Upstream's keys still do what they did.
+        for (key, action) in &without {
+            assert_eq!(with.get(key), Some(action), "{key:?}");
+        }
+    }
 }

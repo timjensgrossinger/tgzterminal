@@ -4645,6 +4645,22 @@ pub(crate) fn sidebar_context_menu_rows(
         SidebarContextMenuKind::FooterItem(_) => {
             vec![row(SidebarContextAction::RemoveFooterItem, "Remove button")]
         }
+        SidebarContextMenuKind::PaneLayouts => {
+            let mut rows = vec![row(SidebarContextAction::BalancePanes, "Balance panes")];
+            rows.extend(
+                config::keyassignment::PaneLayout::ALL
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, layout)| SidebarContextRow {
+                        divider_above: idx == 0,
+                        ..row(
+                            SidebarContextAction::ApplyPaneLayout(*layout),
+                            layout.label(),
+                        )
+                    }),
+            );
+            rows
+        }
         SidebarContextMenuKind::AgentSection => vec![
             SidebarContextRow {
                 checkbox: Some(all_projects),
@@ -7646,7 +7662,7 @@ impl crate::TermWindow {
     }
 
     /// Domain name of the active pane, if it can be resolved.
-    fn active_pane_domain_name(&self) -> Option<String> {
+    pub(crate) fn active_pane_domain_name(&self) -> Option<String> {
         let pane = self.get_active_pane_or_overlay()?;
         Mux::get()
             .get_domain(pane.domain_id())
@@ -7862,7 +7878,7 @@ impl crate::TermWindow {
     }
 
     /// Apply the project-root walk, staying in the right filesystem view.
-    fn project_root_for(&self, cwd: &str, source_distro: Option<&str>) -> PathBuf {
+    pub(crate) fn project_root_for(&self, cwd: &str, source_distro: Option<&str>) -> PathBuf {
         let markers = &self.config.agent_ui.launcher.project_markers;
         match source_distro {
             // The pane lives inside a distro, so the marker walk has to stat
@@ -10383,7 +10399,8 @@ impl crate::TermWindow {
             | I::Settings
             | I::CommandPalette
             | I::SplitRight
-            | I::SplitDown => true,
+            | I::SplitDown
+            | I::Layouts => true,
             I::Changes => self.config.diff_panel.enabled,
             I::Toolbelt => self.sidebar_toolbelt_toggle_shown(),
             I::SecureInput => self.sidebar_secure_input_toggle_shown(),
@@ -12446,6 +12463,31 @@ impl crate::TermWindow {
             })
             .collect();
         let mut rows = rows;
+        // Tabs that open as a set of panes: the user's own layouts, then the
+        // presets, which arrange the tab you are in.
+        let dropdown_row = |label: String, divider_above: bool, action| SidebarDropdownRow {
+            label,
+            dot_color: None,
+            checkbox: None,
+            divider_above,
+            indent: false,
+            trailing_chevron: false,
+            widget: None,
+            inert: false,
+            item_type: UIItemType::SidebarContextMenuItem { action },
+        };
+        for (idx, def) in self.config.tgz_layouts.iter().enumerate() {
+            rows.push(dropdown_row(
+                def.name.clone(),
+                idx == 0,
+                SidebarContextAction::OpenUserPaneLayout(idx),
+            ));
+        }
+        rows.push(dropdown_row(
+            "Pane layouts\u{2026}".to_string(),
+            self.config.tgz_layouts.is_empty(),
+            SidebarContextAction::ShowPaneLayouts,
+        ));
         // Everything else that can be started, which a right click on "+"
         // used to open directly.
         rows.push(SidebarDropdownRow {
@@ -12709,6 +12751,19 @@ impl crate::TermWindow {
             }
             _ => {}
         }
+        if menu.kind == SidebarContextMenuKind::PaneLayouts {
+            // The user's own layouts open a tab of their own, so they come
+            // last, under a divider of their own.
+            for (idx, def) in self.config.tgz_layouts.iter().enumerate() {
+                specs.push((
+                    format!("New tab: {}", def.name),
+                    SidebarContextRow {
+                        divider_above: idx == 0,
+                        ..row(SidebarContextAction::OpenUserPaneLayout(idx))
+                    },
+                ));
+            }
+        }
         if specs.is_empty() {
             self.sidebar_context_menu = None;
             return Ok(());
@@ -12753,6 +12808,7 @@ impl crate::TermWindow {
             SidebarContextMenuKind::AgentSection
                 | SidebarContextMenuKind::FooterAdd
                 | SidebarContextMenuKind::FooterItem(_)
+                | SidebarContextMenuKind::PaneLayouts
         );
         self.paint_sidebar_dropdown(
             layers,

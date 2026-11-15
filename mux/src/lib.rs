@@ -44,6 +44,7 @@ pub mod ssh;
 pub mod ssh_agent;
 pub mod tab;
 pub mod termwiztermtab;
+mod tgz_layout;
 pub mod tmux;
 pub mod tmux_commands;
 mod tmux_pty;

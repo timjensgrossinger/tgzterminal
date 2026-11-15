@@ -1046,6 +1046,39 @@ impl SessionHandler {
                 .detach();
             }
 
+            Pdu::ApplyPaneLayout(ApplyPaneLayout { pane_id, layout }) => {
+                spawn_into_main_thread(async move {
+                    catch(
+                        move || {
+                            let mux = Mux::get();
+                            let (_pane_domain_id, _window_id, tab_id) = mux
+                                .resolve_pane_id(pane_id)
+                                .ok_or_else(|| anyhow!("pane_id {} invalid", pane_id))?;
+                            let tab = mux.get_tab(tab_id).ok_or_else(|| {
+                                anyhow!("Failed to retrieve tab with ID {tab_id}")
+                            })?;
+                            match layout {
+                                None => tab.balance_panes(),
+                                Some(layout) => {
+                                    if let Some(pane) = mux.get_pane(pane_id) {
+                                        tab.set_active_pane(&pane);
+                                    }
+                                    if !tab.apply_layout(layout) {
+                                        anyhow::bail!(
+                                            "the tab is too small for its panes as {}",
+                                            layout.label().to_lowercase()
+                                        );
+                                    }
+                                }
+                            }
+                            Ok(Pdu::UnitResponse(UnitResponse {}))
+                        },
+                        send_response,
+                    )
+                })
+                .detach();
+            }
+
             Pdu::Invalid { .. } => send_response(Err(anyhow!("invalid PDU {:?}", decoded.pdu))),
             Pdu::Pong { .. }
             | Pdu::ListPanesResponse { .. }

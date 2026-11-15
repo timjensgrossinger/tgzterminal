@@ -143,9 +143,9 @@ Two thresholds change the *layout* rather than just the text:
 
 The footer is three rows by default. **New Tab** takes the whole bottom
 row: it is the most used button, so it gets the largest target. Above it sits
-the **launch row**, split in halves — the agent launcher on the left, SSH on
-the right — so each touches a side edge; with no host to offer the agent
-launcher takes the row. On top sits the **view strip**: toggles for what is on
+the **launch row** of the things that open panes, in thirds — the agent
+launcher, SSH (which offers "New SSH connection" until there is a host), and
+**Layouts** (see [Pane Layouts](#pane-layouts)). On top sits the **view strip**: toggles for what is on
 show — Worktree (folder), Changes (`±`), the agent toolbelt (wrench) and
 Secure Keyboard Entry (lock) — lit while their panel or mode is on. The
 toggles share the row equally, and a sidebar wide enough for all of them adds
@@ -179,7 +179,7 @@ is there the buttons drag instead of acting:
 
 The arrangement is remembered across restarts.
 
-**More buttons.** Besides the seven of the default footer, **+** offers:
+**More buttons.** Besides the eight of the default footer, **+** offers:
 
 | Button | Lua name | Does |
 |--------|----------|------|
@@ -225,7 +225,7 @@ config.sidebar_footer = {
 ```
 
 Names: `Worktree`, `Changes`, `Toolbelt`, `SecureInput`, `Agent`, `Ssh`,
-`NewTab`, and the ones in the table above. A button left out is not shown (its action stays in the command
+`Layouts`, `NewTab`, and the ones in the table above. A button left out is not shown (its action stays in the command
 palette). A button with nothing to offer — `Ssh` with no host, `Changes` with
 the panel disabled — is skipped either way. While `sidebar_footer` is set it
 wins over a dragged arrangement, and Customize says so instead of starting.
@@ -2498,6 +2498,86 @@ config.keys = {
   { key = 'h', mods = 'SUPER|SHIFT', action = wezterm.action.ShowSshHostMenu },
 }
 ```
+
+## Pane Layouts
+
+A tab's panes can be rearranged as a preset, and layouts of your own open a
+new tab with a command per pane. The **Layouts** button of the footer (or
+`Cmd+Opt+L`, `ShowPaneLayoutMenu`) lists:
+
+- **Balance panes** (`BalancePanes`, `Cmd+Opt+=`): every split gets an equal
+  share of its space, the way tmux's even layouts divide it.
+- the presets (`ApplyPaneLayout '<name>'`):
+
+  | Preset | Arrangement | Fewest panes |
+  |--------|-------------|--------------|
+  | `EvenColumns` | side by side, equal widths | 2 |
+  | `EvenRows` | stacked, equal heights | 2 |
+  | `MainLeft` | the active pane on the left half, the rest stacked beside it | 2 |
+  | `MainTop` | the active pane across the top 60%, the rest side by side below | 2 |
+  | `Grid` | as square as the count allows, filled column by column | 4 |
+  | `AgentPlusShell` | the active pane on the left 60%, the rest stacked beside it | 3 |
+
+  A preset arranges the panes the tab already has, in their order, and never
+  closes one. A tab with fewer than the preset's fewest gets shells, in the
+  active pane's directory and domain. A window too small to give every pane
+  a cell says so and changes nothing.
+- your own layouts, from `tgz_layouts`.
+
+**Your own layouts.** Each opens a new tab:
+
+```lua
+config.tgz_layouts = {
+  {
+    name = 'Review',
+    layout = 'AgentPlusShell',
+    cwd = 'ProjectRoot',
+    panes = {
+      { args = { 'claude' } },
+      { args = { 'lazygit' } },
+      {},
+    },
+  },
+}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `name` | What the menus call it; `OpenPaneLayout '<name>'` opens it. |
+| `layout` | A preset from the table above; `MainLeft` when unset. The first pane takes the main slot. |
+| `panes` | The panes in order, each a `SpawnCommand` (`args`, `cwd`, `domain`, `set_environment_variables`, `label`). `{}` is the default shell. |
+| `cwd` | Where panes without a `cwd` of their own start: `ActivePane` (default) or `ProjectRoot`, which walks up by `agent_ui.launcher.project_markers` like the agent launcher. |
+
+They are listed in the Layouts menu, in the right-click `+ New Tab` menu (with a
+**Pane layouts…** row into the presets), and in the command palette.
+
+**Keys.** `tgz_pane_keys` (default `true`) adds the pane keys of iTerm2 and
+cmux to upstream's:
+
+| Key | Action |
+|-----|--------|
+| `Cmd+D` / `Cmd+Shift+D` | split right / down |
+| `Cmd+Opt+Arrows` | move focus |
+| `Cmd+Ctrl+Arrows` | resize by 5 cells |
+| `Cmd+Shift+Return` | zoom the pane |
+| `Cmd+Opt+=` | balance panes |
+| `Cmd+Opt+L` | the Layouts menu |
+
+Like every default key they give way to a binding of your own on the same
+keys; `false` leaves upstream's keys exactly as they are. `Cmd+D` also brings
+`Ctrl+Shift+D`, as upstream's `Cmd` keys bring their `Ctrl+Shift` twins.
+
+**Command line.** The same from scripts, against the pane in `WEZTERM_PANE`
+or `--pane-id`:
+
+```sh
+tgzterminal cli apply-layout main-left      # Lua or kebab names; the pane takes the main slot
+tgzterminal cli apply-layout grid --no-fill # only the panes there are
+tgzterminal cli balance-panes
+```
+
+A mux server older than this release answers these with an error; nothing
+else about the protocol changed.
 
 ## Update Checking
 

@@ -87,6 +87,8 @@ pub enum SidebarFooterItem {
     Mosh,
     /// The host menu, narrowed to Eternal Terminal hosts.
     Et,
+    /// The pane layout menu: presets and Balance.
+    Layouts,
     /// `agent:<adapter>`: start that agent where the launcher would.
     AgentLaunch(&'static str),
     /// `agent-tab:<adapter>`: start that agent in a tab of its own.
@@ -115,7 +117,7 @@ fn intern_footer_name(text: &str) -> &'static str {
 impl SidebarFooterItem {
     /// The buttons without a name of their own to carry: the variant, as
     /// Lua spells it, and the state-file spelling.
-    pub const PLAIN: [(Self, &'static str, &'static str); 16] = [
+    pub const PLAIN: [(Self, &'static str, &'static str); 17] = [
         (Self::Worktree, "Worktree", "worktree"),
         (Self::Changes, "Changes", "changes"),
         (Self::Toolbelt, "Toolbelt", "toolbelt"),
@@ -132,6 +134,7 @@ impl SidebarFooterItem {
         (Self::Tower, "Tower", "tower"),
         (Self::Mosh, "Mosh", "mosh"),
         (Self::Et, "Et", "et"),
+        (Self::Layouts, "Layouts", "layouts"),
     ];
 
     /// The button's name in the state file, and in Lua for the ones that
@@ -2154,6 +2157,35 @@ fn default_agent_waiting_ack_ms() -> u64 {
     5000
 }
 
+/// One entry of `tgz_layouts`.
+///
+/// ```lua
+/// config.tgz_layouts = {
+///   { name = 'Review', layout = 'AgentPlusShell', cwd = 'ProjectRoot',
+///     panes = { { args = { 'claude' } }, { args = { 'lazygit' } }, {} } },
+/// }
+/// ```
+#[derive(Debug, Clone, PartialEq, FromDynamic, ToDynamic)]
+pub struct TgzPaneLayout {
+    /// What the menus call it, and what `OpenPaneLayout` is given.
+    pub name: String,
+    /// How the panes are arranged; the first pane takes the main slot.
+    #[dynamic(default = "default_tgz_layout_preset")]
+    pub layout: crate::keyassignment::PaneLayout,
+    /// The panes, in order. Each is a `SpawnCommand`: an empty one is a
+    /// shell, and one without a `cwd` starts in the layout's directory.
+    #[dynamic(default)]
+    pub panes: Vec<SpawnCommand>,
+    /// The directory the panes start in: the active pane's, or the project
+    /// it belongs to (found with `agent_ui.launcher.project_markers`).
+    #[dynamic(default)]
+    pub cwd: AgentLauncherCwd,
+}
+
+fn default_tgz_layout_preset() -> crate::keyassignment::PaneLayout {
+    crate::keyassignment::PaneLayout::MainLeft
+}
+
 #[derive(Debug, Clone, FromDynamic, ToDynamic, ConfigMeta)]
 pub struct Config {
     /// The font size, measured in points
@@ -2712,6 +2744,12 @@ pub struct Config {
     #[dynamic(default)]
     pub sidebar_buttons: HashMap<String, SidebarButtonConfig>,
 
+    /// Pane layouts of your own: a new tab with a command per pane,
+    /// arranged as a preset. Listed in the Layouts menu and the new-tab
+    /// menu, and opened by name with `OpenPaneLayout` (TGZTerminal).
+    #[dynamic(default)]
+    pub tgz_layouts: Vec<TgzPaneLayout>,
+
     /// Most buttons one row of the sidebar footer holds, 1 to 7. A longer
     /// row in `sidebar_footer` continues on the next one; when dragging, a
     /// full row takes no more.
@@ -3081,6 +3119,14 @@ pub struct Config {
     /// works regardless of this setting. Ignored on other platforms.
     #[dynamic(default = "default_true")]
     pub macos_secure_keyboard_entry_auto: bool,
+
+    /// Pane keys in the style of iTerm2 and cmux on top of the upstream
+    /// ones: Cmd+D / Cmd+Shift+D split right / down, Cmd+Opt+Arrows move
+    /// focus, Cmd+Ctrl+Arrows resize, Cmd+Shift+Return zooms, Cmd+Opt+=
+    /// balances and Cmd+Opt+L opens the layout menu. Like every default key
+    /// they give way to the user's own bindings (TGZTerminal).
+    #[dynamic(default = "default_true")]
+    pub tgz_pane_keys: bool,
 
     #[dynamic(default = "default_status_update_interval")]
     pub status_update_interval: u64,

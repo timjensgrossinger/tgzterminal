@@ -718,8 +718,96 @@ pub enum KeyAssignment {
     CustomizeSidebarButtons,
     /// Open the Settings tab (TGZTerminal).
     ShowSettings,
+    /// Give every split in the active tab an equal share of its space
+    /// (TGZTerminal).
+    BalancePanes,
+    /// Rearrange the active tab's panes into a preset layout, adding shells
+    /// in the active pane's directory when the preset needs more panes than
+    /// the tab has. Never closes a pane (TGZTerminal).
+    ApplyPaneLayout(PaneLayout),
+    /// Open the sidebar's pane layout menu (TGZTerminal).
+    ShowPaneLayoutMenu,
+    /// Open the `tgz_layouts` entry of this name in a new tab (TGZTerminal).
+    OpenPaneLayout(String),
 }
 impl_lua_conversion_dynamic!(KeyAssignment);
+
+/// A preset arrangement of a tab's panes, applied by `ApplyPaneLayout`.
+/// Panes fill the slots in the tab's existing pane order, except that the
+/// main-pane layouts put the active pane in the main slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, FromDynamic, ToDynamic)]
+pub enum PaneLayout {
+    /// Side by side, equal widths.
+    EvenColumns,
+    /// Stacked, equal heights.
+    EvenRows,
+    /// The active pane on the left half, the rest stacked on the right.
+    MainLeft,
+    /// The active pane across the top, the rest side by side below.
+    MainTop,
+    /// As square a grid as the pane count allows.
+    Grid,
+    /// The active pane on the left at 60%, two or more stacked on the right:
+    /// an agent beside a shell and a log.
+    AgentPlusShell,
+}
+
+impl PaneLayout {
+    pub const ALL: [PaneLayout; 6] = [
+        PaneLayout::EvenColumns,
+        PaneLayout::EvenRows,
+        PaneLayout::MainLeft,
+        PaneLayout::MainTop,
+        PaneLayout::Grid,
+        PaneLayout::AgentPlusShell,
+    ];
+
+    /// The fewest panes the layout makes sense with; applying it to a tab
+    /// with fewer adds panes up to this.
+    pub fn min_panes(self) -> usize {
+        match self {
+            PaneLayout::EvenColumns
+            | PaneLayout::EvenRows
+            | PaneLayout::MainLeft
+            | PaneLayout::MainTop => 2,
+            PaneLayout::AgentPlusShell => 3,
+            PaneLayout::Grid => 4,
+        }
+    }
+
+    /// Whether the active pane moves to the first (main) slot.
+    pub fn active_pane_first(self) -> bool {
+        matches!(
+            self,
+            PaneLayout::MainLeft | PaneLayout::MainTop | PaneLayout::AgentPlusShell
+        )
+    }
+
+    /// The layout a person named: the Lua spelling (`MainLeft`) or the
+    /// command-line one (`main-left`), in any case.
+    pub fn from_name(name: &str) -> Option<Self> {
+        let wanted: String = name
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .map(|c| c.to_ascii_lowercase())
+            .collect();
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|layout| format!("{layout:?}").to_ascii_lowercase() == wanted)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            PaneLayout::EvenColumns => "Columns",
+            PaneLayout::EvenRows => "Rows",
+            PaneLayout::MainLeft => "Main left",
+            PaneLayout::MainTop => "Main top",
+            PaneLayout::Grid => "Grid",
+            PaneLayout::AgentPlusShell => "Agent + shells",
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, FromDynamic, ToDynamic)]
 pub struct SplitPane {

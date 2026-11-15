@@ -130,6 +130,7 @@ pub mod spawn;
 pub mod tgz_alt_screen;
 pub(crate) mod tgz_footer;
 pub mod tgz_last_session;
+mod tgz_pane_layout;
 pub mod tgz_secret_mask;
 pub(crate) mod tgz_settings;
 pub mod tgz_ssh_hosts;
@@ -794,6 +795,15 @@ pub enum SidebarContextAction {
     /// Sort automatically placed tabs by the folder they are in now.
     RegroupByFolder,
     CloseGroupTabs,
+    /// Pane layouts: even out every split of the active tab.
+    BalancePanes,
+    /// Pane layouts: rearrange the active tab as this preset.
+    ApplyPaneLayout(config::keyassignment::PaneLayout),
+    /// Open the `tgz_layouts` entry with this index in a new tab; from the
+    /// Layouts menu or the new-tab menu.
+    OpenUserPaneLayout(usize),
+    /// The new-tab menu's way into the Layouts menu.
+    ShowPaneLayouts,
 }
 
 /// The tab palette: a filter and the row the keyboard is on.
@@ -860,6 +870,8 @@ pub enum SidebarContextMenuKind {
     MoveToGroup {
         tab_idx: usize,
     },
+    /// The pane layout presets for the active tab.
+    PaneLayouts,
 }
 
 /// An open sidebar context menu, anchored where it was asked for.
@@ -5865,6 +5877,10 @@ done
             ToggleAgentHerdView => self.toggle_agent_herd_view(),
             CustomizeSidebarButtons => self.start_sidebar_footer_edit(),
             ShowSettings => self.show_settings(),
+            BalancePanes => self.balance_panes(),
+            ApplyPaneLayout(layout) => self.apply_pane_layout(*layout),
+            ShowPaneLayoutMenu => self.show_pane_layout_menu(),
+            OpenPaneLayout(name) => self.open_user_pane_layout(name),
             PasteFrom(source) => {
                 self.paste_from_clipboard(pane, *source);
             }

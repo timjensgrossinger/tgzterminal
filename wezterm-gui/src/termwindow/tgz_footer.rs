@@ -38,7 +38,7 @@ pub(crate) const MAX_ROW_ITEMS: usize = 5;
 /// The range `sidebar_footer_max_per_row` is held to: a row needs a button,
 /// and past seven none of them is a target any more.
 pub(crate) fn clamp_max_row_items(configured: usize) -> usize {
-    configured.clamp(1, DEFAULT_ITEMS.len())
+    configured.clamp(1, 7)
 }
 
 /// The weight of `item`; 1 when unset or nonsense.
@@ -96,13 +96,14 @@ pub(crate) fn distribute(total: f32, weights: &[f32], min: f32) -> Vec<f32> {
 }
 
 /// The buttons of the footer as shipped.
-const DEFAULT_ITEMS: [Item; 7] = [
+const DEFAULT_ITEMS: [Item; 8] = [
     Item::Worktree,
     Item::Changes,
     Item::Toolbelt,
     Item::SecureInput,
     Item::Agent,
     Item::Ssh,
+    Item::Layouts,
     Item::NewTab,
 ];
 
@@ -132,8 +133,9 @@ pub(crate) fn pin_new_tab_last(mut rows: FooterRows) -> FooterRows {
     rows
 }
 
-/// The footer as shipped: the view toggles on top, the agent and ssh
-/// launchers as halves below, New Tab across the bottom edge.
+/// The footer as shipped: the view toggles on top, the things that open
+/// panes (agent, ssh, layouts) in thirds below, New Tab across the bottom
+/// edge.
 pub(crate) fn default_footer_rows() -> FooterRows {
     vec![
         vec![
@@ -142,7 +144,7 @@ pub(crate) fn default_footer_rows() -> FooterRows {
             Item::Toolbelt,
             Item::SecureInput,
         ],
-        vec![Item::Agent, Item::Ssh],
+        vec![Item::Agent, Item::Ssh, Item::Layouts],
         vec![Item::NewTab],
     ]
 }
@@ -178,6 +180,7 @@ pub(crate) fn action_look(item: Item) -> Option<(&'static str, &'static [&'stati
         Item::Tower => ("\u{f0e8}", &["Tower"]),
         Item::Mosh => ("\u{f0e7}", &["Mosh"]),
         Item::Et => ("\u{f1e6}", &["ET"]),
+        Item::Layouts => ("\u{f009}", &["Layouts", "Layout"]),
         _ => return None,
     })
 }
@@ -201,6 +204,7 @@ pub(crate) fn library_name(item: Item) -> Option<&'static str> {
         Item::Tower => "Tower",
         Item::Mosh => "Mosh hosts",
         Item::Et => "ET hosts",
+        Item::Layouts => "Pane layouts",
         Item::AgentLaunch(_) | Item::AgentTab(_) | Item::Custom(_) => return None,
     })
 }
@@ -742,9 +746,10 @@ mod tests {
     #[test]
     fn unavailable_buttons_and_the_rows_they_empty_are_not_drawn() {
         let visible = visible_footer_rows(&default_footer_rows(), |item| item != Ssh);
-        assert_eq!(visible[1], vec![Agent]);
-        let no_launchers =
-            visible_footer_rows(&default_footer_rows(), |item| !matches!(item, Agent | Ssh));
+        assert_eq!(visible[1], vec![Agent, Layouts]);
+        let no_launchers = visible_footer_rows(&default_footer_rows(), |item| {
+            !matches!(item, Agent | Ssh | Layouts)
+        });
         assert_eq!(no_launchers.len(), 2);
     }
 
@@ -890,7 +895,7 @@ mod tests {
             moved[0],
             vec![Worktree, Changes, Toolbelt, SecureInput, Ssh]
         );
-        assert_eq!(moved[1], vec![Agent]);
+        assert_eq!(moved[1], vec![Agent, Layouts]);
         // That row is now full: the next one starts a row of its own.
         let rows = vec![moved[0].clone(), vec![Agent, NewTab]];
         let moved = footer_move_up(&rows, NewTab);
@@ -918,16 +923,16 @@ mod tests {
         // A longer list is cut into rows of five.
         let long = vec![DEFAULT_ITEMS.to_vec()];
         let rows = normalize_footer_rows(&long, false);
-        assert_eq!(rows.iter().map(Vec::len).collect::<Vec<_>>(), [5, 2]);
+        assert_eq!(rows.iter().map(Vec::len).collect::<Vec<_>>(), [5, 3]);
     }
 
     #[test]
     fn the_row_cap_is_adjustable() {
         let long = vec![DEFAULT_ITEMS.to_vec()];
         let rows = normalize_footer_rows_capped(&long, false, 3);
-        assert_eq!(rows.iter().map(Vec::len).collect::<Vec<_>>(), [3, 3, 1]);
-        let all = normalize_footer_rows_capped(&long, false, 7);
-        assert_eq!(all.len(), 1);
+        assert_eq!(rows.iter().map(Vec::len).collect::<Vec<_>>(), [3, 3, 2]);
+        let widest = normalize_footer_rows_capped(&long, false, 7);
+        assert_eq!(widest.iter().map(Vec::len).collect::<Vec<_>>(), [7, 1]);
         // Two to a row: a third is refused, and a pushed-out one starts a row.
         let rows = vec![vec![Agent, Ssh], vec![NewTab, Worktree]];
         assert_eq!(
@@ -970,16 +975,22 @@ mod tests {
     fn dragging_within_a_row_swaps_with_the_button_passed() {
         let rows = default_footer_rows();
         let slots = painted(&rows);
-        // Agent (left half of row 1) dragged over Ssh (right half).
-        let target = footer_drag_target(&slots, &rows, Agent, (200., 140.)).unwrap();
+        // Agent (left third of row 1) dragged past the middle of Ssh.
+        let target = footer_drag_target(&slots, &rows, Agent, (180., 140.)).unwrap();
         assert_eq!(target, FooterTarget::After(Ssh));
-        assert_eq!(footer_move(&rows, Agent, target)[1], vec![Ssh, Agent]);
+        assert_eq!(
+            footer_move(&rows, Agent, target)[1],
+            vec![Ssh, Agent, Layouts]
+        );
         // And back.
         let rows = footer_move(&rows, Agent, target);
         let slots = painted(&rows);
         let target = footer_drag_target(&slots, &rows, Agent, (20., 140.)).unwrap();
         assert_eq!(target, FooterTarget::Before(Ssh));
-        assert_eq!(footer_move(&rows, Agent, target)[1], vec![Agent, Ssh]);
+        assert_eq!(
+            footer_move(&rows, Agent, target)[1],
+            vec![Agent, Ssh, Layouts]
+        );
     }
 
     #[test]
@@ -992,9 +1003,9 @@ mod tests {
         let moved = footer_move(&rows, NewTab, target);
         // New Tab's own row is gone with it.
         assert_eq!(moved.len(), 2);
-        assert_eq!(moved[1], vec![NewTab, Agent, Ssh]);
+        assert_eq!(moved[1], vec![NewTab, Agent, Ssh, Layouts]);
         // Onto the right part of Ssh: after it.
-        let target = footer_drag_target(&slots, &rows, NewTab, (290., 140.)).unwrap();
+        let target = footer_drag_target(&slots, &rows, NewTab, (180., 140.)).unwrap();
         assert_eq!(target, FooterTarget::After(Ssh));
     }
 

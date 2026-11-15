@@ -505,6 +505,7 @@ pdu! {
     AdjustPaneSize: 62,
     DomainExec: 63,
     DomainExecResponse: 64,
+    ApplyPaneLayout: 65,
 }
 
 impl Pdu {
@@ -877,6 +878,14 @@ pub struct AdjustPaneSize {
     pub pane_id: PaneId,
     pub direction: PaneDirection,
     pub amount: usize,
+}
+
+/// Rearrange the tab holding `pane_id` as `layout`, that pane in the main
+/// slot; `None` balances the tab's splits instead (TGZTerminal).
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct ApplyPaneLayout {
+    pub pane_id: PaneId,
+    pub layout: Option<config::keyassignment::PaneLayout>,
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Debug)]

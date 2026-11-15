@@ -61,6 +61,8 @@ fn shortcut_actions() -> Vec<KeyAssignment> {
         ToggleSidebarAutoHide,
         CustomizeSidebarButtons,
         TogglePaneToolbelt,
+        ShowPaneLayoutMenu,
+        BalancePanes,
         OpenFileBrowser,
         FocusFileTree,
         ToggleDiffPanel,
