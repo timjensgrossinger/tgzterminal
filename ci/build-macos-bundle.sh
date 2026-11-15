@@ -442,7 +442,11 @@ if [[ "$BUILD_DMG" -eq 1 ]]; then
   STAGING_DIR=$(mktemp -d)
   trap 'rm -rf "$STAGING_DIR"' EXIT
 
-  cp -r "$APP_PATH" "$STAGING_DIR/"
+  # ditto, not `cp -r`: cp follows the Contents/MacOS/wezterm symlink and
+  # writes a second copy of the binary, which breaks the bundle's seal
+  # ("a sealed resource is missing or invalid").
+  ditto "$APP_PATH" "$STAGING_DIR/$APP_NAME"
+  codesign --verify --deep --strict "$STAGING_DIR/$APP_NAME"
   ln -s /Applications "$STAGING_DIR/Applications"
 
   rm -f "$DMG_PATH"
