@@ -299,6 +299,11 @@ impl super::TermWindow {
                 return true;
             }
 
+            // The sidebar's own controls, while it has the keyboard.
+            if self.sidebar_focus_key(keycode, raw_modifiers) {
+                return true;
+            }
+
             if let Some((entry, table_name)) = self.lookup_key(
                 pane,
                 &keycode,
@@ -655,6 +660,11 @@ impl super::TermWindow {
             KC::Escape => {
                 self.sidebar_search = None;
                 context.invalidate();
+                true
+            }
+            // On from the field to the tab list and the sidebar's buttons.
+            KC::Tab | KC::DownArrow => {
+                self.focus_sidebar();
                 true
             }
             KC::Backspace => {

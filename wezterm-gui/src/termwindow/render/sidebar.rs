@@ -552,6 +552,10 @@ pub(crate) struct SidebarPalette {
     /// [`agent_herd::ATTENTION_RGB`] so a branded theme can speak its own
     /// attention colour without four literals drifting apart.
     attention: LinearRgba,
+    /// The ring around whatever has keyboard focus: a soft lavender, apart
+    /// from the accent (running, New Tab) and the attention amber, and never
+    /// white, so it shows on any button without glaring in a dark room.
+    pub(crate) focus_ring: LinearRgba,
     ring: RingColors,
 }
 
@@ -579,6 +583,7 @@ impl SidebarPalette {
         set(&mut self.text_idle, user.text_idle);
         set(&mut self.text_meta, user.text_meta);
         set(&mut self.attention, user.attention);
+        set(&mut self.focus_ring, user.focus_ring);
     }
 
     /// The accent the active rail is drawn in: midway between the ring's
@@ -619,6 +624,7 @@ impl SidebarPalette {
             text_meta: srgb8_to_linear(0x5a, 0x5a, 0x63),
             working_fill: srgb8_to_linear(0x13, 0x13, 0x17),
             attention: default_attention(),
+            focus_ring: default_focus_ring(),
         }
     }
 
@@ -663,6 +669,7 @@ impl SidebarPalette {
                 Some(c) => srgb8_to_linear_tuple(c),
                 None => default_attention(),
             },
+            focus_ring: default_focus_ring(),
             ring,
         }
     }
@@ -688,6 +695,7 @@ impl SidebarPalette {
             text_meta: text_idle.mul_alpha(0.60),
             working_fill: row_fill,
             attention: default_attention(),
+            focus_ring: default_focus_ring(),
             ring,
         }
     }
@@ -723,6 +731,7 @@ impl SidebarPalette {
             text_meta: lerp_rgba(surface, fg, 0.42),
             working_fill: lerp_rgba(surface, fg, 0.04),
             attention: default_attention(),
+            focus_ring: default_focus_ring(),
             ring,
         }
     }
@@ -1269,6 +1278,11 @@ fn srgb8_to_linear_tuple((r, g, b): (u8, u8, u8)) -> LinearRgba {
 
 /// Attention colour for every theme that does not brand its own: the amber the
 /// waiting queue has always used.
+/// The keyboard focus ring's default: #A99BD6.
+fn default_focus_ring() -> LinearRgba {
+    srgb8_to_linear(0xa9, 0x9b, 0xd6)
+}
+
 fn default_attention() -> LinearRgba {
     srgb8_to_linear_tuple(crate::agent_herd::ATTENTION_RGB)
 }
@@ -13445,10 +13459,26 @@ impl crate::TermWindow {
 
             let this_h = row_h * dropdown_row_height_rows(row) as f32;
             let item_type = row.item_type.clone();
-            // The row the arrow keys are on is drawn as the hovered one.
-            let hovered = !row.inert
-                && (hovered_item.as_ref() == Some(&item_type)
-                    || self.dropdown_key_selected.as_ref() == Some(&item_type));
+            // The row the arrow keys are on is drawn as the hovered one, and
+            // ringed so it reads as the keyboard's.
+            let key_selected =
+                !row.inert && self.dropdown_key_selected.as_ref() == Some(&item_type);
+            let hovered = !row.inert && (hovered_item.as_ref() == Some(&item_type) || key_selected);
+            if key_selected {
+                let ring_in = 3. * dpi_scale;
+                self.paint_focus_ring(
+                    layers,
+                    1,
+                    euclid::rect(
+                        menu_x + row_inset + ring_in,
+                        row_y + ring_in,
+                        (rows_w - row_inset * 2. - ring_in * 2.).max(1.),
+                        (row_h * dropdown_row_height_rows(row) as f32 - ring_in * 2.).max(1.),
+                    ),
+                    (row_radius - ring_in).max(0.),
+                    bg,
+                )?;
+            }
             let pressed =
                 hovered && left_pressed && self.pressed_ui_item.as_ref() == Some(&item_type);
             let row_bg = if pressed {
@@ -13936,6 +13966,33 @@ impl crate::TermWindow {
     }
 
     pub fn paint_sidebar(&mut self, layers: &mut TripleLayerQuadAllocator) -> anyhow::Result<()> {
+        self.paint_sidebar_impl(layers)?;
+        // Where the focused control was drawn, for the ring of the next
+        // frame. A control that moved is drawn again at once.
+        let rect = self.sidebar_kb_focus.as_ref().and_then(|focus| {
+            self.ui_items
+                .iter()
+                .rev()
+                .find(|item| {
+                    crate::termwindow::tgz_sidebar_focus::same_target(&item.item_type, focus)
+                })
+                .cloned()
+        });
+        let moved = rect.as_ref().map(|r| (r.x, r.y, r.width, r.height))
+            != self
+                .sidebar_kb_focus_rect
+                .as_ref()
+                .map(|r| (r.x, r.y, r.width, r.height));
+        self.sidebar_kb_focus_rect = rect;
+        if moved && self.sidebar_kb_focus.is_some() {
+            if let Some(window) = self.window.as_ref() {
+                window.invalidate();
+            }
+        }
+        Ok(())
+    }
+
+    fn paint_sidebar_impl(&mut self, layers: &mut TripleLayerQuadAllocator) -> anyhow::Result<()> {
         self.prune_agent_detection_cache();
         self.settle_sidebar_auto_hide_close();
         let border = self.get_os_border();
@@ -14001,6 +14058,27 @@ impl crate::TermWindow {
             euclid::rect(left, top, width as f32, height),
             surface,
         )?;
+        // The keyboard focus ring, on the background and under every control:
+        // the control's own fill, drawn later on this layer, covers its middle.
+        if let Some(item) = self
+            .sidebar_kb_focus
+            .as_ref()
+            .and(self.sidebar_kb_focus_rect.clone())
+        {
+            let dpi_scale = (self.dimensions.dpi as f32 / 96.).clamp(1., 2.5);
+            self.paint_focus_ring(
+                layers,
+                1,
+                euclid::rect(
+                    item.x as f32,
+                    item.y as f32,
+                    item.width as f32,
+                    item.height as f32,
+                ),
+                RADIUS * dpi_scale,
+                surface,
+            )?;
+        }
 
         self.ui_items.push(UIItem {
             x: left as usize,
@@ -17854,6 +17932,18 @@ impl crate::TermWindow {
             };
             let row_rect = euclid::rect(section_x, y, section_w, row_h);
             self.filled_rectangle(layers, 0, row_rect, row_bg)?;
+            if selected {
+                // Inside the row, which runs edge to edge: the ring's outer
+                // edge lands on the row's.
+                let ring_in = 4.0 * dpi;
+                self.paint_focus_ring(
+                    layers,
+                    0,
+                    row_rect.inflate(-(ring_in + dpi), -ring_in),
+                    (RADIUS * dpi).min(row_h * 0.5),
+                    row_bg,
+                )?;
+            }
             // Keyboard cursor: a solid accent bar on the row's leading edge.
             if selected {
                 let accent = if attention {
@@ -18788,6 +18878,38 @@ impl crate::TermWindow {
             stroke,
             behind,
             lerp_rgba(behind, ring.waiting, WAITING_GLOW_STRENGTH),
+        )
+    }
+
+    /// The keyboard focus ring around `rect`: two pixels of the focus colour,
+    /// two pixels clear of it. Drawn as a fill with `behind` punched back
+    /// into its middle, so it goes on a layer *under* whatever it surrounds,
+    /// or before that thing's own fill on the same layer.
+    pub(crate) fn paint_focus_ring(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        layer_num: usize,
+        rect: RectF,
+        radius: f32,
+        behind: LinearRgba,
+    ) -> anyhow::Result<()> {
+        let dpi_scale = (self.dimensions.dpi as f32 / 96.).clamp(1., 2.5);
+        let stroke = (2. * dpi_scale).round().max(2.);
+        let gap = (2. * dpi_scale).round().max(1.);
+        let color = self.sidebar_palette().focus_ring;
+        self.sidebar_rounded_fill(
+            layers,
+            layer_num,
+            rect.inflate(gap + stroke, gap + stroke),
+            radius + gap + stroke,
+            color,
+        )?;
+        self.sidebar_rounded_fill(
+            layers,
+            layer_num,
+            rect.inflate(gap, gap),
+            radius + gap,
+            behind,
         )
     }
 

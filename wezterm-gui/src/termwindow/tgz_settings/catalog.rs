@@ -416,6 +416,7 @@ pub(crate) static CATALOG: &[Setting] = &[
     // Colours
     chrome_color!("Accent", "Focus, selections, the active rail. Default for New Tab and the running ring.", accent),
     chrome_color!("Attention", "An agent waiting for you. Default for the waiting ring.", attention),
+    chrome_color!("Focus ring", "Around whatever has keyboard focus. Default: a soft lavender, never white.", focus_ring),
     choice!(
         Colors,
         "New Tab style",
@@ -867,7 +868,7 @@ mod tests {
             .iter()
             .filter(|setting| matches!(setting.kind, Kind::Color))
             .collect();
-        assert_eq!(colours.len(), 20);
+        assert_eq!(colours.len(), 21);
         assert!(colours.iter().all(
             |setting| setting.section == Section::Colors && setting.path[0] == "sidebar_colors"
         ));

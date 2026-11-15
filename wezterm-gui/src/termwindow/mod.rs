@@ -133,6 +133,7 @@ pub mod tgz_last_session;
 mod tgz_pane_layout;
 pub mod tgz_secret_mask;
 pub(crate) mod tgz_settings;
+pub(crate) mod tgz_sidebar_focus;
 pub mod tgz_ssh_hosts;
 pub mod tgz_ssh_setup;
 pub(crate) mod tgz_tab_groups;
@@ -1604,6 +1605,10 @@ pub struct TermWindow {
     dropdown_key_rows: Vec<UIItem>,
     /// The menu row the arrow keys have selected.
     dropdown_key_selected: Option<UIItemType>,
+    /// The sidebar control that has the keyboard; see `tgz_sidebar_focus`.
+    sidebar_kb_focus: Option<UIItemType>,
+    /// Where that control was last drawn: its ring goes under it next frame.
+    sidebar_kb_focus_rect: Option<UIItem>,
     /// The list scrolled under a key press: once repainted, select its last
     /// (`true`) or first row.
     dropdown_key_pending_edge: Option<bool>,
@@ -2199,6 +2204,8 @@ impl TermWindow {
             ui_text_cache: RefCell::new(tgz_ui_text::UiTextCache::default()),
             dropdown_key_rows: Vec::new(),
             dropdown_key_selected: None,
+            sidebar_kb_focus: None,
+            sidebar_kb_focus_rect: None,
             dropdown_key_pending_edge: None,
             agent_herd_state: RefCell::new(AgentHerdState {
                 collapsed: tgz_ui_state::load_agent_section_collapsed().unwrap_or(false),
@@ -5863,6 +5870,7 @@ done
             }
             ToggleSidebarAutoHide => self.toggle_sidebar_auto_hide(),
             FocusSidebarSearch => self.focus_sidebar_search(),
+            FocusSidebar => self.focus_sidebar(),
             TogglePaneToolbelt => self.toggle_pane_toolbelt_hidden(),
             LaunchDefaultAgent => {
                 if let Some(entry) = self.agent_launcher_default() {

@@ -90,6 +90,7 @@ fn shortcut_actions() -> Vec<KeyAssignment> {
         ActivateAgentSection,
         ToggleAgentHerdView,
         FocusSidebarSearch,
+        FocusSidebar,
         ToggleSidebarAutoHide,
         CustomizeSidebarButtons,
         TogglePaneToolbelt,
@@ -881,21 +882,9 @@ impl TermWindow {
                     content_w + unit * 3.,
                     row_h_at(k) - 2. * dpi_scale,
                 );
+                // The keyboard's row: ringed like every focused control.
+                self.paint_focus_ring(layers, 0, band, 10. * dpi_scale, ground)?;
                 self.sidebar_rounded_fill(layers, 0, band, 10. * dpi_scale, row_bg)?;
-                // The selection bar of a sidebar row.
-                let bar_w = (3. * dpi_scale).round();
-                self.sidebar_pill_fill(
-                    layers,
-                    0,
-                    euclid::rect(
-                        band.origin.x + 2. * dpi_scale,
-                        band.origin.y + band.size.height * 0.25,
-                        bar_w,
-                        band.size.height * 0.5,
-                    ),
-                    bar_w * 0.5,
-                    accent,
-                )?;
             }
             self.settings_text(
                 layers,

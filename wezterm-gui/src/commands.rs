@@ -2241,6 +2241,16 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             menubar: &[],
             icon: Some("md_magnify"),
         },
+        FocusSidebar => CommandDef {
+            brief: "Focus the sidebar".into(),
+            doc: "Puts the keyboard on the sidebar's tabs and buttons: Tab walks them, \
+                  Enter acts, Esc goes back"
+                .into(),
+            keys: vec![(Modifiers::SUPER.union(Modifiers::SHIFT), "e".into())],
+            args: &[ArgType::ActiveWindow],
+            menubar: &["View"],
+            icon: None,
+        },
         TogglePaneToolbelt => CommandDef {
             brief: "Toggle agent toolbelt".into(),
             doc: "Shows or hides the toolbelt on agent panes".into(),
@@ -2456,6 +2466,7 @@ fn compute_default_actions() -> Vec<KeyAssignment> {
         ToggleSidebarAutoHide,
         CustomizeSidebarButtons,
         FocusSidebarSearch,
+        FocusSidebar,
         TogglePaneToolbelt,
         ToggleAgentHerdView,
         CycleWaitingAgent,

@@ -696,6 +696,9 @@ pub enum KeyAssignment {
     ToggleSidebarAutoHide,
     /// Put the keyboard in the sidebar's tab search field (TGZTerminal).
     FocusSidebarSearch,
+    /// Put the keyboard on the sidebar's own controls: Tab walks them, Enter
+    /// acts, Esc hands the keyboard back (TGZTerminal).
+    FocusSidebar,
     /// Show or hide the agent pane toolbelt (TGZTerminal).
     TogglePaneToolbelt,
     /// Start the default agent, as a click on the sidebar's agent button

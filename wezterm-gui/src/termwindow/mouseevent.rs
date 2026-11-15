@@ -437,6 +437,10 @@ impl super::TermWindow {
                         | UIItemType::SidebarDropdownBody
                 )
             );
+            // Any click hands the keyboard back from the sidebar.
+            if self.sidebar_kb_focus.take().is_some() {
+                context.invalidate();
+            }
             if !on_agents {
                 let mut state = self.agent_herd_state.borrow_mut();
                 if state.nav_active || state.context_menu.is_some() {
@@ -2696,7 +2700,7 @@ impl super::TermWindow {
     }
 
     /// Act on `item` as a left click on it would.
-    fn click_ui_item(&mut self, item: UIItem) {
+    pub(crate) fn click_ui_item(&mut self, item: UIItem) {
         let Some(pane) = self.get_active_pane_or_overlay() else {
             return;
         };

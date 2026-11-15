@@ -104,7 +104,7 @@ config.sidebar_scroll_bar = true
 | `sidebar_tab_grouping` | enum | `"Auto"` | `"Auto"`: a new tab joins the group of the project folder (nearest `.git`) it starts in and stays there when it changes folder; tabs with no project sit under "Other". `"Manual"`: tabs are grouped only by hand. `"Off"`: one flat list, no headers. Drag a tab onto a tab or the header of another group to move it there, or use "Move to group" in the tab's right-click menu; click a header to fold the group. "New group…" (tab menu, header menu, or the empty part of the list) names a group of your own in the search field: Enter keeps it, Esc cancels. A header's right-click menu renames or deletes your own groups, re-sorts tabs by folder, and closes the group's tabs. Your groups' names are remembered across restarts; which tab was in which group is not. Groups are contiguous in the tab order, so `ActivateTab` numbers match the rows shown. |
 | `sidebar_font` | font | unset | Font of the sidebar's own text, e.g. `wezterm.font 'Inter'`. Unset: `window_frame.font`, which defaults to the bundled Roboto. The terminal font stays the fallback, so icon glyphs keep resolving. |
 | `sidebar_font_size` | number | `13` on macOS, `10` elsewhere | Size of `sidebar_font` in points. Follows the display's DPI, not the terminal font size. |
-| `sidebar_colors` | table | `{}` | Colour of each part of the fork's chrome: the sidebar, menus, the tab palette and dialogs, the Worktree and Changes panels and the Settings tab. Every key is optional; an unset one keeps what `sidebar_theme` derives. Keys: `background`, `row`, `row_active`, `row_hover`, `row_pressed`, `row_working`, `field`, `field_focused`, `divider`, `menu_border`, `text`, `text_idle`, `text_meta`, `accent` (focus, selections, the active rail; default for `new_tab` and `ring_running`, and takes precedence over `agent_ui.animations.colors.ring_b`), `attention` (an agent waiting for you; default for `ring_waiting`), `new_tab`, `new_tab_text` (default: black or white, whichever reads), `ring_track`, `ring_running`, `ring_waiting`. (`quota` is still accepted but no longer drawn: the `Σ` button's meter takes the quota bars' colours.) Values are anything `colors` accepts, e.g. `config.sidebar_colors = { accent = '#58a6ff', new_tab = '#3fb950' }`. Also in Settings → Colours. The diff colours of the Changes panel come from the terminal palette (`colors.ansi`). |
+| `sidebar_colors` | table | `{}` | Colour of each part of the fork's chrome: the sidebar, menus, the tab palette and dialogs, the Worktree and Changes panels and the Settings tab. Every key is optional; an unset one keeps what `sidebar_theme` derives. Keys: `background`, `row`, `row_active`, `row_hover`, `row_pressed`, `row_working`, `field`, `field_focused`, `divider`, `menu_border`, `text`, `text_idle`, `text_meta`, `accent` (focus, selections, the active rail; default for `new_tab` and `ring_running`, and takes precedence over `agent_ui.animations.colors.ring_b`), `attention` (an agent waiting for you; default for `ring_waiting`), `focus_ring` (the ring around whatever has keyboard focus; default a soft lavender, `#a99bd6`, never white), `new_tab`, `new_tab_text` (default: black or white, whichever reads), `ring_track`, `ring_running`, `ring_waiting`. (`quota` is still accepted but no longer drawn: the `Σ` button's meter takes the quota bars' colours.) Values are anything `colors` accepts, e.g. `config.sidebar_colors = { accent = '#58a6ff', new_tab = '#3fb950' }`. Also in Settings → Colours. The diff colours of the Changes panel come from the terminal palette (`colors.ansi`). |
 | `window_title_app_name` | bool | `true` | Title bar text when no `format-window-title` handler sets one: the app's name (`TGZTerminal`, or the brand name a build is compiled with). `false` gives upstream's title, the active pane's with `[n/m]` when there are several tabs. A `format-window-title` handler always wins. |
 | `sidebar_tab_title_source` | enum | `"Title"` | `"Title"`, `"Command"`, `"WorkingDirectory"`, `"GitBranch"` |
 | `sidebar_tab_metadata` | list of enum | `{ "GitBranch", "WorkingDirectory" }` | Elements: `"GitBranch"`, `"WorkingDirectory"` |
@@ -1610,6 +1610,7 @@ first). Your own `config.keys` entries win over these.
 |--------|---------|------|
 | `ToggleSidebarAutoHide` | `CMD|SHIFT|b` | Pins the sidebar open or lets it collapse to its rail. |
 | `FocusSidebarSearch` | `CMD|SHIFT|f` | Puts the keyboard in the tab search field. |
+| `FocusSidebar` | `CMD|SHIFT|e` | Puts the keyboard on the sidebar's tabs and buttons; see below. |
 | `TogglePaneToolbelt` | `CMD|SHIFT|l` | Shows or hides the agent toolbelt. |
 | `LaunchDefaultAgent` | `CMD|SHIFT|a` | Starts the default agent, as the agent button does. |
 | `LaunchAgent 'claude'` | none | Starts the agent with that adapter id. |
@@ -1632,6 +1633,17 @@ config.keys = {
   { key = 'c', mods = 'CMD|ALT', action = wezterm.action.LaunchAgent 'codex' },
 }
 ```
+
+**Moving through the sidebar.** `FocusSidebar`, or `Tab` / `↓` in the tab
+search field, puts the keyboard on the sidebar itself, starting at the first
+tab. `Tab` / `Shift+Tab` (or `↓` / `↑`) walk every control top to bottom: the
+tabs, the `Σ` and sessions buttons, the footer's toggles and buttons and
+`+ New Tab`. `Enter` or `Space` acts on the focused one as a click would;
+opening a tab or the search field hands the keyboard to it. `Esc`, any other
+key or any click gives the keyboard back to the terminal, which never loses
+`Tab` otherwise. The focused control carries a ring in
+`sidebar_colors.focus_ring`, as do the row the arrow keys are on in a menu,
+in the Agents section and in Settings.
 
 While any sidebar menu is open, `↑`/`↓` move over its rows, `Enter` picks the
 selected row and `Esc` closes the menu. A menu opened from the keyboard appears
