@@ -592,8 +592,9 @@ config.agent_ui = {
     resolve_ripple = true,
     waiting_glow = true,
     agent_enter = true,
-    rail_breathe = true,
-    dot_pulse = true,
+    rail_breathe = false,
+    dot_pulse = false,
+    follow_reduce_motion = true,
     colors = {
       -- all optional; each falls back to the `ring_colors` preset
       ring_a = "#ff6b6b",
@@ -841,12 +842,13 @@ field is optional; naming one does not require naming the rest.
 |---|---|---|---|
 | `enabled` | bool | `true` | Master switch for all sidebar **motion**. Off leaves the sidebar completely still — no throbber, no ripple, no slide-in, no rail breathe, no dot pulse — and the window stops scheduling animation frames for it. The waiting glow survives; see below. |
 | `unfocused` | bool | `true` | Keep animating while the window is not focused. Off restores upstream's focus-gated frame scheduling, so sidebar animations freeze the moment the window loses focus and resume when it regains it. Nothing else changes: the elements are still enabled, they just stop asking for frames in the background. |
-| `working_ring` | bool | `true` | Rotating two-tone throbber around a working agent's tab row. |
+| `working_ring` | bool | `true` | The arc turning around a working agent's tab ring. Off, the ring stands still as a full ring in the running colour, so a working agent still reads apart from a waiting one. |
 | `resolve_ripple` | bool | `true` | One-shot swell-and-fade when an agent finishes, **and** the faint hairline it settles into afterwards. Off means a finished row is drawn exactly like an idle one. |
-| `waiting_glow` | bool | `true` | Standing outline marking an agent that is blocked on you. |
+| `waiting_glow` | bool | `true` | Standing outline marking an agent that is blocked on you, and the slow breathing of its ring. The breathing is motion and stops with `enabled`; the outline is not. |
 | `agent_enter` | bool | `true` | Slide-in played when a new agent row appears. |
-| `rail_breathe` | bool | `true` | Opacity drift of the active tab's gradient rail. Off pins the rail at full opacity. |
-| `dot_pulse` | bool | `true` | Brightness pulse of a working agent's status dot. Additionally gated by `pulse_working_dot` — both must be true for the dot to breathe. |
+| `rail_breathe` | bool | `false` | Opacity drift of the active tab's gradient rail. Off pins the rail at full opacity. Off by default: it moves without saying anything the ring does not. |
+| `dot_pulse` | bool | `false` | Brightness pulse of a working agent's status dot. Additionally gated by `pulse_working_dot` — both must be true for the dot to breathe. Off by default, for the same reason. |
+| `follow_reduce_motion` | bool | `true` | Hold every animation still while the system asks for reduced motion (macOS: System Settings › Accessibility › Display › Reduce motion), as if `enabled` were off. Takes effect within a second of changing the system setting. Other platforms never report it. |
 | `colors` | table | `{}` | Per-animation colour overrides; see below. |
 
 **The waiting glow survives the master switch.** It is the one element here that

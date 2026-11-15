@@ -68,6 +68,12 @@ pub trait ConnectionOps {
         Appearance::Light
     }
 
+    /// Whether the system asks applications to reduce motion (TGZTerminal).
+    /// Only macOS answers; elsewhere this is always false.
+    fn reduce_motion(&self) -> bool {
+        false
+    }
+
     /// Hide the application.
     /// This actions hides all of the windows of the application and switches
     /// focus away from it.

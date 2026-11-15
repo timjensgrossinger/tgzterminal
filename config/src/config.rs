@@ -320,6 +320,11 @@ pub struct SidebarColorsConfig {
     /// reads on `new_tab`.
     #[dynamic(default)]
     pub new_tab_text: Option<RgbaColor>,
+    /// The ring around whatever has keyboard focus. Default: a soft
+    /// lavender, apart from the accent and attention and never white, so it
+    /// shows on any button without glaring in a dark room.
+    #[dynamic(default)]
+    pub focus_ring: Option<RgbaColor>,
     /// The unfilled track of a tab's context ring.
     #[dynamic(default)]
     pub ring_track: Option<RgbaColor>,
@@ -418,6 +423,22 @@ pub enum SidebarTabDensity {
 impl Default for SidebarTabDensity {
     fn default() -> Self {
         Self::Comfortable
+    }
+}
+
+/// How the sidebar's `+ New Tab` button is drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromDynamic, ToDynamic)]
+pub enum SidebarNewTabStyle {
+    /// Filled with `sidebar_colors.new_tab` (default: the accent): the one
+    /// filled button of the sidebar.
+    Filled,
+    /// Drawn like the other footer buttons.
+    Plain,
+}
+
+impl Default for SidebarNewTabStyle {
+    fn default() -> Self {
+        Self::Filled
     }
 }
 
@@ -1078,14 +1099,22 @@ pub struct AgentAnimationsConfig {
     #[dynamic(default = "default_true")]
     pub agent_enter: bool,
 
-    /// Opacity drift of the active tab's gradient rail.
-    #[dynamic(default = "default_true")]
+    /// Opacity drift of the active tab's gradient rail. Off by default: it
+    /// moves without saying anything the ring does not.
+    #[dynamic(default)]
     pub rail_breathe: bool,
 
     /// Brightness pulse of a working agent's status dot. Additionally gated by
-    /// the older `agent_ui.pulse_working_dot`.
-    #[dynamic(default = "default_true")]
+    /// the older `agent_ui.pulse_working_dot`. Off by default, for the same
+    /// reason as `rail_breathe`.
+    #[dynamic(default)]
     pub dot_pulse: bool,
+
+    /// Hold every animation still while the system asks for reduced motion
+    /// (macOS: Accessibility › Display › Reduce motion). A working agent's
+    /// ring then stands as a full ring in the running colour.
+    #[dynamic(default = "default_true")]
+    pub follow_reduce_motion: bool,
 
     /// Per-animation colour overrides.
     #[dynamic(default)]
@@ -1101,8 +1130,9 @@ impl Default for AgentAnimationsConfig {
             resolve_ripple: true,
             waiting_glow: true,
             agent_enter: true,
-            rail_breathe: true,
-            dot_pulse: true,
+            rail_breathe: false,
+            dot_pulse: false,
+            follow_reduce_motion: true,
             colors: AgentAnimationColors::default(),
         }
     }
@@ -2693,6 +2723,10 @@ pub struct Config {
     /// Row density for sidebar tab entries.
     #[dynamic(default)]
     pub sidebar_tab_density: SidebarTabDensity,
+
+    /// Whether `+ New Tab` is filled with its colour or drawn plain.
+    #[dynamic(default)]
+    pub sidebar_new_tab_style: SidebarNewTabStyle,
 
     /// Source used for sidebar tab titles.
     #[dynamic(default)]
@@ -4891,7 +4925,7 @@ mod agent_ui_tests {
     }
 
     #[test]
-    fn agent_animations_default_to_every_toggle_on_and_no_colour_overrides() {
+    fn agent_animations_default_to_the_state_carrying_ones_and_no_colour_overrides() {
         let agent_ui = Config::default_config().agent_ui;
 
         // The table is absent by default; that absence is load-bearing for the
@@ -4906,8 +4940,10 @@ mod agent_ui_tests {
         assert!(anim.resolve_ripple);
         assert!(anim.waiting_glow);
         assert!(anim.agent_enter);
-        assert!(anim.rail_breathe);
-        assert!(anim.dot_pulse);
+        assert!(anim.follow_reduce_motion);
+        // Motion that says nothing the ring does not is off unless asked for.
+        assert!(!anim.rail_breathe);
+        assert!(!anim.dot_pulse);
         assert_eq!(anim.colors, AgentAnimationColors::default());
         assert!(anim.colors.ring_a.is_none());
         assert!(anim.colors.resolve.is_none());
@@ -4957,18 +4993,16 @@ mod agent_ui_tests {
         // Every field carries a `#[dynamic(default = ..)]`, so naming one must
         // not force the user to name the rest.
         let mut table = std::collections::BTreeMap::new();
-        table.insert(
-            Value::String("rail_breathe".to_string()),
-            Value::Bool(false),
-        );
+        table.insert(Value::String("rail_breathe".to_string()), Value::Bool(true));
         let anim =
             AgentAnimationsConfig::from_dynamic(&Value::Object(table.into()), Default::default())
                 .unwrap();
 
-        assert!(!anim.rail_breathe);
+        assert!(anim.rail_breathe);
         assert!(anim.enabled);
         assert!(anim.working_ring);
-        assert!(anim.dot_pulse);
+        assert!(anim.follow_reduce_motion);
+        assert!(!anim.dot_pulse);
         assert_eq!(anim.colors, AgentAnimationColors::default());
     }
 

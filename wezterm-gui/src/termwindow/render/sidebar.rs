@@ -434,6 +434,8 @@ struct SidebarAnimationGates {
     working_ring: bool,
     resolve_ripple: bool,
     waiting_glow: bool,
+    /// The waiting ring's breathing: the moving half of `waiting_glow`.
+    waiting_breathe: bool,
     agent_enter: bool,
     rail_breathe: bool,
     dot_pulse: bool,
@@ -442,9 +444,12 @@ struct SidebarAnimationGates {
 }
 
 impl SidebarAnimationGates {
-    fn from_config(agent_ui: &AgentUiConfig) -> Self {
+    /// `reduce_motion` is the system's setting; it holds everything still
+    /// unless `follow_reduce_motion` is off.
+    fn from_config(agent_ui: &AgentUiConfig, reduce_motion: bool) -> Self {
         let anim = agent_ui.resolved_animations();
-        let master = anim.enabled && !agent_ui.legacy_animation_kill_switch();
+        let reduced = anim.follow_reduce_motion && reduce_motion;
+        let master = anim.enabled && !agent_ui.legacy_animation_kill_switch() && !reduced;
         Self {
             working_ring: master && anim.working_ring,
             resolve_ripple: master && anim.resolve_ripple,
@@ -452,6 +457,7 @@ impl SidebarAnimationGates {
             // and no scheduled frame, and it is the only mark left saying which
             // agent is still blocked on the user.
             waiting_glow: anim.waiting_glow,
+            waiting_breathe: master && anim.waiting_glow,
             agent_enter: master && anim.agent_enter,
             rail_breathe: master && anim.rail_breathe,
             dot_pulse: master && anim.dot_pulse && agent_ui.pulse_working_dot,
@@ -464,10 +470,33 @@ impl SidebarAnimationGates {
     fn any_motion(&self) -> bool {
         self.working_ring
             || self.resolve_ripple
+            || self.waiting_breathe
             || self.agent_enter
             || self.rail_breathe
             || self.dot_pulse
     }
+}
+
+/// The system's reduce-motion setting, asked at most once a second: it is a
+/// message to the window system, and the gates are resolved many times a
+/// frame. A change shows from the next paint after the second is up.
+fn system_reduce_motion() -> bool {
+    use std::cell::Cell;
+    use window::ConnectionOps;
+    thread_local! {
+        static ASKED: Cell<Option<(Instant, bool)>> = const { Cell::new(None) };
+    }
+    ASKED.with(|asked| {
+        let now = Instant::now();
+        if let Some((at, value)) = asked.get() {
+            if now.duration_since(at) < Duration::from_secs(1) {
+                return value;
+            }
+        }
+        let value = window::Connection::get().is_some_and(|conn| conn.reduce_motion());
+        asked.set(Some((now, value)));
+        value
+    })
 }
 
 /// Which of the three mutually exclusive ring treatments a tab row draws.
@@ -11296,7 +11325,21 @@ impl crate::TermWindow {
     /// another app, so by default the sidebar keeps animating in the background
     /// and pays for it via [`Self::schedule_sidebar_frame`].
     fn sidebar_animation_gates(&self) -> SidebarAnimationGates {
-        SidebarAnimationGates::from_config(&self.config.agent_ui)
+        SidebarAnimationGates::from_config(&self.config.agent_ui, system_reduce_motion())
+    }
+
+    /// Phase of a waiting agent's ring breathing, or `None` when it must
+    /// stand still. Its own gate, not the dot pulse's: turning the dot pulse
+    /// off must not also freeze the ring that says an agent needs you.
+    fn agent_waiting_breathe(&self, agent: &AgentPaneState) -> Option<f32> {
+        if !self.sidebar_animation_gates().waiting_breathe
+            || agent.status != AgentStatus::WaitingForInput
+        {
+            return None;
+        }
+        let period = Duration::from_millis(self.config.agent_ui.pulse_period_ms.clamp(400, 6000));
+        self.schedule_sidebar_frame(next_agent_pulse_frame_due());
+        Some(agent_pulse_phase(AGENT_PULSE_EPOCH.elapsed(), period))
     }
 
     /// Register a next-frame deadline for a sidebar animation.
@@ -14399,7 +14442,28 @@ impl crate::TermWindow {
                         intensity,
                     )?,
                     AgentRowRing::None => {
-                        self.sidebar_rounded_fill(layers, 1, tile_rect, rail_radius, faded_tab_bg)?
+                        self.sidebar_rounded_fill(layers, 1, tile_rect, rail_radius, faded_tab_bg)?;
+                        // A working agent whose ring may not turn still gets
+                        // it, held still and whole, as on its expanded row.
+                        if rail_agent
+                            .as_ref()
+                            .is_some_and(|(_, agent)| agent_is_working(&agent.status))
+                        {
+                            let inset = (2. * dpi_scale).round();
+                            let running = self
+                                .user_chrome_color(|c| c.ring_running)
+                                .unwrap_or(sb.ring.b);
+                            self.paint_ring(
+                                layers,
+                                2,
+                                rail_x + inset,
+                                rail_y + tab_offset + inset,
+                                rail_side - inset * 2.,
+                                ring_stroke,
+                                None,
+                                &[(running, 0., 1.)],
+                            )?;
+                        }
                     }
                 }
                 if active {
@@ -15543,20 +15607,25 @@ impl crate::TermWindow {
                         // colour, breathing while animation is allowed. The
                         // colour is blended, not made translucent, so the
                         // ring stays one clean line.
-                        let pulse = self.agent_dot_pulse(state).unwrap_or(1.).clamp(0., 1.);
+                        let pulse = self
+                            .agent_waiting_breathe(state)
+                            .unwrap_or(1.)
+                            .clamp(0., 1.);
                         let color = lerp_rgba(ring_track, ring_waiting, 0.35 + 0.65 * pulse);
                         (None, vec![(fade(color), 0., 1.)])
-                    } else if running {
+                    } else if running && anim.spin.is_some() {
                         // The one thing that moves on a running row: an arc
-                        // in one colour. Without animation it stands still
-                        // at twelve.
-                        let phase = if anim.spin.is_some() {
-                            self.schedule_sidebar_frame(next_agent_pulse_frame_due());
-                            (AGENT_PULSE_EPOCH.elapsed().as_secs_f32() / TAB_RING_TURN_SECS).fract()
-                        } else {
-                            0.
-                        };
+                        // in one colour.
+                        self.schedule_sidebar_frame(next_agent_pulse_frame_due());
+                        let phase = (AGENT_PULSE_EPOCH.elapsed().as_secs_f32()
+                            / TAB_RING_TURN_SECS)
+                            .fract();
                         (Some(ring_track), vec![(fade(ring_running), phase, 0.30)])
+                    } else if running {
+                        // Held still (animation off, or reduced motion): the
+                        // whole ring in the running colour, so running still
+                        // reads apart from waiting by colour alone.
+                        (None, vec![(fade(ring_running), 0., 1.)])
                     } else {
                         (Some(ring_track), vec![])
                     };
@@ -18751,10 +18820,20 @@ mod tests {
         }
     }
 
+    /// Every animation on, including the ones that are off by default, so a
+    /// test that turns one off sees only that one change.
+    fn all_animations_on() -> AgentAnimationsConfig {
+        AgentAnimationsConfig {
+            rail_breathe: true,
+            dot_pulse: true,
+            ..AgentAnimationsConfig::default()
+        }
+    }
+
     fn gates_with(mutate: impl FnOnce(&mut AgentAnimationsConfig)) -> SidebarAnimationGates {
-        let mut anim = AgentAnimationsConfig::default();
+        let mut anim = all_animations_on();
         mutate(&mut anim);
-        SidebarAnimationGates::from_config(&agent_ui_with_animations(anim))
+        SidebarAnimationGates::from_config(&agent_ui_with_animations(anim), false)
     }
 
     /// A plain pane offers exactly one action, and offers it even with agent
@@ -19128,21 +19207,53 @@ mod tests {
     }
 
     #[test]
-    fn every_animation_runs_out_of_the_box() {
-        let gates = SidebarAnimationGates::from_config(&AgentUiConfig::default());
+    fn out_of_the_box_only_the_animations_that_carry_state_run() {
+        let gates = SidebarAnimationGates::from_config(&AgentUiConfig::default(), false);
         assert_eq!(
             gates,
             SidebarAnimationGates {
                 working_ring: true,
                 resolve_ripple: true,
                 waiting_glow: true,
+                waiting_breathe: true,
                 agent_enter: true,
-                rail_breathe: true,
-                dot_pulse: true,
+                rail_breathe: false,
+                dot_pulse: false,
                 unfocused: true,
             }
         );
         assert!(gates.any_motion());
+    }
+
+    #[test]
+    fn reduced_motion_holds_everything_still_unless_told_not_to() {
+        let reduced = SidebarAnimationGates::from_config(
+            &agent_ui_with_animations(all_animations_on()),
+            true,
+        );
+        assert!(!reduced.any_motion());
+        assert!(!reduced.working_ring);
+        assert!(!reduced.waiting_breathe);
+        assert!(!reduced.unfocused);
+        // Static state, not motion: the waiting glow still marks who needs you.
+        assert!(reduced.waiting_glow);
+
+        let ignoring = SidebarAnimationGates::from_config(
+            &agent_ui_with_animations(AgentAnimationsConfig {
+                follow_reduce_motion: false,
+                ..all_animations_on()
+            }),
+            true,
+        );
+        assert_eq!(ignoring, gates_with(|_| {}));
+    }
+
+    #[test]
+    fn the_dot_pulse_no_longer_decides_whether_the_waiting_ring_breathes() {
+        let gates = gates_with(|a| a.dot_pulse = false);
+        assert!(!gates.dot_pulse);
+        assert!(gates.waiting_breathe);
+        assert!(!gates_with(|a| a.waiting_glow = false).waiting_breathe);
     }
 
     #[test]
@@ -19167,6 +19278,7 @@ mod tests {
             gates_with(|a| a.waiting_glow = false),
             SidebarAnimationGates {
                 waiting_glow: false,
+                waiting_breathe: false,
                 ..all
             }
         );
@@ -19204,6 +19316,7 @@ mod tests {
         assert!(!gates.agent_enter);
         assert!(!gates.rail_breathe);
         assert!(!gates.dot_pulse);
+        assert!(!gates.waiting_breathe);
         assert!(!gates.unfocused);
         // Static state, not motion: it is the only mark left saying which agent
         // is still blocked on the user, so it needs its own toggle to go.
@@ -19232,19 +19345,25 @@ mod tests {
     fn pulse_working_dot_stays_a_master_switch_until_the_table_is_written() {
         // Historic behaviour: the key is named for the dot but shipped as the
         // kill switch for every sidebar animation.
-        let legacy = SidebarAnimationGates::from_config(&AgentUiConfig {
-            pulse_working_dot: false,
-            ..AgentUiConfig::default()
-        });
+        let legacy = SidebarAnimationGates::from_config(
+            &AgentUiConfig {
+                pulse_working_dot: false,
+                ..AgentUiConfig::default()
+            },
+            false,
+        );
         assert!(!legacy.any_motion());
         assert!(legacy.waiting_glow);
 
         // Writing any `animations` table opts into the new model: the key is
         // then nothing but an extra AND-gate on the dot pulse.
-        let modern = SidebarAnimationGates::from_config(&AgentUiConfig {
-            pulse_working_dot: false,
-            ..agent_ui_with_animations(AgentAnimationsConfig::default())
-        });
+        let modern = SidebarAnimationGates::from_config(
+            &AgentUiConfig {
+                pulse_working_dot: false,
+                ..agent_ui_with_animations(all_animations_on())
+            },
+            false,
+        );
         assert!(!modern.dot_pulse);
         assert_eq!(
             modern,
@@ -19256,13 +19375,16 @@ mod tests {
 
         // And it cannot revive a dot pulse the new table turned off.
         assert!(
-            !SidebarAnimationGates::from_config(&AgentUiConfig {
-                pulse_working_dot: true,
-                ..agent_ui_with_animations(AgentAnimationsConfig {
-                    dot_pulse: false,
-                    ..AgentAnimationsConfig::default()
-                })
-            })
+            !SidebarAnimationGates::from_config(
+                &AgentUiConfig {
+                    pulse_working_dot: true,
+                    ..agent_ui_with_animations(AgentAnimationsConfig {
+                        dot_pulse: false,
+                        ..all_animations_on()
+                    })
+                },
+                false,
+            )
             .dot_pulse
         );
     }

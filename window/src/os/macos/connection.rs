@@ -153,6 +153,13 @@ impl ConnectionOps for Connection {
         }
     }
 
+    fn reduce_motion(&self) -> bool {
+        unsafe {
+            let workspace: id = msg_send![class!(NSWorkspace), sharedWorkspace];
+            from_yes_no(msg_send![workspace, accessibilityDisplayShouldReduceMotion])
+        }
+    }
+
     fn run_message_loop(&self) -> anyhow::Result<()> {
         unsafe {
             self.ns_app.run();
