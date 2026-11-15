@@ -32,7 +32,13 @@ const STATUS_TTL: Duration = Duration::from_secs(2);
 /// whatever the terminal font is.
 const NAV_MIN_W: f32 = 132.;
 const CONTROL_W: f32 = 320.;
-const MAX_CONTENT_W: f32 = 640.;
+/// The settings column at its narrowest, and at its widest: between the two
+/// it takes a fixed share of the room, so a big window gets a wider column
+/// instead of a narrow one stranded at the left.
+const BASE_CONTENT_W: f32 = 640.;
+const WIDE_CONTENT_W: f32 = 960.;
+/// Share of the room beside the section list the column takes.
+const CONTENT_SHARE: f32 = 0.72;
 /// Beside the file chip in the header.
 const SAVE_NOTE: &str = "Changes save as you make them.";
 
@@ -566,6 +572,23 @@ impl TermWindow {
         if right - left < 300. * dpi_scale || area.size.height < 6. * cell_h {
             return Ok(());
         }
+        let nav_w = Section::ALL
+            .iter()
+            .map(|section| self.chrome_text_width(section.label(), true))
+            .fold(0., f32::max)
+            .ceil()
+            .max(NAV_MIN_W * dpi_scale - unit * 3.)
+            + unit * 3.;
+        // The section list and the column, as one block centred in the tab:
+        // the column grows with the window up to its widest, and the margins
+        // take the rest.
+        let room = (right - left - nav_w - unit * 3.).max(unit);
+        let content_w = (room * CONTENT_SHARE)
+            .clamp(BASE_CONTENT_W * dpi_scale, WIDE_CONTENT_W * dpi_scale)
+            .min(room);
+        let block_w = nav_w + unit * 3. + content_w;
+        let left = left + ((right - left - block_w) * 0.5).max(0.).floor();
+        let right = left + block_w;
 
         // Descriptions and notes: dimmer than a label, still 4.5:1 on the
         // ground.
@@ -605,13 +628,6 @@ impl TermWindow {
         let footer_y = area.max_y() - cell_h * 1.5;
 
         // Sections.
-        let nav_w = Section::ALL
-            .iter()
-            .map(|section| self.chrome_text_width(section.label(), true))
-            .fold(0., f32::max)
-            .ceil()
-            .max(NAV_MIN_W * dpi_scale - unit * 3.)
-            + unit * 3.;
         let nav_row_h = (cell_h + 8. * dpi_scale).ceil();
         let hovered = self
             .last_ui_item
@@ -661,7 +677,7 @@ impl TermWindow {
 
         let section = state.current_section();
         let content_x = left + nav_w + unit * 3.;
-        let content_w = (right - content_x).min(MAX_CONTENT_W * dpi_scale);
+        let content_w = (right - content_x).max(unit);
         let content_right = content_x + content_w;
         let body_h = footer_y - cell_h * 0.5 - body_top;
 
@@ -730,7 +746,9 @@ impl TermWindow {
 
         // Settings of the chosen section.
         let rows = in_section(section);
-        let control_w = (CONTROL_W * dpi_scale).min(content_w * 0.55);
+        // Controls widen with the column.
+        let control_w = (CONTROL_W * dpi_scale * content_w / (BASE_CONTENT_W * dpi_scale))
+            .min(content_w * 0.55);
         let label_w = (content_w - control_w - unit * 2.).max(unit * 8.);
         // A row is its label and its help, which wraps to a second line
         // rather than ending in an ellipsis; a row that opens a group has

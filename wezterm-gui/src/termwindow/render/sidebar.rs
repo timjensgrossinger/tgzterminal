@@ -103,6 +103,8 @@ const SIDEBAR_SECURE_INPUT_GLYPH: &str = "\u{f023}";
 /// From the bundled Symbols Nerd Font for the same reason as
 /// [`SIDEBAR_COPY_GLYPH`].
 const SIDEBAR_CHANGES_GLYPH: &str = "\u{f440}";
+/// `nf-pl-branch`, before the git branch on a tab row's second line.
+const SIDEBAR_BRANCH_GLYPH: &str = "\u{e0a0}";
 
 /// Gap between the close button's right edge and the right edge of its zone.
 /// Both the hover button and the `×` inside it derive from this, and so does the
@@ -816,6 +818,8 @@ const USAGE_GAUGE_TRACK_MIX: f32 = 0.16;
 const USAGE_BARS_HEIGHT_RATIO: f32 = 0.8;
 const USAGE_BAR_GAP: f32 = 2.;
 const USAGE_CHART_BAR_GAP: f32 = 6.;
+/// Share of a day's column the gap beside its chart bar takes.
+const USAGE_CHART_GAP_SHARE: f32 = 0.4;
 const USAGE_CHART_GRID_MIX: f32 = 0.08;
 const USAGE_TAB_ACTIVE_MIX: f32 = 0.18;
 /// Height of the meter along the `Σ` button's foot (logical px, × DPI).
@@ -13743,8 +13747,12 @@ impl crate::TermWindow {
                         )?;
                     }
 
-                    let gap = USAGE_CHART_BAR_GAP * dpi_scale;
-                    let slots = bar_slots(chart.days.len(), plot_w, gap, cell_w * 3.);
+                    // Every day gets an equal share of the plot's width, its
+                    // bar about three fifths of it, so a week spreads across
+                    // the chart instead of bunching up in its middle.
+                    let share = plot_w / chart.days.len().max(1) as f32;
+                    let gap = (share * USAGE_CHART_GAP_SHARE).max(USAGE_CHART_BAR_GAP * dpi_scale);
+                    let slots = bar_slots(chart.days.len(), plot_w, gap, share);
                     for (index, ((x, w), day)) in slots.iter().zip(&chart.days).enumerate() {
                         let x = plot_x + x;
                         let hovered_bar = chart.hovered == Some(index);
@@ -15871,6 +15879,15 @@ impl crate::TermWindow {
                 // The branch takes the right, at most a little under half the
                 // width; the state gets what is left.
                 let gap = 8. * dpi_scale;
+                // The branch reads as one: the Powerline branch mark before it,
+                // from the bundled Symbols Nerd Font.
+                let line2_right = line2_right.map(|right| {
+                    if branch.as_deref() == Some(right.as_str()) {
+                        format!("{SIDEBAR_BRANCH_GLYPH} {right}")
+                    } else {
+                        right
+                    }
+                });
                 let right_w = line2_right.as_deref().map_or(0., |right| {
                     self.ui_text_width(UiFont::Small, right).min(title_w * 0.45)
                 });
@@ -18603,11 +18620,20 @@ impl crate::TermWindow {
         &self,
         action: &config::keyassignment::KeyAssignment,
     ) -> Option<String> {
+        // Several keys can do one thing (new tab: ⌘T and Ctrl+Shift+T on a
+        // mac): show the simplest, the platform's own modifier first.
         let (key, mods) = self
             .input_map
             .locate_app_wide_key_assignment(action)
             .into_iter()
-            .next()?;
+            .min_by_key(|(_, mods)| {
+                let platform = if cfg!(target_os = "macos") {
+                    ::window::Modifiers::SUPER
+                } else {
+                    ::window::Modifiers::CTRL
+                };
+                (mods.bits().count_ones(), !mods.contains(platform))
+            })?;
         let rendering = self.config.ui_key_cap_rendering;
         let separator = if rendering == ::window::UIKeyCapRendering::AppleSymbols {
             ""
