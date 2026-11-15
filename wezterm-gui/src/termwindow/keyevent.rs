@@ -765,7 +765,13 @@ impl super::TermWindow {
                     }
                 }
 
-                // A dialog or the tab palette has the whole keyboard.
+                // A dialog, a form or the tab palette has the whole keyboard.
+                if self.ssh_setup.is_some() {
+                    if window_key.key_is_down {
+                        self.ssh_setup_key(&key, modifiers);
+                    }
+                    return;
+                }
                 if self.chrome_dialog.is_some() {
                     if window_key.key_is_down {
                         self.chrome_dialog_key(&key);

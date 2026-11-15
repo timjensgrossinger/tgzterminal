@@ -188,6 +188,16 @@ pub fn warm_ssh_host_cache() {
     kick_refresh_if_due(&mut SSH_HOST_CACHE.lock().unwrap());
 }
 
+/// Read the ssh config again now: a host was just added to it. Any refresh
+/// already running may have read the file before the change, so a new one
+/// starts regardless.
+pub(crate) fn refresh_ssh_hosts_now() {
+    let mut cache = SSH_HOST_CACHE.lock().unwrap();
+    cache.refreshed_at = None;
+    cache.refresh_started_at = None;
+    kick_refresh_if_due(&mut cache);
+}
+
 /// Changes whenever [`ssh_hosts`] would return something different. Cheap and
 /// non-blocking: safe to call from paint.
 pub(crate) fn ssh_hosts_epoch(config: &ConfigHandle) -> u64 {
@@ -254,11 +264,37 @@ pub(crate) fn build_entries(
     hosts: &[SshHost],
     resolve: &dyn Fn(&str) -> Option<PathBuf>,
     recents: &[String],
+    made_here: &std::collections::BTreeMap<String, SshTransport>,
 ) -> Vec<SshQuickLaunchEntry> {
     let mut entries = Vec::new();
     for host in hosts {
         let domain = &host.domain;
         if host.from_ssh_config && domain.name.starts_with("SSHMUX:") {
+            continue;
+        }
+        // A host made with "New SSH connection" runs the program chosen
+        // there, by its name: it may be newer than this process's mux
+        // domains, and mosh and et read the ssh config for it too.
+        let alias = domain_alias(&domain.name);
+        if let Some(transport) = made_here.get(alias).filter(|_| host.from_ssh_config) {
+            let Some(argv) =
+                crate::termwindow::tgz_ssh_setup::connect_argv(alias, *transport, resolve)
+            else {
+                continue;
+            };
+            entries.push(SshQuickLaunchEntry {
+                domain_name: domain.name.clone(),
+                label: alias.to_string(),
+                transport: *transport,
+                argv,
+                badge: match transport {
+                    SshTransport::Mosh => "mosh",
+                    SshTransport::Et => "et",
+                    _ => "ssh",
+                },
+                detail: host.detail.clone(),
+                recent: false,
+            });
             continue;
         }
         let transport = domain.transport;
@@ -481,6 +517,8 @@ impl TermWindow {
                     window.invalidate();
                 }
             }
+            // No host yet: set one up.
+            _ if self.ssh_quick_launch_entries().is_empty() => self.open_ssh_setup(),
             _ => {
                 self.show_launcher_impl(
                     LauncherActionArgs {
@@ -602,10 +640,29 @@ mod tests {
     fn ssh_config_host_becomes_one_plain_ssh_row() {
         let mut hosts = derived("web1");
         hosts.extend(derived("db1"));
-        let entries = build_entries(&hosts, &found, &[]);
+        let entries = build_entries(&hosts, &found, &[], &Default::default());
         assert_eq!(names(&entries), vec!["SSH:web1", "SSH:db1"]);
         assert_eq!(entries[0].label, "web1");
         assert_eq!(entries[0].badge, "ssh");
+    }
+
+    #[test]
+    fn a_host_made_here_runs_the_program_chosen_for_it() {
+        let mut hosts = derived("web1");
+        hosts.extend(derived("db1"));
+        let mut made_here = std::collections::BTreeMap::new();
+        made_here.insert("web1".to_string(), SshTransport::Mosh);
+        let entries = build_entries(&hosts, &found, &[], &made_here);
+        assert_eq!(names(&entries), vec!["SSH:web1", "SSH:db1"]);
+        assert_eq!(entries[0].badge, "mosh");
+        assert_eq!(entries[0].argv.last().map(String::as_str), Some("web1"));
+        // Not one of ours: through its mux domain as before.
+        assert!(entries[1].argv.is_empty());
+        // Its program missing, it is left out like any sidecar row.
+        assert_eq!(
+            names(&build_entries(&hosts, &missing, &[], &made_here)),
+            vec!["SSH:db1"]
+        );
     }
 
     #[test]
@@ -618,7 +675,7 @@ mod tests {
             }),
             declared(domain("SSHMUX:box", "box")),
         ];
-        let entries = build_entries(&hosts, &found, &[]);
+        let entries = build_entries(&hosts, &found, &[], &Default::default());
         assert_eq!(names(&entries), vec!["SSH:box", "SSHMUX:box"]);
         assert_eq!(entries[0].badge, "ssh");
         assert_eq!(entries[1].badge, "mux");
@@ -631,9 +688,9 @@ mod tests {
             username: Some("tim".to_string()),
             ..domain("roaming", "box.example.com")
         })];
-        assert!(build_entries(&hosts, &missing, &[]).is_empty());
+        assert!(build_entries(&hosts, &missing, &[], &Default::default()).is_empty());
 
-        let entries = build_entries(&hosts, &found, &[]);
+        let entries = build_entries(&hosts, &found, &[], &Default::default());
         assert_eq!(entries[0].label, "tim@box.example.com");
         assert_eq!(
             entries[0].argv,
@@ -653,7 +710,7 @@ mod tests {
             transport: SshTransport::Et,
             ..domain("e", "box:2022")
         });
-        let entries = build_entries(&[mosh, et], &found, &[]);
+        let entries = build_entries(&[mosh, et], &found, &[], &Default::default());
         assert_eq!(
             entries[0].argv,
             vec![
@@ -674,7 +731,7 @@ mod tests {
         });
         // "internet" has "et" in it and is plain ssh.
         let ssh = declared(domain("internet", "internet.example.com"));
-        let entries = build_entries(&[et, ssh], &found, &[]);
+        let entries = build_entries(&[et, ssh], &found, &[], &Default::default());
         assert_eq!(filter_entries(&entries, "et").len(), 2);
         let only: Vec<&str> = filter_entries(&entries, ":et ")
             .iter()
@@ -705,7 +762,7 @@ mod tests {
                 ..domain("empty", "ignored")
             }),
         ];
-        let entries = build_entries(&hosts, &found, &[]);
+        let entries = build_entries(&hosts, &found, &[], &Default::default());
         assert_eq!(names(&entries), vec!["tunnel"]);
         assert_eq!(entries[0].argv, vec!["/usr/bin/autossh", "-M0", "box"]);
         assert_eq!(entries[0].badge, "custom");
@@ -721,7 +778,7 @@ mod tests {
             "SSH:gone".to_string(),
             "SSH:a".to_string(),
         ];
-        let entries = build_entries(&hosts, &found, &recents);
+        let entries = build_entries(&hosts, &found, &recents, &Default::default());
         assert_eq!(names(&entries), vec!["SSH:c", "SSH:a", "SSH:b"]);
         assert_eq!(
             entries.iter().map(|e| e.recent).collect::<Vec<_>>(),
@@ -747,7 +804,7 @@ mod tests {
         hosts[0].detail = Some("deploy@10.0.0.5 via bastion".to_string());
         hosts.extend(derived("web-staging"));
         hosts.extend(derived("db-prod"));
-        let entries = build_entries(&hosts, &found, &[]);
+        let entries = build_entries(&hosts, &found, &[], &Default::default());
 
         let hits = |query: &str| -> Vec<&str> {
             filter_entries(&entries, query)
@@ -767,12 +824,12 @@ mod tests {
     fn row_label_appends_the_detail() {
         let mut hosts = derived("web");
         hosts[0].detail = Some("deploy@10.0.0.5:2222".to_string());
-        let entries = build_entries(&hosts, &found, &[]);
+        let entries = build_entries(&hosts, &found, &[], &Default::default());
         assert_eq!(
             entry_row_label(&entries[0]),
             "web  · ssh · deploy@10.0.0.5:2222"
         );
-        let plain = build_entries(&derived("web"), &found, &[]);
+        let plain = build_entries(&derived("web"), &found, &[], &Default::default());
         assert_eq!(entry_row_label(&plain[0]), "web  · ssh");
     }
 
@@ -852,7 +909,7 @@ mod tests {
     fn the_configured_host_is_the_default_and_the_recent_one_the_fallback() {
         let mut hosts = derived("web");
         hosts.extend(derived("db"));
-        let fresh = build_entries(&hosts, &found, &[]);
+        let fresh = build_entries(&hosts, &found, &[], &Default::default());
         // Nothing configured, nothing used yet: the button opens the menu.
         assert!(default_entry(&fresh, None).is_none());
         assert!(default_entry(&fresh, Some("  ")).is_none());
@@ -865,7 +922,7 @@ mod tests {
             );
         }
 
-        let used = build_entries(&hosts, &found, &["SSH:db".to_string()]);
+        let used = build_entries(&hosts, &found, &["SSH:db".to_string()], &Default::default());
         assert_eq!(
             default_entry(&used, None).map(|e| e.domain_name.as_str()),
             Some("SSH:db")
@@ -886,7 +943,7 @@ mod tests {
     fn dropdown_width_covers_the_longest_row() {
         let mut hosts = derived("web");
         hosts[0].detail = Some("deploy@10.0.0.5:2222 via bastion".to_string());
-        let entries = build_entries(&hosts, &found, &[]);
+        let entries = build_entries(&hosts, &found, &[], &Default::default());
         assert_eq!(
             widest_row_cols(&entries),
             "web  · ssh · deploy@10.0.0.5:2222 via bastion"
@@ -895,7 +952,12 @@ mod tests {
         );
         // Short lists still fit the "no match" row.
         assert_eq!(
-            widest_row_cols(&build_entries(&derived("a"), &found, &[])),
+            widest_row_cols(&build_entries(
+                &derived("a"),
+                &found,
+                &[],
+                &Default::default()
+            )),
             NO_MATCH_ROW.len()
         );
     }

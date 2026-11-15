@@ -101,7 +101,10 @@ impl crate::TermWindow {
         }
     }
 
-    fn modal_backdrop(&mut self, layers: &mut TripleLayerQuadAllocator) -> anyhow::Result<()> {
+    pub(super) fn modal_backdrop(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+    ) -> anyhow::Result<()> {
         let width = self.dimensions.pixel_width as f32;
         let height = self.dimensions.pixel_height as f32;
         self.filled_rectangle(

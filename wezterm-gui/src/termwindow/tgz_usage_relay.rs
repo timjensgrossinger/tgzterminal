@@ -943,6 +943,7 @@ mod tests {
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
     }
 
+    #[cfg(unix)]
     #[test]
     fn relay_script_saves_the_payload_and_runs_the_original() {
         let temp = tempfile::tempdir().unwrap();

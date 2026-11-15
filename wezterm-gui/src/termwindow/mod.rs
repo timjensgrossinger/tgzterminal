@@ -133,6 +133,7 @@ pub mod tgz_last_session;
 pub mod tgz_secret_mask;
 pub(crate) mod tgz_settings;
 pub mod tgz_ssh_hosts;
+pub mod tgz_ssh_setup;
 pub(crate) mod tgz_tab_groups;
 pub(crate) mod tgz_tooltip;
 pub mod tgz_ui_state;
@@ -700,6 +701,19 @@ pub enum UIItemType {
     SidebarSshMenuItem {
         domain_name: String,
     },
+    /// "+ New connection…" at the foot of the SSH dropdown.
+    SidebarSshNewConnection,
+    /// A text field of the "New SSH connection" form.
+    SshSetupField(tgz_ssh_setup::Field),
+    /// One option of a choice in that form.
+    SshSetupOption {
+        field: tgz_ssh_setup::Field,
+        index: usize,
+    },
+    /// Its Cancel (`save: false`) or Save & connect button.
+    SshSetupButton {
+        save: bool,
+    },
     PaneToolbeltButton {
         pane_id: PaneId,
         action: PaneToolbeltAction,
@@ -1146,6 +1160,10 @@ impl UIItemType {
                 | Self::SidebarNewTabMenuItem { .. }
                 | Self::SidebarUsageMenuRow { .. }
                 | Self::SidebarSshMenuItem { .. }
+                | Self::SidebarSshNewConnection
+                | Self::SshSetupField(_)
+                | Self::SshSetupOption { .. }
+                | Self::SshSetupButton { .. }
                 | Self::PaneCopyMenuItem { .. }
                 | Self::CloseTabMenuItem { .. }
                 | Self::SidebarContextMenuItem { .. }
@@ -1616,6 +1634,10 @@ pub struct TermWindow {
     /// Domain names of recently used SSH quick-launch hosts, most recent
     /// first. Persisted in the UI state file.
     ssh_recent_hosts: Vec<String>,
+    /// How to connect to each host made with "New SSH connection".
+    ssh_host_transports: std::collections::BTreeMap<String, config::SshTransport>,
+    /// The "New SSH connection" form, while open; it takes the keyboard.
+    ssh_setup: Option<tgz_ssh_setup::SshSetupForm>,
     /// Past sessions offered by the session menus, and the scan they came from.
     ///
     /// Finding these means statting every transcript on disk and reading the
@@ -2181,6 +2203,8 @@ impl TermWindow {
             wsl_agent_probe_started_at: Cell::new(None),
             ssh_launcher_cache: RefCell::new(None),
             ssh_recent_hosts: tgz_ui_state::load_ssh_recent_hosts(),
+            ssh_host_transports: tgz_ui_state::load_ssh_host_transports(),
+            ssh_setup: None,
             agent_session_cache: None,
             agent_session_scan_started_at: None,
             agent_window_sessions: tgz_last_session::WindowAgents::default(),
@@ -3593,6 +3617,8 @@ impl TermWindow {
 
         let title = match title {
             Some(title) => title,
+            // The tabs are listed in the sidebar; the title bar names the app.
+            None if self.config.window_title_app_name => crate::brand::PRODUCT_NAME.to_string(),
             None => {
                 if let (Some(pos), Some(tab)) = (active_pane, active_tab) {
                     if tabs_count == 1 {
@@ -6477,6 +6503,21 @@ done
             window.set_active_tab_idx_without_saving(idx);
         }
         drop(window);
+        // Expanded rows are remembered by index: carry them with their tabs,
+        // or reordering would unfold some other tab.
+        let expanded: HashSet<usize> = self
+            .sidebar_expanded_tabs
+            .iter()
+            .map(|old| {
+                ids.get(*old)
+                    .and_then(|id| desired.iter().position(|tab| tab == id))
+                    .unwrap_or(*old)
+            })
+            .collect();
+        if expanded != self.sidebar_expanded_tabs {
+            self.sidebar_expanded_tabs = expanded;
+            tgz_ui_state::save_sidebar_expanded_tabs(&self.sidebar_expanded_tabs);
+        }
         self.update_title();
         self.update_scrollbar();
         if let Some(window) = self.window.as_ref() {

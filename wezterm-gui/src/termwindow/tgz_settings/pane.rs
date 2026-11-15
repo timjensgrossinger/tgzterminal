@@ -237,6 +237,16 @@ impl SettingsState {
         let result = if empty && matches!(setting.kind, Kind::Font) {
             self.message = Some(("A font needs a name.".to_string(), true));
             return;
+        } else if !empty
+            && matches!(setting.kind, Kind::Color)
+            && !matches!(&value, Value::Text(text) if super::catalog::is_color(text))
+        {
+            self.message = Some((
+                "Not a colour. Use #rrggbb, e.g. #58a6ff; clear the field for the default."
+                    .to_string(),
+                true,
+            ));
+            return;
         } else if empty {
             match in_file_line {
                 Some(line) => {
@@ -552,7 +562,7 @@ impl SettingsState {
                             self.step(index, 1, config);
                         }
                     }
-                    (Kind::Text | Kind::Font | Kind::Scheme, _) => {
+                    (Kind::Text | Kind::Font | Kind::Scheme | Kind::Color, _) => {
                         if enter || space {
                             self.open_field(index, config, pane_id);
                         }

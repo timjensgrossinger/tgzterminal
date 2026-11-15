@@ -559,23 +559,30 @@ pub(crate) fn context_limit(
 }
 
 /// OpenCode's model catalogue (`~/.cache/opencode/models.json`), parsed once
-/// per version of the file: it is several megabytes.
+/// per version of the file: it is several megabytes. One entry per home, so
+/// that on Windows the host and each WSL distro do not evict each other and
+/// re-parse it on every scan.
 fn model_catalogue(home: &Path) -> Option<std::sync::Arc<serde_json::Value>> {
     type Cached = (PathBuf, SystemTime, std::sync::Arc<serde_json::Value>);
-    static CATALOGUE: std::sync::Mutex<Option<Cached>> = std::sync::Mutex::new(None);
+    static CATALOGUE: std::sync::Mutex<Vec<Cached>> = std::sync::Mutex::new(Vec::new());
     let path = home.join(".cache").join("opencode").join("models.json");
     let modified = std::fs::metadata(&path).ok()?.modified().ok()?;
     let mut cached = CATALOGUE
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some((known, at, models)) = cached.as_ref() {
-        if *known == path && *at == modified {
-            return Some(std::sync::Arc::clone(models));
-        }
+    if let Some((_, _, models)) = cached
+        .iter()
+        .find(|(known, at, _)| *known == path && *at == modified)
+    {
+        return Some(std::sync::Arc::clone(models));
     }
     let models: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).ok()?).ok()?;
     let models = std::sync::Arc::new(models);
-    *cached = Some((path, modified, std::sync::Arc::clone(&models)));
+    cached.retain(|(known, _, _)| *known != path);
+    if cached.len() >= 8 {
+        cached.remove(0);
+    }
+    cached.push((path, modified, std::sync::Arc::clone(&models)));
     Some(models)
 }
 

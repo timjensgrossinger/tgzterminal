@@ -51,6 +51,7 @@ use window::color::LinearRgba;
 use window::{MousePress, RectF, WindowOps};
 
 mod modal;
+mod ssh_setup;
 
 const INSET: f32 = 8.;
 const GAP: f32 = 4.;
@@ -521,6 +522,32 @@ pub(crate) struct SidebarPalette {
 }
 
 impl SidebarPalette {
+    /// Lays `sidebar_colors` over the theme's colours; unset keys keep them.
+    fn apply_user_colors(&mut self, user: &config::SidebarColorsConfig) {
+        let set = |slot: &mut LinearRgba, color: Option<config::RgbaColor>| {
+            if let Some(color) = color {
+                *slot = color.to_linear();
+            }
+        };
+        set(&mut self.surface, user.background);
+        set(&mut self.row_fill, user.row);
+        set(&mut self.active_fill, user.row_active);
+        set(&mut self.hover_fill, user.row_hover);
+        set(&mut self.pressed_fill, user.row_pressed);
+        set(&mut self.working_fill, user.row_working);
+        set(&mut self.search_fill, user.field);
+        // Buttons are outlined in their resting fill (see `sidebar_palette`).
+        set(&mut self.row_border, user.field);
+        set(&mut self.focused_search_fill, user.field_focused);
+        set(&mut self.divider, user.divider);
+        set(&mut self.menu_border, user.menu_border);
+        set(&mut self.text_active, user.text);
+        set(&mut self.text_idle, user.text_idle);
+        set(&mut self.text_meta, user.text_meta);
+        set(&mut self.attention, user.attention);
+        set(&mut self.quota_fill, user.quota);
+    }
+
     /// The accent the active rail is drawn in: midway between the ring's
     /// two stops.
     pub(crate) fn accent(&self) -> LinearRgba {
@@ -3397,6 +3424,36 @@ pub(crate) fn pane_working_dir(pane: &Arc<dyn Pane>) -> Option<PathBuf> {
         .and_then(|url| url.to_file_path().ok())
 }
 
+/// The pane's directory as the program in it sees it. Unlike
+/// [`pane_working_dir`], a shell inside WSL keeps its Linux path: on Windows,
+/// `Url::to_file_path` turns `file://<host>/home/…` into a `\\<host>\home\…`
+/// share that does not exist, and `file:///home/…` into nothing.
+fn pane_native_cwd(pane: &Arc<dyn Pane>) -> Option<PathBuf> {
+    crate::termwindow::composer::pane_cwd(pane).map(PathBuf::from)
+}
+
+/// Where to look for the project a pane's directory belongs to, as this
+/// process can open it: a WSL pane's Linux path goes through the distro's
+/// `\\wsl.localhost\` share.
+fn pane_probe_dir(pane: &Arc<dyn Pane>, config: &config::ConfigHandle) -> Option<PathBuf> {
+    let distro = cfg!(windows)
+        .then(|| Mux::get().get_domain(pane.domain_id()))
+        .flatten()
+        .and_then(|domain| wsl_paths::distro_for_domain(domain.domain_name(), config));
+    match distro {
+        Some(distro) => {
+            let cwd = pane_native_cwd(pane)?;
+            let raw = cwd.to_string_lossy();
+            if raw.starts_with('/') {
+                wsl_paths::wsl_to_windows(&raw, &distro)
+            } else {
+                Some(cwd)
+            }
+        }
+        None => pane_working_dir(pane),
+    }
+}
+
 /// Encode a working directory the way Claude Code names its project folders.
 ///
 /// This used to be a second, subtly wrong copy of the same mapping: it dashed
@@ -5218,26 +5275,52 @@ pub(crate) struct PaneCopyResult {
     pub redacted: usize,
 }
 
-/// What a left click on the sidebar's Copy icon copies; a right click opens
-/// the menu instead.
+/// What a left click on a Copy icon copies (tab row or agent toolbelt); a
+/// right click opens the menu instead. `pane_toolbelt.shell_copy_click` and
+/// `pane_toolbelt.agent_copy_click` choose; out of the box both copy the
+/// whole pane or conversation without secrets.
 ///
-/// A terminal copies its pane without secrets. An agent copies its
-/// conversation, with secrets redacted unless the agent was identified by its
-/// process or an explicit user var: visible text and titles are something any
-/// program can print, and must not be able to turn a click that would have
-/// redacted into one that does not.
-pub(crate) fn sidebar_copy_click_action(kind: &PaneToolbeltKind) -> PaneCopyAction {
+/// An agent identified only by its title or by text on screen never gets an
+/// unredacted copy from a click, whatever was chosen: visible text and titles
+/// are something any program can print, and must not be able to turn a click
+/// that would have redacted into one that does not.
+pub(crate) fn sidebar_copy_click_action(
+    kind: &PaneToolbeltKind,
+    shell: config::ShellCopyClick,
+    agent: config::AgentCopyClick,
+) -> PaneCopyAction {
+    use config::{AgentCopyClick as A, ShellCopyClick as S};
     match kind {
-        PaneToolbeltKind::Agent(agent)
-            if matches!(
-                agent.evidence,
+        PaneToolbeltKind::Shell => match shell {
+            S::PaneNoSecrets => PaneCopyAction::ShellRedacted(ShellCopyAction::WholePane),
+            S::LastOutputNoSecrets => {
+                PaneCopyAction::ShellRedacted(ShellCopyAction::LastCommandOutput)
+            }
+            S::Pane => PaneCopyAction::Shell(ShellCopyAction::WholePane),
+            S::LastOutput => PaneCopyAction::Shell(ShellCopyAction::LastCommandOutput),
+            S::LastCommandAndOutput => {
+                PaneCopyAction::Shell(ShellCopyAction::LastCommandWithOutput)
+            }
+        },
+        PaneToolbeltKind::Agent(state) => {
+            let (action, redacted) = match agent {
+                A::ConversationNoSecrets => (AgentCopyAction::Conversation, true),
+                A::LastMessageNoSecrets => (AgentCopyAction::LastAgentMessage, true),
+                A::Conversation => (AgentCopyAction::Conversation, false),
+                A::LastMessage => (AgentCopyAction::LastAgentMessage, false),
+                A::Markdown => (AgentCopyAction::Markdown, false),
+                A::Summary => (AgentCopyAction::Summary, false),
+            };
+            let trusted = matches!(
+                state.evidence,
                 AgentEvidence::UserVar | AgentEvidence::Process
-            ) =>
-        {
-            PaneCopyAction::Agent(AgentCopyAction::Conversation)
+            );
+            if redacted || !trusted {
+                PaneCopyAction::AgentRedacted(action)
+            } else {
+                PaneCopyAction::Agent(action)
+            }
         }
-        PaneToolbeltKind::Agent(_) => PaneCopyAction::AgentRedacted(AgentCopyAction::Conversation),
-        PaneToolbeltKind::Shell => PaneCopyAction::ShellRedacted(ShellCopyAction::WholePane),
     }
 }
 
@@ -7386,6 +7469,7 @@ impl crate::TermWindow {
             &hosts,
             &resolve_command_path,
             &self.ssh_recent_hosts,
+            &self.ssh_host_transports,
         ));
         *self.ssh_launcher_cache.borrow_mut() = Some((gen, epoch, Arc::clone(&result)));
         result
@@ -7512,6 +7596,13 @@ impl crate::TermWindow {
         // The row order depends on the recents.
         *self.ssh_launcher_cache.borrow_mut() = None;
         let (domain, args, cwd) = match entry.transport {
+            // A host made with "New SSH connection" carries its command,
+            // ssh included: run it like mosh and et below.
+            _ if !entry.argv.is_empty() => (
+                SpawnTabDomain::DomainName("local".to_string()),
+                Some(entry.argv),
+                None,
+            ),
             config::SshTransport::WezTerm | config::SshTransport::Ssh => {
                 let domain = SpawnTabDomain::DomainName(entry.domain_name.clone());
                 let cwd = crate::termwindow::composer::active_pane_cwd(self)
@@ -10060,7 +10151,7 @@ impl crate::TermWindow {
             .map(|tab| {
                 let root = tab
                     .get_active_pane()
-                    .and_then(|pane| pane_working_dir(&pane))
+                    .and_then(|pane| pane_probe_dir(&pane, &self.config))
                     .and_then(|cwd| self.tab_group_root(&cwd));
                 (tab.tab_id(), root)
             })
@@ -10296,7 +10387,8 @@ impl crate::TermWindow {
             I::Changes => self.config.diff_panel.enabled,
             I::Toolbelt => self.sidebar_toolbelt_toggle_shown(),
             I::SecureInput => self.sidebar_secure_input_toggle_shown(),
-            I::Ssh => !self.ssh_quick_launch_entries().is_empty(),
+            // Always there: with no host yet it opens "New SSH connection".
+            I::Ssh => true,
             I::Mosh => has_transport(config::SshTransport::Mosh),
             I::Et => has_transport(config::SshTransport::Et),
             I::Sessions | I::Usage => self.config.agent_ui.enabled,
@@ -11136,10 +11228,14 @@ impl crate::TermWindow {
     /// The sidebar's resolved colours. See [`SidebarPalette`] for why this is
     /// not simply `TabBarColors`.
     pub(crate) fn sidebar_palette(&self) -> SidebarPalette {
-        let ring = RingColors::resolve(
-            self.config.agent_ui.ring_colors,
-            &self.config.agent_ui.resolved_animations().colors,
-        );
+        let user = &self.config.sidebar_colors;
+        // `sidebar_colors.accent` is the cool ring stop, so everything that
+        // derives from that stop (the settled hairline) follows it too.
+        let mut ring_overrides = self.config.agent_ui.resolved_animations().colors;
+        if user.accent.is_some() {
+            ring_overrides.ring_b = user.accent;
+        }
+        let ring = RingColors::resolve(self.config.agent_ui.ring_colors, &ring_overrides);
         let palette = &self.config.resolved_palette;
         let from_window = || match (palette.background, palette.foreground) {
             (Some(bg), Some(fg)) => Some(SidebarPalette::from_window_colors(
@@ -11162,7 +11258,17 @@ impl crate::TermWindow {
         // Controls are filled shapes, not outlined boxes: the outline takes
         // the resting fill's colour and so disappears into it.
         resolved.row_border = resolved.search_fill;
+        resolved.apply_user_colors(user);
         resolved
+    }
+
+    /// A `sidebar_colors` entry that has no slot in [`SidebarPalette`]
+    /// because its default is derived where it is drawn.
+    pub(crate) fn user_chrome_color(
+        &self,
+        pick: impl Fn(&config::SidebarColorsConfig) -> Option<config::RgbaColor>,
+    ) -> Option<LinearRgba> {
+        pick(&self.config.sidebar_colors).map(|color| color.to_linear())
     }
 
     /// Which sidebar animations `agent_ui` allows. Focus deliberately does not
@@ -12928,6 +13034,18 @@ impl crate::TermWindow {
                 divider_above,
             ));
         }
+        // Last, under its own divider: set up another host.
+        rows.push(SidebarDropdownRow {
+            label: "+ New connection\u{2026}".to_string(),
+            dot_color: None,
+            checkbox: None,
+            divider_above: true,
+            indent: false,
+            trailing_chevron: false,
+            widget: None,
+            inert: false,
+            item_type: UIItemType::SidebarSshNewConnection,
+        });
 
         // The button anchors at the bottom of the sidebar, so the dropdown
         // grows upward — same as the agent launch menu.
@@ -13039,7 +13157,15 @@ impl crate::TermWindow {
             pin.top = Some(top);
             top
         });
+        // A menu that opened above its button keeps its *bottom* edge at
+        // the button and grows upward. Pinning its top instead left a
+        // two-row "Scanning…" panel floating as high as the full list
+        // would reach, far from the button that opened it.
+        let opens_above = pinned_top.is_some_and(|top| top < anchor_y);
         let max_body = match pinned_top {
+            Some(_) if opens_above => cap_body
+                .min(anchor_y - FLOAT_GAP * 2. - menu_pad)
+                .max(row_h),
             Some(top) => cap_body
                 .min(window_h - top - FLOAT_GAP - menu_pad)
                 .max(row_h),
@@ -13074,8 +13200,11 @@ impl crate::TermWindow {
         let menu_x = anchor_x.clamp(FLOAT_GAP, max_x);
         // Open in the requested direction; if that would run off-screen,
         // flip to the other side so the menu stays visible.
-        let menu_y =
-            pinned_top.unwrap_or_else(|| dropdown_top(anchor_y, menu_h, downward, window_h));
+        let menu_y = match pinned_top {
+            Some(_) if opens_above => (anchor_y - FLOAT_GAP - menu_h).max(FLOAT_GAP),
+            Some(top) => top,
+            None => dropdown_top(anchor_y, menu_h, downward, window_h),
+        };
 
         let sb = self.sidebar_palette();
         let fg = sb.text_active;
@@ -15300,7 +15429,16 @@ impl crate::TermWindow {
                 _ => (None, None),
             };
             let ring_stroke_px = (2.5 * dpi_scale).max(2.);
-            let ring_track = fade(lerp_rgba(surface, active_fg, 0.20));
+            let ring_track = fade(
+                self.user_chrome_color(|c| c.ring_track)
+                    .unwrap_or_else(|| lerp_rgba(surface, active_fg, 0.20)),
+            );
+            let ring_running = self
+                .user_chrome_color(|c| c.ring_running)
+                .unwrap_or(sb.ring.b);
+            let ring_waiting = self
+                .user_chrome_color(|c| c.ring_waiting)
+                .unwrap_or(sb.attention);
             match agent.as_ref() {
                 Some(state) => {
                     let waiting = agent_waits_unseen;
@@ -15312,7 +15450,7 @@ impl crate::TermWindow {
                         // colour is blended, not made translucent, so the
                         // ring stays one clean line.
                         let pulse = self.agent_dot_pulse(state).unwrap_or(1.).clamp(0., 1.);
-                        let color = lerp_rgba(ring_track, sb.attention, 0.35 + 0.65 * pulse);
+                        let color = lerp_rgba(ring_track, ring_waiting, 0.35 + 0.65 * pulse);
                         (None, vec![(fade(color), 0., 1.)])
                     } else if running {
                         // The one thing that moves on a running row: an arc
@@ -15324,7 +15462,7 @@ impl crate::TermWindow {
                         } else {
                             0.
                         };
-                        (Some(ring_track), vec![(fade(sb.ring.b), phase, 0.30)])
+                        (Some(ring_track), vec![(fade(ring_running), phase, 0.30)])
                     } else {
                         (Some(ring_track), vec![])
                     };
@@ -15345,7 +15483,7 @@ impl crate::TermWindow {
                             &percent.to_string(),
                             ring_x + ring_side * 0.5,
                             ring_y + ring_side * 0.5,
-                            fade(if waiting { sb.attention } else { inactive_fg }),
+                            fade(if waiting { ring_waiting } else { inactive_fg }),
                         )?;
                     }
                 }
@@ -15880,11 +16018,15 @@ impl crate::TermWindow {
                         )?;
                         // The one filled button of the sidebar: it is what
                         // the bottom edge is for.
+                        let base = self.user_chrome_color(|c| c.new_tab).unwrap_or(sb.ring.b);
                         let fill = if hovered {
-                            lerp_rgba(sb.ring.b, active_fg, 0.16)
+                            lerp_rgba(base, active_fg, 0.16)
                         } else {
-                            sb.ring.b
+                            base
                         };
+                        let label_color = self
+                            .user_chrome_color(|c| c.new_tab_text)
+                            .unwrap_or_else(|| contrast_label_color(fill, surface));
                         self.sidebar_rounded_fill(
                             layers,
                             1,
@@ -15905,7 +16047,7 @@ impl crate::TermWindow {
                                 x,
                                 row_y + (row_height as f32 - line_h) * 0.5 + offset,
                                 w,
-                                contrast_label_color(fill, surface),
+                                label_color,
                                 Align::Center,
                             )?;
                         }
@@ -16360,11 +16502,12 @@ impl crate::TermWindow {
                                 .then(|| {
                                     // A pane that was not tied to a session
                                     // reports no folder either: ask the pane
-                                    // itself.
+                                    // itself, in the form Claude Code
+                                    // reports (a Linux path inside WSL).
                                     let cwd = agent.cwd.clone().or_else(|| {
                                         Mux::get()
                                             .get_pane(pane_id)
-                                            .and_then(|pane| pane_working_dir(&pane))
+                                            .and_then(|pane| pane_native_cwd(&pane))
                                     });
                                     crate::agent_herd::quota::claude_context_percent(
                                         agent.session_id.as_deref(),
@@ -18571,26 +18714,52 @@ mod tests {
     }
 
     #[test]
-    fn copy_icon_left_click_redacts_a_shell_pane() {
+    fn copy_icon_left_click_ships_without_secrets() {
+        use config::{AgentCopyClick, ShellCopyClick};
+        let (shell, agent) = (ShellCopyClick::default(), AgentCopyClick::default());
         assert_eq!(
-            sidebar_copy_click_action(&PaneToolbeltKind::Shell),
+            sidebar_copy_click_action(&PaneToolbeltKind::Shell, shell, agent),
             PaneCopyAction::ShellRedacted(ShellCopyAction::WholePane)
         );
-    }
-
-    /// Only evidence a program cannot fake by printing text gets the plain
-    /// copy; every other agent still copies its conversation, redacted.
-    #[test]
-    fn copy_icon_left_click_copies_the_conversation_of_an_agent() {
         for evidence in [AgentEvidence::UserVar, AgentEvidence::Process] {
             assert_eq!(
-                sidebar_copy_click_action(&PaneToolbeltKind::Agent(claude_state_with_evidence(
-                    evidence
-                ))),
-                PaneCopyAction::Agent(AgentCopyAction::Conversation),
+                sidebar_copy_click_action(
+                    &PaneToolbeltKind::Agent(claude_state_with_evidence(evidence)),
+                    shell,
+                    agent
+                ),
+                PaneCopyAction::AgentRedacted(AgentCopyAction::Conversation),
                 "{evidence:?}"
             );
         }
+    }
+
+    #[test]
+    fn copy_icon_left_click_follows_the_setting() {
+        use config::{AgentCopyClick, ShellCopyClick};
+        assert_eq!(
+            sidebar_copy_click_action(
+                &PaneToolbeltKind::Shell,
+                ShellCopyClick::LastCommandAndOutput,
+                AgentCopyClick::default()
+            ),
+            PaneCopyAction::Shell(ShellCopyAction::LastCommandWithOutput)
+        );
+        assert_eq!(
+            sidebar_copy_click_action(
+                &PaneToolbeltKind::Agent(claude_state_with_evidence(AgentEvidence::Process)),
+                ShellCopyClick::default(),
+                AgentCopyClick::LastMessage
+            ),
+            PaneCopyAction::Agent(AgentCopyAction::LastAgentMessage)
+        );
+    }
+
+    /// Only evidence a program cannot fake by printing text gets a plain
+    /// copy, even when a plain copy is what the click is set to.
+    #[test]
+    fn copy_icon_left_click_redacts_an_agent_seen_only_on_screen() {
+        use config::{AgentCopyClick, ShellCopyClick};
         for evidence in [
             AgentEvidence::TitlePhrase,
             AgentEvidence::VisibleChrome,
@@ -18598,9 +18767,11 @@ mod tests {
             AgentEvidence::Metadata,
         ] {
             assert_eq!(
-                sidebar_copy_click_action(&PaneToolbeltKind::Agent(claude_state_with_evidence(
-                    evidence
-                ))),
+                sidebar_copy_click_action(
+                    &PaneToolbeltKind::Agent(claude_state_with_evidence(evidence)),
+                    ShellCopyClick::default(),
+                    AgentCopyClick::Conversation
+                ),
                 PaneCopyAction::AgentRedacted(AgentCopyAction::Conversation),
                 "{evidence:?}"
             );
@@ -23492,6 +23663,32 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
         ));
         // Nothing pending at all.
         assert!(!is_waiting_queued((pane, None, None, None), None));
+    }
+
+    #[test]
+    fn sidebar_colors_override_only_what_they_set() {
+        use std::convert::TryFrom;
+        let ring =
+            RingColors::resolve(AgentRingColors::default(), &AgentAnimationColors::default());
+        let theme = SidebarPalette::modern(ring);
+        let color = |hex: &str| Some(config::RgbaColor::try_from(hex.to_string()).unwrap());
+        let user = config::SidebarColorsConfig {
+            background: color("#102030"),
+            field: color("#405060"),
+            attention: color("#ff00ff"),
+            ..Default::default()
+        };
+        let mut sb = theme;
+        sb.apply_user_colors(&user);
+        assert_eq!(sb.surface, srgb8_to_linear(0x10, 0x20, 0x30));
+        // A field's outline is its fill, so both follow.
+        assert_eq!(sb.search_fill, srgb8_to_linear(0x40, 0x50, 0x60));
+        assert_eq!(sb.row_border, sb.search_fill);
+        assert_eq!(sb.attention, srgb8_to_linear(0xff, 0x00, 0xff));
+        // Unset keys keep the theme's.
+        assert_eq!(sb.row_fill, theme.row_fill);
+        assert_eq!(sb.text_active, theme.text_active);
+        assert_eq!(sb.accent(), theme.accent());
     }
 
     /// The sidebar has to read as a distinct surface from the terminal it sits

@@ -19,6 +19,7 @@ use config::keyassignment::{KeyAssignment, SpawnTabDomain};
 use mux::pane::{CachePolicy, Pane};
 use mux::tab::{PositionedPane, Tab};
 use mux::Mux;
+use std::convert::TryFrom;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -799,7 +800,10 @@ impl TermWindow {
                         ),
                         Segment::button("+", SettingsHit::Step(*index, 1)),
                     ],
-                    (Kind::Text | Kind::Font | Kind::Scheme, Value::Text(current)) => {
+                    (
+                        Kind::Text | Kind::Font | Kind::Scheme | Kind::Color,
+                        Value::Text(current),
+                    ) => {
                         let typed = state
                             .editing
                             .as_ref()
@@ -841,6 +845,54 @@ impl TermWindow {
             };
             let control_left =
                 self.paint_settings_segments(layers, content_right, control_y, &segments, row_bg)?;
+
+            // A colour shows itself beside its field: what is being typed
+            // once it parses, else what is set. Unset shows nothing, since
+            // the theme's own colour is then in use everywhere.
+            if matches!(setting.kind, Kind::Color) {
+                let typed = state
+                    .editing
+                    .as_ref()
+                    .filter(|editing| editing.index == *index)
+                    .map(|editing| editing.buffer.clone());
+                let shown = match (typed, &value) {
+                    (Some(buffer), _) if super::catalog::is_color(&buffer) => Some(buffer),
+                    (_, Value::Text(current)) if !current.is_empty() => Some(current.clone()),
+                    _ => None,
+                };
+                if let Some(color) =
+                    shown.and_then(|text| config::RgbaColor::try_from(text.trim().to_string()).ok())
+                {
+                    let side = (control_h - 6. * dpi_scale).max(6.).round();
+                    let gap = (8. * dpi_scale).round();
+                    let swatch = euclid::rect(
+                        control_left - gap - side,
+                        control_y + ((control_h - side) * 0.5).round(),
+                        side,
+                        side,
+                    );
+                    let stroke = dpi_scale.round().max(1.);
+                    self.sidebar_rounded_fill(
+                        layers,
+                        0,
+                        swatch,
+                        (4. * dpi_scale).min(side * 0.5),
+                        opaque(lerp_rgba(row_bg, sb.text_meta, 0.45)),
+                    )?;
+                    self.sidebar_rounded_fill(
+                        layers,
+                        0,
+                        euclid::rect(
+                            swatch.origin.x + stroke,
+                            swatch.origin.y + stroke,
+                            side - stroke * 2.,
+                            side - stroke * 2.,
+                        ),
+                        ((4. * dpi_scale) - stroke).max(0.).min(side * 0.5),
+                        color.to_linear(),
+                    )?;
+                }
+            }
 
             // The field being typed into gets an accent line under it.
             if editing_this {

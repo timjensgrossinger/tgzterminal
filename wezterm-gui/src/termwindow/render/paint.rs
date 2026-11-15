@@ -8,6 +8,12 @@ use wezterm_font::ClearShapeCache;
 
 /// The layer floating menus paint on.
 const MENU_ZINDEX: i8 = 20;
+/// The Worktree and Changes panels and the pane toolbelts: above the panes
+/// and the sidebar, below the z-index 10 tab bar and docked input and the
+/// menus.
+const PANEL_ZINDEX: i8 = 5;
+/// An auto-hidden sidebar while it is open: over the panels.
+const SIDEBAR_FLOAT_ZINDEX: i8 = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AllowImage {
@@ -303,33 +309,61 @@ impl crate::TermWindow {
             }
         }
 
+        // An auto-hidden sidebar that is open lies over whatever is beside
+        // its strip, the panels included, so it is painted after them.
+        let sidebar_floats = self.sidebar_is_active()
+            && self.config.sidebar_auto_hide
+            && self.sidebar_auto_hide_open;
         if self.sidebar_is_active() {
-            self.paint_sidebar(&mut layers).context("paint_sidebar")?;
+            if !sidebar_floats {
+                self.paint_sidebar(&mut layers).context("paint_sidebar")?;
+            }
         } else if self.show_tab_bar {
             self.paint_tab_bar(&mut layers).context("paint_tab_bar")?;
-        }
-
-        // Before the menus so they still float above it, after the panes and
-        // the sidebar so a floating panel wins clicks over what it covers.
-        self.paint_file_tree(&mut layers)
-            .context("paint_file_tree")?;
-        self.paint_diff_panel(&mut layers)
-            .context("paint_diff_panel")?;
-
-        // After the Changes panel: by default the strip keeps clear of it,
-        // and one the user dragged onto it is meant to be on top of it, both
-        // drawn and for clicks.
-        // Every pane, not only the focused one: the strip used to vanish from
-        // an agent the moment focus moved to the pane beside it.
-        self.begin_pane_toolbelts();
-        for pos in &toolbelt_panes {
-            self.paint_pane_toolbelt(&mut layers, pos)
-                .context("paint_pane_toolbelt")?;
         }
 
         self.paint_window_borders(&mut layers)
             .context("paint_window_borders")?;
         drop(layers);
+
+        // The panels float on a layer of their own: chrome text sits on the
+        // top sub-layer of whatever layer it is in, so on the panes' layer
+        // the sidebar's labels showed through a panel's fill. Before the
+        // menus so they still float above it, after the panes and the
+        // sidebar so a floating panel wins clicks over what it covers.
+        {
+            let gl_state = self.render_state.as_ref().unwrap();
+            let layer = gl_state
+                .layer_for_zindex(PANEL_ZINDEX)
+                .context("layer_for_zindex(PANEL_ZINDEX)")?;
+            let mut layers = layer.quad_allocator();
+            self.paint_file_tree(&mut layers)
+                .context("paint_file_tree")?;
+            self.paint_diff_panel(&mut layers)
+                .context("paint_diff_panel")?;
+
+            // After the Changes panel: by default the strip keeps clear of
+            // it, and one the user dragged onto it is meant to be on top of
+            // it, both drawn and for clicks.
+            // Every pane, not only the focused one: the strip used to vanish
+            // from an agent the moment focus moved to the pane beside it.
+            self.begin_pane_toolbelts();
+            for pos in &toolbelt_panes {
+                self.paint_pane_toolbelt(&mut layers, pos)
+                    .context("paint_pane_toolbelt")?;
+            }
+        }
+
+        // After the panels, on a layer above theirs: drawn over them, and
+        // its rows win clicks over theirs.
+        if sidebar_floats {
+            let gl_state = self.render_state.as_ref().unwrap();
+            let layer = gl_state
+                .layer_for_zindex(SIDEBAR_FLOAT_ZINDEX)
+                .context("layer_for_zindex(SIDEBAR_FLOAT_ZINDEX)")?;
+            let mut layers = layer.quad_allocator();
+            self.paint_sidebar(&mut layers).context("paint_sidebar")?;
+        }
         self.paint_docked_input().context("paint_docked_input")?;
         self.paint_menus().context("paint_menus")?;
         self.paint_modal().context("paint_modal")?;
@@ -379,6 +413,8 @@ impl crate::TermWindow {
             .context("paint_tab_palette")?;
         self.paint_chrome_dialog(&mut layers)
             .context("paint_chrome_dialog")?;
+        self.paint_ssh_setup(&mut layers)
+            .context("paint_ssh_setup")?;
         Ok(())
     }
 

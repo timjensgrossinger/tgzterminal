@@ -113,6 +113,10 @@ impl super::TermWindow {
             | UIItemType::SidebarNewTabMenuItem { .. }
             | UIItemType::SidebarSshLaunchButton
             | UIItemType::SidebarSshMenuItem { .. }
+            | UIItemType::SidebarSshNewConnection
+            | UIItemType::SshSetupField(_)
+            | UIItemType::SshSetupOption { .. }
+            | UIItemType::SshSetupButton { .. }
             | UIItemType::PaneToolbeltButton { .. }
             | UIItemType::PaneToolbeltHandle { .. }
             | UIItemType::PaneCopyMenuItem { .. }
@@ -192,6 +196,10 @@ impl super::TermWindow {
             | UIItemType::SidebarNewTabMenuItem { .. }
             | UIItemType::SidebarSshLaunchButton
             | UIItemType::SidebarSshMenuItem { .. }
+            | UIItemType::SidebarSshNewConnection
+            | UIItemType::SshSetupField(_)
+            | UIItemType::SshSetupOption { .. }
+            | UIItemType::SshSetupButton { .. }
             | UIItemType::PaneToolbeltButton { .. }
             | UIItemType::PaneToolbeltHandle { .. }
             | UIItemType::PaneCopyMenuItem { .. }
@@ -653,6 +661,7 @@ impl super::TermWindow {
                                 config::SidebarFooterItem::Mosh | config::SidebarFooterItem::Et
                             )
                             | UIItemType::SidebarSshMenuItem { .. }
+                            | UIItemType::SidebarSshNewConnection
                             | UIItemType::SidebarDropdownBody
                             | UIItemType::SidebarDropdownScrollTrack
                             | UIItemType::SidebarDropdownScrollThumb
@@ -1223,6 +1232,19 @@ impl super::TermWindow {
             UIItemType::SidebarUsageMenuRow { action } => {
                 self.mouse_event_sidebar_usage_menu_row(action, event, context);
             }
+            UIItemType::SidebarSshNewConnection => {
+                if event.kind == WMEK::Release(MousePress::Left) {
+                    self.pressed_ui_item = None;
+                    self.ssh_launch_menu = None;
+                    self.open_ssh_setup();
+                }
+                context.invalidate();
+            }
+            UIItemType::SshSetupField(_)
+            | UIItemType::SshSetupOption { .. }
+            | UIItemType::SshSetupButton { .. } => {
+                self.mouse_event_ssh_setup(&item.item_type, &event, context);
+            }
             UIItemType::SidebarSshMenuItem { domain_name } => {
                 self.mouse_event_sidebar_ssh_menu_item(domain_name, event, context);
             }
@@ -1387,6 +1409,8 @@ impl super::TermWindow {
                             let action =
                                 crate::termwindow::render::sidebar::sidebar_copy_click_action(
                                     &kind,
+                                    self.config.pane_toolbelt.shell_copy_click,
+                                    self.config.pane_toolbelt.agent_copy_click,
                                 );
                             self.perform_pane_copy(&pane, &action, CopySource::Button);
                         }
@@ -1634,10 +1658,11 @@ impl super::TermWindow {
             WMEK::Press(MousePress::Right) => self.ssh_launch_menu.take().is_none(),
             _ => false,
         };
-        // Don't open an empty dropdown — the button shouldn't have been
-        // hit-testable in that case, but be defensive against a stale
-        // render between the cache rebuild and the click.
-        if open_menu && !self.ssh_quick_launch_entries().is_empty() {
+        // No host yet: the click sets one up instead of opening an empty
+        // dropdown.
+        if open_menu && self.ssh_quick_launch_entries().is_empty() {
+            self.open_ssh_setup();
+        } else if open_menu {
             self.ssh_launch_menu = Some(SshLaunchMenuState {
                 x: item.x,
                 y: item.y,
@@ -1828,6 +1853,7 @@ impl super::TermWindow {
                 | UIItemType::SidebarAgentMenuRestoreLastWindow
                 | UIItemType::SidebarSessionsSearch
                 | UIItemType::SidebarSshMenuItem { .. }
+                | UIItemType::SidebarSshNewConnection
                 | UIItemType::SidebarDropdownBody
                 | UIItemType::SidebarDropdownScrollTrack
                 | UIItemType::SidebarDropdownScrollThumb
@@ -2854,6 +2880,8 @@ impl super::TermWindow {
                                     let action =
                                         crate::termwindow::render::sidebar::sidebar_copy_click_action(
                                             &kind,
+                                            self.config.pane_toolbelt.shell_copy_click,
+                                            self.config.pane_toolbelt.agent_copy_click,
                                         );
                                     self.perform_pane_copy(&pane, &action, CopySource::Button);
                                 }

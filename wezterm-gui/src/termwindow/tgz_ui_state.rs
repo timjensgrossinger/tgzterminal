@@ -33,6 +33,11 @@ struct TgzUiState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     ssh_recent_hosts: Option<Vec<String>>,
 
+    /// How to connect to the hosts made with "New SSH connection": host
+    /// name to `"Ssh"`, `"Mosh"` or `"Et"`. Names only, like the recents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ssh_host_transports: Option<std::collections::BTreeMap<String, String>>,
+
     /// Names of the tab groups the user made in the sidebar, in order. Which
     /// tab is in which group is not kept: tabs do not outlive the window.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -164,6 +169,39 @@ pub fn load_tab_groups() -> Vec<String> {
 pub fn save_tab_groups(names: &[String]) {
     let mut state = read_state();
     state.tab_groups = Some(names.to_vec());
+    write_state(&state);
+}
+
+/// How to connect to each host made with "New SSH connection".
+pub fn load_ssh_host_transports() -> std::collections::BTreeMap<String, config::SshTransport> {
+    read_state()
+        .ssh_host_transports
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(name, transport)| {
+            let transport = match transport.as_str() {
+                "Ssh" => config::SshTransport::Ssh,
+                "Mosh" => config::SshTransport::Mosh,
+                "Et" => config::SshTransport::Et,
+                _ => return None,
+            };
+            Some((name, transport))
+        })
+        .collect()
+}
+
+/// Remember how to connect to `name`. Best-effort.
+pub fn save_ssh_host_transport(name: &str, transport: config::SshTransport) {
+    let mut state = read_state();
+    let value = match transport {
+        config::SshTransport::Mosh => "Mosh",
+        config::SshTransport::Et => "Et",
+        _ => "Ssh",
+    };
+    state
+        .ssh_host_transports
+        .get_or_insert_with(Default::default)
+        .insert(name.to_string(), value.to_string());
     write_state(&state);
 }
 
@@ -511,6 +549,7 @@ mod tests {
         let state = TgzUiState {
             agent_launcher_project_root: Some(true),
             ssh_recent_hosts: None,
+            ssh_host_transports: None,
             ..TgzUiState::default()
         };
         let json = serde_json::to_string_pretty(&state).unwrap();
@@ -528,6 +567,7 @@ mod tests {
             sidebar_footer_weights: None,
             agent_launcher_project_root: Some(true),
             ssh_recent_hosts: None,
+            ssh_host_transports: None,
             tab_groups: None,
             sidebar_expanded_tabs: Some(vec![0, 2]),
             agent_section_collapsed: None,
@@ -605,6 +645,7 @@ mod tests {
             sidebar_footer_weights: None,
             agent_launcher_project_root: Some(true),
             ssh_recent_hosts: None,
+            ssh_host_transports: None,
             tab_groups: None,
             sidebar_expanded_tabs: Some(vec![0]),
             agent_section_collapsed: None,

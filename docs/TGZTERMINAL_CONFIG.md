@@ -8,8 +8,10 @@ WezTerm compatibility unless noted.
 `CMD|,` (action `ShowSettings`, also in the command palette and in the menu
 of a right click on the empty tab list) opens Settings as a tab. It covers the
 fork's settings and a few basics (font, font size, line height, colour scheme,
-window opacity), grouped as Appearance, Sidebar, Agents, Worktree, Changes,
-Input and Privacy. A last section, Shortcuts, lists the fork's key bindings as
+window opacity), grouped as Appearance, Colours, Sidebar, Agents, Worktree,
+Changes, Input and Privacy. Colours holds one field per `sidebar_colors` key:
+type a colour such as `#58a6ff` and Enter; a swatch shows it beside the
+field, and clearing the field goes back to the theme's colour. A last section, Shortcuts, lists the fork's key bindings as
 they are bound right now; it is read-only, since bindings are changed with
 `config.keys`.
 
@@ -97,6 +99,8 @@ config.sidebar_scroll_bar = true
 | `sidebar_tab_grouping` | enum | `"Auto"` | `"Auto"`: a new tab joins the group of the project folder (nearest `.git`) it starts in and stays there when it changes folder; tabs with no project sit under "Other". `"Manual"`: tabs are grouped only by hand. `"Off"`: one flat list, no headers. Drag a tab onto a tab or the header of another group to move it there, or use "Move to group" in the tab's right-click menu; click a header to fold the group. "New group…" (tab menu, header menu, or the empty part of the list) names a group of your own in the search field: Enter keeps it, Esc cancels. A header's right-click menu renames or deletes your own groups, re-sorts tabs by folder, and closes the group's tabs. Your groups' names are remembered across restarts; which tab was in which group is not. Groups are contiguous in the tab order, so `ActivateTab` numbers match the rows shown. |
 | `sidebar_font` | font | unset | Font of the sidebar's own text, e.g. `wezterm.font 'Inter'`. Unset: `window_frame.font`, which defaults to the bundled Roboto. The terminal font stays the fallback, so icon glyphs keep resolving. |
 | `sidebar_font_size` | number | `13` on macOS, `10` elsewhere | Size of `sidebar_font` in points. Follows the display's DPI, not the terminal font size. |
+| `sidebar_colors` | table | `{}` | Colour of each part of the fork's chrome: the sidebar, menus, the tab palette and dialogs, the Worktree and Changes panels and the Settings tab. Every key is optional; an unset one keeps what `sidebar_theme` derives. Keys: `background`, `row`, `row_active`, `row_hover`, `row_pressed`, `row_working`, `field`, `field_focused`, `divider`, `menu_border`, `text`, `text_idle`, `text_meta`, `accent` (focus, selections, the active rail; default for `new_tab` and `ring_running`, and takes precedence over `agent_ui.animations.colors.ring_b`), `attention` (an agent waiting for you; default for `ring_waiting`), `quota` (the `Σ` button), `new_tab`, `new_tab_text` (default: black or white, whichever reads), `ring_track`, `ring_running`, `ring_waiting`. Values are anything `colors` accepts, e.g. `config.sidebar_colors = { accent = '#58a6ff', new_tab = '#3fb950' }`. Also in Settings → Colours. The diff colours of the Changes panel come from the terminal palette (`colors.ansi`). |
+| `window_title_app_name` | bool | `true` | Title bar text when no `format-window-title` handler sets one: the app's name (`TGZTerminal`, or the brand name a build is compiled with). `false` gives upstream's title, the active pane's with `[n/m]` when there are several tabs. A `format-window-title` handler always wins. |
 | `sidebar_tab_title_source` | enum | `"Title"` | `"Title"`, `"Command"`, `"WorkingDirectory"`, `"GitBranch"` |
 | `sidebar_tab_metadata` | list of enum | `{ "GitBranch", "WorkingDirectory" }` | Elements: `"GitBranch"`, `"WorkingDirectory"` |
 | `sidebar_tab_hover_details` | bool | `false` | Shows the metadata sub-line on the active/hovered row — **and makes every row two text lines tall** whether or not you hover, so fewer tabs fit on screen. |
@@ -115,8 +119,7 @@ under their tab.
 to move, Enter to switch, Esc or a click beside it to close.
 
 Closing a tab or pane that is still running something asks in a dialog that names what would be stopped.
-Enter and Esc keep it open; `y` or the named button closes. Closing the window itself still uses the
-terminal's own prompt.
+Enter and Esc keep it open; `y` or the named button closes. Closing the window asks in the same dialog.
 
 The tab list scrolls with the mouse wheel when there are more tabs than visible
 rows.
@@ -1675,13 +1678,21 @@ Every tab gets a `Copy` control on its **sidebar tab row**, left of that row's
 
 | Tab | Left click | Right click (ctrl+click on macOS) |
 | --- | --- | --- |
-| Shell or ssh | Copies the pane without secrets, as `Copy pane (no secrets)` does | Opens the menu |
-| Agent | Copies the conversation | Opens the agent copy menu (conversation, Markdown, last message, agent details) |
+| Shell or ssh | `pane_toolbelt.shell_copy_click`: out of the box `Copy pane (no secrets)` | Opens the menu |
+| Agent | `pane_toolbelt.agent_copy_click`: out of the box `Copy conversation (no secrets)` | Opens the agent copy menu (conversation, Markdown, last message, agent details) |
 
-An agent's left click copies unredacted only when the agent was identified by
-its process or an `agent.*` user var. One identified only by its title or by
-text on screen copies its conversation with secrets redacted, since any program
-can print those. The menu's `Copy conversation` row is always plain, unless
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `pane_toolbelt.shell_copy_click` | enum | `"PaneNoSecrets"` | What a left click on a shell pane's Copy icon copies: `"PaneNoSecrets"`, `"LastOutputNoSecrets"`, `"Pane"`, `"LastOutput"`, `"LastCommandAndOutput"`. Also in Settings → Privacy. |
+| `pane_toolbelt.agent_copy_click` | enum | `"ConversationNoSecrets"` | The same for an agent pane (tab row and toolbelt): `"ConversationNoSecrets"`, `"LastMessageNoSecrets"`, `"Conversation"`, `"LastMessage"`, `"Markdown"`, `"Summary"`. Also in Settings → Privacy. |
+
+A plain (not "no secrets") choice copies unredacted only when the agent was
+identified by its process or an `agent.*` user var. One identified only by its
+title or by text on screen is always copied with secrets redacted, since any
+program can print those.
+
+With `secret_masking.redact_copy_actions = true` every Copy row already leaves
+secrets out, so the menu does not repeat them as "(no secrets)" rows. The menu's `Copy conversation` row is always plain, unless
 `secret_masking.redact_copy_actions` redacts it. A tab whose focused pane is a
 shell copies as a shell, even when another pane in that tab runs an agent.
 
@@ -2342,6 +2353,32 @@ for pre-registered SSH connections. Each connection opens in a new tab.
 - **Right-click** (or Ctrl+click on macOS) always opens the host menu. Its
   first row is a search field that stays in place while the hosts scroll:
   type to narrow the list, Enter connects to the first match, Esc closes.
+- The button is always in the footer, unless you take it out with
+  "Customize buttons". With no host yet, a click opens **New SSH
+  connection**; with hosts, the menu's last row, `+ New connection…`, does.
+
+### New SSH connection
+
+A form for one host: a name (what the menu and `ssh <name>` call it), the
+host, a user and a port (both optional), how you sign in (password, or a key
+file) and what connects (SSH, Mosh or ET). Tab or the arrows move between
+fields, Left/Right change a choice, Ctrl+V (Cmd+V on macOS) pastes, Enter saves
+and connects in a new tab, Esc closes.
+
+Save adds a `Host` block to `~/.ssh/config` (`%USERPROFILE%\.ssh\config` on
+Windows), so `ssh`, `mosh` and `et` all know the host by its name and the
+host shows up in this menu like any other. The file is only appended to, and
+a name that is already a `Host` there is refused rather than shadowed. A key
+is written as `IdentityFile` with `IdentitiesOnly yes`. **Passwords are never
+saved:** OpenSSH has no setting for one, so ssh asks for it in the terminal
+when it connects. Which program connects is remembered per host name in the
+UI state file (names only). Mosh and ET must be installed; the form says so
+when they are not.
+
+These hosts connect with the real `ssh`, `mosh` or `et` command rather than
+WezTerm's built-in SSH, so ssh's own prompts, agent and known-hosts apply.
+While `config.ssh_domains` is set in Lua the menu lists those domains only,
+as before, and hosts added here are reached with `ssh <name>`.
 
 ```lua
 -- An ssh_domains name or a ~/.ssh/config alias, in any case.

@@ -8,9 +8,9 @@
 
 use super::lua_edit::LuaValue;
 use config::{
-    AgentLaunchTarget, AgentRingColors, Config, DiffPanelLongLines, DiffPanelMode,
+    AgentCopyClick, AgentLaunchTarget, AgentRingColors, Config, DiffPanelLongLines, DiffPanelMode,
     DiffPanelPosition, DiffPanelRaisedMode, FileBrowserEditorPlacement, FileBrowserUi,
-    PaneToolbeltPosition, SidebarPosition, SidebarTabDensity, SidebarTabGrouping,
+    PaneToolbeltPosition, ShellCopyClick, SidebarPosition, SidebarTabDensity, SidebarTabGrouping,
     SidebarTabTitleSource, SidebarTheme,
 };
 use std::convert::TryFrom;
@@ -18,6 +18,8 @@ use std::convert::TryFrom;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Section {
     Appearance,
+    /// `sidebar_colors`: every colour of the fork's chrome.
+    Colors,
     Sidebar,
     Agents,
     Worktree,
@@ -31,8 +33,9 @@ pub(crate) enum Section {
 }
 
 impl Section {
-    pub(crate) const ALL: [Section; 9] = [
+    pub(crate) const ALL: [Section; 10] = [
         Section::Appearance,
+        Section::Colors,
         Section::Sidebar,
         Section::Agents,
         Section::Worktree,
@@ -46,6 +49,7 @@ impl Section {
     pub(crate) fn label(self) -> &'static str {
         match self {
             Section::Appearance => "Appearance",
+            Section::Colors => "Colours",
             Section::Sidebar => "Sidebar",
             Section::Agents => "Agents",
             Section::Worktree => "Worktree",
@@ -87,6 +91,9 @@ pub(crate) enum Kind {
     Font,
     /// A colour scheme, picked from the known ones; empty means none.
     Scheme,
+    /// A colour, typed as `#rrggbb` (or anything `colors` accepts); empty
+    /// means the theme's own.
+    Color,
 }
 
 pub(crate) struct Setting {
@@ -209,6 +216,38 @@ macro_rules! text {
     };
 }
 
+/// One `sidebar_colors` entry, shown as `#rrggbb`.
+macro_rules! chrome_color {
+    ($label:expr, $help:expr, $field:ident) => {
+        Setting {
+            section: Section::Colors,
+            path: &["sidebar_colors", stringify!($field)],
+            label: $label,
+            help: $help,
+            kind: Kind::Color,
+            get: |c| Value::Text(color_hex(c.sidebar_colors.$field)),
+        }
+    };
+}
+
+/// `#rrggbb` (or `#rrggbbaa` when not opaque); empty when unset.
+pub(crate) fn color_hex(color: Option<config::RgbaColor>) -> String {
+    let Some(color) = color else {
+        return String::new();
+    };
+    let (r, g, b, a) = color.to_srgb_u8();
+    if a == 0xff {
+        format!("#{r:02x}{g:02x}{b:02x}")
+    } else {
+        format!("#{r:02x}{g:02x}{b:02x}{a:02x}")
+    }
+}
+
+/// Whether `text` is a colour the config would accept.
+pub(crate) fn is_color(text: &str) -> bool {
+    config::RgbaColor::try_from(text.trim().to_string()).is_ok()
+}
+
 /// One field of a button of the user's own. The Settings tab has room for
 /// four of them, `custom1` to `custom4`; more, other names and buttons that
 /// run a key assignment are written in the file.
@@ -329,6 +368,34 @@ pub(crate) static CATALOG: &[Setting] = &[
         "Show it only while scrolling or hovering.",
         scroll_bar_auto_hide
     ),
+    toggle!(
+        Appearance,
+        "App name as window title",
+        "Off: the active tab's title, as upstream WezTerm shows it.",
+        window_title_app_name
+    ),
+    // Colours
+    chrome_color!("Accent", "Focus, selections, the active rail. Default for New Tab and the running ring.", accent),
+    chrome_color!("Attention", "An agent waiting for you. Default for the waiting ring.", attention),
+    chrome_color!("New Tab button", "Fill of + New Tab. Default: the accent.", new_tab),
+    chrome_color!("New Tab label", "Default: black or white, whichever reads.", new_tab_text),
+    chrome_color!("Ring: running", "The arc turning while an agent works. Default: the accent.", ring_running),
+    chrome_color!("Ring: waiting", "The ring while an agent waits. Default: attention.", ring_waiting),
+    chrome_color!("Ring: track", "The unfilled part of a context ring.", ring_track),
+    chrome_color!("Background", "Sidebar and panels.", background),
+    chrome_color!("Row", "Resting fill of rows and buttons.", row),
+    chrome_color!("Row: active", "The active tab's row.", row_active),
+    chrome_color!("Row: hover", "Under the pointer.", row_hover),
+    chrome_color!("Row: pressed", "While pressed.", row_pressed),
+    chrome_color!("Row: working", "Behind a row whose agent works.", row_working),
+    chrome_color!("Field", "Search and text fields.", field),
+    chrome_color!("Field: typing", "A field being typed in.", field_focused),
+    chrome_color!("Divider", "Between the sidebar and the terminal, and between sections.", divider),
+    chrome_color!("Menu edge", "Edge of menus and floating cards.", menu_border),
+    chrome_color!("Text", "Titles and the active tab.", text),
+    chrome_color!("Text: idle", "Rows that are not active.", text_idle),
+    chrome_color!("Text: meta", "Second lines, hints and counts.", text_meta),
+    chrome_color!("Usage button", "Fill of the \u{3a3} button.", quota),
     // Sidebar
     toggle!(
         Sidebar,
@@ -634,8 +701,22 @@ pub(crate) static CATALOG: &[Setting] = &[
     toggle!(
         Privacy,
         "Redact when copying",
-        "Copy actions leave recognised secrets out.",
+        "Every Copy row leaves secrets out, so the (no secrets) rows are not needed.",
         secret_masking.redact_copy_actions
+    ),
+    choice!(
+        Privacy,
+        "Copy icon on a shell",
+        "What a click on the Copy icon copies. The others are on right click.",
+        ShellCopyClick,
+        pane_toolbelt.shell_copy_click
+    ),
+    choice!(
+        Privacy,
+        "Copy icon on an agent",
+        "What a click copies. An agent known only by its title is always redacted.",
+        AgentCopyClick,
+        pane_toolbelt.agent_copy_click
     ),
     toggle!(
         Privacy,
@@ -679,6 +760,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn colour_fields_show_hex_and_accept_only_colours() {
+        use std::convert::TryFrom;
+        assert_eq!(color_hex(None), "");
+        let blue = config::RgbaColor::try_from("#58A6FF".to_string()).unwrap();
+        assert_eq!(color_hex(Some(blue)), "#58a6ff");
+        assert!(is_color("#58a6ff"));
+        assert!(is_color(" #58a6ff "));
+        assert!(!is_color("blueish"));
+        assert!(!is_color(""));
+        let colours: Vec<&Setting> = CATALOG
+            .iter()
+            .filter(|setting| matches!(setting.kind, Kind::Color))
+            .collect();
+        assert_eq!(colours.len(), 21);
+        assert!(colours.iter().all(
+            |setting| setting.section == Section::Colors && setting.path[0] == "sidebar_colors"
+        ));
+    }
+
+    #[test]
     fn every_setting_reads_a_value_of_its_kind_from_the_default_config() {
         let config = Config::default_config();
         for setting in CATALOG {
@@ -689,7 +790,10 @@ mod tests {
                     | (Kind::Choice(_), Value::Text(_))
                     | (Kind::Int { .. }, Value::Int(_))
                     | (Kind::Float { .. }, Value::Float(_))
-                    | (Kind::Text | Kind::Font | Kind::Scheme, Value::Text(_))
+                    | (
+                        Kind::Text | Kind::Font | Kind::Scheme | Kind::Color,
+                        Value::Text(_)
+                    )
             );
             assert!(fits, "{}: {value:?}", setting.label);
             if let (Kind::Choice(variants), Value::Text(current)) = (setting.kind, &value) {

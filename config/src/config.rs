@@ -252,6 +252,83 @@ impl SidebarButtonConfig {
     }
 }
 
+/// Colours of the fork's chrome: the sidebar and everything drawn like it
+/// (menus, the tab palette and dialogs, the Worktree and Changes panels, the
+/// Settings tab). Every key is optional; an unset one keeps the colour the
+/// `sidebar_theme` derives, so a single override does not have to restate
+/// the rest. Colours are anything `colors` accepts, e.g. `"#58a6ff"`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, FromDynamic, ToDynamic)]
+pub struct SidebarColorsConfig {
+    /// Background of the sidebar and of the panels.
+    #[dynamic(default)]
+    pub background: Option<RgbaColor>,
+    /// Resting fill of a row or button.
+    #[dynamic(default)]
+    pub row: Option<RgbaColor>,
+    /// Fill of the active tab's row.
+    #[dynamic(default)]
+    pub row_active: Option<RgbaColor>,
+    /// Fill under the pointer.
+    #[dynamic(default)]
+    pub row_hover: Option<RgbaColor>,
+    /// Fill while pressed.
+    #[dynamic(default)]
+    pub row_pressed: Option<RgbaColor>,
+    /// Fill behind a row whose agent is working.
+    #[dynamic(default)]
+    pub row_working: Option<RgbaColor>,
+    /// Search and text fields.
+    #[dynamic(default)]
+    pub field: Option<RgbaColor>,
+    /// A text field being typed in.
+    #[dynamic(default)]
+    pub field_focused: Option<RgbaColor>,
+    /// The line between the sidebar and the terminal, and between sections.
+    #[dynamic(default)]
+    pub divider: Option<RgbaColor>,
+    /// Edge of menus and floating cards.
+    #[dynamic(default)]
+    pub menu_border: Option<RgbaColor>,
+    /// Main text: titles, the active tab.
+    #[dynamic(default)]
+    pub text: Option<RgbaColor>,
+    /// Text of rows that are not active.
+    #[dynamic(default)]
+    pub text_idle: Option<RgbaColor>,
+    /// Second lines, hints, counts.
+    #[dynamic(default)]
+    pub text_meta: Option<RgbaColor>,
+    /// The accent: focus, the active rail, selections, quota bars with room
+    /// left. Also the default for `new_tab` and `ring_running`. Takes
+    /// precedence over `agent_ui.animations.colors.ring_b`.
+    #[dynamic(default)]
+    pub accent: Option<RgbaColor>,
+    /// "This agent needs you": waiting dots, the waiting glow, full quota
+    /// bars. Also the default for `ring_waiting`.
+    #[dynamic(default)]
+    pub attention: Option<RgbaColor>,
+    /// Fill of the `Σ` usage button.
+    #[dynamic(default)]
+    pub quota: Option<RgbaColor>,
+    /// Fill of the `+ New Tab` button. Default: `accent`.
+    #[dynamic(default)]
+    pub new_tab: Option<RgbaColor>,
+    /// Label of the `+ New Tab` button. Default: black or white, whichever
+    /// reads on `new_tab`.
+    #[dynamic(default)]
+    pub new_tab_text: Option<RgbaColor>,
+    /// The unfilled track of a tab's context ring.
+    #[dynamic(default)]
+    pub ring_track: Option<RgbaColor>,
+    /// The arc turning on a tab's ring while its agent works. Default:
+    /// `accent`.
+    #[dynamic(default)]
+    pub ring_running: Option<RgbaColor>,
+    /// A tab's ring while its agent waits for you. Default: `attention`.
+    #[dynamic(default)]
+    pub ring_waiting: Option<RgbaColor>,
+}
+
 /// How the sidebar groups its tabs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, FromDynamic, ToDynamic)]
 pub enum SidebarTabGrouping {
@@ -509,11 +586,57 @@ pub struct PaneToolbeltConfig {
     /// Show the Copy icon on the sidebar tab rows of plain shell and ssh panes.
     #[dynamic(default = "default_true")]
     pub shell_copy: bool,
+    /// What a left click on the Copy icon copies from a shell or ssh pane.
+    #[dynamic(default)]
+    pub shell_copy_click: ShellCopyClick,
+    /// What a left click on the Copy icon (tab row or agent toolbelt)
+    /// copies from an agent pane.
+    #[dynamic(default)]
+    pub agent_copy_click: AgentCopyClick,
 }
 
 impl Default for PaneToolbeltConfig {
     fn default() -> Self {
-        Self { shell_copy: true }
+        Self {
+            shell_copy: true,
+            shell_copy_click: ShellCopyClick::default(),
+            agent_copy_click: AgentCopyClick::default(),
+        }
+    }
+}
+
+/// The copy a left click on a shell pane's Copy icon makes; the same rows
+/// as its right-click menu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromDynamic, ToDynamic)]
+pub enum ShellCopyClick {
+    PaneNoSecrets,
+    LastOutputNoSecrets,
+    Pane,
+    LastOutput,
+    LastCommandAndOutput,
+}
+
+/// The copy a left click on an agent pane's Copy icon makes; the same rows
+/// as its right-click menu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromDynamic, ToDynamic)]
+pub enum AgentCopyClick {
+    ConversationNoSecrets,
+    LastMessageNoSecrets,
+    Conversation,
+    LastMessage,
+    Markdown,
+    Summary,
+}
+
+impl Default for ShellCopyClick {
+    fn default() -> Self {
+        Self::PaneNoSecrets
+    }
+}
+
+impl Default for AgentCopyClick {
+    fn default() -> Self {
+        Self::ConversationNoSecrets
     }
 }
 
@@ -2610,6 +2733,16 @@ pub struct Config {
     /// the terminal font size, so zooming the terminal leaves the sidebar alone.
     #[dynamic(default = "default_sidebar_font_size")]
     pub sidebar_font_size: f64,
+
+    /// Title bar text when no `format-window-title` handler sets one: the
+    /// app's name. False gives upstream's title (the active pane's, with
+    /// `[n/m]` when there are several tabs).
+    #[dynamic(default = "default_true")]
+    pub window_title_app_name: bool,
+
+    /// Colour overrides for the fork's chrome; see `SidebarColorsConfig`.
+    #[dynamic(default)]
+    pub sidebar_colors: SidebarColorsConfig,
 
     /// File browser pane behavior.
     #[dynamic(default)]

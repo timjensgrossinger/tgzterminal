@@ -510,7 +510,11 @@ impl crate::TermWindow {
         for (glyph, advance) in glyphs {
             if let Some(texture) = glyph.texture.as_ref() {
                 let glyph_x = pos_x + (glyph.x_offset + glyph.bearing_x).get() as f32;
-                let glyph_y = y + baseline - (glyph.y_offset + glyph.bearing_y).get() as f32;
+                // Whole pixels, like `glyph_x`: a glyph quad between pixel
+                // rows loses a row of ink when sampled, and callers pass
+                // half-pixel insets. It took the tops off round letters.
+                let glyph_y =
+                    (y + baseline - (glyph.y_offset + glyph.bearing_y).get() as f32).round();
                 let width = texture.coords.size.width as f32 * glyph.scale as f32;
                 let height = texture.coords.size.height as f32 * glyph.scale as f32;
                 let mut quad = layers.allocate(2)?;
