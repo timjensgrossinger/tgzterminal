@@ -42,6 +42,8 @@ config since 2019, it still works exactly the same. We just added furniture to t
 
 - [Features](#features)
 - [Knowing what your agents are doing](#knowing-what-your-agents-are-doing)
+- [Settings without the Lua](#settings-without-the-lua)
+- [From the keyboard](#from-the-keyboard)
 - [Download & install](#download--install)
 - [Staying up to date](#staying-up-to-date)
 - [Build from source](#build-from-source)
@@ -53,27 +55,51 @@ config since 2019, it still works exactly the same. We just added furniture to t
 
 ## Features
 
-| | Feature | What it does | Why an admin would care |
+### The sidebar
+
+| | Feature | What it does | Why you'd care |
 |---|---|---|---|
-| 🗂️ | **Vertical sidebar** | Docked, resizable replacement for the top tab bar — configurable width, position, density, title source and auto-hide, plus type-to-filter search. Labels step down to shorter forms when a column gets tight instead of clipping mid-word. | Twenty panes stop looking like twenty identical rectangles. |
+| 🗂️ | **Vertical sidebar** | Docked, resizable replacement for the top tab bar: width, position, density, title source and auto-hide are all yours, plus type-to-filter search and a collapsed icon rail. Each tab row has two lines: what it is, then the agent and its state on the left (`Claude waiting`) and the git branch on the right. Labels step down to shorter forms when a column gets tight instead of clipping mid-word. | Twenty panes stop looking like twenty identical rectangles. |
+| 📂 | **Tab groups** | New tabs file themselves under the project folder they start in, with a header that counts how many of its agents are waiting on you. Drag tabs between groups, collapse a group, or turn grouping off for one flat list. | Four repos open at once read as four projects, not one long list. |
 | 🌲 | **Pane rows** | Split tabs get a chevron that expands into indented pane rows: click to focus, hover for a per-pane `×`, `(remote)` on anything running on another host. Which tabs are expanded survives a restart. | The tab list finally admits that a "tab" is three panes, one of which is the one you actually wanted. |
-| 🤖 | **Agent awareness** | Vendor-neutral detection of running coding agents (Claude, Codex, Gemini, OpenCode, Copilot, Cursor, Amp, Antigravity). Every signal is ranked by strength — user vars, then process, then title, then the agent's own on-screen chrome — so a brand word in ordinary output can't badge a plain shell, and an established badge doesn't flip when the agent retitles itself. Surfaces status, model and token/cost metadata. | You stop `Cmd+Tab`-ing between six windows to find out which agent is stuck waiting on you — and the badge tells the truth. |
-| ✨ | **Live status motion** | A working agent's tab row is wrapped in a slowly rotating two-colour ring. When its turn ends the ring resolves into a ripple that swells and fades. An agent that needs you keeps a steady glow until you actually go look. Every piece is individually switchable and recolourable. | Peripheral vision does the work. You know something finished without reading a word. |
-| 🔔 | **Waiting queue** | Agents that stop and wait for you are tracked as a queue, not a vibe: a count badge on the macOS dock icon while the app is unfocused, a throttled notification, a chip on the collapsed rail, and `CycleWaitingAgent` to walk them. An agent is "acknowledged" simply by you activating its pane — no dismiss button to hunt for. | The thing that has been blocked on your input for eleven minutes stops being a thing you discover by accident. |
-| 🚀 | **Agent launcher** | Sidebar button that starts a fresh agent. The menu is *discovered*, not configured — an agent shows up only if its CLI actually resolves on `PATH` or in the usual install dirs (`~/.local/bin`, `~/.claude/local`, `~/.bun/bin`, Homebrew, …). Left-click launches the default, Alt-click flips split↔new-tab, right-click lists everything installed plus a sticky **Project root** toggle. | One click to put an agent beside the shell you were already in, in the directory you were already in — including from an SSH pane, where it runs *locally* by default because that's where the CLI and its credentials live. |
-| 🔭 | **Agents section** | A section inside the sidebar listing every agent this terminal can see, grouped by project, with what each one is *doing right now* (`now: Bash cargo check`), expandable rows carrying its recent tool calls, subagents, and token/cost telemetry. Agents needing attention can sort to the top so they aren't buried under healthy rows. Reads each vendor's own session store, including OpenCode's SQLite database. | "Is it still working, or is it waiting on me?" answered without switching to the pane and squinting at the last twenty lines — and the `now:` label downgrades itself to `last:` rather than lie about a stale transcript. |
-| 🧰 | **Agent toolbelt** | Per-pane strip with a live status dot plus context actions — Copy conversation · Stop · Attach · Resume · open logs · compose input. | The nuclear-launch-codes buttons (Stop/Resume/Attach) are locked behind a config flag and real evidence, not vibes — see below. |
-| ➕ | **New-tab dropdown** | Right-clicking `+ New Tab` opens a grouped picker of what this machine actually has: discovered shells (`/etc/shells`, or PowerShell / PowerShell 7 / cmd / Git Bash on Windows), every registered domain including each WSL distro, and your own `launch_menu` entries. | Opening a tab in a specific distro or on a specific host stops being a `wezterm cli` invocation you have to remember. |
-| 🧩 | **Pane layouts** | A **Layouts** footer button and `Cmd+Opt+L` open a menu of presets — Columns, Rows, Main left, Main top, Grid, Agent + shells — plus **Balance panes**. A preset rearranges the panes the tab already has, adds shells in the current directory when it needs more, and never closes anything. iTerm2/cmux-style keys on top of upstream's: `Cmd+D` / `Cmd+Shift+D` split right / down, `Cmd+Opt+Arrows` move focus, `Cmd+Ctrl+Arrows` resize, `Cmd+Shift+Return` zoom, `Cmd+Opt+=` balance. Your own bindings still win; `tgz_pane_keys = false` drops ours. Define layouts of your own with a command per pane (see [Pane layouts](#pane-layouts)), and drive it all from scripts with `cli apply-layout` / `cli balance-panes`. | "Agent on the left, a shell and a log on the right" is one click instead of three splits and a minute of dragging dividers. |
-| 📁 | **File-browser pane** | Lightweight worktree browser that also works inside SSH sessions. | You can look at a file tree on a box three hops away without giving up your terminal identity. |
+| 🎛️ | **A footer you arrange** | Three rows by default: view toggles (**Files**, **Diff**, **Tools**, **Lock**), a launch row (agent launcher, **SSH**, **Layouts**) and **+ New Tab** with its shortcut beside it. Drag buttons into the order you want, add more from a library, or define your own that run a command. New Tab is filled with the accent or drawn plain, your call. | The buttons you use are where your hand already is; the ones you don't are gone. |
+| ➕ | **New-tab dropdown** | Right-clicking `+ New Tab` opens a grouped picker of what this machine actually has: discovered shells (`/etc/shells`, or PowerShell / PowerShell 7 / cmd / Git Bash on Windows), every registered domain including each WSL distro, your own `launch_menu` entries and your own pane layouts. | Opening a tab in a specific distro or on a specific host stops being a `wezterm cli` invocation you have to remember. |
+
+### Agents
+
+| | Feature | What it does | Why you'd care |
+|---|---|---|---|
+| 🤖 | **Agent awareness** | Vendor-neutral detection of running coding agents (Claude, Codex, Gemini, OpenCode, Copilot, Cursor, Amp, Antigravity). Every signal is ranked by strength (user vars, then process, then title, then the agent's own on-screen chrome), so a brand word in ordinary output can't badge a plain shell, and an established badge doesn't flip when the agent retitles itself. | You stop `Cmd+Tab`-ing between six windows to find out which agent is stuck waiting on you, and the badge tells the truth. |
+| ✨ | **Status rings** | Every agent's tab carries a ring: an arc turning while it works, the whole ring in amber while it waits for you, one ripple when it finishes. It follows macOS **Reduce Motion**, holding still as a full ring in the running colour. Every animation has its own switch. See [below](#knowing-what-your-agents-are-doing). | Peripheral vision does the work. You know something finished without reading a word. |
+| 🔔 | **Waiting queue** | Agents that stop and wait for you are tracked as a queue, not a vibe: a count badge on the macOS dock icon while the app is unfocused, a throttled notification, a chip on the collapsed rail, and `CycleWaitingAgent` to walk them. An agent is "acknowledged" simply by you activating its pane; there's no dismiss button to hunt for. | The thing that has been blocked on your input for eleven minutes stops being a thing you discover by accident. |
+| 🚀 | **Agent launcher** | Sidebar button that starts a fresh agent. The menu is *discovered*, not configured: an agent shows up only if its CLI actually resolves on `PATH` or in the usual install dirs (`~/.local/bin`, `~/.claude/local`, `~/.bun/bin`, Homebrew, …). Left-click launches the default, Alt-click flips split↔new-tab, right-click lists everything installed plus a sticky **Project root** toggle and recent sessions to resume. | One click puts an agent beside the shell you were already in, in the directory you were already in, including from an SSH pane, where it runs *locally* by default because that's where the CLI and its credentials live. |
+| 🔭 | **Agents section** | A section at the foot of the sidebar listing every agent this terminal can see, grouped by project, with what each one is *doing right now* (`now: Bash cargo check`), expandable rows carrying its recent tool calls, subagents and token/cost telemetry. Agents needing attention can sort to the top. Reads each vendor's own session store, including OpenCode's SQLite database. | "Is it still working, or is it waiting on me?" answered without switching to the pane, and the `now:` label downgrades itself to `last:` rather than lie about a stale transcript. |
+| Σ | **Usage at a glance** | The **Σ** button shows how much of your plan's tightest window is used, as a thin meter that turns amber only as it runs out. Click it for the full picture in proper columns: Claude's 5-hour and weekly windows with their reset times, last session cost, OpenCode spend, tokens per open session, totals, and a tokens-per-day chart over 7, 14 or 30 days. | You find out you're at 97% of the 5-hour window before the agent does. |
+| 🧰 | **Agent toolbelt** | Per-pane strip with a live status dot plus context actions: Copy conversation, Stop, Attach, Resume, open logs, compose input. Drag it where it doesn't cover your prompt. | The nuclear-launch-codes buttons (Stop/Resume/Attach) are locked behind a config flag and real evidence, not vibes. See below. |
+
+### Panes, files and hosts
+
+| | Feature | What it does | Why you'd care |
+|---|---|---|---|
+| 🧩 | **Pane layouts** | A **Layouts** footer button and `Cmd+Opt+L` open a menu of presets (Columns, Rows, Main left, Main top, Grid, Agent + shells) plus **Balance panes**. A preset rearranges the panes the tab already has, adds shells in the current directory when it needs more, and never closes anything. iTerm2/cmux-style keys on top of upstream's: `Cmd+D` / `Cmd+Shift+D` split right / down, `Cmd+Opt+Arrows` move focus, `Cmd+Ctrl+Arrows` resize, `Cmd+Shift+Return` zoom, `Cmd+Opt+=` balance. Your own bindings still win; `tgz_pane_keys = false` drops ours. Define layouts of your own with a command per pane (see [Pane layouts](#pane-layouts)), and drive it all from scripts with `cli apply-layout` / `cli balance-panes`. | "Agent on the left, a shell and a log on the right" is one click instead of three splits and a minute of dragging dividers. |
+| ± | **Changes panel** | Diffs beside the pane, from git (or a folder of working copies, or no version control at all). In session mode it shows only the files this agent session touched. Docks left or right, raises above a growing prompt if you ask it to. | You read what the agent changed while it's still changing it, not after the commit. |
+| 📁 | **Worktree browser** | A file tree beside your panes (or a fuzzy picker), with quick preview, open-in-editor and a right-click menu. Also works inside SSH sessions. | You can look at a file tree on a box three hops away without giving up your terminal identity. |
+| 🔐 | **SSH quick-launch** | An SSH button that connects to your usual host in one click, a filterable host menu, and a **New SSH connection** form (password or key, SSH, Mosh or Eternal Terminal) that adds the `Host` block to `~/.ssh/config` for you. | `ssh prod` without remembering whether it was `prod`, `prod-1` or `prod.internal`. |
 | ⌨️ | **Rich input composer** | On-demand bottom-anchored modal plus a persistent Warp-style docked input strip. Both insert plain text references only and submit visible text as ordinary bracketed-paste input. | Multi-line prompts stop looking like you're arguing with `readline`. |
 | 🪟 | **WSL-aware paths** | Launching across a domain boundary carries the working directory with it: Windows→WSL hands the path to `wsl.exe --cd`, WSL→Windows becomes `C:\…` or a `\\wsl.localhost\…` UNC path, and a path with no meaning in the target is dropped instead of guessed. | The agent starts in the repo you were looking at, not in `/home/you` or `C:\Windows\System32`. |
 
-> **Security model** — Control actions (Stop / Resume / Attach) are gated behind **both**
+### Safety
+
+| | Feature | What it does | Why you'd care |
+|---|---|---|---|
+| 🙈 | **Secret masking** | Token-shaped strings (API keys, access tokens, passwords in URLs) are hidden on screen and left out of the copy menu's "(no secrets)" rows. On by default. | Screen-sharing a terminal stops being a small act of faith. |
+| 🔒 | **Secure Keyboard Entry** (macOS) | The **Lock** button holds Secure Keyboard Entry while a TGZTerminal window has focus, and it switches on by itself at password prompts. Keyloggers and input monitors stop seeing what you type. | The same switch Terminal.app and iTerm2 have, without a trip to the menu bar. |
+
+> **Security model**: Control actions (Stop / Resume / Attach) are gated behind **both**
 > an explicit config opt-in **and** trusted evidence (process name or explicit user
-> variable) — never visible terminal text alone. A pane printing the word "claude" in a
+> variable), never visible terminal text alone. A pane printing the word "claude" in a
 > `cat`'d log file does not get to press your buttons. Copy actions are always
-> user-initiated and need no trust gate — copying is not a privileged operation, it's
+> user-initiated and need no trust gate: copying is not a privileged operation, it's
 > just Tuesday. Both halves of the gate are required: trusted evidence on its own does
 > not unlock anything, and neither does flipping the flag on a pane nobody can identify.
 > The launcher is deliberately outside that gate for the same reason:
@@ -88,36 +114,41 @@ anything: **is it working, did it finish, or is it waiting on me?**
 
 | State | What you see |
 |---|---|
-| **Working** | The tab row is wrapped in a two-colour ring that rotates slowly. It holds through the small pauses inside a single turn, so it doesn't stutter every time the agent redraws its prompt box mid-thought. |
-| **Just finished** | The ring stops and resolves: one ripple swells outward, fades, and leaves a faint trace on the row. |
-| **Waiting for you** | A steady, non-animating glow stays on the row until you activate that pane. It costs nothing to draw and it does not blink, because a thing that needs you should not also be annoying. |
+| **Working** | An arc turns around the ring on the agent's tab, in the running colour (the accent). It holds through the small pauses inside a single turn, so it doesn't stutter every time the agent redraws its prompt box mid-thought. |
+| **Waiting for you** | The whole ring goes amber and breathes slowly; the second line says `Claude waiting` in amber and the group header counts it. It stays until you activate that pane. |
+| **Just finished** | The arc stops and resolves: one ripple swells outward, fades, and leaves a faint trace on the row. |
 | **Newly appeared** | The row slides in rather than popping into existence, so a new agent doesn't make the list jump under your cursor. |
-| **Active tab** | The rail on the left edge carries the same colour pair with a slow breathe. |
+| **Reduced motion** | With macOS Reduce Motion on (or animations off), nothing moves: a working agent shows a still, full ring in the running colour, a waiting one a still amber ring. Running and waiting still read apart by colour alone. |
 
-Two behaviours worth knowing about because they're deliberate:
+Three behaviours worth knowing about because they're deliberate:
 
+- **Only motion that carries state is on by default.** The turning arc, the waiting
+  breath, the finish ripple and the slide-in are on. The status-dot pulse and the active
+  rail's breathe move without saying anything new, so they're off unless you ask.
 - **Motion continues while the window is unfocused.** The whole point is seeing agent
   state from another window. Turn it off with `animations.unfocused = false` if you'd
   rather a background window cost nothing.
-- **The waiting glow is state, not motion.** It survives `animations.enabled = false`,
-  because switching off animation should stop things moving, not blind you to which
-  agent is blocked. It has its own `waiting_glow` toggle if you genuinely want it gone.
+- **The waiting outline is state, not motion.** It survives `animations.enabled = false`
+  and Reduce Motion, because switching off animation should stop things moving, not
+  blind you to which agent is blocked. It has its own `waiting_glow` toggle if you
+  genuinely want it gone.
 
-Everything is switchable and recolourable:
+Every switch is in **Settings → Agents → Animations**, or in Lua:
 
 ```lua
 config.agent_ui = {
   ring_colors = 'RedBlue',   -- RedBlue | OrangeCyan | TanSage | BrownSlate
 
   animations = {
-    enabled        = true,   -- master switch for all sidebar motion
-    unfocused      = true,   -- keep animating when the window isn't focused
-    working_ring   = true,
-    resolve_ripple = true,
-    waiting_glow   = true,
-    agent_enter    = true,
-    rail_breathe   = true,
-    dot_pulse      = true,
+    enabled              = true,  -- master switch for all sidebar motion
+    follow_reduce_motion = true,  -- hold still while macOS asks for reduced motion
+    unfocused            = true,  -- keep animating when the window isn't focused
+    working_ring         = true,
+    resolve_ripple       = true,
+    waiting_glow         = true,
+    agent_enter          = true,
+    rail_breathe         = false,
+    dot_pulse            = false,
 
     -- All optional. Anything unset falls back to the ring_colors preset.
     colors = {
@@ -137,10 +168,52 @@ brightness, so a custom pair doesn't leave the "finished" trace looking like it 
 from a different design.
 
 > **Upgrading?** `agent_ui.pulse_working_dot` used to be the single kill switch for all
-> of this. It still is — for as long as you have not written an `animations` table. The
-> moment you add one (even an empty `animations = {}`), `animations.enabled` takes over
-> as the master switch and `pulse_working_dot` goes back to meaning only what its name
-> says. Nobody who already switched motion off gets it silently switched back on.
+> of this. It still is, for as long as you have not written an `animations` table. The
+> moment you add one (even an empty `animations = {}`, or a flip of any Animations
+> switch in Settings), `animations.enabled` takes over as the master switch and
+> `pulse_working_dot` goes back to meaning only what its name says. Nobody who already
+> switched motion off gets it silently switched back on.
+
+## Settings without the Lua
+
+`Cmd+,` opens **Settings** as a tab: the fork's settings plus the basics (font, size,
+line height, colour scheme, opacity), grouped as Appearance, Colours, Sidebar, Agents,
+Worktree, Changes, Input, Privacy, Buttons and a read-only Shortcuts list. On/off
+settings are switches, lists open a filterable picker, colours take any value `colors`
+accepts and show a swatch.
+
+Every change is written straight into your `wezterm.lua`, in place where the file
+already sets that key and in a small managed block where it doesn't. Keys you set from
+code (a function, a computed value) are shown as such and left alone, with a link to the
+line. The Lua file stays the single source of truth; Settings is just a nicer pen.
+
+**Colours** has one field per part of the chrome (`sidebar_colors`): the accent, the
+attention amber, the keyboard focus ring (a soft lavender by default, never white, so it
+doesn't glare at night), New Tab, the rings, every row, field and text tone.
+
+## From the keyboard
+
+Everything the sidebar's buttons do has a key assignment, each one is in the command
+palette, and most have a default. On macOS they use `Cmd`; elsewhere the same letters
+with `Super`. Your own `config.keys` entries win over all of these.
+
+| Keys | Does |
+|---|---|
+| `Cmd+,` | Settings |
+| `Cmd+Shift+E` | Put the keyboard on the sidebar: `Tab` / `Shift+Tab` walk the tabs and buttons, `Enter` acts, `Esc` goes back |
+| `Cmd+Shift+F` | Search tabs (then `Tab` or `↓` moves on into the sidebar) |
+| `Cmd+Shift+J` | Jump to the next agent that's waiting on you |
+| `Ctrl+Shift+A` | Walk the Agents section with the arrow keys |
+| `Cmd+Shift+A` / `Cmd+Shift+G` | Start the default agent / open the agent menu |
+| `Cmd+Shift+U` | Usage popup |
+| `Cmd+Shift+H` | SSH host menu, ready to type a filter |
+| `Cmd+Shift+N` | The `+ New Tab` shell/domain menu |
+| `Cmd+Opt+L` | Pane layouts |
+| `Cmd+Shift+B` | Pin the sidebar open, or let it collapse to its rail |
+
+Whatever has keyboard focus wears the same lavender ring, in the sidebar, in menus and
+in Settings. The terminal never loses `Tab` unless you sent the keyboard to the sidebar
+on purpose.
 
 ## Download & install
 
@@ -366,9 +439,9 @@ full packaging steps if `cargo build` alone leaves you a pile of loose `.exe` fi
 
 ## Configuration
 
-Fork keys live alongside standard WezTerm config in `~/.config/wezterm/wezterm.lua` — no
-new config file, no new format, no new place to lose track of. A minimal setup that gets
-you most of the way there:
+Fork keys live alongside standard WezTerm config in `~/.config/wezterm/wezterm.lua`: no
+new config file, no new format, no new place to lose track of. Everything below is also
+in the Settings tab, and every key is optional. A setup that shows most of what there is:
 
 ```lua
 local wezterm = require 'wezterm'
@@ -378,10 +451,18 @@ local config = wezterm.config_builder()
 config.sidebar_enabled = true
 config.sidebar_position = 'Left'
 config.sidebar_tab_metadata = { 'GitBranch', 'WorkingDirectory' }
+config.sidebar_tab_grouping = 'Auto'      -- 'Manual' or 'Off' for one flat list
+config.sidebar_new_tab_style = 'Filled'   -- or 'Plain'
 
 -- Width is 2x-calibrated and scales on 1x displays; a drag-resize is
 -- per-session, not persisted
 config.sidebar_width_px = 400
+
+-- Chrome colours: set only what you want to change
+config.sidebar_colors = {
+  accent = '#58a6ff',
+  focus_ring = '#a99bd6',
+}
 
 -- Agent awareness + toolbelt
 config.agent_ui = {
@@ -393,7 +474,7 @@ config.agent_ui = {
 
   -- See "Knowing what your agents are doing" for the full set
   ring_colors = 'RedBlue',
-  animations = { enabled = true, unfocused = true },
+  animations = { follow_reduce_motion = true },
 
   -- Agents that stop and wait for you
   waiting_notification = true,
@@ -411,21 +492,16 @@ config.agent_ui = {
     -- domain = 'WSL:Ubuntu',    -- pin a distro if you have several
   },
 
-  -- The agents section inside the sidebar (bind ActivateAgentSection to jump to it)
+  -- The agents section at the foot of the sidebar
   section = {
     enabled = true,
     refresh_ms = 1000,            -- clamped to 100..=10000
     show_activity = true,         -- read transcripts for "what is it doing now"
     show_tokens = true,           -- pane-reported token/cost telemetry
+    show_quota = true,            -- plan limits on the Σ button and in its popup
     show_non_interactive = false, -- SDK harnesses and hook children stay hidden
     sort_attention_first = true,  -- blocked/waiting agents float to the top
   },
-}
-
--- Jump straight to the agents section, or cycle through whatever is waiting on you
-config.keys = {
-  { key = 'a', mods = 'CTRL|SHIFT', action = wezterm.action.ActivateAgentSection },
-  { key = 'w', mods = 'CTRL|SHIFT', action = wezterm.action.CycleWaitingAgent },
 }
 
 -- Grouped shell/domain picker behind a right-click on the sidebar's + New Tab
@@ -433,6 +509,9 @@ config.new_tab_menu = { enabled = true, show_shells = true, show_domains = true 
 
 -- Rich multiline input
 config.rich_input = { enabled = true, docked = true }
+
+-- Diffs beside the pane
+config.diff_panel = { enabled = true, position = 'Right', default_mode = 'Session' }
 
 return config
 ```
