@@ -143,10 +143,19 @@ from a different design.
 
 ## Download & install
 
-Prebuilt binaries are attached to every [GitHub Release](../../releases). No package
-manager ritual required, no `brew install` incantation to memorize and forget.
+Prebuilt binaries are attached to every [GitHub Release](../../releases). Homebrew
+(macOS) and winget (Windows) are optional and skip the "unidentified developer" prompts.
 
 ### macOS
+
+With Homebrew (no Gatekeeper prompt, since the cask clears the quarantine flag):
+
+```sh
+brew trust timjensgrossinger/tap
+brew install timjensgrossinger/tap/tgzterminal
+```
+
+`brew upgrade` picks up new releases. Or install by hand:
 
 1. Download `TGZTerminal.dmg` from the latest release.
 2. Open it, drag **TGZTerminal** onto **Applications**, feel a brief sense of
@@ -282,7 +291,8 @@ want the notes first.
 
 Install it the same way you installed the last one:
 
-- **macOS** — open the dmg, drag onto **Applications**, replace the old copy.
+- **macOS** — `brew upgrade tgzterminal` if you installed with Homebrew; otherwise open
+  the dmg, drag onto **Applications**, replace the old copy.
 - **Windows** — run `TGZTerminal-Setup-<version>.exe`; it upgrades in place and closes a
   running instance for you. On the portable zip, extract over the old folder (keeping the
   `.portable` marker).

@@ -140,3 +140,45 @@ jobs:
           files: dist/TGZTerminal.dmg
           generate_release_notes: true
           fail_on_unmatched_files: true
+
+  # Bumps the cask in timjensgrossinger/homebrew-tap so
+  # `brew install timjensgrossinger/tap/tgzterminal` picks up this release.
+  # Off until the secret HOMEBREW_TAP_TOKEN is set: a fine-grained token with
+  # Contents read/write on the homebrew-tap repo.
+  homebrew:
+    name: Update Homebrew tap
+    needs: release
+    if: startsWith(github.ref, 'refs/tags/tgz-v')
+    runs-on: ubuntu-latest
+    env:
+      HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+    steps:
+      - name: Homebrew tap not configured
+        if: env.HOMEBREW_TAP_TOKEN == ''
+        run: echo "::notice::HOMEBREW_TAP_TOKEN is not set; skipping the Homebrew tap update."
+
+      - name: Bump cask version and sha256
+        if: env.HOMEBREW_TAP_TOKEN != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#tgz-v}"
+          gh release download "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" \
+            -p TGZTerminal.dmg -D "$RUNNER_TEMP"
+          sha=$(sha256sum "$RUNNER_TEMP/TGZTerminal.dmg" | cut -d' ' -f1)
+          git clone --depth 1 \
+            "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/timjensgrossinger/homebrew-tap.git" tap
+          cd tap
+          sed -i -E \
+            -e "s/^  version \".*\"/  version \"${version}\"/" \
+            -e "s/^  sha256 \".*\"/  sha256 \"${sha}\"/" \
+            Casks/tgzterminal.rb
+          if git diff --quiet; then
+            echo "Cask already at ${version}"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "tgzterminal ${version}"
+          git push

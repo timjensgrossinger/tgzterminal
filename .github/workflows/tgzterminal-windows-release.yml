@@ -188,7 +188,14 @@ jobs:
           # see ci/fetch-fzf.sh for the pinned version + checksum.
           chmod +x ci/fetch-fzf.sh
           ci/fetch-fzf.sh windows amd64 "$pkg/fzf.exe"
-          # Mesa software GL is optional; include it only if the build produced it.
+          # wezterm-gui/build.rs copies mesa into target/release, but a build
+          # restored from rust-cache can skip that copy, which also drops the
+          # installer (it requires mesa). Stage it from the asset directly.
+          if [ ! -f target/release/mesa/opengl32.dll ] && [ -f assets/windows/mesa/opengl32.dll ]; then
+            mkdir -p target/release/mesa
+            cp assets/windows/mesa/opengl32.dll target/release/mesa/
+          fi
+          # Mesa software GL is optional; include it only if it is present.
           if [ -f target/release/mesa/opengl32.dll ]; then
             cp target/release/mesa/opengl32.dll "$pkg/mesa/"
           else
