@@ -1,102 +1,27 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
   <defs>
-    <!-- Rich dark slate plate (crisp physical depth, no "dim screen" feel) -->
-    <linearGradient id="cyanPlateGrad" x1="0%" y1="0%" x2="0%" y2="100%">
-      <stop offset="0%" stop-color="#2D3B42"/>
-      <stop offset="45%" stop-color="#222C32"/>
-      <stop offset="100%" stop-color="#161F24"/>
-    </linearGradient>
-
-    <linearGradient id="cyanRimGrad" x1="0%" y1="0%" x2="0%" y2="100%">
-      <stop offset="0%" stop-color="#4B5E68" stop-opacity="0.85"/>
-      <stop offset="50%" stop-color="#313E45" stop-opacity="0.5"/>
-      <stop offset="100%" stop-color="#1B2429" stop-opacity="0.3"/>
-    </linearGradient>
-
-    <radialGradient id="cyanPlateSheen" cx="50%" cy="15%" r="70%">
-      <stop offset="0%" stop-color="#5B7685" stop-opacity="0.16"/>
-      <stop offset="60%" stop-color="#5B7685" stop-opacity="0.02"/>
-      <stop offset="100%" stop-color="#5B7685" stop-opacity="0"/>
-    </radialGradient>
-
-    <!-- Deep sapphire blue arcs -->
-    <linearGradient id="cyanLeftArc" x1="50%" y1="0%" x2="50%" y2="100%">
-      <stop offset="0%" stop-color="#5288BE"/>
-      <stop offset="50%" stop-color="#3B6F9E"/>
-      <stop offset="100%" stop-color="#244B70"/>
-    </linearGradient>
-
-    <linearGradient id="cyanRightArc" x1="50%" y1="0%" x2="50%" y2="100%">
-      <stop offset="0%" stop-color="#244B70"/>
-      <stop offset="50%" stop-color="#3B6F9E"/>
-      <stop offset="100%" stop-color="#5288BE"/>
-    </linearGradient>
-
-    <!-- Bold Cyan/Sky Blue T (100% Blue, ZERO white glare) -->
-    <linearGradient id="cyanTGrad" x1="0%" y1="0%" x2="0%" y2="100%">
-      <stop offset="0%" stop-color="#58A6FF"/>
-      <stop offset="50%" stop-color="#3B8BE8"/>
-      <stop offset="100%" stop-color="#1E65BA"/>
-    </linearGradient>
-
-    <filter id="cyanShadow" x="-12%" y="-10%" width="124%" height="128%" filterUnits="userSpaceOnUse">
-      <feDropShadow dx="0" dy="16" stdDeviation="18" flood-color="#000000" flood-opacity="0.6"/>
-      <feDropShadow dx="0" dy="4" stdDeviation="6" flood-color="#000000" flood-opacity="0.3"/>
+    <!-- One soft drop shadow; the plate itself is flat -->
+    <filter id="plateShadow" x="-12%" y="-10%" width="124%" height="128%" filterUnits="userSpaceOnUse">
+      <feDropShadow dx="0" dy="10" stdDeviation="12" flood-color="#000000" flood-opacity="0.45"/>
     </filter>
   </defs>
 
-  <!-- 1. Base Squircle Plate -->
+  <!-- 1. Flat squircle plate -->
   <rect x="46" y="46" width="420" height="420" rx="94" ry="94"
-        fill="url(#cyanPlateGrad)"
-        filter="url(#cyanShadow)"
-        stroke="url(#cyanRimGrad)"
-        stroke-width="1.75"/>
+        fill="#1D262B"
+        filter="url(#plateShadow)"/>
 
-  <!-- Top Ambient Sheen -->
-  <rect x="48" y="48" width="416" height="416" rx="92" ry="92"
-        fill="url(#cyanPlateSheen)"/>
-
-  <!-- 2. Dual Loading Circle Elements -->
-  <circle cx="256" cy="256" r="142"
-          fill="none"
-          stroke="#1E282E"
-          stroke-width="2.5"
-          stroke-dasharray="4 8"
-          opacity="0.7"/>
-
-  <!-- Left Loading Curve -->
+  <!-- 2. The two loading arcs, one solid blue -->
   <path d="M 155.6,356.4 A 142,142 0 0,1 155.6,155.6"
-        fill="none"
-        stroke="url(#cyanLeftArc)"
-        stroke-width="15"
-        stroke-linecap="round"/>
-
-  <!-- Right Loading Curve -->
+        fill="none" stroke="#4A80B8" stroke-width="18" stroke-linecap="round"/>
   <path d="M 356.4,155.6 A 142,142 0 0,1 356.4,356.4"
-        fill="none"
-        stroke="url(#cyanRightArc)"
-        stroke-width="15"
-        stroke-linecap="round"/>
+        fill="none" stroke="#4A80B8" stroke-width="18" stroke-linecap="round"/>
 
-  <!-- Ticker dots -->
-  <circle cx="155.6" cy="155.6" r="3.75" fill="#58A6FF" opacity="0.75"/>
-  <circle cx="356.4" cy="356.4" r="3.75" fill="#58A6FF" opacity="0.75"/>
-
-  <!-- 3. Middle Symbol: Pure Blue <T -->
-  <!-- Chevron '<' in Soft Slate Blue -->
+  <!-- 3. The <T prompt -->
   <path d="M 218,212 L 168,256 L 218,300"
-        fill="none"
-        stroke="#4B81B7"
-        stroke-width="17"
-        stroke-linecap="round"
-        stroke-linejoin="round"/>
-
-  <!-- Monospace 'T' in Rich Cyan-Blue #58A6FF (No white at all) -->
-  <path d="M 244,208 H 340 C 342,208 344,210 344,212 V 224 C 344,226 342,228 340,228 H 304 V 298 C 304,300 302,302 299,302 H 285 C 282,302 280,300 280,298 V 228 H 244 C 242,228 240,226 240,224 V 212 C 240,210 242,208 244,208 Z"
-        fill="url(#cyanTGrad)"
-        stroke="#0E1E2C"
-        stroke-width="1.25"/>
-
-  <!-- Dot in matching blue -->
-  <circle cx="292" cy="318" r="4.25" fill="#58A6FF" opacity="0.85"/>
+        fill="none" stroke="#4A80B8" stroke-width="20"
+        stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M 244,206 H 340 C 342,206 346,210 346,212 V 226 C 346,228 342,232 340,232 H 306 V 298 C 306,302 302,304 299,304 H 285 C 282,304 278,302 278,298 V 232 H 244 C 242,232 238,228 238,226 V 212 C 238,210 242,206 244,206 Z"
+        fill="#58A6FF"/>
+  <circle cx="292" cy="322" r="6" fill="#58A6FF"/>
 </svg>
