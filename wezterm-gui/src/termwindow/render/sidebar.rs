@@ -59,6 +59,9 @@ const GAP: f32 = 4.;
 pub(crate) const FOOTER_GAP: f32 = GAP;
 pub(crate) const PAD_X: f32 = 10.;
 const ACTIVE_RAIL_W: f32 = 3.;
+/// How far the active tab row's one-pixel edge is mixed from its fill
+/// towards the idle text colour.
+const ACTIVE_ROW_EDGE_MIX: f32 = 0.25;
 const ACTIVE_TEXT_GAP: f32 = 7.;
 /// Horizontal step a pane row is inset from its parent tab row.
 const PANE_ROW_INDENT: f32 = 14.;
@@ -95,6 +98,11 @@ const SIDEBAR_WORKTREE_GLYPH: &str = "\u{f07b}";
 /// same glyph upstream draws as the cursor at a password prompt, so the two
 /// read as one feature.
 const SIDEBAR_SECURE_INPUT_GLYPH: &str = "\u{f023}";
+/// `nf-oct-diff`, for the Changes toggle in the sidebar footer: a document
+/// with a plus over a minus reads as "changes" where a bare `±` read as maths.
+/// From the bundled Symbols Nerd Font for the same reason as
+/// [`SIDEBAR_COPY_GLYPH`].
+const SIDEBAR_CHANGES_GLYPH: &str = "\u{f440}";
 
 /// Gap between the close button's right edge and the right edge of its zone.
 /// Both the hover button and the `×` inside it derive from this, and so does the
@@ -544,9 +552,6 @@ pub(crate) struct SidebarPalette {
     /// [`agent_herd::ATTENTION_RGB`] so a branded theme can speak its own
     /// attention colour without four literals drifting apart.
     attention: LinearRgba,
-    /// Fill of the `Σ` button, as far as the window closest to its limit is
-    /// used: a light red, so the button reads as a meter, not as the accent.
-    quota_fill: LinearRgba,
     ring: RingColors,
 }
 
@@ -574,7 +579,6 @@ impl SidebarPalette {
         set(&mut self.text_idle, user.text_idle);
         set(&mut self.text_meta, user.text_meta);
         set(&mut self.attention, user.attention);
-        set(&mut self.quota_fill, user.quota);
     }
 
     /// The accent the active rail is drawn in: midway between the ring's
@@ -615,7 +619,6 @@ impl SidebarPalette {
             text_meta: srgb8_to_linear(0x5a, 0x5a, 0x63),
             working_fill: srgb8_to_linear(0x13, 0x13, 0x17),
             attention: default_attention(),
-            quota_fill: default_quota_fill(),
         }
     }
 
@@ -660,7 +663,6 @@ impl SidebarPalette {
                 Some(c) => srgb8_to_linear_tuple(c),
                 None => default_attention(),
             },
-            quota_fill: default_quota_fill(),
             ring,
         }
     }
@@ -686,7 +688,6 @@ impl SidebarPalette {
             text_meta: text_idle.mul_alpha(0.60),
             working_fill: row_fill,
             attention: default_attention(),
-            quota_fill: default_quota_fill(),
             ring,
         }
     }
@@ -722,7 +723,6 @@ impl SidebarPalette {
             text_meta: lerp_rgba(surface, fg, 0.42),
             working_fill: lerp_rgba(surface, fg, 0.04),
             attention: default_attention(),
-            quota_fill: default_quota_fill(),
             ring,
         }
     }
@@ -809,12 +809,8 @@ const USAGE_BAR_GAP: f32 = 2.;
 const USAGE_CHART_BAR_GAP: f32 = 6.;
 const USAGE_CHART_GRID_MIX: f32 = 0.08;
 const USAGE_TAB_ACTIVE_MIX: f32 = 0.18;
-/// How far the `Σ` button's quota fill is mixed from the button fill towards
-/// [`SidebarPalette::quota_fill`]: enough to read as red, not so much that
-/// the percentage on top loses contrast. A window at its critical level gets
-/// the full colour.
-const USAGE_BUTTON_FILL_MIX: f32 = 0.6;
-const USAGE_BUTTON_FILL_CRITICAL_MIX: f32 = 0.9;
+/// Height of the meter along the `Σ` button's foot (logical px, × DPI).
+const USAGE_BUTTON_METER_H: f32 = 3.;
 /// Tile pitch along the ring, as a fraction of the stroke.
 ///
 /// The ring is a gradient drawn as flat tiles, so this is the difference
@@ -1275,11 +1271,6 @@ fn srgb8_to_linear_tuple((r, g, b): (u8, u8, u8)) -> LinearRgba {
 /// waiting queue has always used.
 fn default_attention() -> LinearRgba {
     srgb8_to_linear_tuple(crate::agent_herd::ATTENTION_RGB)
-}
-
-/// A soft red: the `Σ` button's quota fill in every theme.
-fn default_quota_fill() -> LinearRgba {
-    srgb8_to_linear(0xf2, 0x8b, 0x82)
 }
 
 /// Near-black label colour, for fills no scheme foreground can sit on.
@@ -3195,6 +3186,9 @@ pub(crate) enum SidebarRow {
         active: bool,
         title: String,
         metadata: Vec<String>,
+        /// The git branch, when `sidebar_tab_metadata` shows it: drawn at the
+        /// right of the second line rather than joined into it.
+        branch: Option<String>,
         /// Panes in this tab. A count above one is what earns an expand
         /// chevron; single-pane tabs stay exactly as they were.
         pane_count: usize,
@@ -3225,6 +3219,7 @@ pub(crate) struct SidebarTabInput {
     active: bool,
     title: String,
     metadata: Vec<String>,
+    branch: Option<String>,
     panes: Vec<SidebarRow>,
     /// Labels of the subagents working in the tab right now.
     subagents: Vec<String>,
@@ -3271,6 +3266,7 @@ fn push_sidebar_tab_rows(
         active: tab.active,
         title: tab.title,
         metadata: tab.metadata,
+        branch: tab.branch,
         pane_count,
         expanded,
     });
@@ -3377,6 +3373,57 @@ fn assemble_grouped_sidebar_rows(
 
 /// Case-insensitive substring match of `query` against a tab's title or any of
 /// its metadata fields.
+/// The note after the Agents header's count: a fresh feedback message, else
+/// how many agents need you and whether every project is shown. `true` when
+/// it is about agents needing you, which draws it in the attention colour.
+fn agent_section_note(
+    feedback: Option<&str>,
+    attention_count: usize,
+    view_all: bool,
+) -> Option<(String, bool)> {
+    if let Some(message) = feedback {
+        return Some((message.to_string(), false));
+    }
+    let mut parts = vec![];
+    if attention_count > 0 {
+        parts.push(format!("{attention_count} need you"));
+    }
+    if view_all {
+        parts.push("all projects".to_string());
+    }
+    (!parts.is_empty()).then(|| (parts.join(", "), attention_count > 0))
+}
+
+/// A tab row's second line, as its left and right parts. At the left, the
+/// agent and its state (`Claude waiting`), or for a tab with no agent its
+/// other metadata; at the right, the git branch. Nothing is joined with a
+/// middle dot: the two parts are drawn apart.
+///
+/// An agent row with no branch keeps the first metadata line (the folder) at
+/// the right, so it says where the agent works as it did before.
+fn tab_subtitle(
+    agent: Option<(&str, Option<&str>)>,
+    metadata: &[String],
+    branch: Option<&str>,
+) -> (String, Option<String>) {
+    let rest: Vec<&str> = metadata
+        .iter()
+        .map(String::as_str)
+        .filter(|item| Some(*item) != branch)
+        .collect();
+    match agent {
+        Some((kind, status)) => {
+            let left = match status {
+                Some(status) => format!("{kind} {status}"),
+                None => kind.to_string(),
+            };
+            let right = branch.or_else(|| rest.first().copied());
+            (left, right.map(str::to_string))
+        }
+        None => (rest.join(", "), branch.map(str::to_string)),
+    }
+}
+
 fn query_matches(title: &str, metadata: &[String], query: &str) -> bool {
     if query.is_empty() {
         return true;
@@ -10062,7 +10109,7 @@ impl crate::TermWindow {
             .iter()
             .filter_map(|entry| match entry.item {
                 TabBarItem::Tab { tab_idx, .. } => {
-                    let (title, metadata) = self.sidebar_tab_labels(tab_idx, &entry.title);
+                    let (title, metadata, _) = self.sidebar_tab_labels(tab_idx, &entry.title);
                     Some((tab_idx, title, metadata))
                 }
                 _ => None,
@@ -10100,12 +10147,13 @@ impl crate::TermWindow {
                 let TabBarItem::Tab { tab_idx, active } = entry.item else {
                     return None;
                 };
-                let (title, metadata) = self.sidebar_tab_labels(tab_idx, &entry.title);
+                let (title, metadata, branch) = self.sidebar_tab_labels(tab_idx, &entry.title);
                 Some(SidebarTabInput {
                     tab_idx,
                     active,
                     title,
                     metadata,
+                    branch,
                     panes: self.sidebar_pane_rows_for_tab_idx(tab_idx),
                     subagents: self.sidebar_tab_subagents(tab_idx),
                 })
@@ -10775,13 +10823,19 @@ impl crate::TermWindow {
         }
     }
 
-    fn sidebar_tab_labels(&self, tab_idx: usize, fallback_title: &Line) -> (String, Vec<String>) {
+    /// A tab's title, its metadata lines, and the git branch among them (if
+    /// `sidebar_tab_metadata` shows it), which the row draws apart.
+    fn sidebar_tab_labels(
+        &self,
+        tab_idx: usize,
+        fallback_title: &Line,
+    ) -> (String, Vec<String>, Option<String>) {
         let fallback = line_to_string(fallback_title).trim().to_string();
         let Some(tab) = Mux::get()
             .get_window(self.mux_window_id)
             .and_then(|window| window.get_tab_at_idx(tab_idx).cloned())
         else {
-            return (fallback, Vec::new());
+            return (fallback, Vec::new(), None);
         };
         let active_pane = tab.get_active_pane();
         let panes = tab.iter_panes_ignoring_zoom();
@@ -10857,8 +10911,11 @@ impl crate::TermWindow {
         }
         metadata.retain(|item| item != &title);
         metadata.dedup();
+        let branch = git_branch
+            .filter(|branch| metadata.contains(branch))
+            .filter(|branch| !branch.is_empty());
 
-        (title, metadata)
+        (title, metadata, branch)
     }
 
     /// Panes of `tab_idx` as sidebar child rows, in split order.
@@ -14186,7 +14243,11 @@ impl crate::TermWindow {
             paint_square_toggle(
                 this,
                 layers,
-                (UIItemType::SidebarDiffPanelButton, "\u{00b1}", on),
+                (
+                    UIItemType::SidebarDiffPanelButton,
+                    SIDEBAR_CHANGES_GLYPH,
+                    on,
+                ),
                 rect,
                 radius,
                 hit,
@@ -14247,7 +14308,7 @@ impl crate::TermWindow {
                 .iter()
                 .filter_map(|entry| match entry.item {
                     TabBarItem::Tab { tab_idx, active } => {
-                        let (title, _) = self.sidebar_tab_labels(tab_idx, &entry.title);
+                        let (title, _, _) = self.sidebar_tab_labels(tab_idx, &entry.title);
                         Some((tab_idx, active, title))
                     }
                     _ => None,
@@ -15057,15 +15118,18 @@ impl crate::TermWindow {
             .skip(self.sidebar_scroll_offset)
             .take(visible_rows)
         {
-            let (tab_idx, active, title, metadata, pane_count, expanded) = match row {
+            let (tab_idx, active, title, metadata, branch, pane_count, expanded) = match row {
                 SidebarRow::Tab {
                     tab_idx,
                     active,
                     title,
                     metadata,
+                    branch,
                     pane_count,
                     expanded,
-                } => (tab_idx, active, title, metadata, pane_count, expanded),
+                } => (
+                    tab_idx, active, title, metadata, branch, pane_count, expanded,
+                ),
                 SidebarRow::GroupHeader {
                     group_idx,
                     name,
@@ -15495,7 +15559,20 @@ impl crate::TermWindow {
             };
             let row_bg = fade(row_bg);
             let treatment = anim.ring_treatment();
-            if row_filled {
+            if active && !tab_dragging {
+                // The tab you are in: its fill plus a one-pixel edge a step
+                // lighter, so it stands out without adding a hue next to the
+                // amber of a waiting agent.
+                self.sidebar_bordered_fill(
+                    layers,
+                    1,
+                    row_rect,
+                    tab_row_radius,
+                    dpi_scale.max(1.),
+                    row_bg,
+                    fade(lerp_rgba(active_fill, sb.text_idle, ACTIVE_ROW_EDGE_MIX)),
+                )?;
+            } else if row_filled {
                 self.sidebar_rounded_fill(layers, 1, row_rect, tab_row_radius, row_bg)?;
             }
             // On a tab row only the round ring carries status: no outline
@@ -15667,26 +15744,25 @@ impl crate::TermWindow {
             // Line 1 says what the tab is doing, line 2 who is doing it and
             // in what state. A tab with no agent keeps its title and puts
             // branch and folder below.
-            let (line1, line2) = match agent.as_ref() {
-                Some(state) => {
-                    let mut parts = vec![state.kind.label().to_string()];
-                    match state.status {
-                        AgentStatus::Unknown => {}
-                        AgentStatus::WaitingForInput if !agent_waits_unseen => {
-                            parts.push("ready".to_string())
-                        }
-                        _ => parts.push(state.status.label().to_string()),
-                    }
-                    if let Some(first) = metadata.first() {
-                        parts.push(first.clone());
-                    }
-                    (herd_name.unwrap_or(title), parts.join(" · "))
-                }
-                None => (title, metadata.join(" · ")),
+            let kind_label = agent.as_ref().map(|state| state.kind.label());
+            let status_label = agent.as_ref().and_then(|state| match state.status {
+                AgentStatus::Unknown => None,
+                AgentStatus::WaitingForInput if !agent_waits_unseen => Some("ready"),
+                _ => Some(state.status.label()),
+            });
+            let (line2, line2_right) = tab_subtitle(
+                kind_label.as_deref().map(|kind| (kind, status_label)),
+                &metadata,
+                branch.as_deref(),
+            );
+            let line1 = match agent.as_ref() {
+                Some(_) => herd_name.unwrap_or(title),
+                None => title,
             };
             let line1_h = self.ui_line_height(UiFont::Medium);
             let line2_h = self.ui_line_height(UiFont::Small);
-            let show_line2 = !line2.is_empty() && row_height as f32 >= line1_h + line2_h + 2.;
+            let show_line2 = !(line2.is_empty() && line2_right.is_none())
+                && row_height as f32 >= line1_h + line2_h + 2.;
             let block_h = if show_line2 {
                 line1_h + line2_h
             } else {
@@ -15701,27 +15777,53 @@ impl crate::TermWindow {
                 text_top,
                 title_w,
                 fade(if lit {
-                    inactive_fg
+                    active_fg
                 } else {
-                    inactive_fg.mul_alpha(0.82)
+                    inactive_fg.mul_alpha(0.86)
                 }),
                 Align::Left,
             )?;
             if show_line2 {
-                let waiting = agent_waits_unseen;
+                // Opaque enough to read at 4.5:1 on the active fill.
+                let meta_fg = if lit {
+                    inactive_fg.mul_alpha(0.88)
+                } else {
+                    inactive_fg.mul_alpha(0.78)
+                };
+                // The branch takes the right, at most a little under half the
+                // width; the state gets what is left.
+                let gap = 8. * dpi_scale;
+                let right_w = line2_right.as_deref().map_or(0., |right| {
+                    self.ui_text_width(UiFont::Small, right).min(title_w * 0.45)
+                });
+                if let Some(right) = line2_right.as_deref() {
+                    self.paint_ui_text(
+                        layers,
+                        UiFont::Small,
+                        right,
+                        title_x + slide_x + title_w - right_w,
+                        text_top + line1_h,
+                        right_w,
+                        fade(meta_fg),
+                        Align::Right,
+                    )?;
+                }
+                let left_w = if right_w > 0. {
+                    (title_w - right_w - gap).max(0.)
+                } else {
+                    title_w
+                };
                 self.paint_ui_text(
                     layers,
                     UiFont::Small,
                     &line2,
                     title_x + slide_x,
                     text_top + line1_h,
-                    title_w,
-                    fade(if waiting {
+                    left_w,
+                    fade(if agent_waits_unseen {
                         sb.attention
-                    } else if lit {
-                        inactive_fg.mul_alpha(0.66)
                     } else {
-                        inactive_fg.mul_alpha(0.50)
+                        meta_fg
                     }),
                     Align::Left,
                 )?;
@@ -16131,88 +16233,147 @@ impl crate::TermWindow {
                                 label,
                             )
                         });
-                        let group_w = dot_size
-                            + if label.is_some() {
-                                ACTION_ICON_GAP + label_w
-                            } else {
-                                0.
-                            };
-                        let group_x = x + ((w - group_w) * 0.5).max(0.);
-                        let dot_color = match launcher_entry.as_ref() {
-                            // The vendor's own colour, at full strength.
-                            Some(entry) => entry.color,
-                            None => inactive_fg.mul_alpha(0.5),
-                        };
-                        self.sidebar_rounded_fill(
-                            layers,
-                            2,
-                            euclid::rect(
-                                group_x,
-                                row_y + offset + (row_height as f32 - dot_size) * 0.5,
-                                dot_size,
-                                dot_size,
-                            ),
-                            dot_size * 0.5,
-                            dot_color,
-                        )?;
-                        if let Some(label) = label {
-                            render_text(
-                                self,
-                                layers,
-                                &label,
-                                &CellAttributes::default(),
-                                group_x + dot_size + ACTION_ICON_GAP,
-                                row_y + text_inset_y + offset,
-                                label_w + 0.5,
-                                fg,
-                                bg,
-                            )?;
+                        match label {
+                            // The name says which agent; a dot beside it would
+                            // only decorate.
+                            Some(label) => {
+                                render_text(
+                                    self,
+                                    layers,
+                                    &label,
+                                    &CellAttributes::default(),
+                                    x + ((w - label_w) * 0.5).max(0.),
+                                    row_y + text_inset_y + offset,
+                                    label_w + 0.5,
+                                    fg,
+                                    bg,
+                                )?;
+                            }
+                            // Too narrow for any name: the vendor's dot stands
+                            // for the agent.
+                            None => {
+                                let dot_color = match launcher_entry.as_ref() {
+                                    Some(entry) => entry.color,
+                                    None => inactive_fg.mul_alpha(0.5),
+                                };
+                                self.sidebar_rounded_fill(
+                                    layers,
+                                    2,
+                                    euclid::rect(
+                                        x + ((w - dot_size) * 0.5).max(0.),
+                                        row_y + offset + (row_height as f32 - dot_size) * 0.5,
+                                        dot_size,
+                                        dot_size,
+                                    ),
+                                    dot_size * 0.5,
+                                    dot_color,
+                                )?;
+                            }
                         }
                     }
                     // Tab: left opens a tab, right the shell/domain picker.
                     SidebarFooterItem::NewTab => {
                         use crate::termwindow::tgz_ui_text::{Align, UiFont};
-                        let (_, _, offset, hovered) = paint_create_segment(
+                        let (_, plain_fg, offset, hovered) = paint_create_segment(
                             self,
                             layers,
                             UIItemType::SidebarNewTabButton,
                             (x, w),
                             row_y,
                         )?;
-                        // The one filled button of the sidebar: it is what
-                        // the bottom edge is for.
-                        let base = self.user_chrome_color(|c| c.new_tab).unwrap_or(sb.ring.b);
-                        let fill = if hovered {
-                            lerp_rgba(base, active_fg, 0.16)
-                        } else {
-                            base
+                        let (label_color, hint_color) = match self.config.sidebar_new_tab_style {
+                            // The one filled button of the sidebar: it is
+                            // what the bottom edge is for.
+                            config::SidebarNewTabStyle::Filled => {
+                                let base =
+                                    self.user_chrome_color(|c| c.new_tab).unwrap_or(sb.ring.b);
+                                let fill = if hovered {
+                                    lerp_rgba(base, active_fg, 0.16)
+                                } else {
+                                    base
+                                };
+                                let label = self
+                                    .user_chrome_color(|c| c.new_tab_text)
+                                    .unwrap_or_else(|| contrast_label_color(fill, surface));
+                                self.sidebar_rounded_fill(
+                                    layers,
+                                    1,
+                                    euclid::rect(x, row_y + offset, w, row_height as f32),
+                                    footer_radius.min(w * 0.5),
+                                    fill,
+                                )?;
+                                (label, lerp_rgba(fill, label, 0.72))
+                            }
+                            // Drawn like the footer's other buttons.
+                            config::SidebarNewTabStyle::Plain => {
+                                let label = if hovered { active_fg } else { plain_fg };
+                                (label, inactive_fg.mul_alpha(0.78))
+                            }
                         };
-                        let label_color = self
-                            .user_chrome_color(|c| c.new_tab_text)
-                            .unwrap_or_else(|| contrast_label_color(fill, surface));
-                        self.sidebar_rounded_fill(
-                            layers,
-                            1,
-                            euclid::rect(x, row_y + offset, w, row_height as f32),
-                            footer_radius.min(w * 0.5),
-                            fill,
-                        )?;
-                        let room = (w - FOOTER_SEGMENT_PAD * 2.).max(0.);
-                        let label = NEW_TAB_LABELS
-                            .iter()
-                            .find(|label| self.ui_text_width(UiFont::Medium, label) <= room);
-                        if let Some(label) = label {
-                            let line_h = self.ui_line_height(UiFont::Medium);
-                            self.paint_ui_text(
-                                layers,
-                                UiFont::Medium,
-                                label,
-                                x,
-                                row_y + (row_height as f32 - line_h) * 0.5 + offset,
-                                w,
-                                label_color,
-                                Align::Center,
-                            )?;
+                        // The bound shortcut at the right, when the label
+                        // still fits at full length beside it.
+                        let hint =
+                            self.shortcut_text(&config::keyassignment::KeyAssignment::SpawnTab(
+                                config::keyassignment::SpawnTabDomain::CurrentPaneDomain,
+                            ));
+                        let pad = FOOTER_SEGMENT_PAD * 1.5;
+                        let room = (w - pad * 2.).max(0.);
+                        let hint_w = hint
+                            .as_deref()
+                            .map_or(0., |hint| self.ui_text_width(UiFont::Regular, hint));
+                        let full = NEW_TAB_LABELS[0];
+                        let line_h = self.ui_line_height(UiFont::Medium);
+                        let label_y = row_y + (row_height as f32 - line_h) * 0.5 + offset;
+                        match hint.as_deref() {
+                            Some(hint)
+                                if self.ui_text_width(UiFont::Medium, full)
+                                    + hint_w
+                                    + 16. * dpi_scale
+                                    <= room =>
+                            {
+                                self.paint_ui_text(
+                                    layers,
+                                    UiFont::Medium,
+                                    full,
+                                    x + pad,
+                                    label_y,
+                                    room - hint_w,
+                                    label_color,
+                                    Align::Left,
+                                )?;
+                                self.paint_ui_text(
+                                    layers,
+                                    UiFont::Regular,
+                                    hint,
+                                    x + pad + room - hint_w,
+                                    row_y
+                                        + (row_height as f32
+                                            - self.ui_line_height(UiFont::Regular))
+                                            * 0.5
+                                        + offset,
+                                    hint_w,
+                                    hint_color,
+                                    Align::Right,
+                                )?;
+                            }
+                            _ => {
+                                let room = (w - FOOTER_SEGMENT_PAD * 2.).max(0.);
+                                let label = NEW_TAB_LABELS.iter().find(|label| {
+                                    self.ui_text_width(UiFont::Medium, label) <= room
+                                });
+                                if let Some(label) = label {
+                                    self.paint_ui_text(
+                                        layers,
+                                        UiFont::Medium,
+                                        label,
+                                        x,
+                                        label_y,
+                                        w,
+                                        label_color,
+                                        Align::Center,
+                                    )?;
+                                }
+                            }
                         }
                     }
                     // SSH: left connects to the host the button names, right
@@ -17366,22 +17527,10 @@ impl crate::TermWindow {
             false,
         )?;
 
-        // "Agents · N" label. The budget is measured from the label's own
-        // origin, not from `section_x`, or the region overruns the sidebar.
-        let label = feedback
-            .map(|message| format!("Agents · {agent_count} · {message}"))
-            .unwrap_or_else(|| {
-                let base = if attention_count > 0 {
-                    format!("Agents · {agent_count} · {attention_count}⚠")
-                } else {
-                    format!("Agents · {agent_count}")
-                };
-                if view_all {
-                    format!("{base} · all")
-                } else {
-                    base
-                }
-            });
+        // "Agents", its count in a badge, then a note: feedback while it is
+        // fresh, else how many need you and whether all projects are shown.
+        // Nothing is joined with a middle dot.
+        let note = agent_section_note(feedback.as_deref(), attention_count, view_all);
         // Sessions button, right-aligned in the header. Reserved before the
         // label is measured so a long "Agents - N - all" cannot run under it.
         let sessions_type = UIItemType::SidebarSessionsButton;
@@ -17430,16 +17579,54 @@ impl crate::TermWindow {
         } else {
             section_x + section_w - pad
         };
-        self.paint_text(
-            layers,
-            &label,
-            label_x,
-            header_y + (header_h - cell_h) * 0.5,
-            (label_right - label_x).max(0.),
-            fg,
-            bg,
-            true,
-        )?;
+        {
+            use crate::termwindow::tgz_ui_text::{Align, UiFont};
+            let text_y = header_y + (header_h - cell_h) * 0.5;
+            let room = (label_right - label_x).max(0.);
+            let name = "Agents";
+            let name_w = self.ui_text_width(UiFont::Medium, name).min(room);
+            self.paint_text(layers, name, label_x, text_y, name_w + 1., fg, bg, true)?;
+            let mut x = label_x + name_w + 6.0 * dpi;
+            let count = agent_count.to_string();
+            let badge_pad = 5.0 * dpi;
+            let badge_w = self.ui_text_width(UiFont::Small, &count) + badge_pad * 2.;
+            let badge_h = (self.ui_line_height(UiFont::Small) + 2.0 * dpi).min(header_h);
+            if x + badge_w <= label_right {
+                let badge_y = header_y + (header_h - badge_h) * 0.5;
+                self.sidebar_pill_fill(
+                    layers,
+                    1,
+                    euclid::rect(x, badge_y, badge_w, badge_h),
+                    badge_h * 0.5,
+                    lerp_rgba(bg, fg, 0.12),
+                )?;
+                self.paint_ui_text(
+                    layers,
+                    UiFont::Small,
+                    &count,
+                    x,
+                    badge_y + (badge_h - self.ui_line_height(UiFont::Small)) * 0.5,
+                    badge_w,
+                    fg,
+                    Align::Center,
+                )?;
+                x += badge_w + 6.0 * dpi;
+            }
+            if let Some((note, urgent)) = note {
+                if x < label_right {
+                    self.paint_ui_text(
+                        layers,
+                        UiFont::Small,
+                        &note,
+                        x,
+                        header_y + (header_h - self.ui_line_height(UiFont::Small)) * 0.5,
+                        label_right - x,
+                        if urgent { sb.attention } else { sb.text_idle },
+                        Align::Left,
+                    )?;
+                }
+            }
+        }
 
         // Push UIItem for the header click.
         self.ui_items.push(UIItem {
@@ -17560,39 +17747,50 @@ impl crate::TermWindow {
                 sb.row_border,
             )?;
             if let Some((fraction, _, level)) = usage_band {
-                let inset = dpi.max(1.) + dpi;
-                let inner_w = (usage_w - inset * 2.).max(0.);
-                let inner_h = (usage_h - inset * 2.).max(0.);
-                let fill_w = inner_w * fraction;
-                if fill_w >= 1. && inner_h >= 1. {
-                    let mix = if level == crate::agent_herd::quota::GaugeLevel::Critical {
-                        USAGE_BUTTON_FILL_CRITICAL_MIX
-                    } else {
-                        USAGE_BUTTON_FILL_MIX
-                    };
-                    self.sidebar_rounded_fill(
+                // A thin meter along the button's foot, coloured like the
+                // popup's bars: the accent while there is room, attention only
+                // as the window runs out. It never sits under the label.
+                let inset = dpi.max(1.) + 2.0 * dpi;
+                let track_w = (usage_w - inset * 2.).max(0.);
+                let track_h = (USAGE_BUTTON_METER_H * dpi).round().max(2.);
+                let track_y = header_y + 2.0 * dpi + usage_offset + usage_h - inset - track_h;
+                if track_w >= 2. {
+                    self.sidebar_pill_fill(
                         layers,
                         1,
-                        euclid::rect(
-                            usage_x + inset,
-                            header_y + 2.0 * dpi + usage_offset + inset,
-                            fill_w,
-                            inner_h,
-                        ),
-                        ((RADIUS * dpi).min(usage_h * 0.5) - inset).max(0.),
-                        lerp_rgba(usage_fill, sb.quota_fill, mix),
+                        euclid::rect(usage_x + inset, track_y, track_w, track_h),
+                        track_h * 0.5,
+                        lerp_rgba(usage_fill, fg, USAGE_GAUGE_TRACK_MIX),
+                    )?;
+                    let fill_w = (track_w * fraction.clamp(0., 1.)).max(track_h);
+                    self.sidebar_pill_fill(
+                        layers,
+                        1,
+                        euclid::rect(usage_x + inset, track_y, fill_w, track_h),
+                        track_h * 0.5,
+                        sb.gauge_color(level),
                     )?;
                 }
             }
-            let usage_text_w = usage_label.chars().count() as f32 * cell_w;
+            let usage_text_w = self
+                .ui_text_width(
+                    crate::termwindow::tgz_ui_text::UiFont::Regular,
+                    &usage_label,
+                )
+                .min(usage_w);
+            // Lifted by half the meter, so label and meter read as one unit.
+            let meter_lift = if usage_band.is_some() {
+                USAGE_BUTTON_METER_H * dpi * 0.5
+            } else {
+                0.
+            };
             self.paint_text(
                 layers,
                 &usage_label,
                 usage_x + (usage_w - usage_text_w) * 0.5,
-                header_y + (header_h - cell_h) * 0.5 + usage_offset,
-                usage_text_w,
-                // A figure on the fill has to be read, not glanced at.
-                if usage_band.is_some() { fg } else { usage_fg },
+                header_y + (header_h - cell_h) * 0.5 + usage_offset - meter_lift,
+                usage_text_w + 1.,
+                usage_fg,
                 bg,
                 false,
             )?;
@@ -18309,6 +18507,35 @@ impl crate::TermWindow {
     /// The tooltip of the icon control the pointer rests on; see
     /// `tgz_tooltip`. Painted last among the floating surfaces. It registers
     /// no hit item, so it never takes a click from what it covers.
+    /// The first key bound to `action`, as the chrome shows keys (`⌘T`,
+    /// or `Ctrl-Shift-T` without Apple symbols), or `None` when none is.
+    pub(crate) fn shortcut_text(
+        &self,
+        action: &config::keyassignment::KeyAssignment,
+    ) -> Option<String> {
+        let (key, mods) = self
+            .input_map
+            .locate_app_wide_key_assignment(action)
+            .into_iter()
+            .next()?;
+        let rendering = self.config.ui_key_cap_rendering;
+        let separator = if rendering == ::window::UIKeyCapRendering::AppleSymbols {
+            ""
+        } else {
+            "-"
+        };
+        let mut text = mods.to_string_with_separator(::window::ModifierToStringArgs {
+            separator,
+            want_none: false,
+            ui_key_cap_rendering: Some(rendering),
+        });
+        if !text.is_empty() {
+            text.push_str(separator);
+        }
+        text.push_str(&crate::inputmap::ui_key(&key, rendering));
+        Some(text)
+    }
+
     pub(crate) fn paint_chrome_tooltip(
         &mut self,
         layers: &mut TripleLayerQuadAllocator,
@@ -18343,29 +18570,10 @@ impl crate::TermWindow {
             return Ok(());
         };
 
-        let shortcut = tooltip.action.as_ref().and_then(|action| {
-            let (key, mods) = self
-                .input_map
-                .locate_app_wide_key_assignment(action)
-                .into_iter()
-                .next()?;
-            let rendering = self.config.ui_key_cap_rendering;
-            let separator = if rendering == ::window::UIKeyCapRendering::AppleSymbols {
-                ""
-            } else {
-                "-"
-            };
-            let mut text = mods.to_string_with_separator(::window::ModifierToStringArgs {
-                separator,
-                want_none: false,
-                ui_key_cap_rendering: Some(rendering),
-            });
-            if !text.is_empty() {
-                text.push_str(separator);
-            }
-            text.push_str(&crate::inputmap::ui_key(&key, rendering));
-            Some(text)
-        });
+        let shortcut = tooltip
+            .action
+            .as_ref()
+            .and_then(|action| self.shortcut_text(action));
         let text = match shortcut {
             Some(keys) => format!("{}  {keys}", tooltip.label),
             None => tooltip.label.to_string(),
@@ -19223,6 +19431,37 @@ mod tests {
             }
         );
         assert!(gates.any_motion());
+    }
+
+    #[test]
+    fn a_tab_subtitle_puts_the_state_left_and_the_branch_right() {
+        let meta = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // An agent: what it is and what it is doing, the branch apart.
+        assert_eq!(
+            tab_subtitle(
+                Some(("Claude", Some("waiting"))),
+                &meta(&["main", "tgzterminal"]),
+                Some("main"),
+            ),
+            ("Claude waiting".to_string(), Some("main".to_string()))
+        );
+        // No branch: the folder takes the right instead.
+        assert_eq!(
+            tab_subtitle(Some(("Codex", None)), &meta(&["~/src"]), None),
+            ("Codex".to_string(), Some("~/src".to_string()))
+        );
+        // A shell: the folder at the left, the branch at the right.
+        assert_eq!(
+            tab_subtitle(None, &meta(&["main", "tgzterminal"]), Some("main")),
+            ("tgzterminal".to_string(), Some("main".to_string()))
+        );
+        assert_eq!(
+            tab_subtitle(None, &meta(&["tim"]), None),
+            ("tim".to_string(), None)
+        );
+        // Never a middle dot.
+        let (left, right) = tab_subtitle(None, &meta(&["a", "b", "c"]), None);
+        assert!(!left.contains('·') && right.is_none(), "{left}");
     }
 
     #[test]
@@ -20474,6 +20713,7 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
             active: false,
             title: title.to_string(),
             metadata: Vec::new(),
+            branch: None,
             panes: pane_ids.iter().copied().map(pane_row).collect(),
             subagents: vec![],
         }

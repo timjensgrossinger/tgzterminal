@@ -10,8 +10,8 @@ use super::lua_edit::LuaValue;
 use config::{
     AgentCopyClick, AgentLaunchTarget, AgentRingColors, Config, DiffPanelLongLines, DiffPanelMode,
     DiffPanelPosition, DiffPanelRaisedMode, FileBrowserEditorPlacement, FileBrowserUi,
-    PaneToolbeltPosition, ShellCopyClick, SidebarPosition, SidebarTabDensity, SidebarTabGrouping,
-    SidebarTabTitleSource, SidebarTheme,
+    PaneToolbeltPosition, ShellCopyClick, SidebarNewTabStyle, SidebarPosition, SidebarTabDensity,
+    SidebarTabGrouping, SidebarTabTitleSource, SidebarTheme,
 };
 use std::convert::TryFrom;
 
@@ -377,6 +377,13 @@ pub(crate) static CATALOG: &[Setting] = &[
     // Colours
     chrome_color!("Accent", "Focus, selections, the active rail. Default for New Tab and the running ring.", accent),
     chrome_color!("Attention", "An agent waiting for you. Default for the waiting ring.", attention),
+    choice!(
+        Colors,
+        "New Tab style",
+        "Filled uses the colour below; Plain matches the other sidebar buttons.",
+        SidebarNewTabStyle,
+        sidebar_new_tab_style
+    ),
     chrome_color!("New Tab button", "Fill of + New Tab. Default: the accent.", new_tab),
     chrome_color!("New Tab label", "Default: black or white, whichever reads.", new_tab_text),
     chrome_color!("Ring: running", "The arc turning while an agent works. Default: the accent.", ring_running),
@@ -395,7 +402,6 @@ pub(crate) static CATALOG: &[Setting] = &[
     chrome_color!("Text", "Titles and the active tab.", text),
     chrome_color!("Text: idle", "Rows that are not active.", text_idle),
     chrome_color!("Text: meta", "Second lines, hints and counts.", text_meta),
-    chrome_color!("Usage button", "Fill of the \u{3a3} button.", quota),
     // Sidebar
     toggle!(
         Sidebar,
@@ -773,7 +779,7 @@ mod tests {
             .iter()
             .filter(|setting| matches!(setting.kind, Kind::Color))
             .collect();
-        assert_eq!(colours.len(), 21);
+        assert_eq!(colours.len(), 20);
         assert!(colours.iter().all(
             |setting| setting.section == Section::Colors && setting.path[0] == "sidebar_colors"
         ));

@@ -310,7 +310,8 @@ pub struct SidebarColorsConfig {
     /// bars. Also the default for `ring_waiting`.
     #[dynamic(default)]
     pub attention: Option<RgbaColor>,
-    /// Fill of the `Σ` usage button.
+    /// No longer drawn: the `Σ` button's meter takes the quota bars'
+    /// colours. Kept so a config that sets it still loads.
     #[dynamic(default)]
     pub quota: Option<RgbaColor>,
     /// Fill of the `+ New Tab` button. Default: `accent`.

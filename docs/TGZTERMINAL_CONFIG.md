@@ -96,10 +96,11 @@ config.sidebar_scroll_bar = true
 | `sidebar_position` | enum | `"Left"` | `"Left"`, `"Right"` |
 | `sidebar_theme` | enum | `"Auto"` (`"Brand"` in a build with a brand palette) | `"Auto"`, `"Modern"`, `"FollowColorScheme"`, `"Brand"`. `Auto` derives the sidebar from `colors.tab_bar` when the scheme defines it, else from `colors.background` + `colors.foreground`, else uses the fork's near-black palette. `Modern` pins that near-black palette regardless of the scheme. `Brand` pins the chrome of the brand this binary was compiled with: dark base tinted with `BRAND_NEUTRAL`, `BRAND_ACCENT` for active/focus, `BRAND_ATTENTION` for attention. Every variant is chrome only — terminal colours are never touched. See [Build flavours](#build-flavours). |
 | `sidebar_tab_density` | enum | `"Comfortable"` | `"Comfortable"`, `"Compact"`. `Compact` also suppresses the metadata sub-line entirely. |
+| `sidebar_new_tab_style` | enum | `"Filled"` | `"Filled"`: `+ New Tab` is the one filled button of the sidebar, in `sidebar_colors.new_tab` (default: the accent). `"Plain"`: drawn like the footer's other buttons. Either way the bound shortcut (`⌘T`) shows at its right when there is room. Also in Settings → Colours. |
 | `sidebar_tab_grouping` | enum | `"Auto"` | `"Auto"`: a new tab joins the group of the project folder (nearest `.git`) it starts in and stays there when it changes folder; tabs with no project sit under "Other". `"Manual"`: tabs are grouped only by hand. `"Off"`: one flat list, no headers. Drag a tab onto a tab or the header of another group to move it there, or use "Move to group" in the tab's right-click menu; click a header to fold the group. "New group…" (tab menu, header menu, or the empty part of the list) names a group of your own in the search field: Enter keeps it, Esc cancels. A header's right-click menu renames or deletes your own groups, re-sorts tabs by folder, and closes the group's tabs. Your groups' names are remembered across restarts; which tab was in which group is not. Groups are contiguous in the tab order, so `ActivateTab` numbers match the rows shown. |
 | `sidebar_font` | font | unset | Font of the sidebar's own text, e.g. `wezterm.font 'Inter'`. Unset: `window_frame.font`, which defaults to the bundled Roboto. The terminal font stays the fallback, so icon glyphs keep resolving. |
 | `sidebar_font_size` | number | `13` on macOS, `10` elsewhere | Size of `sidebar_font` in points. Follows the display's DPI, not the terminal font size. |
-| `sidebar_colors` | table | `{}` | Colour of each part of the fork's chrome: the sidebar, menus, the tab palette and dialogs, the Worktree and Changes panels and the Settings tab. Every key is optional; an unset one keeps what `sidebar_theme` derives. Keys: `background`, `row`, `row_active`, `row_hover`, `row_pressed`, `row_working`, `field`, `field_focused`, `divider`, `menu_border`, `text`, `text_idle`, `text_meta`, `accent` (focus, selections, the active rail; default for `new_tab` and `ring_running`, and takes precedence over `agent_ui.animations.colors.ring_b`), `attention` (an agent waiting for you; default for `ring_waiting`), `quota` (the `Σ` button), `new_tab`, `new_tab_text` (default: black or white, whichever reads), `ring_track`, `ring_running`, `ring_waiting`. Values are anything `colors` accepts, e.g. `config.sidebar_colors = { accent = '#58a6ff', new_tab = '#3fb950' }`. Also in Settings → Colours. The diff colours of the Changes panel come from the terminal palette (`colors.ansi`). |
+| `sidebar_colors` | table | `{}` | Colour of each part of the fork's chrome: the sidebar, menus, the tab palette and dialogs, the Worktree and Changes panels and the Settings tab. Every key is optional; an unset one keeps what `sidebar_theme` derives. Keys: `background`, `row`, `row_active`, `row_hover`, `row_pressed`, `row_working`, `field`, `field_focused`, `divider`, `menu_border`, `text`, `text_idle`, `text_meta`, `accent` (focus, selections, the active rail; default for `new_tab` and `ring_running`, and takes precedence over `agent_ui.animations.colors.ring_b`), `attention` (an agent waiting for you; default for `ring_waiting`), `new_tab`, `new_tab_text` (default: black or white, whichever reads), `ring_track`, `ring_running`, `ring_waiting`. (`quota` is still accepted but no longer drawn: the `Σ` button's meter takes the quota bars' colours.) Values are anything `colors` accepts, e.g. `config.sidebar_colors = { accent = '#58a6ff', new_tab = '#3fb950' }`. Also in Settings → Colours. The diff colours of the Changes panel come from the terminal palette (`colors.ansi`). |
 | `window_title_app_name` | bool | `true` | Title bar text when no `format-window-title` handler sets one: the app's name (`TGZTerminal`, or the brand name a build is compiled with). `false` gives upstream's title, the active pane's with `[n/m]` when there are several tabs. A `format-window-title` handler always wins. |
 | `sidebar_tab_title_source` | enum | `"Title"` | `"Title"`, `"Command"`, `"WorkingDirectory"`, `"GitBranch"` |
 | `sidebar_tab_metadata` | list of enum | `{ "GitBranch", "WorkingDirectory" }` | Elements: `"GitBranch"`, `"WorkingDirectory"` |
@@ -146,7 +147,7 @@ row: it is the most used button, so it gets the largest target. Above it sits
 the **launch row** of the things that open panes, in thirds — the agent
 launcher, SSH (which offers "New SSH connection" until there is a host), and
 **Layouts** (see [Pane Layouts](#pane-layouts)). On top sits the **view strip**: toggles for what is on
-show — Worktree (folder), Changes (`±`), the agent toolbelt (wrench) and
+show — Worktree (folder), Changes (a diff icon), the agent toolbelt (wrench) and
 Secure Keyboard Entry (lock) — lit while their panel or mode is on. The
 toggles share the row equally, and a sidebar wide enough for all of them adds
 a word beside each icon (`Files`, `Diff`, `Tools`, `Lock`). When the strip is
@@ -1813,7 +1814,7 @@ moved and switched off at runtime:
   pane, and is drawn above the Changes panel, so it can be parked anywhere.
 - **Double-click** the dot or label to put it back where `toolbelt_position`
   places it (which also keeps clear of a floating Changes panel again).
-- The **wrench button** beside the Changes (`±`) button in the sidebar shows or
+- The **wrench button** beside the Changes (diff icon) button in the sidebar shows or
   hides the strip. It sits in the footer's view strip and in the collapsed
   rail; a strip too narrow for every toggle drops the lock first, then the
   wrench. Hiding the strip does not touch the sidebar's Copy icon.
@@ -1970,7 +1971,7 @@ config.keys = {
 }
 ```
 
-The sidebar lock (beside `±` and the wrench, or at the top of the bottom stack in
+The sidebar lock (beside the Changes button and the wrench, or at the top of the bottom stack in
 the collapsed rail) is lit whenever secure input is held, pinned or automatic.
 Clicking it flips the pin. On a very narrow sidebar the lock gives way first; the
 menu item still works. Changing focus to another app always releases it.
@@ -2143,8 +2144,8 @@ A tab with no Claude or Codex session whose transcript can be read always
 shows All.
 
 There is one panel per **tab**: split panes share it. It is hidden until
-switched on, with the **Changes** button on an agent pane's toolbelt, the `±`
-sidebar button or the `ToggleDiffPanel` action (also in the command palette as
+switched on, with the **Changes** button on an agent pane's toolbelt, the
+sidebar Changes button or the `ToggleDiffPanel` action (also in the command palette as
 "Toggle Changes Panel"). There is no default key binding:
 
 ```lua

@@ -58,7 +58,7 @@ impl crate::TermWindow {
                 let TabBarItem::Tab { tab_idx, active } = entry.item else {
                     return None;
                 };
-                let (title, metadata) = self.sidebar_tab_labels(tab_idx, &entry.title);
+                let (title, metadata, _) = self.sidebar_tab_labels(tab_idx, &entry.title);
                 let (line1, line2, mark) = match self.sidebar_agent_row_for_tab_idx(tab_idx) {
                     Some((pane_id, state)) => {
                         let (name, _) = self.sidebar_herd_tab_info(pane_id, state.kind.label());
