@@ -425,8 +425,14 @@ mod test {
 
     #[test]
     fn layouts_are_found_by_lua_and_cli_names() {
-        assert_eq!(PaneLayout::from_name("MainLeft"), Some(PaneLayout::MainLeft));
-        assert_eq!(PaneLayout::from_name("main-left"), Some(PaneLayout::MainLeft));
+        assert_eq!(
+            PaneLayout::from_name("MainLeft"),
+            Some(PaneLayout::MainLeft)
+        );
+        assert_eq!(
+            PaneLayout::from_name("main-left"),
+            Some(PaneLayout::MainLeft)
+        );
         assert_eq!(PaneLayout::from_name("GRID"), Some(PaneLayout::Grid));
         assert_eq!(
             PaneLayout::from_name("agent_plus_shell"),
