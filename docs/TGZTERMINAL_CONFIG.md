@@ -9,9 +9,13 @@ WezTerm compatibility unless noted.
 of a right click on the empty tab list) opens Settings as a tab. It covers the
 fork's settings and a few basics (font, font size, line height, colour scheme,
 window opacity), grouped as Appearance, Colours, Sidebar, Agents, Worktree,
-Changes, Input and Privacy. Colours holds one field per `sidebar_colors` key:
-type a colour such as `#58a6ff` and Enter; a swatch shows it beside the
-field, and clearing the field goes back to the theme's colour. A last section, Shortcuts, lists the fork's key bindings as
+Changes, Input and Privacy; long sections are split by small headings
+(Agents ends with **Animations**, one switch per `agent_ui.animations` key).
+On/off settings are switches, filled with the accent only while on. Colours
+holds one field per `sidebar_colors` key, plus the New Tab style: type a
+colour such as `#58a6ff` and Enter; a swatch shows it beside the field, and
+clearing the field goes back to the theme's colour (an empty field reads
+"Default"). A last section, Shortcuts, lists the fork's key bindings as
 they are bound right now; it is read-only, since bindings are changed with
 `config.keys`.
 

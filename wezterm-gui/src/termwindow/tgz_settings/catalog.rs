@@ -303,6 +303,45 @@ macro_rules! custom_button_icon {
     };
 }
 
+/// One `agent_ui.animations` switch. The table is optional in the config, so
+/// the value is read through `resolved_animations` rather than a field path.
+macro_rules! animation {
+    ($label:expr, $help:expr, $field:ident) => {
+        Setting {
+            section: Section::Agents,
+            path: &["agent_ui", "animations", stringify!($field)],
+            label: $label,
+            help: $help,
+            kind: Kind::Toggle,
+            get: |c| Value::Bool(c.agent_ui.resolved_animations().$field),
+        }
+    };
+}
+
+/// Small headings that split a long section into groups: each is drawn
+/// above the setting with that path.
+const GROUP_HEADINGS: &[(&[&str], &str)] = &[
+    (&["font"], "Text"),
+    (&["color_scheme"], "Window"),
+    (&["sidebar_colors", "accent"], "Chrome"),
+    (&["sidebar_new_tab_style"], "New Tab button"),
+    (&["sidebar_colors", "ring_running"], "Rings"),
+    (&["sidebar_colors", "background"], "Surfaces and text"),
+    (&["agent_ui", "enabled"], "Detection"),
+    (&["agent_ui", "show_pane_toolbelt"], "Toolbelt"),
+    (&["agent_ui", "section", "enabled"], "Agents section"),
+    (&["agent_ui", "launcher", "open_in"], "Launcher"),
+    (&["agent_ui", "animations", "enabled"], "Animations"),
+];
+
+/// The heading drawn above `setting`, if a group starts there.
+pub(crate) fn group_heading(setting: &Setting) -> Option<&'static str> {
+    GROUP_HEADINGS
+        .iter()
+        .find(|(path, _)| *path == setting.path)
+        .map(|(_, heading)| *heading)
+}
+
 pub(crate) static CATALOG: &[Setting] = &[
     // Appearance
     Setting {
@@ -485,6 +524,19 @@ pub(crate) static CATALOG: &[Setting] = &[
     ),
     toggle!(
         Agents,
+        "Notify when waiting",
+        "Send a notification when an agent needs you.",
+        agent_ui.waiting_notification
+    ),
+    choice!(
+        Agents,
+        "Ring colours",
+        "Colour set for agent states.",
+        AgentRingColors,
+        agent_ui.ring_colors
+    ),
+    toggle!(
+        Agents,
         "Toolbelt",
         "Floating controls on agent panes.",
         agent_ui.show_pane_toolbelt
@@ -495,25 +547,6 @@ pub(crate) static CATALOG: &[Setting] = &[
         "Where the toolbelt starts before you drag it.",
         PaneToolbeltPosition,
         agent_ui.toolbelt_position
-    ),
-    toggle!(
-        Agents,
-        "Notify when waiting",
-        "Send a notification when an agent needs you.",
-        agent_ui.waiting_notification
-    ),
-    toggle!(
-        Agents,
-        "Pulse while working",
-        "Animate the ring of a working agent.",
-        agent_ui.pulse_working_dot
-    ),
-    choice!(
-        Agents,
-        "Ring colours",
-        "Colour set for agent states.",
-        AgentRingColors,
-        agent_ui.ring_colors
     ),
     toggle!(
         Agents,
@@ -571,6 +604,61 @@ pub(crate) static CATALOG: &[Setting] = &[
         "Default agent",
         "Adapter the agent button starts, e.g. claude. Empty uses the first installed.",
         agent_ui.launcher.default_adapter
+    ),
+    Setting {
+        section: Section::Agents,
+        path: &["agent_ui", "animations", "enabled"],
+        label: "Animations",
+        help: "Off: rings and dots hold still and show state by colour alone.",
+        kind: Kind::Toggle,
+        // The older `pulse_working_dot = false` still stops everything until
+        // the table is written; show what is in effect.
+        get: |c| {
+            Value::Bool(
+                c.agent_ui.resolved_animations().enabled
+                    && !c.agent_ui.legacy_animation_kill_switch(),
+            )
+        },
+    },
+    animation!(
+        "Follow Reduce Motion",
+        "While macOS Reduce Motion is on, hold everything still.",
+        follow_reduce_motion
+    ),
+    animation!(
+        "Running ring",
+        "The arc turning while an agent works. Off: a still ring.",
+        working_ring
+    ),
+    animation!(
+        "Waiting glow",
+        "The outline and slow breathing on a tab whose agent needs you.",
+        waiting_glow
+    ),
+    animation!(
+        "Finish ripple",
+        "One ripple when an agent finishes.",
+        resolve_ripple
+    ),
+    animation!(
+        "New agent fade-in",
+        "A new agent's row slides in.",
+        agent_enter
+    ),
+    animation!(
+        "Pulse while working",
+        "The status dot pulses while its agent works.",
+        dot_pulse
+    ),
+    animation!(
+        "Rail breathe",
+        "The active tab's rail slowly breathes.",
+        rail_breathe
+    ),
+    animation!(
+        "Animate in background windows",
+        "Off saves battery while TGZTerminal is not focused.",
+        unfocused
     ),
     // Worktree
     choice!(
@@ -828,6 +916,26 @@ mod tests {
                 section
             );
         }
+    }
+
+    #[test]
+    fn every_group_heading_sits_above_a_setting() {
+        for (path, heading) in GROUP_HEADINGS {
+            assert!(
+                CATALOG.iter().any(|s| s.path == *path),
+                "{heading}: no setting at {path:?}"
+            );
+        }
+        let animations: Vec<_> = in_section(Section::Agents)
+            .into_iter()
+            .map(|index| &CATALOG[index])
+            .skip_while(|s| group_heading(s) != Some("Animations"))
+            .collect();
+        // The group holds every switch of the table, and nothing else.
+        assert_eq!(animations.len(), 9);
+        assert!(animations
+            .iter()
+            .all(|s| s.path.starts_with(&["agent_ui", "animations"])));
     }
 
     #[test]

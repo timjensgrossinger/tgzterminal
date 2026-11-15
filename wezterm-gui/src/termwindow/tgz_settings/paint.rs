@@ -32,7 +32,39 @@ const STATUS_TTL: Duration = Duration::from_secs(2);
 /// whatever the terminal font is.
 const NAV_MIN_W: f32 = 132.;
 const CONTROL_W: f32 = 320.;
-const MAX_CONTENT_W: f32 = 820.;
+const MAX_CONTENT_W: f32 = 640.;
+/// Beside the file chip in the header.
+const SAVE_NOTE: &str = "Changes save as you make them.";
+
+/// `text` broken at spaces into at most two lines no wider than `max_w` as
+/// `measure` measures them. The second keeps whatever is left, for the
+/// painter to end in an ellipsis if it must.
+fn wrap_two_lines(text: &str, max_w: f32, measure: impl Fn(&str) -> f32) -> Vec<String> {
+    if measure(text) <= max_w {
+        return vec![text.to_string()];
+    }
+    let words: Vec<&str> = text.split(' ').collect();
+    let mut first = String::new();
+    let mut used = 0;
+    for word in &words {
+        let candidate = if first.is_empty() {
+            word.to_string()
+        } else {
+            format!("{first} {word}")
+        };
+        if !first.is_empty() && measure(&candidate) > max_w {
+            break;
+        }
+        first = candidate;
+        used += 1;
+    }
+    let rest = words[used..].join(" ");
+    if rest.is_empty() {
+        vec![first]
+    } else {
+        vec![first, rest]
+    }
+}
 /// Space on each side of a label inside its box.
 const SEGMENT_PAD: f32 = 10.;
 
@@ -391,6 +423,91 @@ impl TermWindow {
         Ok(left)
     }
 
+    /// An on/off switch ending at `right`, centred on a control's height:
+    /// filled with the accent only while on, so "on" is never a guess.
+    /// Returns the x it starts at.
+    fn paint_settings_switch(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+        right: f32,
+        y: f32,
+        on: bool,
+        hit: SettingsHit,
+        ground: LinearRgba,
+    ) -> anyhow::Result<f32> {
+        let sb = self.sidebar_palette();
+        let dpi_scale = (self.dimensions.dpi as f32 / 96.).clamp(1., 2.5);
+        let cell_h = self.render_metrics.cell_size.height as f32;
+        let control_h = (cell_h + 6. * dpi_scale).ceil();
+        let h = (control_h * 0.78).round();
+        let w = (h * 1.75).round();
+        let x = right - w;
+        let top = y + ((control_h - h) * 0.5).round();
+        let item_type = UIItemType::Settings(hit);
+        let hovered = self
+            .last_ui_item
+            .as_ref()
+            .is_some_and(|item| item.item_type == item_type);
+        let stroke = dpi_scale.round().max(1.);
+        let track = if on {
+            opaque(lerp_rgba(
+                ground,
+                sb.accent(),
+                if hovered { 0.95 } else { 0.85 },
+            ))
+        } else {
+            opaque(lerp_rgba(
+                ground,
+                sb.text_meta,
+                if hovered { 0.38 } else { 0.26 },
+            ))
+        };
+        if !on {
+            // An edge, so an off switch on a dark ground still reads as one.
+            self.sidebar_pill_fill(
+                layers,
+                0,
+                euclid::rect(x, top, w, h),
+                h * 0.5,
+                opaque(lerp_rgba(ground, sb.text_idle, 0.38)),
+            )?;
+        }
+        let inset = if on { 0. } else { stroke };
+        self.sidebar_pill_fill(
+            layers,
+            0,
+            euclid::rect(x + inset, top + inset, w - inset * 2., h - inset * 2.),
+            (h * 0.5 - inset).max(0.),
+            track,
+        )?;
+        let knob_pad = (2. * dpi_scale).round();
+        let knob = h - knob_pad * 2.;
+        let knob_x = if on {
+            x + w - knob_pad - knob
+        } else {
+            x + knob_pad
+        };
+        self.sidebar_pill_fill(
+            layers,
+            0,
+            euclid::rect(knob_x, top + knob_pad, knob, knob),
+            knob * 0.5,
+            if on {
+                contrast_label_color(track, sb.text_active)
+            } else {
+                sb.text_idle
+            },
+        )?;
+        self.ui_items.push(UIItem {
+            x: x.max(0.) as usize,
+            y: top.max(0.) as usize,
+            width: w as usize,
+            height: h as usize,
+            item_type,
+        });
+        Ok(x)
+    }
+
     pub(crate) fn paint_settings_pane(
         &mut self,
         pos: &PositionedPane,
@@ -449,7 +566,12 @@ impl TermWindow {
             return Ok(());
         }
 
-        // Header: the tab's name, and the file everything is written to.
+        // Descriptions and notes: dimmer than a label, still 4.5:1 on the
+        // ground.
+        let meta_fg = lerp_rgba(sb.text_meta, sb.text_idle, 0.55);
+
+        // Header: the tab's name, and under it the file everything is
+        // written to and that it is written as you go.
         let header_y = area.origin.y + (cell_h * 0.5).floor();
         self.settings_text(
             layers,
@@ -461,10 +583,24 @@ impl TermWindow {
             ground,
             true,
         )?;
+        let file_line_y = header_y + cell_h + 6. * dpi_scale;
+        let chip_w = (self.chrome_text_width(&file_label, false)
+            + (SEGMENT_PAD * dpi_scale).round() * 2.)
+            .ceil();
         let open = [Segment::button(file_label, SettingsHit::OpenFile)];
-        self.paint_settings_segments(layers, right, header_y - 3. * dpi_scale, &open, ground)?;
+        self.paint_settings_segments(layers, left + chip_w, file_line_y, &open, ground)?;
+        self.settings_text(
+            layers,
+            SAVE_NOTE,
+            left + chip_w + unit * 1.5,
+            file_line_y + 3. * dpi_scale,
+            (right - left - chip_w - unit * 1.5).max(1.),
+            meta_fg,
+            ground,
+            false,
+        )?;
 
-        let body_top = header_y + cell_h * 2.5;
+        let body_top = file_line_y + cell_h * 2.5;
         let footer_y = area.max_y() - cell_h * 1.5;
 
         // Sections.
@@ -595,19 +731,72 @@ impl TermWindow {
         let rows = in_section(section);
         let control_w = (CONTROL_W * dpi_scale).min(content_w * 0.55);
         let label_w = (content_w - control_w - unit * 2.).max(unit * 8.);
-        let row_h = (cell_h * 2. + 12. * dpi_scale).ceil();
-        let visible = ((body_h / row_h).floor() as usize).max(1);
-        state.visible_rows = visible;
-        state.max_scroll = rows.len().saturating_sub(visible);
+        // A row is its label and its help, which wraps to a second line
+        // rather than ending in an ellipsis; a row that opens a group has
+        // its heading above it. Scrolling still counts rows.
+        let help_h = self.ui_line_height(crate::termwindow::tgz_ui_text::UiFont::Small);
+        let heading_h = (cell_h + 12. * dpi_scale).ceil();
+        let help_lines: Vec<Vec<String>> = rows
+            .iter()
+            .map(|index| {
+                wrap_two_lines(CATALOG[*index].help, label_w, |text| {
+                    self.ui_text_width(crate::termwindow::tgz_ui_text::UiFont::Small, text)
+                })
+            })
+            .collect();
+        let headings: Vec<Option<&'static str>> = rows
+            .iter()
+            .map(|index| super::catalog::group_heading(&CATALOG[*index]))
+            .collect();
+        let row_h_at = |k: usize| {
+            (cell_h * 2. + 12. * dpi_scale + help_lines[k].len().saturating_sub(1) as f32 * help_h)
+                .ceil()
+        };
+        let block_h: Vec<f32> = (0..rows.len())
+            .map(|k| row_h_at(k) + headings[k].map_or(0., |_| heading_h))
+            .collect();
+        let mut max_scroll = rows.len().saturating_sub(1);
+        let mut tail = 0.;
+        for k in (0..rows.len()).rev() {
+            tail += block_h[k];
+            if tail > body_h {
+                break;
+            }
+            max_scroll = k;
+        }
+        state.max_scroll = max_scroll;
         state.scroll = state.scroll.min(state.max_scroll);
+        let mut visible = 0;
+        let mut used = 0.;
+        for k in state.scroll..rows.len() {
+            if visible > 0 && used + block_h[k] > body_h {
+                break;
+            }
+            used += block_h[k];
+            visible += 1;
+        }
+        let visible = visible.max(1);
+        state.visible_rows = visible;
+        // Where each row in view starts, below its heading if it has one.
+        let row_tops: Vec<f32> = {
+            let mut y = body_top;
+            (state.scroll..(state.scroll + visible).min(rows.len()))
+                .map(|k| {
+                    let top = y + headings[k].map_or(0., |_| heading_h);
+                    y += block_h[k];
+                    top
+                })
+                .collect()
+        };
         let control_h = (cell_h + 6. * dpi_scale).ceil();
         let seg_pad = (SEGMENT_PAD * dpi_scale).round();
         // A text field is as wide as a control may be; its text has that
         // less the padding.
         let field_w = control_w.max(unit * 12.).round();
         let field_text_w = field_w - seg_pad * 2.;
-        let control_y_of =
-            |slot: usize| body_top + slot as f32 * row_h + (cell_h * 2. - control_h) * 0.5;
+        let control_y_of = |slot: usize| {
+            row_tops.get(slot).copied().unwrap_or(body_top) + (cell_h * 2. - control_h) * 0.5
+        };
 
         // The open picker's list: what it shows and where, worked out before
         // the rows so the controls it covers are left out.
@@ -665,8 +854,21 @@ impl TermWindow {
 
         for (slot, index) in rows.iter().skip(state.scroll).take(visible).enumerate() {
             let setting = &CATALOG[*index];
-            let y = body_top + slot as f32 * row_h;
-            let focused = state.focus == Some(state.scroll + slot);
+            let k = state.scroll + slot;
+            let y = row_tops[slot];
+            if let Some(heading) = headings[k] {
+                self.settings_text(
+                    layers,
+                    heading,
+                    content_x,
+                    y - heading_h + 4. * dpi_scale,
+                    content_w,
+                    sb.text_idle,
+                    ground,
+                    true,
+                )?;
+            }
+            let focused = state.focus == Some(k);
             let row_bg = if focused {
                 opaque(lerp_rgba(ground, sb.text_meta, 0.1))
             } else {
@@ -677,7 +879,7 @@ impl TermWindow {
                     content_x - unit * 1.5,
                     y - 5. * dpi_scale,
                     content_w + unit * 3.,
-                    cell_h * 2. + 10. * dpi_scale,
+                    row_h_at(k) - 2. * dpi_scale,
                 );
                 self.sidebar_rounded_fill(layers, 0, band, 10. * dpi_scale, row_bg)?;
                 // The selection bar of a sidebar row.
@@ -707,17 +909,18 @@ impl TermWindow {
             )?;
             {
                 use crate::termwindow::tgz_ui_text::{Align, UiFont};
-                let help_h = self.ui_line_height(UiFont::Small);
-                self.paint_ui_text(
-                    layers,
-                    UiFont::Small,
-                    setting.help,
-                    content_x,
-                    y + cell_h + (cell_h - help_h) * 0.5,
-                    label_w,
-                    sb.text_meta,
-                    Align::Left,
-                )?;
+                for (line_no, line) in help_lines[k].iter().enumerate() {
+                    self.paint_ui_text(
+                        layers,
+                        UiFont::Small,
+                        line,
+                        content_x,
+                        y + cell_h + (cell_h - help_h) * 0.5 + line_no as f32 * help_h,
+                        label_w,
+                        meta_fg,
+                        Align::Left,
+                    )?;
+                }
             }
 
             let control_y = control_y_of(slot);
@@ -757,16 +960,8 @@ impl TermWindow {
                 }]
             } else {
                 match (setting.kind, &value) {
-                    (Kind::Toggle, Value::Bool(on)) => vec![
-                        Segment {
-                            selected: !*on,
-                            ..Segment::button("Off", SettingsHit::Toggle(*index))
-                        },
-                        Segment {
-                            selected: *on,
-                            ..Segment::button("On", SettingsHit::Toggle(*index))
-                        },
-                    ],
+                    // Drawn as a switch below.
+                    (Kind::Toggle, Value::Bool(_)) => vec![],
                     (Kind::Choice(variants), Value::Text(current)) => {
                         let variants = variants();
                         let needed: f32 = variants
@@ -828,7 +1023,14 @@ impl TermWindow {
                                 ),
                                 false,
                             ),
-                            None if current.is_empty() => ("not set".to_string(), true),
+                            None if current.is_empty() => (
+                                match setting.kind {
+                                    Kind::Scheme => "Default (none)",
+                                    _ => "Default",
+                                }
+                                .to_string(),
+                                false,
+                            ),
                             None => (
                                 self.chrome_elide_start(current, field_text_w - 1., false),
                                 false,
@@ -845,8 +1047,23 @@ impl TermWindow {
                     _ => vec![Segment::label(value_text(setting, &value), 0.)],
                 }
             };
-            let control_left =
-                self.paint_settings_segments(layers, content_right, control_y, &segments, row_bg)?;
+            let control_left = match &value {
+                Value::Bool(on) if segments.is_empty() => self.paint_settings_switch(
+                    layers,
+                    content_right,
+                    control_y,
+                    *on,
+                    SettingsHit::Toggle(*index),
+                    row_bg,
+                )?,
+                _ => self.paint_settings_segments(
+                    layers,
+                    content_right,
+                    control_y,
+                    &segments,
+                    row_bg,
+                )?,
+            };
 
             // A colour shows itself beside its field: what is being typed
             // once it parses, else what is set. Unset shows nothing, since
@@ -992,20 +1209,21 @@ impl TermWindow {
             Some((text, _)) => text.clone(),
             None if !editable => store::ApplyError::Shape.message(&state.file),
             None if popup.is_some() => {
-                "Type to filter \u{00b7} \u{2191}\u{2193} choose \u{00b7} Enter takes it \u{00b7} Esc cancels"
+                "Type to filter    \u{2191}\u{2193} choose    Enter takes it    Esc cancels"
                     .to_string()
             }
             None if state.focus.is_some() => {
-                "\u{2191}\u{2193} rows \u{00b7} \u{2190}\u{2192} change \u{00b7} Enter opens a field \u{00b7} Tab next section"
+                "\u{2191}\u{2193} rows    \u{2190}\u{2192} change    Enter opens a field    Tab next section"
                     .to_string()
             }
             None if state.max_scroll > 0 => format!(
-                "{}\u{2013}{} of {}  \u{00b7}  scroll for more",
+                "{}\u{2013}{} of {}, scroll for more",
                 state.scroll + 1,
                 (state.scroll + visible).min(rows.len()),
                 rows.len()
             ),
-            None => "Changes are saved to the config file as you make them.".to_string(),
+            // Said once, in the header.
+            None => String::new(),
         };
         let is_error = state.message.as_ref().is_some_and(|(_, error)| *error) || !editable;
         self.settings_text(
@@ -1014,11 +1232,7 @@ impl TermWindow {
             content_x,
             footer_y,
             right - content_x,
-            if is_error {
-                sb.text_active
-            } else {
-                sb.text_meta
-            },
+            if is_error { sb.text_active } else { meta_fg },
             ground,
             false,
         )?;
@@ -1038,5 +1252,34 @@ impl TermWindow {
         if let Some(window) = self.window.as_ref() {
             window.invalidate();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wrap_two_lines;
+
+    fn chars(text: &str) -> f32 {
+        text.chars().count() as f32
+    }
+
+    #[test]
+    fn help_that_fits_stays_on_one_line() {
+        assert_eq!(wrap_two_lines("In points.", 20., chars), vec!["In points."]);
+    }
+
+    #[test]
+    fn long_help_breaks_at_a_space_into_two_lines() {
+        let text = "A built-in or configured scheme. Without one, your own colours apply.";
+        let lines = wrap_two_lines(text, 40., chars);
+        assert_eq!(lines.len(), 2);
+        assert!(chars(&lines[0]) <= 40.);
+        assert_eq!(lines.join(" "), text);
+    }
+
+    #[test]
+    fn a_word_wider_than_the_line_is_kept_whole() {
+        let lines = wrap_two_lines("Supercalifragilistic word", 5., chars);
+        assert_eq!(lines, vec!["Supercalifragilistic", "word"]);
     }
 }
