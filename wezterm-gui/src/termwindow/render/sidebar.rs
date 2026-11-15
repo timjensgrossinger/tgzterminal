@@ -764,6 +764,8 @@ const RAIL_GRADIENT_BANDS: usize = 5;
 /// px, × DPI), bar height as a share of the cell height, and how far the
 /// empty track is mixed from the row fill towards the text colour.
 const USAGE_GAUGE_GAP: f32 = 8.;
+/// Room between two value columns of the usage popup (logical px, × DPI).
+const USAGE_CELL_GAP: f32 = 12.;
 const USAGE_GAUGE_HEIGHT_RATIO: f32 = 0.42;
 const USAGE_GAUGE_TRACK_MIX: f32 = 0.16;
 /// The usage popup's bar graphs: the one-line graph's height as a share of
@@ -4551,10 +4553,11 @@ pub(crate) struct SidebarDropdownRow {
     /// Draw a trailing `>` chevron, marking a row that expands into a
     /// submenu rather than acting immediately.
     pub(crate) trailing_chevron: bool,
-    /// Something drawn with the label (the usage popup's quota bars, bar
-    /// graph, chart and span buttons). A gauge or buttons take the right of
-    /// the row and the label gives way; a chart makes the row taller.
-    pub(crate) widget: Option<crate::termwindow::tgz_usage_menu::RowWidget>,
+    /// What a usage popup row draws beyond its label: a header weight,
+    /// right-aligned value columns, and its quota bar, bar graph, chart or
+    /// span buttons. Columns, a gauge or buttons take the right of the row
+    /// and the label gives way; a chart makes the row taller.
+    pub(crate) widget: Option<crate::termwindow::tgz_usage_menu::UsageLine>,
     /// A line for reading only: no hover or press highlight.
     pub(crate) inert: bool,
     pub(crate) item_type: UIItemType,
@@ -12888,17 +12891,14 @@ impl crate::TermWindow {
         let mut usage_rows = vec![];
         if self.config.agent_ui.section.show_quota {
             let snapshot = crate::agent_herd::quota::snapshot();
-            usage_rows = tgz_usage_menu::quota_rows(
-                &tgz_usage_menu::QuotaInputs {
-                    snapshot: &snapshot,
-                    relay: crate::termwindow::tgz_usage_relay::last_status(),
-                    claude_active,
-                    without_figures,
-                    opencode: history.as_deref().and_then(|history| history.opencode),
-                    now,
-                },
-                cols,
-            );
+            usage_rows = tgz_usage_menu::quota_rows(&tgz_usage_menu::QuotaInputs {
+                snapshot: &snapshot,
+                relay: crate::termwindow::tgz_usage_relay::last_status(),
+                claude_active,
+                without_figures,
+                opencode: history.as_deref().and_then(|history| history.opencode),
+                now,
+            });
         }
         let mut token_rows = tgz_usage_menu::usage_rows(
             &sessions,
@@ -12909,7 +12909,6 @@ impl crate::TermWindow {
                 expanded: self.usage_graph_expanded,
                 hovered: hovered_day,
             },
-            cols,
         );
         if let Some(first) = token_rows.first_mut() {
             first.divider_above = !usage_rows.is_empty();
@@ -12919,18 +12918,17 @@ impl crate::TermWindow {
         let rows: Vec<SidebarDropdownRow> = usage_rows
             .into_iter()
             .map(|row| SidebarDropdownRow {
-                label: row.label,
-                dot_color: row
-                    .vendor
-                    .as_ref()
-                    .map(|vendor| srgb8_to_linear_tuple(vendor.dot_color())),
+                // A vendor's colour is named by the chart's legend; a dot
+                // before its card would only decorate.
+                dot_color: None,
                 checkbox: None,
                 divider_above: row.divider_above,
-                indent: false,
+                indent: row.indent,
                 trailing_chevron: row.trailing_chevron,
-                widget: row.widget,
+                widget: row.line(),
                 inert: row.action == UsageRowAction::Inert,
                 item_type: UIItemType::SidebarUsageMenuRow { action: row.action },
+                label: row.label,
             })
             .collect();
 
@@ -13427,15 +13425,55 @@ impl crate::TermWindow {
             // buttons): pushed after the row's own, so they win hit-testing.
             let mut widget_items: Vec<UIItem> = vec![];
             let mut draw_label = true;
-            use crate::termwindow::tgz_usage_menu::RowWidget;
-            match &row.widget {
+            use crate::termwindow::tgz_ui_text::{Align, UiFont};
+            use crate::termwindow::tgz_usage_menu::{RowWidget, CELL_COLUMN_TEMPLATES};
+            let header = row.widget.as_ref().is_some_and(|line| line.header);
+            // Value columns, laid right to left from the row's right edge.
+            // Each is as wide as its template or its own text, whichever is
+            // wider, so the figures of consecutive rows share a right edge.
+            if let Some(line) = &row.widget {
+                let col_gap = USAGE_CELL_GAP * dpi_scale;
+                let font = if line.header {
+                    UiFont::Small
+                } else {
+                    UiFont::Regular
+                };
+                let text_y = row_y + (row_h - self.ui_line_height(font)) * 0.5;
+                let mut right = label_right;
+                for (index, cell) in line.cells.iter().rev().enumerate() {
+                    let min_w = CELL_COLUMN_TEMPLATES.get(index).map_or(0., |templates| {
+                        templates
+                            .iter()
+                            .map(|template| self.ui_text_width(UiFont::Regular, template))
+                            .fold(0., f32::max)
+                    });
+                    let col_w = self.ui_text_width(font, &cell.text).max(min_w);
+                    let color = if cell.dim || line.header {
+                        sb.text_idle
+                    } else {
+                        contrast_label_color(row_bg, sb.text_active)
+                    };
+                    self.paint_ui_text(
+                        layers,
+                        font,
+                        &cell.text,
+                        right - col_w,
+                        text_y,
+                        col_w,
+                        color,
+                        Align::Right,
+                    )?;
+                    right -= col_w + col_gap;
+                }
+                label_right = right;
+            }
+            match row.widget.as_ref().and_then(|line| line.widget.as_ref()) {
                 None => {}
                 Some(RowWidget::Gauge(gauge)) => {
-                    use crate::termwindow::tgz_usage_menu::{GAUGE_COLS, GAUGE_TRAILING_COLS};
+                    use crate::termwindow::tgz_usage_menu::GAUGE_COLS;
                     let cell_w = cell_width as f32;
-                    let trailing_x = label_right - GAUGE_TRAILING_COLS as f32 * cell_w;
                     let bar_w = GAUGE_COLS as f32 * cell_w;
-                    let bar_x = trailing_x - USAGE_GAUGE_GAP * dpi_scale - bar_w;
+                    let bar_x = label_right - bar_w;
                     let bar_h = (cell_h_f * USAGE_GAUGE_HEIGHT_RATIO).max(3. * dpi_scale);
                     let bar_y = row_y + (row_h - bar_h) * 0.5;
                     if bar_x > text_x {
@@ -13460,20 +13498,6 @@ impl crate::TermWindow {
                         }
                         label_right = bar_x - USAGE_GAUGE_GAP * dpi_scale;
                     }
-                    render_text(
-                        self,
-                        layers,
-                        &gauge.trailing,
-                        trailing_x,
-                        row_y + (row_h - cell_h_f) * 0.5,
-                        GAUGE_TRAILING_COLS as f32 * cell_w,
-                        if gauge.fraction > 0. {
-                            contrast_label_color(row_bg, sb.text_active)
-                        } else {
-                            sb.text_meta
-                        },
-                        row_bg,
-                    )?;
                 }
                 Some(RowWidget::Bars(bars)) => {
                     use crate::agent_herd::usage_history::DayTokens;
@@ -13508,13 +13532,12 @@ impl crate::TermWindow {
                     let cell_w = cell_width as f32;
                     let left = menu_x + row_text_inset;
                     let right = menu_x + rows_w - row_text_inset;
-                    let tick_cols = chart
+                    let tick_w = chart
                         .ticks
                         .iter()
-                        .map(|(_, text)| text.chars().count())
-                        .max()
-                        .unwrap_or(1);
-                    let plot_x = left + (tick_cols + 1) as f32 * cell_w;
+                        .map(|(_, text)| self.ui_text_width(UiFont::Regular, text))
+                        .fold(cell_w, f32::max);
+                    let plot_x = left + tick_w + cell_w;
                     let plot_w = (right - plot_x).max(1.);
                     // A line for the legend above the plot, one for the dates
                     // below it.
@@ -13523,11 +13546,16 @@ impl crate::TermWindow {
                     let plot_bottom = row_y + this_h - label_band;
                     let plot_h = (plot_bottom - plot_top).max(1.);
 
+                    // Every vendor with a token in the span, in the order the
+                    // bars stack them, each as a swatch of its bar colour.
                     let mut legend_x = plot_x;
-                    for vendor in [AgentVendor::Claude, AgentVendor::Codex] {
-                        let used = chart.days.iter().any(|day| match vendor {
-                            AgentVendor::Claude => day.claude > 0,
-                            _ => day.codex > 0,
+                    let empty = crate::agent_herd::usage_history::DayTokens::default();
+                    let stacked = crate::termwindow::tgz_usage_menu::day_vendors(&empty);
+                    for (vendor, _) in stacked {
+                        let used = chart.days.iter().any(|day| {
+                            crate::termwindow::tgz_usage_menu::day_vendors(day)
+                                .iter()
+                                .any(|(seen, tokens)| *seen == vendor && *tokens > 0)
                         });
                         if !used {
                             continue;
@@ -13541,12 +13569,12 @@ impl crate::TermWindow {
                                 dot_size,
                                 dot_size,
                             ),
-                            dot_size * 0.5,
+                            (2. * dpi_scale).min(dot_size * 0.5),
                             srgb8_to_linear_tuple(vendor.dot_color()),
                         )?;
                         legend_x += dot_size + ACTION_ICON_GAP;
                         let name = vendor.label().to_string();
-                        let name_w = name.chars().count() as f32 * cell_w;
+                        let name_w = self.ui_text_width(UiFont::Regular, &name);
                         render_text(
                             self,
                             layers,
@@ -13554,7 +13582,7 @@ impl crate::TermWindow {
                             legend_x,
                             row_y,
                             name_w,
-                            sb.text_meta,
+                            sb.text_idle,
                             bg,
                         )?;
                         legend_x += name_w + cell_w * 2.;
@@ -13573,16 +13601,15 @@ impl crate::TermWindow {
                             euclid::rect(plot_x, y, plot_w, divider_h),
                             lerp_rgba(bg, fg, USAGE_CHART_GRID_MIX),
                         )?;
-                        let cols = text.chars().count();
-                        render_text(
-                            self,
+                        self.paint_ui_text(
                             layers,
+                            UiFont::Regular,
                             text,
-                            left + tick_cols.saturating_sub(cols) as f32 * cell_w,
-                            y - cell_h_f * 0.5,
-                            cols as f32 * cell_w,
-                            sb.text_meta,
-                            bg,
+                            left,
+                            y - self.ui_line_height(UiFont::Regular) * 0.5,
+                            tick_w,
+                            sb.text_idle,
+                            Align::Right,
                         )?;
                     }
 
@@ -13626,14 +13653,14 @@ impl crate::TermWindow {
                         let Some((x, w)) = slots.get(*index) else {
                             continue;
                         };
-                        let text_w = text.chars().count() as f32 * cell_w;
+                        let text_w = self.ui_text_width(UiFont::Regular, text);
                         let centre = plot_x + x + w * 0.5;
                         let label_x =
                             (centre - text_w * 0.5).clamp(left, (right - text_w).max(left));
                         let color = if chart.hovered == Some(*index) || *index == last {
                             sb.text_active
                         } else {
-                            sb.text_meta
+                            sb.text_idle
                         };
                         render_text(
                             self,
@@ -13707,7 +13734,18 @@ impl crate::TermWindow {
                     label_right = x - gap;
                 }
             }
-            if draw_label {
+            if draw_label && header {
+                self.paint_ui_text(
+                    layers,
+                    UiFont::Medium,
+                    &row.label,
+                    text_x,
+                    row_y + (row_h - self.ui_line_height(UiFont::Medium)) * 0.5,
+                    (label_right - text_x).max(1.),
+                    contrast_label_color(row_bg, sb.text_active),
+                    Align::Left,
+                )?;
+            } else if draw_label {
                 render_text(
                     self,
                     layers,

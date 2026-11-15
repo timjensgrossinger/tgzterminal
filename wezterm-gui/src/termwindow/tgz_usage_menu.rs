@@ -27,10 +27,14 @@ pub(crate) const USAGE_MENU_WIDE_COLS: usize = 72;
 /// Rows the expanded chart is tall, counted in popup rows.
 pub(crate) const CHART_ROWS: usize = 8;
 
-/// Columns a quota bar takes, and the columns kept after it for its
-/// `47% · 2h 13m` caption. Fixed, so the bars of every row line up.
+/// Columns a quota bar takes. Fixed, so the bars of every row line up.
 pub(crate) const GAUGE_COLS: usize = 12;
-pub(crate) const GAUGE_TRAILING_COLS: usize = 14;
+
+/// The narrowest each value column is, rightmost first, as the text that
+/// fills it at its widest: the cells of every row line up on these unless
+/// one of them is wider still.
+pub(crate) const CELL_COLUMN_TEMPLATES: [&[&str]; 2] =
+    [&["resets 23h 59m", "888.8k"], &["$888.88", "100%"]];
 
 /// The spans the expanded chart offers.
 pub(crate) const GRAPH_SPANS: [usize; 3] = [7, 14, usage_history::HISTORY_DAYS];
@@ -196,14 +200,52 @@ pub enum UsageRowAction {
     ChartDay(usize),
 }
 
-/// A quota bar drawn at the right of a row, with its caption after it.
+/// A quota bar drawn at the right of a row, left of its cells.
 #[derive(Clone, Debug, PartialEq)]
 pub struct UsageGauge {
     /// Used share, 0..=1.
     pub fraction: f32,
     pub level: GaugeLevel,
-    /// `47% · 2h 13m`, at most [`GAUGE_TRAILING_COLS`] columns.
-    pub trailing: String,
+}
+
+/// One value in a row's columns.
+#[derive(Clone, Debug, PartialEq)]
+pub struct UsageCell {
+    pub text: String,
+    /// A note or a column head rather than a figure: drawn dimmer.
+    pub dim: bool,
+}
+
+impl UsageCell {
+    fn value(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            dim: false,
+        }
+    }
+
+    fn note(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            dim: true,
+        }
+    }
+}
+
+/// What a row of the popup draws beyond its label, as the dropdown painter
+/// takes it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct UsageLine {
+    pub header: bool,
+    pub cells: Vec<UsageCell>,
+    pub widget: Option<RowWidget>,
+}
+
+impl UsageLine {
+    /// How many popup rows the line takes.
+    pub fn height_rows(&self) -> usize {
+        self.widget.as_ref().map_or(1, RowWidget::height_rows)
+    }
 }
 
 /// A day per bar, oldest first, split by vendor so a bar can be stacked.
@@ -259,28 +301,64 @@ impl RowWidget {
     }
 }
 
-/// One line of the popup.
+/// One line of the popup: a label at the left, values in columns at the
+/// right.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct UsageRow {
     pub label: String,
     pub divider_above: bool,
     pub action: UsageRowAction,
     pub widget: Option<RowWidget>,
-    /// Draw this vendor's dot before the label.
+    /// Heads a group: the label in the medium weight.
+    pub header: bool,
+    /// Nested under the header above it.
+    pub indent: bool,
+    /// Right-aligned columns at the right of the row, rightmost last.
+    pub cells: Vec<UsageCell>,
+    /// The vendor a card belongs to; cards are divided from each other.
     pub vendor: Option<AgentVendor>,
     pub trailing_chevron: bool,
 }
 
 impl UsageRow {
-    fn text(label: String, divider_above: bool) -> Self {
+    fn text(label: impl Into<String>, divider_above: bool) -> Self {
         Self {
-            label,
+            label: label.into(),
             divider_above,
             action: UsageRowAction::Inert,
             widget: None,
+            header: false,
+            indent: false,
+            cells: vec![],
             vendor: None,
             trailing_chevron: false,
         }
+    }
+
+    fn header(label: impl Into<String>, divider_above: bool) -> Self {
+        Self {
+            header: true,
+            ..Self::text(label, divider_above)
+        }
+    }
+
+    fn indented(mut self) -> Self {
+        self.indent = true;
+        self
+    }
+
+    fn with_cells(mut self, cells: Vec<UsageCell>) -> Self {
+        self.cells = cells;
+        self
+    }
+
+    /// What the dropdown painter draws beyond the label, if anything.
+    pub fn line(&self) -> Option<UsageLine> {
+        (self.header || !self.cells.is_empty() || self.widget.is_some()).then(|| UsageLine {
+            header: self.header,
+            cells: self.cells.clone(),
+            widget: self.widget.clone(),
+        })
     }
 }
 
@@ -397,17 +475,19 @@ pub(crate) fn day_vendors(day: &DayTokens) -> [(AgentVendor, u64); 5] {
     ]
 }
 
-/// The line under the chart: the hovered day in full, else the span's
-/// average and its busiest day.
-pub(crate) fn chart_detail(days: &[DayTokens], today: NaiveDate, hovered: Option<usize>) -> String {
+/// The line under the chart, as a label and its cells: the hovered day with
+/// its vendors and total, else the span's average and its busiest day.
+pub(crate) fn chart_detail(
+    days: &[DayTokens],
+    today: NaiveDate,
+    hovered: Option<usize>,
+) -> (String, Vec<UsageCell>) {
     let count = days.len();
     if let Some(index) = hovered.filter(|index| *index < count) {
         let tokens = days[index];
-        let mut text = format!(
-            "{} · {}",
-            chart_day(today, count, index).format("%a %-d %b"),
-            compact(tokens.total())
-        );
+        let label = chart_day(today, count, index)
+            .format("%a %-d %b")
+            .to_string();
         // Split only when several vendors are in it; otherwise the total says
         // it all.
         let parts: Vec<(AgentVendor, u64)> = day_vendors(&tokens)
@@ -415,16 +495,22 @@ pub(crate) fn chart_detail(days: &[DayTokens], today: NaiveDate, hovered: Option
             .filter(|(_, tokens)| *tokens > 0)
             .cloned()
             .collect();
+        let mut cells = vec![];
         if parts.len() > 1 {
             for (vendor, tokens) in parts {
-                text.push_str(&format!(" · {} {}", vendor.label(), compact(tokens)));
+                cells.push(UsageCell::note(format!(
+                    "{} {}",
+                    vendor.label(),
+                    compact(tokens)
+                )));
             }
         }
-        return text;
+        cells.push(UsageCell::value(compact(tokens.total())));
+        return (label, cells);
     }
     let total: u64 = days.iter().map(DayTokens::total).sum();
     if total == 0 {
-        return "No tokens in this span".to_string();
+        return ("No tokens in this span".to_string(), vec![]);
     }
     let (peak_at, peak) = days
         .iter()
@@ -432,11 +518,13 @@ pub(crate) fn chart_detail(days: &[DayTokens], today: NaiveDate, hovered: Option
         .enumerate()
         .max_by_key(|(index, total)| (*total, *index))
         .unwrap_or((0, 0));
-    format!(
-        "Avg {}/day · Peak {} ({})",
-        compact(total / count as u64),
-        compact(peak),
-        chart_day(today, count, peak_at).format("%b %-d")
+    (
+        format!("Average {} per day", compact(total / count as u64)),
+        vec![UsageCell::note(format!(
+            "Peak {} on {}",
+            compact(peak),
+            chart_day(today, count, peak_at).format("%b %-d")
+        ))],
     )
 }
 
@@ -449,22 +537,6 @@ fn compact(value: u64) -> String {
     }
 }
 
-/// `left` and `right` at opposite ends of a `cols`-wide line. `left` gives
-/// way when the two do not fit.
-fn spread(left: &str, right: &str, cols: usize) -> String {
-    let right_len = right.chars().count();
-    let room = cols.saturating_sub(right_len + 1);
-    let left_len = left.chars().count();
-    let left: String = if left_len > room {
-        let kept: String = left.chars().take(room.saturating_sub(1)).collect();
-        format!("{kept}…")
-    } else {
-        left.to_string()
-    };
-    let gap = cols.saturating_sub(left.chars().count() + right_len);
-    format!("{left}{}{right}", " ".repeat(gap))
-}
-
 /// The token part of the popup's rows.
 ///
 /// `sessions` are the live agents; `history` is `None` until the first scan
@@ -474,59 +546,55 @@ pub(crate) fn usage_rows(
     history: Option<&UsageHistory>,
     today: NaiveDate,
     graph: GraphView,
-    cols: usize,
 ) -> Vec<UsageRow> {
-    let row = UsageRow::text;
     let mut rows = vec![];
 
     let mut sessions: Vec<&LiveSession> = sessions.iter().collect();
     sessions.sort_by(|a, b| b.tokens.cmp(&a.tokens));
     let live_total: u64 = sessions.iter().map(|session| session.tokens).sum();
-    rows.push(row(
-        spread(
-            &format!("Open sessions · {}", sessions.len()),
-            &compact(live_total),
-            cols,
-        ),
-        false,
-    ));
+    rows.push(
+        UsageRow::header("Open sessions", false)
+            .with_cells(vec![UsageCell::value(compact(live_total))]),
+    );
     for session in sessions.iter().take(MAX_SESSION_ROWS) {
-        let right = match &session.cost {
-            Some(cost) => format!("{} · {}", short_cost(cost), compact(session.tokens)),
-            None => compact(session.tokens),
-        };
-        rows.push(row(
-            spread(&format!("  {}", session.name), &right, cols),
-            false,
-        ));
+        let mut cells = vec![];
+        if let Some(cost) = &session.cost {
+            cells.push(UsageCell::value(short_cost(cost)));
+        }
+        cells.push(UsageCell::value(compact(session.tokens)));
+        rows.push(
+            UsageRow::text(session.name.clone(), false)
+                .indented()
+                .with_cells(cells),
+        );
     }
     if sessions.len() > MAX_SESSION_ROWS {
         let rest: u64 = sessions[MAX_SESSION_ROWS..]
             .iter()
             .map(|session| session.tokens)
             .sum();
-        rows.push(row(
-            spread(
-                &format!("  {} more", sessions.len() - MAX_SESSION_ROWS),
-                &compact(rest),
-                cols,
-            ),
-            false,
-        ));
+        rows.push(
+            UsageRow::text(format!("{} more", sessions.len() - MAX_SESSION_ROWS), false)
+                .indented()
+                .with_cells(vec![UsageCell::value(compact(rest))]),
+        );
     }
 
     let Some(history) = history else {
-        rows.push(row("Reading transcripts…".to_string(), true));
+        rows.push(UsageRow::text("Reading transcripts…", true));
         return rows;
     };
-    rows.push(row(
-        spread("Today", &compact(history.total(today, 1)), cols),
-        true,
-    ));
-    rows.push(row(
-        spread("Last 7 days", &compact(history.total(today, 7)), cols),
-        false,
-    ));
+    rows.push(UsageRow::header("All tools", true).with_cells(vec![UsageCell::note("Tokens")]));
+    rows.push(
+        UsageRow::text("Today", false)
+            .indented()
+            .with_cells(vec![UsageCell::value(compact(history.total(today, 1)))]),
+    );
+    rows.push(
+        UsageRow::text("Last 7 days", false)
+            .indented()
+            .with_cells(vec![UsageCell::value(compact(history.total(today, 7)))]),
+    );
     let days = history.series_split(today, graph.days);
     let total: u64 = days.iter().map(DayTokens::total).sum();
     if graph.expanded {
@@ -547,11 +615,11 @@ pub(crate) fn usage_rows(
             .collect();
         rows.push(UsageRow {
             widget: Some(RowWidget::Tabs(tabs)),
-            ..row(format!("Tokens per day · {}", compact(total)), true)
+            ..UsageRow::header("Tokens per day", true)
         });
         let axis_max = nice_axis_max(days.iter().map(DayTokens::total).max().unwrap_or(0));
         let hovered = graph.hovered.filter(|index| *index < days.len());
-        let detail = chart_detail(&days, today, hovered);
+        let (detail, detail_cells) = chart_detail(&days, today, hovered);
         rows.push(UsageRow {
             widget: Some(RowWidget::Chart(UsageChart {
                 axis_max,
@@ -560,28 +628,20 @@ pub(crate) fn usage_rows(
                 hovered,
                 days,
             })),
-            ..row(String::new(), false)
+            ..UsageRow::text(String::new(), false)
         });
-        rows.push(row(detail, false));
+        rows.push(UsageRow::text(detail, false).with_cells(detail_cells));
         return rows;
     }
-    // The bars take the left of the row; the caption is what shortens when
-    // the two do not fit. Two columns go to the chevron.
-    let caption_cols = cols.saturating_sub(2);
-    let room = caption_cols.saturating_sub(GRAPH_BAR_COLS + 1);
-    let caption = vec![
-        format!("{} days · {}", graph.days, compact(total)),
-        format!("{} days", graph.days),
-        format!("{}d", graph.days),
-    ]
-    .into_iter()
-    .find(|caption| caption.chars().count() <= room)
-    .unwrap_or_default();
+    // The bars take the left of the row, the span and its total the right.
     rows.push(UsageRow {
         action: UsageRowAction::ExpandGraph,
         widget: Some(RowWidget::Bars(UsageBars { days })),
         trailing_chevron: true,
-        ..row(spread("", &caption, caption_cols), true)
+        ..UsageRow::text(String::new(), true).with_cells(vec![
+            UsageCell::note(format!("{} days", graph.days)),
+            UsageCell::value(compact(total)),
+        ])
     });
     rows
 }
@@ -603,8 +663,12 @@ fn money(usd: f64) -> String {
     }
 }
 
-fn spend_text(spend: &Spend) -> String {
-    format!("{} · {}", money(spend.cost_usd()), compact(spend.tokens))
+/// A spend as its cost and tokens columns.
+fn spend_cells(spend: &Spend) -> Vec<UsageCell> {
+    vec![
+        UsageCell::value(money(spend.cost_usd())),
+        UsageCell::value(compact(spend.tokens)),
+    ]
 }
 
 /// What the quota part of the popup is built from.
@@ -622,57 +686,69 @@ pub(crate) struct QuotaInputs<'a> {
     pub now: SystemTime,
 }
 
-/// `47% · 2h 13m`, `47%`, or `reset` once the window has passed.
-fn band_gauge(band: &quota::QuotaBand, now: SystemTime) -> UsageGauge {
+/// A window's bar and its two columns: `47%` and `resets 2h 13m`, or an
+/// empty percent and `reset` once the window has passed.
+fn band_gauge(band: &quota::QuotaBand, now: SystemTime) -> (UsageGauge, Vec<UsageCell>) {
     let percent = band.used_percent.round().max(0.);
-    let (trailing, level) = match band.state(now) {
+    let (cells, level) = match band.state(now) {
         BandState::Live {
             remaining: Some(remaining),
         } => (
-            format!("{percent:.0}% · {}", quota::countdown_text(remaining)),
+            vec![
+                UsageCell::value(format!("{percent:.0}%")),
+                UsageCell::note(format!("resets {}", quota::countdown_text(remaining))),
+            ],
             quota::gauge_level(band.used_percent),
         ),
         BandState::Live { remaining: None } => (
-            format!("{percent:.0}%"),
+            vec![
+                UsageCell::value(format!("{percent:.0}%")),
+                UsageCell::note(""),
+            ],
             quota::gauge_level(band.used_percent),
         ),
-        BandState::Reset => ("reset".to_string(), GaugeLevel::Ok),
+        BandState::Reset => (
+            vec![UsageCell::value(""), UsageCell::note("reset")],
+            GaugeLevel::Ok,
+        ),
     };
-    UsageGauge {
-        fraction: band.fraction(now),
-        level,
-        trailing,
-    }
+    (
+        UsageGauge {
+            fraction: band.fraction(now),
+            level,
+        },
+        cells,
+    )
 }
 
-fn vendor_card(quota: &VendorQuota, now: SystemTime, cols: usize) -> Vec<UsageRow> {
+fn vendor_card(quota: &VendorQuota, now: SystemTime) -> Vec<UsageRow> {
     let mut title = quota.vendor.label().to_string();
     if let Some(plan) = &quota.plan {
-        title.push_str(" · ");
+        title.push(' ');
         title.push_str(&quota::plan_label(plan));
     }
     let mut rows = vec![UsageRow {
         vendor: Some(quota.vendor.clone()),
-        ..UsageRow::text(
-            spread(
-                &title,
-                &format!("updated {}", quota::freshness_text(quota.sampled_at, now)),
-                cols,
-            ),
-            false,
-        )
+        ..UsageRow::header(title, false).with_cells(vec![UsageCell::note(format!(
+            "updated {}",
+            quota::freshness_text(quota.sampled_at, now)
+        ))])
     }];
     for band in &quota.bands {
+        let (gauge, cells) = band_gauge(band, now);
         rows.push(UsageRow {
-            widget: Some(RowWidget::Gauge(band_gauge(band, now))),
-            ..UsageRow::text(format!("  {}", band.window.label()), false)
+            widget: Some(RowWidget::Gauge(gauge)),
+            ..UsageRow::text(band.window.label(), false)
+                .indented()
+                .with_cells(cells)
         });
     }
     if let Some(cost) = quota.last_cost_usd {
-        rows.push(UsageRow::text(
-            spread("  Last session cost", &money(cost), cols),
-            false,
-        ));
+        rows.push(
+            UsageRow::text("Last session cost", false)
+                .indented()
+                .with_cells(vec![UsageCell::value(money(cost))]),
+        );
     }
     rows
 }
@@ -711,17 +787,19 @@ pub(crate) fn vendors_without_figures(
 
 /// The subscription part of the popup: a card per vendor with its windows,
 /// then OpenCode's spend. Empty when there is nothing to say.
-pub(crate) fn quota_rows(inputs: &QuotaInputs, cols: usize) -> Vec<UsageRow> {
+pub(crate) fn quota_rows(inputs: &QuotaInputs) -> Vec<UsageRow> {
     let mut rows = vec![];
     match (inputs.snapshot.vendor(&AgentVendor::Claude), inputs.relay) {
-        (Some(claude), _) => rows.extend(vendor_card(claude, inputs.now, cols)),
+        (Some(claude), _) => rows.extend(vendor_card(claude, inputs.now)),
         (None, Some(RelayStatus::Connected)) => rows.push(UsageRow {
             vendor: Some(AgentVendor::Claude),
-            ..UsageRow::text(spread("Claude", "limits after its next reply", cols), false)
+            ..UsageRow::header("Claude", false)
+                .with_cells(vec![UsageCell::note("limits after its next reply")])
         }),
         (None, Some(RelayStatus::Unsupported)) if inputs.claude_active => rows.push(UsageRow {
             vendor: Some(AgentVendor::Claude),
-            ..UsageRow::text("Claude · limits need Git Bash".to_string(), false)
+            ..UsageRow::header("Claude", false)
+                .with_cells(vec![UsageCell::note("limits need Git Bash")])
         }),
         _ => {}
     }
@@ -731,8 +809,7 @@ pub(crate) fn quota_rows(inputs: &QuotaInputs, cols: usize) -> Vec<UsageRow> {
         .iter()
         .filter(|quota| quota.vendor != AgentVendor::Claude)
     {
-        let card = vendor_card(vendor, inputs.now, cols);
-        rows.extend(card);
+        rows.extend(vendor_card(vendor, inputs.now));
     }
     if let Some(spend) = inputs
         .opencode
@@ -740,15 +817,19 @@ pub(crate) fn quota_rows(inputs: &QuotaInputs, cols: usize) -> Vec<UsageRow> {
     {
         rows.push(UsageRow {
             vendor: Some(AgentVendor::OpenCode),
-            ..UsageRow::text(
-                spread("OpenCode · today", &spend_text(&spend.today), cols),
-                false,
-            )
+            ..UsageRow::header("OpenCode", false)
+                .with_cells(vec![UsageCell::note("Cost"), UsageCell::note("Tokens")])
         });
-        rows.push(UsageRow::text(
-            spread("  Last 7 days", &spend_text(&spend.week), cols),
-            false,
-        ));
+        rows.push(
+            UsageRow::text("Today", false)
+                .indented()
+                .with_cells(spend_cells(&spend.today)),
+        );
+        rows.push(
+            UsageRow::text("Last 7 days", false)
+                .indented()
+                .with_cells(spend_cells(&spend.week)),
+        );
     }
     for vendor in &inputs.without_figures {
         let note = match vendor {
@@ -757,7 +838,7 @@ pub(crate) fn quota_rows(inputs: &QuotaInputs, cols: usize) -> Vec<UsageRow> {
         };
         rows.push(UsageRow {
             vendor: Some(vendor.clone()),
-            ..UsageRow::text(format!("{} · {note}", vendor.label()), false)
+            ..UsageRow::header(vendor.label(), false).with_cells(vec![UsageCell::note(note)])
         });
     }
     // A divider between vendor cards, none above the first.
@@ -806,8 +887,26 @@ mod tests {
         }
     }
 
-    fn labels(rows: &[UsageRow]) -> Vec<&str> {
-        rows.iter().map(|row| row.label.as_str()).collect()
+    /// A row as one line: `# ` before a header, two spaces before an
+    /// indented row, then the label and each cell after a `|`.
+    fn line(row: &UsageRow) -> String {
+        let mut text = String::new();
+        if row.header {
+            text.push_str("# ");
+        }
+        if row.indent {
+            text.push_str("  ");
+        }
+        text.push_str(&row.label);
+        for cell in &row.cells {
+            text.push_str(" | ");
+            text.push_str(&cell.text);
+        }
+        text
+    }
+
+    fn lines(rows: &[UsageRow]) -> Vec<String> {
+        rows.iter().map(line).collect()
     }
 
     fn live(name: &str, tokens: u64) -> LiveSession {
@@ -827,12 +926,6 @@ mod tests {
     }
 
     #[test]
-    fn spread_pins_both_ends_and_shortens_the_left() {
-        assert_eq!(spread("Today", "1.2m", 12), "Today   1.2m");
-        assert_eq!(spread("a long session name", "19.5k", 12), "a lon… 19.5k");
-    }
-
-    #[test]
     fn rows_list_sessions_then_totals_then_the_graph() {
         let sessions = vec![live("small", 19_500), live("big", 508_400)];
         let rows = usage_rows(
@@ -840,28 +933,31 @@ mod tests {
             Some(&history()),
             day("2026-10-07"),
             compact_graph(7),
-            40,
         );
         assert_eq!(
-            labels(&rows),
+            lines(&rows),
             vec![
-                "Open sessions · 2                 527.9k",
-                "  big                             508.4k",
-                "  small                            19.5k",
-                "Today                             250.0k",
-                "Last 7 days                         1.8m",
-                format!("{}7 days · 1.8m", " ".repeat(25)).as_str(),
+                "# Open sessions | 527.9k",
+                "  big | 508.4k",
+                "  small | 19.5k",
+                "# All tools | Tokens",
+                "  Today | 250.0k",
+                "  Last 7 days | 1.8m",
+                " | 7 days | 1.8m",
             ]
         );
+        // Column heads and notes are dim, figures are not.
+        assert!(rows[3].cells[0].dim);
+        assert!(!rows[4].cells[0].dim);
         // Dividers open the totals and the graph; only the graph is clickable.
         assert_eq!(
             rows.iter().map(|r| r.divider_above).collect::<Vec<_>>(),
-            vec![false, false, false, true, false, true]
+            vec![false, false, false, true, false, false, true]
         );
         let graph = rows.last().unwrap();
         assert_eq!(graph.action, UsageRowAction::ExpandGraph);
         assert!(graph.trailing_chevron);
-        assert!(rows[..5].iter().all(|r| r.action == UsageRowAction::Inert));
+        assert!(rows[..6].iter().all(|r| r.action == UsageRowAction::Inert));
         let Some(RowWidget::Bars(bars)) = &graph.widget else {
             panic!("the graph row carries its bars");
         };
@@ -872,10 +968,10 @@ mod tests {
 
     #[test]
     fn rows_say_so_while_the_history_is_still_being_read() {
-        let rows = usage_rows(&[], None, day("2026-10-07"), compact_graph(7), 30);
+        let rows = usage_rows(&[], None, day("2026-10-07"), compact_graph(7));
         assert_eq!(
-            labels(&rows),
-            vec!["Open sessions · 0            0", "Reading transcripts…"]
+            lines(&rows),
+            vec!["# Open sessions | 0", "Reading transcripts…"]
         );
     }
 
@@ -883,23 +979,38 @@ mod tests {
     fn sessions_past_the_cap_are_folded_into_one_row() {
         let sessions: Vec<LiveSession> =
             (1..=7).map(|n| live(&format!("s{n}"), n * 1_000)).collect();
-        let rows = usage_rows(&sessions, None, day("2026-10-07"), compact_graph(7), 30);
-        assert_eq!(rows[1].label, "  s7                      7.0k");
-        assert_eq!(rows[6].label, "  2 more                  3.0k");
+        let rows = usage_rows(&sessions, None, day("2026-10-07"), compact_graph(7));
+        assert_eq!(line(&rows[1]), "  s7 | 7.0k");
+        assert_eq!(line(&rows[6]), "  2 more | 3.0k");
     }
 
     #[test]
-    fn the_graph_caption_shortens_to_leave_the_bars_their_room() {
+    fn the_graph_row_names_its_span_and_total() {
+        let rows = usage_rows(&[], Some(&history()), day("2026-10-07"), compact_graph(14));
+        assert_eq!(line(rows.last().unwrap()), " | 14 days | 1.8m");
+    }
+
+    #[test]
+    fn no_row_joins_its_parts_with_a_middle_dot() {
+        let sessions = vec![LiveSession {
+            cost: Some("$0.1250".to_string()),
+            ..live("oc", 19_500)
+        }];
         let today = day("2026-10-07");
-        let caption = |cols| {
-            usage_rows(&[], Some(&history()), today, compact_graph(14), cols)
-                .pop()
-                .unwrap()
-                .label
-        };
-        assert!(caption(40).ends_with("14 days · 1.8m"));
-        assert!(caption(30).ends_with(" 14 days"));
-        assert!(caption(24).ends_with(" 14d"));
+        let mut rows = usage_rows(&sessions, Some(&history()), today, compact_graph(7));
+        for hovered in [None, Some(5)] {
+            let graph = GraphView {
+                days: 7,
+                expanded: true,
+                hovered,
+            };
+            rows.extend(usage_rows(&sessions, Some(&history()), today, graph));
+        }
+        let snap = snapshot_with(vec![claude_quota()]);
+        rows.extend(quota_rows(&inputs(&snap, Some(RelayStatus::Connected))));
+        for text in lines(&rows) {
+            assert!(!text.contains('·'), "{text}");
+        }
     }
 
     #[test]
@@ -910,9 +1021,9 @@ mod tests {
             expanded: true,
             hovered: None,
         };
-        let rows = usage_rows(&[], Some(&history()), today, graph, USAGE_MENU_WIDE_COLS);
+        let rows = usage_rows(&[], Some(&history()), today, graph);
         let tail = &rows[rows.len() - 3..];
-        assert_eq!(tail[0].label, "Tokens per day · 1.8m");
+        assert_eq!(line(&tail[0]), "# Tokens per day");
         let Some(RowWidget::Tabs(tabs)) = &tail[0].widget else {
             panic!("the header carries the span tabs");
         };
@@ -944,16 +1055,19 @@ mod tests {
             ]
         );
         assert_eq!(chart.x_labels.last().unwrap(), &(6, "Today".to_string()));
-        assert_eq!(tail[2].label, "Avg 250.0k/day · Peak 1.0m (Oct 6)");
+        assert_eq!(
+            line(&tail[2]),
+            "Average 250.0k per day | Peak 1.0m on Oct 6"
+        );
 
         let hovered = GraphView {
             hovered: Some(5),
             ..graph
         };
-        let rows = usage_rows(&[], Some(&history()), today, hovered, USAGE_MENU_WIDE_COLS);
+        let rows = usage_rows(&[], Some(&history()), today, hovered);
         assert_eq!(
-            rows.last().unwrap().label,
-            "Tue 6 Oct · 1.0m · Claude 600.0k · Codex 400.0k"
+            line(rows.last().unwrap()),
+            "Tue 6 Oct | Claude 600.0k | Codex 400.0k | 1.0m"
         );
     }
 
@@ -1014,7 +1128,7 @@ mod tests {
     fn a_quiet_span_says_so() {
         assert_eq!(
             chart_detail(&[DayTokens::default(); 7], day("2026-10-07"), None),
-            "No tokens in this span"
+            ("No tokens in this span".to_string(), vec![])
         );
     }
 
@@ -1024,8 +1138,8 @@ mod tests {
             cost: Some("$0.1250".to_string()),
             ..live("oc", 19_500)
         }];
-        let rows = usage_rows(&sessions, None, day("2026-10-07"), compact_graph(7), 30);
-        assert_eq!(rows[1].label, "  oc             $0.12 · 19.5k");
+        let rows = usage_rows(&sessions, None, day("2026-10-07"), compact_graph(7));
+        assert_eq!(line(&rows[1]), "  oc | $0.12 | 19.5k");
     }
 
     use crate::agent_herd::quota::{QuotaBand, QuotaWindow};
@@ -1087,16 +1201,17 @@ mod tests {
             sampled_at: at(NOW),
         };
         let snap = snapshot_with(vec![claude_quota(), codex]);
-        let rows = quota_rows(&inputs(&snap, Some(RelayStatus::Connected)), 40);
+        let rows = quota_rows(&inputs(&snap, Some(RelayStatus::Connected)));
         assert_eq!(
-            labels(&rows),
+            lines(&rows),
             vec![
-                "Claude                    updated 2m ago",
-                "  5h window",
-                "  Weekly",
-                "  Last session cost                $3.41",
-                "Codex · Plus                 updated now",
-                "  5h window",
+                "# Claude | updated 2m ago",
+                "  5h window | 47% | resets 2h 13m",
+                // Past its reset the weekly bar empties instead of showing old news.
+                "  Weekly |  | reset",
+                "  Last session cost | $3.41",
+                "# Codex Plus | updated now",
+                "  5h window | 12% | ",
             ]
         );
         let gauges: Vec<_> = rows
@@ -1106,47 +1221,39 @@ mod tests {
                 _ => None,
             })
             .collect();
-        let five = gauges[1].as_ref().unwrap();
-        assert_eq!(five.trailing, "47% · 2h 13m");
-        assert!((five.fraction - 0.47).abs() < 1e-6);
-        // Past its reset the weekly bar empties instead of showing old news.
-        let weekly = gauges[2].as_ref().unwrap();
-        assert_eq!(weekly.trailing, "reset");
-        assert_eq!(weekly.fraction, 0.);
-        assert_eq!(gauges[5].as_ref().unwrap().trailing, "12%");
+        assert!((gauges[1].as_ref().unwrap().fraction - 0.47).abs() < 1e-6);
+        assert_eq!(gauges[2].as_ref().unwrap().fraction, 0.);
+        // Every bar has the same two columns after it, so the bars line up.
+        assert!(rows
+            .iter()
+            .filter(|r| r.widget.is_some())
+            .all(|r| r.cells.len() == 2));
         // A divider between the two cards only.
         assert_eq!(
             rows.iter().map(|r| r.divider_above).collect::<Vec<_>>(),
             vec![false, false, false, false, true, false]
         );
-        assert!(gauges
-            .iter()
-            .flatten()
-            .all(|g| g.trailing.chars().count() <= GAUGE_TRAILING_COLS));
     }
 
     #[test]
     fn claude_without_figures_awaits_the_relay() {
         let empty = QuotaSnapshot::default();
         // Turned off, or no Claude Code here: nothing to say.
-        assert!(quota_rows(&inputs(&empty, Some(RelayStatus::Disconnected)), 40).is_empty());
+        assert!(quota_rows(&inputs(&empty, Some(RelayStatus::Disconnected))).is_empty());
 
-        let rows = quota_rows(&inputs(&empty, Some(RelayStatus::Connected)), 40);
-        assert_eq!(
-            labels(&rows),
-            vec!["Claude       limits after its next reply"]
-        );
+        let rows = quota_rows(&inputs(&empty, Some(RelayStatus::Connected)));
+        assert_eq!(lines(&rows), vec!["# Claude | limits after its next reply"]);
         assert_eq!(rows[0].action, UsageRowAction::Inert);
 
-        let rows = quota_rows(&inputs(&empty, Some(RelayStatus::Unsupported)), 40);
-        assert_eq!(labels(&rows), vec!["Claude · limits need Git Bash"]);
+        let rows = quota_rows(&inputs(&empty, Some(RelayStatus::Unsupported)));
+        assert_eq!(lines(&rows), vec!["# Claude | limits need Git Bash"]);
         // Before the first look, and on Windows without a Claude agent: nothing.
-        assert!(quota_rows(&inputs(&empty, None), 40).is_empty());
+        assert!(quota_rows(&inputs(&empty, None)).is_empty());
         let quiet = QuotaInputs {
             claude_active: false,
             ..inputs(&empty, Some(RelayStatus::Unsupported))
         };
-        assert!(quota_rows(&quiet, 40).is_empty());
+        assert!(quota_rows(&quiet).is_empty());
     }
 
     #[test]
@@ -1167,17 +1274,18 @@ mod tests {
             ..inputs(&empty, None)
         };
         assert_eq!(
-            labels(&quota_rows(&with, 40)),
+            lines(&quota_rows(&with)),
             vec![
-                "OpenCode · today           $1.23 · 48.2k",
-                "  Last 7 days                $140 · 2.1m",
+                "# OpenCode | Cost | Tokens",
+                "  Today | $1.23 | 48.2k",
+                "  Last 7 days | $140 | 2.1m",
             ]
         );
         let none = QuotaInputs {
             opencode: Some(OpencodeSpend::default()),
             ..inputs(&empty, None)
         };
-        assert!(quota_rows(&none, 40).is_empty());
+        assert!(quota_rows(&none).is_empty());
     }
 
     #[test]
@@ -1205,10 +1313,10 @@ mod tests {
             ..inputs(&empty, None)
         };
         assert_eq!(
-            labels(&quota_rows(&with, 40)),
+            lines(&quota_rows(&with)),
             vec![
-                "Antigravity · no usage data on disk",
-                "Copilot · totals when a session ends",
+                "# Antigravity | no usage data on disk",
+                "# Copilot | totals when a session ends",
             ]
         );
     }
@@ -1220,7 +1328,11 @@ mod tests {
             gemini: 2_000,
             ..Default::default()
         }];
-        let text = chart_detail(&days, day("2026-10-07"), Some(0));
-        assert!(text.ends_with("· Claude 1.0k · Gemini 2.0k"), "{text}");
+        let (label, cells) = chart_detail(&days, day("2026-10-07"), Some(0));
+        assert_eq!(label, "Wed 7 Oct");
+        assert_eq!(
+            cells.iter().map(|c| c.text.as_str()).collect::<Vec<_>>(),
+            vec!["Claude 1.0k", "Gemini 2.0k", "3.0k"]
+        );
     }
 }
