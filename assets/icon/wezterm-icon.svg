@@ -1,221 +1,102 @@
-<?xml version="1.0" encoding="UTF-8" standalone="no"?>
-<svg
-   xmlns:dc="http://purl.org/dc/elements/1.1/"
-   xmlns:cc="http://creativecommons.org/ns#"
-   xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
-   xmlns:svg="http://www.w3.org/2000/svg"
-   xmlns="http://www.w3.org/2000/svg"
-   xmlns:xlink="http://www.w3.org/1999/xlink"
-   xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd"
-   xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape"
-   width="55.010815mm"
-   height="55mm"
-   viewBox="0 0 55.010814 55"
-   version="1.1"
-   id="svg8"
-   inkscape:version="1.0.1 (c497b03c, 2020-09-10)"
-   sodipodi:docname="wezterm-icon.svg"
-   inkscape:export-filename="/Users/wez/Documents/wezterm-icon.png"
-   inkscape:export-xdpi="59.112728"
-   inkscape:export-ydpi="59.112728">
-  <defs
-     id="defs2">
-    <linearGradient
-       inkscape:collect="always"
-       id="linearGradient1113">
-      <stop
-         style="stop-color:#2b383f;stop-opacity:1"
-         offset="0"
-         id="stop1109" />
-      <stop
-         style="stop-color:#172024;stop-opacity:1"
-         offset="1"
-         id="stop1111" />
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <!-- Rich dark slate plate (crisp physical depth, no "dim screen" feel) -->
+    <linearGradient id="cyanPlateGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#2D3B42"/>
+      <stop offset="45%" stop-color="#222C32"/>
+      <stop offset="100%" stop-color="#161F24"/>
     </linearGradient>
-    <inkscape:path-effect
-       effect="fillet_chamfer"
-       id="path-effect943"
-       is_visible="true"
-       lpeversion="1"
-       satellites_param="F,0,0,1,0,2.6458333,0,1 @ F,0,0,1,0,2.6458333,0,1 @ F,0,0,1,0,0,0,1 @ F,0,0,1,0,0,0,1"
-       unit="px"
-       method="auto"
-       mode="F"
-       radius="10"
-       chamfer_steps="1"
-       flexible="false"
-       use_knot_distance="true"
-       apply_no_radius="true"
-       apply_with_radius="true"
-       only_selected="false"
-       hide_knots="false" />
-    <inkscape:path-effect
-       effect="fillet_chamfer"
-       id="path-effect939"
-       is_visible="true"
-       lpeversion="1"
-       satellites_param="F,0,0,1,0,0,0,1 @ F,0,0,1,0,0,0,1 @ F,0,0,1,0,0,0,1 @ F,0,0,1,0,0,0,1"
-       unit="px"
-       method="auto"
-       mode="C"
-       radius="10"
-       chamfer_steps="1"
-       flexible="false"
-       use_knot_distance="true"
-       apply_no_radius="true"
-       apply_with_radius="true"
-       only_selected="true"
-       hide_knots="false" />
-    <inkscape:path-effect
-       effect="fillet_chamfer"
-       id="path-effect934"
-       is_visible="true"
-       lpeversion="1"
-       satellites_param="F,1,0,1,0,0.1,0,1 @ F,1,0,1,0,0.1,0,1 @ F,1,0,1,0,0.1,0,1 @ F,1,0,1,0,0.1,0,1"
-       unit="px"
-       method="auto"
-       mode="F"
-       radius="10"
-       chamfer_steps="1"
-       flexible="true"
-       use_knot_distance="true"
-       apply_no_radius="true"
-       apply_with_radius="true"
-       only_selected="false"
-       hide_knots="false" />
-    <linearGradient
-       inkscape:collect="always"
-       id="linearGradient905">
-      <stop
-         style="stop-color:#ff00ff;stop-opacity:1;"
-         offset="0"
-         id="stop901" />
-      <stop
-         style="stop-color:#ff00ff;stop-opacity:0;"
-         offset="1"
-         id="stop903" />
+
+    <linearGradient id="cyanRimGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#4B5E68" stop-opacity="0.85"/>
+      <stop offset="50%" stop-color="#313E45" stop-opacity="0.5"/>
+      <stop offset="100%" stop-color="#1B2429" stop-opacity="0.3"/>
     </linearGradient>
-    <inkscape:path-effect
-       effect="fillet_chamfer"
-       id="path-effect3137"
-       is_visible="true"
-       lpeversion="1"
-       satellites_param="F,1,0,1,0,0.1,0,1 @ F,1,0,1,0,0.1,0,1 @ F,1,0,1,0,0.1,0,1 @ F,1,0,1,0,0.1,0,1"
-       unit="px"
-       method="auto"
-       mode="F"
-       radius="10"
-       chamfer_steps="1"
-       flexible="true"
-       use_knot_distance="true"
-       apply_no_radius="true"
-       apply_with_radius="true"
-       only_selected="false"
-       hide_knots="false" />
-    <inkscape:path-effect
-       effect="fillet_chamfer"
-       id="path-effect2756"
-       is_visible="true"
-       lpeversion="1"
-       satellites_param="F,1,0,1,0,0.2,0,1 @ F,1,0,1,0,0.2,0,1 @ F,1,0,1,0,0.2,0,1 @ F,1,0,1,0,0.2,0,1"
-       unit="px"
-       method="auto"
-       mode="F"
-       radius="20"
-       chamfer_steps="1"
-       flexible="true"
-       use_knot_distance="true"
-       apply_no_radius="true"
-       apply_with_radius="true"
-       only_selected="false"
-       hide_knots="false" />
-    <linearGradient
-       inkscape:collect="always"
-       xlink:href="#linearGradient905"
-       id="linearGradient907"
-       x1="39.079655"
-       y1="72.459702"
-       x2="90.17334"
-       y2="72.459702"
-       gradientUnits="userSpaceOnUse" />
-    <linearGradient
-       inkscape:collect="always"
-       xlink:href="#linearGradient1113"
-       id="linearGradient1115"
-       x1="66.095612"
-       y1="43.676846"
-       x2="66.095612"
-       y2="98.112801"
-       gradientUnits="userSpaceOnUse" />
+
+    <radialGradient id="cyanPlateSheen" cx="50%" cy="15%" r="70%">
+      <stop offset="0%" stop-color="#5B7685" stop-opacity="0.16"/>
+      <stop offset="60%" stop-color="#5B7685" stop-opacity="0.02"/>
+      <stop offset="100%" stop-color="#5B7685" stop-opacity="0"/>
+    </radialGradient>
+
+    <!-- Deep sapphire blue arcs -->
+    <linearGradient id="cyanLeftArc" x1="50%" y1="0%" x2="50%" y2="100%">
+      <stop offset="0%" stop-color="#5288BE"/>
+      <stop offset="50%" stop-color="#3B6F9E"/>
+      <stop offset="100%" stop-color="#244B70"/>
+    </linearGradient>
+
+    <linearGradient id="cyanRightArc" x1="50%" y1="0%" x2="50%" y2="100%">
+      <stop offset="0%" stop-color="#244B70"/>
+      <stop offset="50%" stop-color="#3B6F9E"/>
+      <stop offset="100%" stop-color="#5288BE"/>
+    </linearGradient>
+
+    <!-- Bold Cyan/Sky Blue T (100% Blue, ZERO white glare) -->
+    <linearGradient id="cyanTGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#58A6FF"/>
+      <stop offset="50%" stop-color="#3B8BE8"/>
+      <stop offset="100%" stop-color="#1E65BA"/>
+    </linearGradient>
+
+    <filter id="cyanShadow" x="-12%" y="-10%" width="124%" height="128%" filterUnits="userSpaceOnUse">
+      <feDropShadow dx="0" dy="16" stdDeviation="18" flood-color="#000000" flood-opacity="0.6"/>
+      <feDropShadow dx="0" dy="4" stdDeviation="6" flood-color="#000000" flood-opacity="0.3"/>
+    </filter>
   </defs>
-  <sodipodi:namedview
-     id="base"
-     pagecolor="#ffffff"
-     bordercolor="#666666"
-     borderopacity="1.0"
-     inkscape:pageopacity="0.0"
-     inkscape:pageshadow="2"
-     inkscape:zoom="2.8190618"
-     inkscape:cx="85.466562"
-     inkscape:cy="106.8872"
-     inkscape:document-units="mm"
-     inkscape:current-layer="layer1"
-     inkscape:document-rotation="0"
-     showgrid="false"
-     inkscape:window-width="1252"
-     inkscape:window-height="847"
-     inkscape:window-x="54"
-     inkscape:window-y="25"
-     inkscape:window-maximized="0"
-     fit-margin-top="0"
-     fit-margin-left="0"
-     fit-margin-right="0"
-     fit-margin-bottom="0" />
-  <metadata
-     id="metadata5">
-    <rdf:RDF>
-      <cc:Work
-         rdf:about="">
-        <dc:format>image/svg+xml</dc:format>
-        <dc:type
-           rdf:resource="http://purl.org/dc/dcmitype/StillImage" />
-        <dc:title />
-        <dc:creator>
-          <cc:Agent>
-            <dc:title>Wez Furlong</dc:title>
-          </cc:Agent>
-        </dc:creator>
-      </cc:Work>
-    </rdf:RDF>
-  </metadata>
-  <g
-     inkscape:label="Layer 1"
-     inkscape:groupmode="layer"
-     id="layer1"
-     transform="translate(-37.656612,-43.207115)">
-    <path
-       style="opacity:1;fill:url(#linearGradient1115);fill-opacity:1;stroke:none;stroke-width:7.01263;stroke-linecap:butt;stroke-linejoin:round;stroke-miterlimit:4;stroke-dasharray:none"
-       id="rect10"
-       width="55"
-       height="55"
-       x="37.656612"
-       y="43.207115"
-       sodipodi:type="rect"
-       d="m 48.656612,43.207115 h 33 a 11,11 45 0 1 11,11 v 33 a 11,11 135 0 1 -11,11 h -33 a 11,11 45 0 1 -11,-11 v -33 a 11,11 135 0 1 11,-11 z"
-       inkscape:path-effect="#path-effect2756" />
-    <g
-       aria-label="$W"
-       id="text3144"
-       style="font-style:normal;font-variant:normal;font-weight:normal;font-stretch:normal;font-size:47.9778px;line-height:1.25;font-family:'Operator Mono';-inkscape-font-specification:'Operator Mono';fill:#4e49ee;fill-opacity:1;stroke-width:0.264583"
-       transform="matrix(0.84051205,0,0,0.84423619,11.628829,8.3486634)">
-      <path
-         d="m 47.07925,66.906972 c 0,-1.247423 1.247423,-2.015068 4.270024,-2.015068 l -1.007534,5.517447 c -1.871134,-1.247423 -3.26249,-2.39889 -3.26249,-3.502379 z m 8.06027,13.625694 c 0,1.295401 -1.295401,2.159001 -4.270024,2.302935 l 1.055511,-5.853292 c 1.871135,1.247423 3.214513,2.350912 3.214513,3.550357 z m -5.277558,11.99445 0.911578,-5.421491 c 7.244648,-0.67169 10.075338,-3.598335 10.075338,-6.812848 0,-3.310468 -4.030135,-5.901269 -7.724426,-8.156225 l 1.343379,-7.100715 c 1.535289,0.143934 3.358446,0.431801 5.517447,0.863601 l 0.623711,-4.941713 C 58.977744,60.717836 57.442454,60.62188 56.00312,60.525924 l 1.10349,-5.277558 -4.749802,-0.04798 -0.911579,5.373513 c -7.244647,0.575734 -10.075337,3.598335 -10.075337,6.812847 0,3.262491 4.030135,5.757336 7.724425,7.916337 l -1.343378,7.436559 c -1.727201,-0.09596 -3.838224,-0.383822 -6.285092,-0.815623 l -0.959556,4.941714 c 2.063046,0.239889 3.982158,0.383822 5.709358,0.4318 l -1.055511,5.181602 z"
-         style="font-style:normal;font-variant:normal;font-weight:normal;font-stretch:normal;font-size:47.9778px;font-family:'Operator Mono';-inkscape-font-specification:'Operator Mono';fill:#4e49ee;fill-opacity:1;stroke-width:0.264583"
-         id="path854" />
-      <path
-         d="m 81.132992,88.73687 h 5.373513 c 0.671689,-5.613403 1.631245,-16.936163 2.254957,-29.746235 h -5.133625 c -0.143933,3.022601 -0.671689,21.014275 -0.8636,22.501587 h -0.143934 c -1.2954,-4.845757 -2.350912,-8.779937 -3.646312,-13.577717 h -2.926646 c -1.247423,4.79778 -2.111023,8.396115 -3.406424,13.577717 H 72.44901 C 72.305077,80.00491 71.489454,62.013236 71.393499,58.990635 h -5.325536 c 0.623711,12.810072 1.53529,24.132832 2.206979,29.746235 H 73.5525 l 3.69429,-14.249406 z"
-         style="font-style:normal;font-variant:normal;font-weight:normal;font-stretch:normal;font-size:47.9778px;font-family:'Operator Mono';-inkscape-font-specification:'Operator Mono';fill:#4e49ee;fill-opacity:1;stroke-width:0.264583"
-         id="path856" />
-    </g>
-  </g>
+
+  <!-- 1. Base Squircle Plate -->
+  <rect x="46" y="46" width="420" height="420" rx="94" ry="94"
+        fill="url(#cyanPlateGrad)"
+        filter="url(#cyanShadow)"
+        stroke="url(#cyanRimGrad)"
+        stroke-width="1.75"/>
+
+  <!-- Top Ambient Sheen -->
+  <rect x="48" y="48" width="416" height="416" rx="92" ry="92"
+        fill="url(#cyanPlateSheen)"/>
+
+  <!-- 2. Dual Loading Circle Elements -->
+  <circle cx="256" cy="256" r="142"
+          fill="none"
+          stroke="#1E282E"
+          stroke-width="2.5"
+          stroke-dasharray="4 8"
+          opacity="0.7"/>
+
+  <!-- Left Loading Curve -->
+  <path d="M 155.6,356.4 A 142,142 0 0,1 155.6,155.6"
+        fill="none"
+        stroke="url(#cyanLeftArc)"
+        stroke-width="15"
+        stroke-linecap="round"/>
+
+  <!-- Right Loading Curve -->
+  <path d="M 356.4,155.6 A 142,142 0 0,1 356.4,356.4"
+        fill="none"
+        stroke="url(#cyanRightArc)"
+        stroke-width="15"
+        stroke-linecap="round"/>
+
+  <!-- Ticker dots -->
+  <circle cx="155.6" cy="155.6" r="3.75" fill="#58A6FF" opacity="0.75"/>
+  <circle cx="356.4" cy="356.4" r="3.75" fill="#58A6FF" opacity="0.75"/>
+
+  <!-- 3. Middle Symbol: Pure Blue <T -->
+  <!-- Chevron '<' in Soft Slate Blue -->
+  <path d="M 218,212 L 168,256 L 218,300"
+        fill="none"
+        stroke="#4B81B7"
+        stroke-width="17"
+        stroke-linecap="round"
+        stroke-linejoin="round"/>
+
+  <!-- Monospace 'T' in Rich Cyan-Blue #58A6FF (No white at all) -->
+  <path d="M 244,208 H 340 C 342,208 344,210 344,212 V 224 C 344,226 342,228 340,228 H 304 V 298 C 304,300 302,302 299,302 H 285 C 282,302 280,300 280,298 V 228 H 244 C 242,228 240,226 240,224 V 212 C 240,210 242,208 244,208 Z"
+        fill="url(#cyanTGrad)"
+        stroke="#0E1E2C"
+        stroke-width="1.25"/>
+
+  <!-- Dot in matching blue -->
+  <circle cx="292" cy="318" r="4.25" fill="#58A6FF" opacity="0.85"/>
 </svg>

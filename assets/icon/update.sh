@@ -1,27 +1,25 @@
 #!/usr/bin/env bash
 # This script updates the icon files from the svg file.
-# It assumes that the svg file is square.
-set -x
-cd $(git rev-parse --show-toplevel)/assets/icon
+# It assumes that the svg file is square and already carries the macOS icon-grid
+# margin (plate ~82% of the canvas), so no border is added.
+# Needs rsvg-convert (librsvg) and magick (imagemagick); macOS for the .icns.
+set -ex
+cd $(git rev-parse --show-toplevel)
 
-src=wezterm-icon.svg
-
-conv_opts="-colors 256 -background none -density 300"
+src=assets/icon/wezterm-icon.svg
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
 
 # the linux icon
-convert $conv_opts -resize "!128x128" "$src" ../icon/terminal.png
+rsvg-convert -w 128 -h 128 "$src" -o assets/icon/terminal.png
 
-for dim in 16 32 128 256 512 1024 ; do
-  # convert is the imagemagick convert utility
-  convert $conv_opts -border '10%' -bordercolor 'rgba(0,0,0,0)' -resize "!${dim}x${dim}" "$src" "icon_${dim}px.png"
-done
-# png2icns is part of the libicns-utils on Fedora systems.
-# It glues together the various png files into a macOS .icns file
-png2icns ../macos/WezTerm.app/Contents/Resources/terminal.icns icon_*px.png
-
-# Clean up
-rm -f icon_*px.png
+# the macOS icon
+rsvg-convert -w 1024 -h 1024 "$src" -o "$work/icon_1024.png"
+rm -f assets/macos/WezTerm.app/Contents/Resources/terminal.icns
+ci/make-icns.sh "$work/icon_1024.png" assets/macos/WezTerm.app/Contents/Resources/terminal.icns
 
 # The Windows icon
-convert $conv_opts -define icon:auto-resize=256,128,96,64,48,32,16 $src ../windows/terminal.ico
-
+for dim in 16 32 48 64 96 128 256 ; do
+  rsvg-convert -w $dim -h $dim "$src" -o "$work/ico_$(printf %03d $dim).png"
+done
+magick "$work"/ico_*.png assets/windows/terminal.ico
