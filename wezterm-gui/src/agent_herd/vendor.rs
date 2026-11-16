@@ -167,6 +167,9 @@ pub struct VendorSession {
     pub output_tokens: Option<u64>,
     /// How full the model's context window is, in percent, when known.
     pub context_percent: Option<u8>,
+    /// When the session last made a model request (see
+    /// `usage::UsageTotals::last_turn_at`). Claude and Codex only.
+    pub last_turn_at: Option<SystemTime>,
     pub cost: Option<String>,
     /// Is this a session a human is typing into?
     ///

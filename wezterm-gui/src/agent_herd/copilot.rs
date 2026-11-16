@@ -120,6 +120,7 @@ impl SessionSource for CopilotDetector {
                         input_tokens: None,
                         output_tokens: None,
                         context_percent: None,
+                        last_turn_at: None,
                         cost: None,
                     });
                 }
@@ -198,6 +199,7 @@ fn collect_state_sessions(home: &Path) -> Vec<VendorSession> {
             input_tokens: None,
             output_tokens: None,
             context_percent: None,
+            last_turn_at: None,
             cost: None,
         });
     }

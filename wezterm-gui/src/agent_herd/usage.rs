@@ -59,6 +59,10 @@ pub struct UsageTotals {
     pub context_tokens: Option<u64>,
     /// Size of that window, when the transcript says (Codex does).
     pub context_window: Option<u64>,
+    /// When the session last made a model request: the latest main-thread
+    /// turn that reported usage. Every request re-reads (and so refreshes) the
+    /// provider's prompt cache, so the time since this is how cold it is.
+    pub last_turn_at: Option<SystemTime>,
 }
 
 /// Claude's context window when nothing reports it: the standard size, or the
@@ -92,6 +96,7 @@ struct UsageState {
     started_at: Option<SystemTime>,
     context_tokens: Option<u64>,
     context_window: Option<u64>,
+    last_turn_at: Option<SystemTime>,
 }
 
 impl UsageState {
@@ -103,7 +108,23 @@ impl UsageState {
             started_at: self.started_at,
             context_tokens: self.context_tokens,
             context_window: self.context_window,
+            last_turn_at: self.last_turn_at,
         }
+    }
+}
+
+/// An RFC 3339 transcript timestamp as a `SystemTime`.
+fn parse_record_time(text: &str) -> Option<SystemTime> {
+    let at = chrono::DateTime::parse_from_rfc3339(text).ok()?;
+    let millis = u64::try_from(at.timestamp_millis()).ok()?;
+    Some(SystemTime::UNIX_EPOCH + Duration::from_millis(millis))
+}
+
+/// The later of two optional times.
+fn later(a: Option<SystemTime>, b: Option<SystemTime>) -> Option<SystemTime> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
     }
 }
 
@@ -114,6 +135,7 @@ struct ClaudeRecord {
     /// is not the session's.
     #[serde(rename = "isSidechain")]
     is_sidechain: Option<bool>,
+    timestamp: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -157,8 +179,13 @@ fn fold_claude_record(line: &str, state: &mut UsageState) {
     // What the model was sent for this turn is what its context holds now.
     // The newest turn wins; a made-up message reports nothing and is skipped.
     let context = input + usage.cache_read_input_tokens.unwrap_or(0);
-    if context > 0 && record.is_sidechain != Some(true) {
-        state.context_tokens = Some(context);
+    if record.is_sidechain != Some(true) {
+        if context > 0 {
+            state.context_tokens = Some(context);
+        }
+        // A subagent's request warms its own cache, not the session's.
+        let at = record.timestamp.as_deref().and_then(parse_record_time);
+        state.last_turn_at = later(state.last_turn_at, at);
     }
     // An early record of a message can carry a partial output count, and a
     // later one can repeat it, so the largest report is the one kept.
@@ -216,12 +243,7 @@ fn fold_codex_record(line: &str, state: &mut UsageState) {
         return;
     };
     if state.started_at.is_none() {
-        state.started_at = record
-            .timestamp
-            .as_deref()
-            .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok())
-            .and_then(|at| u64::try_from(at.timestamp_millis()).ok())
-            .map(|millis| SystemTime::UNIX_EPOCH + Duration::from_millis(millis));
+        state.started_at = record.timestamp.as_deref().and_then(parse_record_time);
     }
     let Some(payload) = record.payload else {
         return;
@@ -239,6 +261,8 @@ fn fold_codex_record(line: &str, state: &mut UsageState) {
     let Some(info) = payload.info else {
         return;
     };
+    let at = record.timestamp.as_deref().and_then(parse_record_time);
+    state.last_turn_at = later(state.last_turn_at, at);
     if let Some(last) = &info.last_token_usage {
         // Codex counts cached tokens inside `input_tokens`, so this is the
         // whole turn: everything sent plus what came back.
@@ -380,6 +404,50 @@ mod tests {
         assert_eq!(totals.context_tokens, Some(40_800));
         assert_eq!(totals.context_window, Some(272_000));
         assert_eq!(context_percent(40_800, 272_000), Some(15));
+    }
+
+    /// The cold-cache marker reads the newest main-thread request: a
+    /// subagent's request does not warm the session's cache, and a record
+    /// without usage (a user prompt, a tool result) is not a request.
+    #[test]
+    fn last_turn_is_the_newest_main_thread_request() {
+        let at = |text: &str| parse_record_time(text).unwrap();
+        let stamped = |line: String, ts: &str| {
+            let mut value: serde_json::Value = serde_json::from_str(&line).unwrap();
+            value["timestamp"] = serde_json::json!(ts);
+            value.to_string()
+        };
+        let side = serde_json::json!({
+            "type": "assistant",
+            "isSidechain": true,
+            "timestamp": "2026-08-30T03:00:00.000Z",
+            "message": { "id": "s", "model": "m", "usage": { "input_tokens": 5, "output_tokens": 1 } },
+        })
+        .to_string();
+        let prompt = serde_json::json!({
+            "type": "user",
+            "timestamp": "2026-08-30T04:00:00.000Z",
+            "message": { "role": "user", "content": "hi" },
+        })
+        .to_string();
+        let totals = fold_all(
+            UsageFormat::Claude,
+            &[
+                stamped(claude_line("a", "m", 1, 1, 1), "2026-08-30T01:00:00.000Z"),
+                stamped(claude_line("b", "m", 1, 1, 1), "2026-08-30T02:00:00.000Z"),
+                side,
+                prompt,
+            ],
+        );
+        assert_eq!(totals.last_turn_at, Some(at("2026-08-30T02:00:00.000Z")));
+
+        let codex = fold_all(UsageFormat::Codex, &[codex_tokens(10, 5, 1)]);
+        assert_eq!(codex.last_turn_at, Some(at("2026-08-30T00:20:00.000Z")));
+        assert_eq!(
+            fold_all(UsageFormat::Claude, &[claude_line("a", "m", 1, 1, 1)]).last_turn_at,
+            None,
+            "a record with no timestamp dates nothing"
+        );
     }
 
     #[test]

@@ -63,7 +63,7 @@ impl TermWindow {
         if !copy_toast_wanted(source, copied, result.redacted) {
             return;
         }
-        wezterm_toast_notification::show(wezterm_toast_notification::ToastNotification {
+        crate::termwindow::tgz_notify::copy(wezterm_toast_notification::ToastNotification {
             title: result.title.to_string(),
             message: result.message,
             url: None,

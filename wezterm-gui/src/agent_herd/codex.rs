@@ -167,6 +167,7 @@ impl SessionSource for CodexDetector {
                         input_tokens: None,
                         output_tokens: None,
                         context_percent: None,
+                        last_turn_at: None,
                         cost: None,
                     });
                 }
@@ -255,6 +256,7 @@ fn collect_rollout_sessions(home: &Path) -> Vec<VendorSession> {
                 context_percent: usage.context_tokens.zip(usage.context_window).and_then(
                     |(used, window)| crate::agent_herd::usage::context_percent(used, window),
                 ),
+                last_turn_at: usage.last_turn_at,
                 cost: None,
             });
         }

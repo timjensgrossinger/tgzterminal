@@ -61,6 +61,32 @@ impl UiFont {
     }
 }
 
+/// Which part of the sidebar is being laid out or painted, for its own text
+/// size (`sidebar_tab_font_size`, `sidebar_agents_font_size`,
+/// `sidebar_button_font_size`). Everything else -- menus, dialogs, the
+/// Changes panel, the Worktree -- uses `sidebar_font_size`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum UiArea {
+    #[default]
+    Base,
+    Tabs,
+    Agents,
+    Buttons,
+}
+
+/// The point size of an area's text: its own key when set, else the base.
+pub(crate) fn area_font_size(config: &config::Config, area: UiArea) -> f64 {
+    let own = match area {
+        UiArea::Base => None,
+        UiArea::Tabs => config.sidebar_tab_font_size,
+        UiArea::Agents => config.sidebar_agents_font_size,
+        UiArea::Buttons => config.sidebar_button_font_size,
+    };
+    own.filter(|size| size.is_finite() && *size > 0.)
+        .unwrap_or(config.sidebar_font_size)
+        .max(1.0)
+}
+
 /// Where a string sits inside the width it was given.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Align {
@@ -306,9 +332,24 @@ impl crate::TermWindow {
     /// The loaded font for a chrome text style.
     pub(crate) fn ui_font(&self, which: UiFont) -> anyhow::Result<Rc<LoadedFont>> {
         self.fonts.ui_font(
-            self.config.sidebar_font_size.max(1.0) * which.scale(),
+            area_font_size(&self.config, self.ui_area.get()) * which.scale(),
             which.weight(),
         )
+    }
+
+    /// Make `area` the one chrome text is sized for, returning the previous
+    /// one so the caller can put it back.
+    pub(crate) fn set_ui_area(&self, area: UiArea) -> UiArea {
+        self.ui_area.replace(area)
+    }
+
+    /// Run `f` with chrome text sized for `area`, then restore the previous
+    /// area. For layout code that measures one area from anywhere.
+    pub(crate) fn in_ui_area<R>(&self, area: UiArea, f: impl FnOnce() -> R) -> R {
+        let previous = self.set_ui_area(area);
+        let result = f();
+        self.set_ui_area(previous);
+        result
     }
 
     fn ui_metrics(&self, font: &Rc<LoadedFont>) -> RenderMetrics {
@@ -646,6 +687,19 @@ impl crate::TermWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_area_size_falls_back_to_the_sidebar_font_size() {
+        let mut config = config::Config::default_config();
+        config.sidebar_font_size = 13.0;
+        assert_eq!(area_font_size(&config, UiArea::Tabs), 13.0);
+        config.sidebar_tab_font_size = Some(15.0);
+        assert_eq!(area_font_size(&config, UiArea::Tabs), 15.0);
+        assert_eq!(area_font_size(&config, UiArea::Agents), 13.0);
+        assert_eq!(area_font_size(&config, UiArea::Base), 13.0);
+        config.sidebar_button_font_size = Some(0.0);
+        assert_eq!(area_font_size(&config, UiArea::Buttons), 13.0, "0 is unset");
+    }
 
     #[test]
     fn a_long_path_keeps_its_end() {

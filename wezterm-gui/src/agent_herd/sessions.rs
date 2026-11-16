@@ -1300,20 +1300,23 @@ fn is_codex_instruction_blob(text: &str) -> bool {
 /// contiguously in the flat list; a node whose parent cannot be placed that
 /// way becomes a root of its own rather than vanishing.
 pub fn build_subagent_tree(flat: &[super::HerdSubagent]) -> Vec<SubagentNode> {
+    let now = std::time::SystemTime::now();
     let mut nodes: Vec<SubagentNode> = flat
         .iter()
         .map(|sub| SubagentNode {
             agent_id: sub.agent_id.clone(),
             agent_type: sub.agent_type.clone(),
             description: sub.description.clone(),
-            // Pending in the background is working by the parent's account,
-            // however long the transcript has been quiet.
-            status: if sub.pending && sub.status != super::HerdStatus::Done {
+            // Pending in the background is working by the parent's account --
+            // within the same quiet cap the tab row applies, so a launch whose
+            // notification never landed does not read "working" for days.
+            status: if sub.pending && super::subagent_is_working(sub, now) {
                 super::HerdStatus::Working
             } else {
                 sub.status
             },
             depth: sub.depth,
+            last_activity: sub.last_activity,
             children: Vec::new(),
             events: Vec::new(),
         })
@@ -1934,7 +1937,7 @@ mod tests {
             description: id.to_string(),
             status: crate::agent_herd::HerdStatus::Unknown,
             depth,
-            last_activity: None,
+            last_activity: Some(std::time::SystemTime::now()),
             pending,
         }
     }

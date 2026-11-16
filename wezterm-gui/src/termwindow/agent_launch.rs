@@ -463,7 +463,7 @@ fn notify_restore_outcome(restored: usize, unavailable: usize) {
         (n, 0) => format!("Reopened {n} agent session{}", plural(n)),
         (n, u) => format!("Reopened {n} agent session{}, {u} unavailable", plural(n)),
     };
-    wezterm_toast_notification::show(wezterm_toast_notification::ToastNotification {
+    crate::termwindow::tgz_notify::status(wezterm_toast_notification::ToastNotification {
         title: "Agent restore".to_string(),
         message,
         url: None,

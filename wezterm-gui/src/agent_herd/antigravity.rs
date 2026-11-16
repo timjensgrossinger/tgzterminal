@@ -152,6 +152,7 @@ impl SessionSource for AntigravityDetector {
                     input_tokens: None,
                     output_tokens: None,
                     context_percent: None,
+                    last_turn_at: None,
                     cost: None,
                 })
             })

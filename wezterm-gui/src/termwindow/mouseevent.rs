@@ -2343,7 +2343,7 @@ impl super::TermWindow {
                             })
                         }
                         _ => {
-                            wezterm_toast_notification::show(
+                            crate::termwindow::tgz_notify::status(
                                 wezterm_toast_notification::ToastNotification {
                                     title: "Sidebar button".to_string(),
                                     message: format!(
@@ -2382,7 +2382,7 @@ impl super::TermWindow {
     pub(crate) fn start_sidebar_footer_edit(&mut self) {
         let (rows, from_lua) = self.sidebar_footer_full_rows();
         if from_lua {
-            wezterm_toast_notification::show(wezterm_toast_notification::ToastNotification {
+            crate::termwindow::tgz_notify::status(wezterm_toast_notification::ToastNotification {
                 title: "Sidebar buttons".to_string(),
                 message: "The layout is set by `sidebar_footer` in your config; remove that \
                           key to arrange the buttons by dragging"
@@ -2886,7 +2886,7 @@ impl super::TermWindow {
                                 {
                                     log::warn!("failed to send agent interrupt: {err:#}");
                                 } else {
-                                    wezterm_toast_notification::show(
+                                    crate::termwindow::tgz_notify::status(
                                         wezterm_toast_notification::ToastNotification {
                                             title: "Agent control".to_string(),
                                             message: "Sent Ctrl-C to the active agent pane"
@@ -4200,7 +4200,7 @@ impl super::TermWindow {
                     // Without both an id and a directory the resume command
                     // cannot be built; saying so beats spawning something wrong.
                     _ => {
-                        wezterm_toast_notification::show(
+                        crate::termwindow::tgz_notify::status(
                             wezterm_toast_notification::ToastNotification {
                                 title: "Agent resume".to_string(),
                                 message: "This agent did not report a session id and directory"
@@ -4214,7 +4214,7 @@ impl super::TermWindow {
             }
             AgentRowAction::Attach | AgentRowAction::Logs | AgentRowAction::Stop => {
                 let Some(pane) = agent.pane_id.and_then(|id| Mux::get().get_pane(id)) else {
-                    wezterm_toast_notification::show(
+                    crate::termwindow::tgz_notify::status(
                         wezterm_toast_notification::ToastNotification {
                             title: "Agent".to_string(),
                             message: format!(
@@ -4236,7 +4236,7 @@ impl super::TermWindow {
                         } else {
                             // The same word the toolbelt's Stop gives, so the
                             // click is seen to have done something.
-                            wezterm_toast_notification::show(
+                            crate::termwindow::tgz_notify::status(
                                 wezterm_toast_notification::ToastNotification {
                                     title: "Agent control".to_string(),
                                     message: "Sent Ctrl-C to the agent pane".to_string(),

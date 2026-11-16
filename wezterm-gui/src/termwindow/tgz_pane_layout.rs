@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 fn toast(message: String) {
-    wezterm_toast_notification::show(wezterm_toast_notification::ToastNotification {
+    crate::termwindow::tgz_notify::status(wezterm_toast_notification::ToastNotification {
         title: "Pane layout".to_string(),
         message,
         url: None,

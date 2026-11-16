@@ -1887,6 +1887,37 @@ pub fn default_agent_section_refresh_ms() -> u64 {
     500
 }
 
+/// `tgz_notifications`: which of TGZTerminal's system notifications show.
+///
+/// `enabled` is the master switch: off silences every notification the
+/// process would show (programs' OSC 9/777 alerts, agent alerts, updates,
+/// copy and status messages) and hides the dock badge. The other keys pick
+/// within it. Program alerts keep upstream's `notification_handling`, agent
+/// alerts `agent_ui.waiting_notification`, update notices
+/// `check_for_updates`.
+#[derive(Debug, Clone, FromDynamic, ToDynamic)]
+pub struct TgzNotificationsConfig {
+    #[dynamic(default = "default_true")]
+    pub enabled: bool,
+    /// "Copied …" confirmations after a copy from a pane or the sidebar.
+    #[dynamic(default = "default_true")]
+    pub copy: bool,
+    /// Feedback and errors from the fork's own actions: agent launch, resume
+    /// and control, layouts, the Worktree, sidebar buttons, the usage relay.
+    #[dynamic(default = "default_true")]
+    pub status: bool,
+}
+
+impl Default for TgzNotificationsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            copy: true,
+            status: true,
+        }
+    }
+}
+
 /// Configuration for the agent section embedded in the sidebar.
 #[derive(Debug, Clone, FromDynamic, ToDynamic)]
 pub struct AgentSectionConfig {
@@ -1932,6 +1963,12 @@ pub struct AgentSectionConfig {
     /// list so they are not buried under healthy rows.
     #[dynamic(default = "default_true")]
     pub sort_attention_first: bool,
+
+    /// How long, in milliseconds, a subagent that has finished stays listed
+    /// under its agent in the Agents section. A long-lived session otherwise
+    /// lists every helper it ever started. `0` keeps them all.
+    #[dynamic(default = "default_finished_subagents_keep_ms")]
+    pub finished_subagents_keep_ms: u64,
 }
 
 impl Default for AgentSectionConfig {
@@ -1945,8 +1982,13 @@ impl Default for AgentSectionConfig {
             show_quota: true,
             claude_usage_relay: true,
             sort_attention_first: true,
+            finished_subagents_keep_ms: default_finished_subagents_keep_ms(),
         }
     }
+}
+
+fn default_finished_subagents_keep_ms() -> u64 {
+    3_600_000
 }
 
 /// Sidebar new-tab dropdown: the shells and domains offered by the chevron
@@ -2103,6 +2145,25 @@ pub struct AgentUiConfig {
     #[dynamic(default = "default_agent_waiting_ack_ms")]
     pub waiting_ack_ms: u64,
 
+    /// Whether a waiting agent's tab row turns from the amber "waiting" ring
+    /// to a grey "ready" once you have seen it (see `waiting_ack_ms`). Set
+    /// false to keep the row amber for as long as the agent waits.
+    #[dynamic(default = "default_true")]
+    pub waiting_settles_when_seen: bool,
+
+    /// After this many milliseconds a waiting agent counts as seen even if you
+    /// never visited it: its row turns grey and it leaves the waiting queue
+    /// and the dock badge. `0` never settles it by time.
+    #[dynamic(default = "default_agent_waiting_settle_after_ms")]
+    pub waiting_settle_after_ms: u64,
+
+    /// Mark an agent's tab row with a snowflake and the idle time once its
+    /// session has made no model request for this many milliseconds -- the
+    /// provider's prompt cache has most likely expired, so the next message
+    /// re-reads the whole context. Claude and Codex only. `0` turns it off.
+    #[dynamic(default = "default_agent_cache_cold_after_ms")]
+    pub cache_cold_after_ms: u64,
+
     /// Treat a sustained burst of pane output as evidence that the agent is
     /// working, even when its visible text says otherwise.
     ///
@@ -2148,6 +2209,9 @@ impl Default for AgentUiConfig {
             dock_badge: true,
             track_exited_unseen: true,
             waiting_ack_ms: default_agent_waiting_ack_ms(),
+            waiting_settles_when_seen: true,
+            waiting_settle_after_ms: default_agent_waiting_settle_after_ms(),
+            cache_cold_after_ms: default_agent_cache_cold_after_ms(),
             activity_from_output: true,
             activity_from_subagents: true,
         }
@@ -2186,6 +2250,14 @@ fn default_agent_pulse_period_ms() -> u64 {
 
 fn default_agent_waiting_ack_ms() -> u64 {
     5000
+}
+
+fn default_agent_waiting_settle_after_ms() -> u64 {
+    600_000
+}
+
+fn default_agent_cache_cold_after_ms() -> u64 {
+    3_600_000
 }
 
 /// One entry of `tgz_layouts`.
@@ -2807,6 +2879,21 @@ pub struct Config {
     #[dynamic(default = "default_sidebar_font_size")]
     pub sidebar_font_size: f64,
 
+    /// Size of the tab list's text (tab rows, group headers, pane and
+    /// subagent rows), in points. Unset follows `sidebar_font_size`.
+    #[dynamic(default)]
+    pub sidebar_tab_font_size: Option<f64>,
+
+    /// Size of the Agents section's text, in points. Unset follows
+    /// `sidebar_font_size`.
+    #[dynamic(default)]
+    pub sidebar_agents_font_size: Option<f64>,
+
+    /// Size of the sidebar's buttons and search field, in points. Unset
+    /// follows `sidebar_font_size`.
+    #[dynamic(default)]
+    pub sidebar_button_font_size: Option<f64>,
+
     /// Title bar text when no `format-window-title` handler sets one: the
     /// app's name. False gives upstream's title (the active pane's, with
     /// `[n/m]` when there are several tabs).
@@ -2833,6 +2920,11 @@ pub struct Config {
     /// Vendor-neutral agent detection and lightweight pane controls.
     #[dynamic(default)]
     pub agent_ui: AgentUiConfig,
+
+    /// Which system notifications show, with a master switch; see
+    /// [`TgzNotificationsConfig`].
+    #[dynamic(default)]
+    pub tgz_notifications: TgzNotificationsConfig,
 
     /// The floating per-pane toolbelt strip on panes with no agent.
     #[dynamic(default)]

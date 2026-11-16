@@ -1056,7 +1056,7 @@ impl crate::TermWindow {
                     }
                     if let Err(err) = command.spawn() {
                         log::warn!("file tree: could not start the editor: {err:#}");
-                        wezterm_toast_notification::show(
+                        crate::termwindow::tgz_notify::status(
                             wezterm_toast_notification::ToastNotification {
                                 title: "Editor unavailable".to_string(),
                                 message: format!("{}: {err}", argv[0]),

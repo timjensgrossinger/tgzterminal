@@ -1227,6 +1227,24 @@ impl crate::agent_herd::vendor::SessionSource for ClaudeDetector {
                         let pending = super::background::pending_agents(path);
                         for sub in &mut s.subagents {
                             sub.pending = pending.contains(&sub.agent_id);
+                            // A launch with no delivered result and a long-
+                            // silent transcript: the row no longer spins for
+                            // it, but say why it is still listed.
+                            if sub.pending && sub.status != super::HerdStatus::Done {
+                                let quiet = sub.last_activity.and_then(|at| {
+                                    std::time::SystemTime::now().duration_since(at).ok()
+                                });
+                                if quiet.map_or(true, |q| q > std::time::Duration::from_secs(3600))
+                                {
+                                    log::debug!(
+                                        "subagent {} of session {}: launched in the \
+                                         background, result never delivered, quiet {:?}",
+                                        sub.agent_id,
+                                        s.session_id,
+                                        quiet
+                                    );
+                                }
+                            }
                         }
                     }
                 }
@@ -1276,6 +1294,7 @@ impl crate::agent_herd::vendor::SessionSource for ClaudeDetector {
                     input_tokens: usage.input_tokens,
                     output_tokens: usage.output_tokens,
                     context_percent,
+                    last_turn_at: usage.last_turn_at,
                     cost: None,
                 }
             })

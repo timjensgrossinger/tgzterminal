@@ -105,6 +105,9 @@ const SIDEBAR_SECURE_INPUT_GLYPH: &str = "\u{f023}";
 const SIDEBAR_CHANGES_GLYPH: &str = "\u{f440}";
 /// `nf-pl-branch`, before the git branch on a tab row's second line.
 const SIDEBAR_BRANCH_GLYPH: &str = "\u{e0a0}";
+/// `nf-fa-snowflake_o`, from the bundled Symbols Nerd Font: a session whose
+/// prompt cache has most likely expired.
+const SIDEBAR_COLD_GLYPH: &str = "\u{f2dc}";
 
 /// Gap between the close button's right edge and the right edge of its zone.
 /// Both the hover button and the `×` inside it derive from this, and so does the
@@ -1703,6 +1706,44 @@ pub(crate) fn next_waiting_ack(
     }
 }
 
+/// `agent_ui.waiting_settle_after_ms` as a duration, `None` when it is `0`
+/// (never settle by time).
+pub(crate) fn waiting_settle_after(ms: u64) -> Option<Duration> {
+    (ms > 0).then(|| Duration::from_millis(ms))
+}
+
+/// Whether a wait has gone on long enough to count as seen without a visit.
+pub(crate) fn waiting_settled_by_time(
+    waiting_since: Option<Instant>,
+    settle_after: Option<Duration>,
+    now: Instant,
+) -> bool {
+    match (waiting_since, settle_after) {
+        (Some(since), Some(after)) => now.saturating_duration_since(since) >= after,
+        _ => false,
+    }
+}
+
+/// Whether a waiting agent's row still carries the amber "waiting" look
+/// (ring, label, dot, group count) rather than the grey "ready" one.
+///
+/// It goes grey once the wait has been seen -- the same acknowledgement that
+/// clears the glow and the queue -- unless `settles_when_seen` is off, and in
+/// any case once it has waited `settle_after`.
+pub(crate) fn waiting_row_is_unseen(
+    waiting: bool,
+    waiting_since: Option<Instant>,
+    acknowledged_at: Option<Instant>,
+    settles_when_seen: bool,
+    settle_after: Option<Duration>,
+    now: Instant,
+) -> bool {
+    if !waiting || (settles_when_seen && acknowledged_at.is_some()) {
+        return false;
+    }
+    !waiting_settled_by_time(waiting_since, settle_after, now)
+}
+
 /// Exited-unseen timestamp: set when a real agent identity is lost while the
 /// window is unfocused, cleared when the pane is (still) an agent or the
 /// window has focus.
@@ -3098,11 +3139,39 @@ fn title_case_label(value: &str) -> Option<String> {
 }
 
 fn path_label(path: &Path) -> String {
+    if is_home_dir(path, dirs_next::home_dir().as_deref()) {
+        return "~".to_string();
+    }
     path.file_name()
         .and_then(|name| name.to_str())
         .filter(|name| !name.is_empty())
         .map(|name| name.to_string())
         .unwrap_or_else(|| path.display().to_string())
+}
+
+/// Whether `path` is a home directory: this user's own, or one shaped like a
+/// home (`/home/<user>`, `/Users/<user>`, `C:\Users\<user>`) -- a WSL or
+/// remote shell's home is not this machine's. Its last segment is the user
+/// name, which is what a sidebar label used to show for an agent started
+/// there; `~` says the same thing without reading as someone's name.
+fn is_home_dir(path: &Path, home: Option<&Path>) -> bool {
+    if home.is_some_and(|home| home == path) {
+        return true;
+    }
+    let text = path.to_string_lossy().replace('\\', "/");
+    let parts: Vec<&str> = text.split('/').filter(|p| !p.is_empty()).collect();
+    let parts = match parts.first() {
+        // `C:` (a drive) or a WSL share's `wsl.localhost/<distro>` prefix.
+        Some(first) if first.len() == 2 && first.ends_with(':') => &parts[1..],
+        Some(first)
+            if first.eq_ignore_ascii_case("wsl.localhost")
+                || first.eq_ignore_ascii_case("wsl$") =>
+        {
+            parts.get(2..).unwrap_or(&[])
+        }
+        _ => &parts[..],
+    };
+    matches!(parts, [root, _user] if root.eq_ignore_ascii_case("home") || root.eq_ignore_ascii_case("users"))
 }
 
 fn is_generic_shell_title(title: &str, command: Option<&str>) -> bool {
@@ -3442,6 +3511,56 @@ fn tab_subtitle(
     }
 }
 
+/// `agent_ui.cache_cold_after_ms` as a duration, `None` when it is `0` (off).
+fn cache_cold_after(ms: u64) -> Option<Duration> {
+    (ms > 0).then(|| Duration::from_millis(ms))
+}
+
+/// How long a session has gone without a model request, when that is past
+/// `after` and so its prompt cache has most likely expired. `None` while it
+/// is warm, when the marker is off, or when the time of the last request is
+/// unknown.
+fn cache_cold_idle(
+    last_turn_at: Option<SystemTime>,
+    after: Option<Duration>,
+    now: SystemTime,
+) -> Option<Duration> {
+    let idle = now.duration_since(last_turn_at?).ok()?;
+    (idle >= after?).then_some(idle)
+}
+
+/// Short idle time for the cold-cache marker: `52m`, `1h`, `1h20`, `3d`.
+fn cold_cache_label(idle: Duration) -> String {
+    let minutes = idle.as_secs() / 60;
+    match minutes {
+        0..=59 => format!("{minutes}m"),
+        60..=1439 => match minutes % 60 {
+            0 => format!("{}h", minutes / 60),
+            rest => format!("{}h{rest:02}", minutes / 60),
+        },
+        _ => format!("{}d", minutes / 1440),
+    }
+}
+
+/// Line 2 with the cold-cache marker: the marker takes the right, and what
+/// was there (the branch or folder, already decorated) moves to the end of
+/// the left part so it is not lost.
+fn with_cold_marker(
+    left: String,
+    right: Option<String>,
+    idle: Duration,
+) -> (String, Option<String>) {
+    let left = match right {
+        Some(right) if left.is_empty() => right,
+        Some(right) => format!("{left}  {right}"),
+        None => left,
+    };
+    (
+        left,
+        Some(format!("{SIDEBAR_COLD_GLYPH} {}", cold_cache_label(idle))),
+    )
+}
+
 fn query_matches(title: &str, metadata: &[String], query: &str) -> bool {
     if query.is_empty() {
         return true;
@@ -3619,12 +3738,25 @@ fn foreground_process_pids(pane: &Arc<dyn Pane>) -> HashSet<u32> {
     pids
 }
 
-fn find_git_branch(mut dir: &Path) -> Option<String> {
+/// What the nearest version-control marker above a directory says.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum VcsHead {
+    /// A git checkout: the branch (or short commit when detached).
+    Git(String),
+    /// A Subversion working copy root; its branch is read from `.svn/wc.db`,
+    /// which is SQLite and so is read off the paint path.
+    Svn(PathBuf),
+}
+
+/// Walk up from `dir` to the nearest `.git` or `.svn` -- whichever is closer,
+/// the same rule as the Changes panel's `detect_vcs`, so a git checkout inside
+/// an SVN working copy (or the other way round) reports its own branch.
+fn find_vcs_head(mut dir: &Path) -> Option<VcsHead> {
     loop {
         let git = dir.join(".git");
         if git.is_dir() {
             let head = std::fs::read_to_string(git.join("HEAD")).ok()?;
-            return parse_git_head(&head);
+            return parse_git_head(&head).map(VcsHead::Git);
         }
         if git.is_file() {
             let indirection = std::fs::read_to_string(&git).ok()?;
@@ -3637,10 +3769,62 @@ fn find_git_branch(mut dir: &Path) -> Option<String> {
                 dir.join(git_dir)
             };
             let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
-            return parse_git_head(&head);
+            return parse_git_head(&head).map(VcsHead::Git);
+        }
+        if dir.join(".svn").is_dir() {
+            return Some(VcsHead::Svn(dir.to_path_buf()));
         }
         dir = dir.parent()?;
     }
+}
+
+/// The branch an SVN working copy is checked out from, from its own metadata
+/// (`.svn/wc.db`, SVN 1.7+), without starting `svn`. `None` for an older
+/// working copy format or a database that is busy or unreadable.
+///
+/// Blocking file I/O: called off the GUI thread only.
+fn read_svn_branch(wc_root: &Path) -> Option<String> {
+    use rusqlite::{Connection, OpenFlags};
+    let db = wc_root.join(".svn").join("wc.db");
+    if !db.is_file() {
+        return None;
+    }
+    let conn = Connection::open_with_flags(
+        &db,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+    // `svn` holds a write lock while it works; wait a moment, then give up
+    // until the next refresh rather than stall the probe thread.
+    conn.busy_timeout(Duration::from_millis(200)).ok()?;
+    let repos_path: String = conn
+        .query_row(
+            "SELECT repos_path FROM nodes \
+             WHERE local_relpath = '' AND op_depth = 0 LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .ok()?;
+    svn_branch_label(&repos_path)
+}
+
+/// Name an SVN checkout by the conventional layout of its repository path:
+/// `…/branches/<name>/…` and `…/tags/<name>/…` give `<name>`, anything under
+/// `trunk` gives `trunk`, and a path that follows neither gives its last
+/// segment.
+fn svn_branch_label(repos_path: &str) -> Option<String> {
+    let parts: Vec<&str> = repos_path.split('/').filter(|p| !p.is_empty()).collect();
+    for (i, part) in parts.iter().enumerate() {
+        if matches!(*part, "branches" | "tags") {
+            if let Some(name) = parts.get(i + 1) {
+                return Some(name.to_string());
+            }
+        }
+        if *part == "trunk" {
+            return Some("trunk".to_string());
+        }
+    }
+    parts.last().map(|last| last.to_string())
 }
 
 /// Results of filesystem walks over network (UNC) paths, computed off the
@@ -3685,6 +3869,17 @@ fn probe_path_off_thread<T: Clone + Send + 'static>(
     if !is_network_path(path) {
         return probe(path);
     }
+    probe_cached_off_thread(cache, path, probe)
+}
+
+/// The last result of `probe(path)` (or `None`), with a background refresh
+/// started when it is older than [`NETWORK_PATH_PROBE_TTL`]. For probes too
+/// slow for paint on any path, such as opening a database.
+fn probe_cached_off_thread<T: Clone + Send + 'static>(
+    cache: &'static LazyLock<Mutex<NetworkPathProbes<T>>>,
+    path: &Path,
+    probe: fn(&Path) -> Option<T>,
+) -> Option<T> {
     let now = Instant::now();
     let mut probes = cache.lock().unwrap();
     let cached = probes.entries.get(path).cloned();
@@ -3712,14 +3907,21 @@ fn probe_path_off_thread<T: Clone + Send + 'static>(
     cached.and_then(|(_, answer)| answer)
 }
 
-static GIT_BRANCH_PROBES: LazyLock<Mutex<NetworkPathProbes<String>>> =
+static VCS_HEAD_PROBES: LazyLock<Mutex<NetworkPathProbes<VcsHead>>> =
+    LazyLock::new(Default::default);
+static SVN_BRANCH_PROBES: LazyLock<Mutex<NetworkPathProbes<String>>> =
     LazyLock::new(Default::default);
 static PROJECT_ROOT_PROBES: LazyLock<Mutex<NetworkPathProbes<PathBuf>>> =
     LazyLock::new(Default::default);
 
-/// [`find_git_branch`], never blocking paint on a network path.
-fn git_branch_for(dir: &Path) -> Option<String> {
-    probe_path_off_thread(&GIT_BRANCH_PROBES, dir, find_git_branch)
+/// The git or SVN branch `dir` is in ([`find_vcs_head`]), never blocking
+/// paint: a network path is walked off-thread, and an SVN working copy's
+/// database is always read off-thread (the first frames show no branch).
+fn vcs_branch_for(dir: &Path) -> Option<String> {
+    match probe_path_off_thread(&VCS_HEAD_PROBES, dir, find_vcs_head)? {
+        VcsHead::Git(branch) => Some(branch),
+        VcsHead::Svn(root) => probe_cached_off_thread(&SVN_BRANCH_PROBES, &root, read_svn_branch),
+    }
 }
 
 /// [`crate::agent_herd::project_root_for`], never blocking paint on a
@@ -8101,7 +8303,7 @@ impl crate::TermWindow {
         if let Some(why) =
             crate::termwindow::tgz_tower::launch_refusal(&entry.adapter_id, cwd.as_deref())
         {
-            wezterm_toast_notification::show(wezterm_toast_notification::ToastNotification {
+            crate::termwindow::tgz_notify::status(wezterm_toast_notification::ToastNotification {
                 title: "Agent not started".to_string(),
                 message: why,
                 url: None,
@@ -8609,12 +8811,14 @@ impl crate::TermWindow {
             self.resolve_agent_resume_anywhere(&adapter, &values, origin)
         else {
             if !quiet {
-                wezterm_toast_notification::show(wezterm_toast_notification::ToastNotification {
-                    title: "Agent resume".to_string(),
-                    message: format!("{label} has no resume command, or it is not on PATH"),
-                    url: None,
-                    timeout: Some(Duration::from_millis(2600)),
-                });
+                crate::termwindow::tgz_notify::status(
+                    wezterm_toast_notification::ToastNotification {
+                        title: "Agent resume".to_string(),
+                        message: format!("{label} has no resume command, or it is not on PATH"),
+                        url: None,
+                        timeout: Some(Duration::from_millis(2600)),
+                    },
+                );
             }
             return None;
         };
@@ -9539,7 +9743,12 @@ impl crate::TermWindow {
         // transitions can happen at any time, not just around focus changes
         // (which is the only other place the badge is refreshed).
         if self.config.agent_ui.dock_badge && self.focused.is_none() {
-            crate::macos_dock_badge::set_waiting_count(self.waiting_queue().len());
+            let count = if self.config.tgz_notifications.enabled {
+                self.waiting_queue().len()
+            } else {
+                0
+            };
+            crate::macos_dock_badge::set_waiting_count(count);
         }
         state
     }
@@ -9617,30 +9826,96 @@ impl crate::TermWindow {
         }
         let focused = self.is_focused_active_pane(pane_id);
         let dwell = Duration::from_millis(self.config.agent_ui.waiting_ack_ms);
+        let settle_after = waiting_settle_after(self.config.agent_ui.waiting_settle_after_ms);
+        let now = Instant::now();
         let due = {
             let mut cache = self.agent_detection_cache.borrow_mut();
             let Some(entry) = cache.get_mut(&pane_id) else {
                 return;
             };
-            let (focused_since, acknowledged_at) = next_waiting_ack(
+            let (mut focused_since, mut acknowledged_at) = next_waiting_ack(
                 entry.waiting_since.is_some(),
                 focused,
                 entry.focused_since,
                 entry.acknowledged_at,
-                Instant::now(),
+                now,
                 dwell,
             );
+            // A wait nobody visited still ends: after `waiting_settle_after_ms`
+            // it counts as seen, so the queue, the dock badge and the row all
+            // settle together instead of one of them staying amber for days.
+            if acknowledged_at.is_none()
+                && waiting_settled_by_time(entry.waiting_since, settle_after, now)
+            {
+                acknowledged_at = Some(now);
+                focused_since = None;
+            }
             entry.focused_since = focused_since;
             entry.acknowledged_at = acknowledged_at;
             // `checked_add`: an absurd `waiting_ack_ms` must not panic the
             // paint path; it just never completes, like an infinite dwell.
-            focused_since.and_then(|since| since.checked_add(dwell))
+            let dwell_due = focused_since.and_then(|since| since.checked_add(dwell));
+            let settle_due = match (acknowledged_at, entry.waiting_since, settle_after) {
+                (None, Some(since), Some(after)) => since.checked_add(after),
+                _ => None,
+            };
+            [dwell_due, settle_due].iter().flatten().min().copied()
         };
         // WezTerm repaints on demand and this screen is not going to change,
         // so without this the frame that completes the dwell never comes.
         if let Some(due) = due {
             self.schedule_sidebar_frame(due);
         }
+    }
+
+    /// How long this agent's session has gone without a model request, once
+    /// that is past `agent_ui.cache_cold_after_ms` ([`cache_cold_idle`]).
+    /// Never while the agent works: it is making requests. Schedules the
+    /// frame that shows the marker, and then one a minute so the time ticks.
+    fn agent_cache_cold(&self, pane_id: PaneId, status: &AgentStatus) -> Option<Duration> {
+        let after = cache_cold_after(self.config.agent_ui.cache_cold_after_ms)?;
+        if matches!(status, AgentStatus::Running) {
+            return None;
+        }
+        let last_turn_at = self
+            .herd_tab_info
+            .borrow()
+            .get(&pane_id)
+            .and_then(|info| info.last_turn_at)?;
+        let now = SystemTime::now();
+        let idle = now.duration_since(last_turn_at).ok()?;
+        let minute = Duration::from_secs(60);
+        let wait = match after.checked_sub(idle) {
+            Some(left) if !left.is_zero() => left,
+            _ => minute - Duration::from_secs(idle.as_secs() % 60),
+        };
+        if let Some(due) = Instant::now().checked_add(wait) {
+            self.schedule_sidebar_frame(due);
+        }
+        cache_cold_idle(Some(last_turn_at), Some(after), now)
+    }
+
+    /// [`waiting_row_is_unseen`] for one pane, from its detection-cache entry.
+    pub(crate) fn agent_waits_unseen(&self, pane_id: PaneId, status: &AgentStatus) -> bool {
+        let waiting = matches!(status, AgentStatus::WaitingForInput);
+        if !waiting {
+            return false;
+        }
+        let (waiting_since, acknowledged_at) = self
+            .agent_detection_cache
+            .borrow()
+            .get(&pane_id)
+            .map(|entry| (entry.waiting_since, entry.acknowledged_at))
+            .unwrap_or((None, None));
+        let ui = &self.config.agent_ui;
+        waiting_row_is_unseen(
+            waiting,
+            waiting_since,
+            acknowledged_at,
+            ui.waiting_settles_when_seen,
+            waiting_settle_after(ui.waiting_settle_after_ms),
+            Instant::now(),
+        )
     }
 
     /// Raw queue flags for a single pane, used by the rail badge rendering.
@@ -9885,7 +10160,7 @@ impl crate::TermWindow {
         };
         let Some(adapter_id) = agent.adapter_id.as_deref() else {
             self.set_agent_feedback("Resume unavailable: agent vendor unknown");
-            wezterm_toast_notification::show(wezterm_toast_notification::ToastNotification {
+            crate::termwindow::tgz_notify::status(wezterm_toast_notification::ToastNotification {
                 title: "Agent control".to_string(),
                 message: "Resume is not configured for this agent".to_string(),
                 url: None,
@@ -9899,7 +10174,7 @@ impl crate::TermWindow {
         };
         if !agent.trusted_controls {
             self.set_agent_feedback("Resume blocked: enable trusted agent controls");
-            wezterm_toast_notification::show(wezterm_toast_notification::ToastNotification {
+            crate::termwindow::tgz_notify::status(wezterm_toast_notification::ToastNotification {
                 title: "Agent control".to_string(),
                 message:
                     "Resume requires trusted agent evidence or explicit agent_ui control enablement"
@@ -9911,7 +10186,7 @@ impl crate::TermWindow {
         }
         if !agent.actions.resume {
             self.set_agent_feedback("Resume unavailable: command missing");
-            wezterm_toast_notification::show(wezterm_toast_notification::ToastNotification {
+            crate::termwindow::tgz_notify::status(wezterm_toast_notification::ToastNotification {
                 title: "Agent control".to_string(),
                 message: "Resume is not configured or its command is not on PATH".to_string(),
                 url: None,
@@ -9942,7 +10217,7 @@ impl crate::TermWindow {
             "Started {} resume",
             adapter_label(&adapter, adapter_id)
         ));
-        wezterm_toast_notification::show(wezterm_toast_notification::ToastNotification {
+        crate::termwindow::tgz_notify::status(wezterm_toast_notification::ToastNotification {
             title: "Agent control".to_string(),
             message: format!("Started {label} resume in a new tab"),
             url: None,
@@ -9965,7 +10240,7 @@ impl crate::TermWindow {
         };
         if !agent.trusted_controls {
             self.set_agent_feedback("Attach blocked: enable trusted agent controls");
-            wezterm_toast_notification::show(wezterm_toast_notification::ToastNotification {
+            crate::termwindow::tgz_notify::status(wezterm_toast_notification::ToastNotification {
                 title: "Agent control".to_string(),
                 message:
                     "Attach requires trusted agent evidence or explicit agent_ui control enablement"
@@ -9977,7 +10252,7 @@ impl crate::TermWindow {
         }
         if !agent.actions.attach {
             self.set_agent_feedback("Attach unavailable: no attach URL or command");
-            wezterm_toast_notification::show(wezterm_toast_notification::ToastNotification {
+            crate::termwindow::tgz_notify::status(wezterm_toast_notification::ToastNotification {
                 title: "Agent control".to_string(),
                 message:
                     "Attach is not configured, missing an attach URL, or its command is not on PATH"
@@ -10008,7 +10283,7 @@ impl crate::TermWindow {
             "Started {} attach",
             adapter_label(&adapter, adapter_id)
         ));
-        wezterm_toast_notification::show(wezterm_toast_notification::ToastNotification {
+        crate::termwindow::tgz_notify::status(wezterm_toast_notification::ToastNotification {
             title: "Agent control".to_string(),
             message: format!("Started {label} attach in a new tab"),
             url: None,
@@ -10023,7 +10298,7 @@ impl crate::TermWindow {
         };
         let Some(adapter_id) = agent.adapter_id.as_deref() else {
             self.set_agent_feedback("Logs unavailable: agent vendor unknown");
-            wezterm_toast_notification::show(wezterm_toast_notification::ToastNotification {
+            crate::termwindow::tgz_notify::status(wezterm_toast_notification::ToastNotification {
                 title: "Agent details".to_string(),
                 message: "Details are not configured for this agent".to_string(),
                 url: None,
@@ -10045,7 +10320,7 @@ impl crate::TermWindow {
             self.set_agent_feedback(format!(
                 "Opening {detail_label} blocked: enable trusted controls"
             ));
-            wezterm_toast_notification::show(wezterm_toast_notification::ToastNotification {
+            crate::termwindow::tgz_notify::status(wezterm_toast_notification::ToastNotification {
                 title: title.to_string(),
                 message: format!(
                     "Opening {detail_label} requires trusted agent evidence or explicit agent_ui control enablement"
@@ -10057,7 +10332,7 @@ impl crate::TermWindow {
         }
         if !agent.actions.open_logs {
             self.set_agent_feedback(format!("{detail_label} unavailable: path not found"));
-            wezterm_toast_notification::show(wezterm_toast_notification::ToastNotification {
+            crate::termwindow::tgz_notify::status(wezterm_toast_notification::ToastNotification {
                 title: title.to_string(),
                 message: format!("{detail_label} are not configured or no details path exists"),
                 url: None,
@@ -10079,21 +10354,25 @@ impl crate::TermWindow {
             Ok(url) => {
                 wezterm_open_url::open_url(url.as_str());
                 self.set_agent_feedback(format!("Opening {}", path.display()));
-                wezterm_toast_notification::show(wezterm_toast_notification::ToastNotification {
-                    title: title.to_string(),
-                    message: format!("Opening {}", path.display()),
-                    url: None,
-                    timeout: Some(Duration::from_millis(2200)),
-                });
+                crate::termwindow::tgz_notify::status(
+                    wezterm_toast_notification::ToastNotification {
+                        title: title.to_string(),
+                        message: format!("Opening {}", path.display()),
+                        url: None,
+                        timeout: Some(Duration::from_millis(2200)),
+                    },
+                );
             }
             Err(()) => {
                 self.set_agent_feedback("Agent details path could not be opened");
-                wezterm_toast_notification::show(wezterm_toast_notification::ToastNotification {
-                    title: title.to_string(),
-                    message: "Agent details path could not be opened".to_string(),
-                    url: None,
-                    timeout: Some(Duration::from_millis(2200)),
-                });
+                crate::termwindow::tgz_notify::status(
+                    wezterm_toast_notification::ToastNotification {
+                        title: title.to_string(),
+                        message: "Agent details path could not be opened".to_string(),
+                        url: None,
+                        timeout: Some(Duration::from_millis(2200)),
+                    },
+                );
             }
         }
     }
@@ -10103,7 +10382,9 @@ impl crate::TermWindow {
         let cell = self.render_metrics.cell_size.height as usize;
         // The height of the sidebar's controls: the search field and the
         // footer buttons. One line of chrome text with room around it.
-        let line = self.ui_line_height(UiFont::Regular);
+        let line = self.in_ui_area(crate::termwindow::tgz_ui_text::UiArea::Buttons, || {
+            self.ui_line_height(UiFont::Regular)
+        });
         match self.config.sidebar_tab_density {
             SidebarTabDensity::Comfortable => ((line * 1.9).ceil() as usize).max(cell + 8),
             SidebarTabDensity::Compact => ((line * 1.6).ceil() as usize).max(cell + 4),
@@ -10113,8 +10394,12 @@ impl crate::TermWindow {
     /// Height of a tab row: two lines of chrome text, or one when compact.
     fn sidebar_tab_row_height(&self) -> usize {
         use crate::termwindow::tgz_ui_text::UiFont;
-        let first = self.ui_line_height(UiFont::Medium);
-        let second = self.ui_line_height(UiFont::Small);
+        let (first, second) = self.in_ui_area(crate::termwindow::tgz_ui_text::UiArea::Tabs, || {
+            (
+                self.ui_line_height(UiFont::Medium),
+                self.ui_line_height(UiFont::Small),
+            )
+        });
         match self.config.sidebar_tab_density {
             SidebarTabDensity::Comfortable => (first + second + first * 0.75).ceil() as usize,
             SidebarTabDensity::Compact => (first * 1.7).ceil() as usize,
@@ -10182,7 +10467,6 @@ impl crate::TermWindow {
             return assemble_sidebar_rows(tabs, &self.sidebar_expanded_tabs, query);
         }
         let ids = self.mux_tab_ids();
-        let focused_pane = self.focused_active_pane_id();
         let groups = self.tab_groups.borrow();
         let inputs: Vec<SidebarGroupInput> = groups
             .layout(&ids)
@@ -10194,10 +10478,7 @@ impl crate::TermWindow {
                     .filter_map(|id| ids.iter().position(|candidate| candidate == id))
                     .map(|tab_idx| {
                         let waiting = self.sidebar_agent_row_for_tab_idx(tab_idx).is_some_and(
-                            |(pane_id, agent)| {
-                                let _ = (pane_id, focused_pane);
-                                matches!(agent.status, AgentStatus::WaitingForInput)
-                            },
+                            |(pane_id, agent)| self.agent_waits_unseen(pane_id, &agent.status),
                         );
                         (tab_idx, waiting)
                     })
@@ -10308,13 +10589,17 @@ impl crate::TermWindow {
 
     /// Height of a group header row.
     fn sidebar_header_row_height(&self) -> usize {
-        let line = self.ui_line_height(crate::termwindow::tgz_ui_text::UiFont::SmallMedium);
+        let line = self.in_ui_area(crate::termwindow::tgz_ui_text::UiArea::Tabs, || {
+            self.ui_line_height(crate::termwindow::tgz_ui_text::UiFont::SmallMedium)
+        });
         (line * 1.8).ceil() as usize
     }
 
     /// Height of the one-line rows under a tab: its panes and subagents.
     fn sidebar_child_row_height(&self) -> usize {
-        let line = self.ui_line_height(crate::termwindow::tgz_ui_text::UiFont::Regular);
+        let line = self.in_ui_area(crate::termwindow::tgz_ui_text::UiArea::Tabs, || {
+            self.ui_line_height(crate::termwindow::tgz_ui_text::UiFont::Regular)
+        });
         let cell = self.render_metrics.cell_size.height as f32;
         (line * 1.6).max(cell + 4.).ceil() as usize
     }
@@ -10394,8 +10679,15 @@ impl crate::TermWindow {
         let expanded_agent = expanded_idx.and_then(|idx| state.agents.get(idx));
         let show_activity = self.config.agent_ui.section.show_activity;
         let show_tokens = self.config.agent_ui.section.show_tokens;
+        // Rows are sized from a terminal cell, which a larger
+        // `sidebar_agents_font_size` would outgrow.
+        let agents_line_h = (self.render_metrics.cell_size.height as f32).max(
+            self.in_ui_area(crate::termwindow::tgz_ui_text::UiArea::Agents, || {
+                self.ui_line_height(crate::termwindow::tgz_ui_text::UiFont::Regular)
+            }),
+        );
         let metrics = sidebar_agent_herd_metrics(
-            self.render_metrics.cell_size.height as f32,
+            agents_line_h,
             self.dimensions.dpi as f32 / 96.0,
             state.collapsed,
             state.agents.len(),
@@ -10413,7 +10705,7 @@ impl crate::TermWindow {
         }
 
         Some(sidebar_agent_herd_metrics(
-            self.render_metrics.cell_size.height as f32,
+            agents_line_h,
             self.dimensions.dpi as f32 / 96.0,
             state.collapsed,
             state.agents.len(),
@@ -10868,8 +11160,21 @@ impl crate::TermWindow {
                     .map(|pos| pos.pane.clone())
             })
             .or(active_pane);
-        let cwd = pane.as_ref().and_then(pane_working_dir);
-        let git_branch = cwd.as_deref().and_then(git_branch_for);
+        // A WSL pane without OSC 7 reports the `wsl.exe` host's Windows home;
+        // the agent session bound to it knows the real (Linux) directory.
+        let wsl_cwd = pane
+            .as_ref()
+            .and_then(|pane| self.wsl_pane_session_cwd(pane));
+        let probe_dir = match (&wsl_cwd, &pane) {
+            (Some(linux), Some(pane)) => Mux::get()
+                .get_domain(pane.domain_id())
+                .and_then(|domain| wsl_paths::distro_for_domain(domain.domain_name(), &self.config))
+                .and_then(|distro| wsl_paths::wsl_to_windows(&linux.to_string_lossy(), &distro)),
+            (None, Some(pane)) => pane_probe_dir(pane, &self.config),
+            _ => None,
+        };
+        let cwd = wsl_cwd.or_else(|| pane.as_ref().and_then(pane_working_dir));
+        let git_branch = probe_dir.as_deref().and_then(vcs_branch_for);
         let command = pane
             .as_ref()
             .and_then(|pane| pane.get_foreground_process_name(CachePolicy::AllowStale))
@@ -13974,7 +14279,12 @@ impl crate::TermWindow {
     }
 
     pub fn paint_sidebar(&mut self, layers: &mut TripleLayerQuadAllocator) -> anyhow::Result<()> {
-        self.paint_sidebar_impl(layers)?;
+        // Each region sets its own text size area; whatever happens inside,
+        // the Changes panel and the Worktree painted after this see the base.
+        self.set_ui_area(crate::termwindow::tgz_ui_text::UiArea::Tabs);
+        let painted = self.paint_sidebar_impl(layers);
+        self.set_ui_area(crate::termwindow::tgz_ui_text::UiArea::Base);
+        painted?;
         // Where the focused control was drawn, for the ring of the next
         // frame. A control that moved is drawn again at once.
         let rect = self.sidebar_kb_focus.as_ref().and_then(|focus| {
@@ -14667,7 +14977,7 @@ impl crate::TermWindow {
                 // Hidden while the ring turns — it would read as a static pip
                 // come loose from the moving outline, same call the expanded
                 // row makes — and it rides the enter fade with the tile.
-                if let Some((_, agent)) = &rail_agent {
+                if let Some((rail_pane_id, agent)) = &rail_agent {
                     if anim.shows_status_dot() {
                         let dot_size = sidebar_status_dot_size(cell_height as f32);
                         let inset = 1.5;
@@ -14675,13 +14985,20 @@ impl crate::TermWindow {
                             SidebarPosition::Left => rail_x + rail_side - dot_size - inset,
                             SidebarPosition::Right => rail_x + inset,
                         };
+                        let dot_base = if active { accent } else { icon_color };
+                        // A wait you have seen is "ready": no amber dot.
+                        let dot_waiting = if self.agent_waits_unseen(*rail_pane_id, &agent.status) {
+                            sb.ring.waiting
+                        } else {
+                            dot_base
+                        };
                         let dot_color = agent_status_dot_accent(
                             &agent.status,
-                            if active { accent } else { icon_color },
+                            dot_base,
                             faded_tab_bg,
                             self.agent_dot_pulse(agent),
                             sb.ring.pulse,
-                            sb.ring.waiting,
+                            dot_waiting,
                         )
                         .mul_alpha(anim.enter);
                         self.sidebar_pill_fill(
@@ -15066,6 +15383,7 @@ impl crate::TermWindow {
             // A typed query keeps its *tail*, so the caret you are typing at
             // stays visible. The placeholder steps down through shorter forms
             // and is dropped entirely rather than shown as a truncated stub.
+            self.set_ui_area(crate::termwindow::tgz_ui_text::UiArea::Buttons);
             let search_font = crate::termwindow::tgz_ui_text::UiFont::Regular;
             // While a group is being named the field is that prompt.
             let typing = match &self.tab_group_edit {
@@ -15149,6 +15467,7 @@ impl crate::TermWindow {
             self.update_agent_herd_state();
         }
         self.sync_tab_groups();
+        self.set_ui_area(crate::termwindow::tgz_ui_text::UiArea::Tabs);
         let rows = self.sidebar_rows();
 
         let tab_list_top = y;
@@ -15447,17 +15766,23 @@ impl crate::TermWindow {
                         .filter(|_| anim.shows_status_dot() || anim.spin.is_some())
                         .map(|state| {
                             let size = sidebar_status_dot_size(cell_height as f32);
+                            let dot_base = if active {
+                                accent
+                            } else {
+                                inactive_fg.mul_alpha(0.58)
+                            };
+                            let dot_waiting = if self.agent_waits_unseen(pane_id, &state.status) {
+                                sb.ring.waiting
+                            } else {
+                                dot_base
+                            };
                             let color = agent_status_dot_accent(
                                 &state.status,
-                                if active {
-                                    accent
-                                } else {
-                                    inactive_fg.mul_alpha(0.58)
-                                },
+                                dot_base,
                                 row_bg,
                                 self.agent_dot_pulse(state),
                                 sb.ring.pulse,
-                                sb.ring.waiting,
+                                dot_waiting,
                             );
                             (size, color)
                         });
@@ -15621,11 +15946,11 @@ impl crate::TermWindow {
                 .unwrap_or_else(AgentRowAnimation::still);
             let agent_pane_id = agent_row.as_ref().map(|(pane_id, _)| *pane_id);
             let agent = agent_row.map(|(_, state)| state);
-            // Waiting on you: the amber ring, for as long as it waits,
-            // whether or not you are looking at it.
-            let agent_waits_unseen = agent
-                .as_ref()
-                .is_some_and(|state| matches!(state.status, AgentStatus::WaitingForInput));
+            // Waiting on you: the amber ring until you have seen it or it has
+            // waited `waiting_settle_after_ms`; then the grey "ready" look.
+            let agent_waits_unseen = agent_pane_id
+                .zip(agent.as_ref())
+                .is_some_and(|(pane_id, state)| self.agent_waits_unseen(pane_id, &state.status));
             let slide_x = anim.slide_x();
             // Scales whatever alpha the colour already carried, so a settled row
             // (`enter == 1.0`) is bit-identical to what it was before.
@@ -15841,6 +16166,22 @@ impl crate::TermWindow {
                 &metadata,
                 branch.as_deref(),
             );
+            // The branch reads as one: the Powerline branch mark before it,
+            // from the bundled Symbols Nerd Font.
+            let line2_right = line2_right.map(|right| {
+                if branch.as_deref() == Some(right.as_str()) {
+                    format!("{SIDEBAR_BRANCH_GLYPH} {right}")
+                } else {
+                    right
+                }
+            });
+            let cold_idle = agent_pane_id
+                .zip(agent.as_ref())
+                .and_then(|(pane_id, state)| self.agent_cache_cold(pane_id, &state.status));
+            let (line2, line2_right) = match cold_idle {
+                Some(idle) => with_cold_marker(line2, line2_right, idle),
+                None => (line2, line2_right),
+            };
             let line1 = match agent.as_ref() {
                 Some(_) => herd_name.unwrap_or(title),
                 None => title,
@@ -15879,15 +16220,6 @@ impl crate::TermWindow {
                 // The branch takes the right, at most a little under half the
                 // width; the state gets what is left.
                 let gap = 8. * dpi_scale;
-                // The branch reads as one: the Powerline branch mark before it,
-                // from the bundled Symbols Nerd Font.
-                let line2_right = line2_right.map(|right| {
-                    if branch.as_deref() == Some(right.as_str()) {
-                        format!("{SIDEBAR_BRANCH_GLYPH} {right}")
-                    } else {
-                        right
-                    }
-                });
                 let right_w = line2_right.as_deref().map_or(0., |right| {
                     self.ui_text_width(UiFont::Small, right).min(title_w * 0.45)
                 });
@@ -16146,6 +16478,7 @@ impl crate::TermWindow {
         // which rows, is data (`tgz_footer`): the default, the user's dragged
         // arrangement, or `sidebar_footer` from Lua. The same rows decide the
         // paint, the hit boxes and the row count, so they cannot drift apart.
+        self.set_ui_area(crate::termwindow::tgz_ui_text::UiArea::Buttons);
         let footer_rows = self.sidebar_footer_visible_rows();
         let footer_radius = RADIUS * dpi_scale;
         let footer_stride = row_height as f32 + GAP;
@@ -16731,6 +17064,7 @@ impl crate::TermWindow {
         if let Some(agent_metrics) = self.sidebar_agent_herd_metrics(top, height, row_height as f32)
         {
             let section_bottom = self.sidebar_bottom_controls_top(top, height, row_height as f32);
+            self.set_ui_area(crate::termwindow::tgz_ui_text::UiArea::Agents);
             self.paint_agent_herd_section(
                 layers,
                 width as f32,
@@ -16912,6 +17246,7 @@ impl crate::TermWindow {
                             name: agent.name.clone(),
                             session_id: agent.session_id.clone(),
                             model: agent.model.clone(),
+                            last_turn_at: agent.last_turn_at,
                             // Claude Code's own figure from its status
                             // line first: it is read within a moment of
                             // being written, and covers a session whose
@@ -17401,6 +17736,10 @@ impl crate::TermWindow {
         let distros = self.wsl_distro_specs();
         let poll_quota = self.config.agent_ui.section.show_quota;
         let want_relay = self.config.agent_ui.section.claude_usage_relay;
+        let keep_finished = match self.config.agent_ui.section.finished_subagents_keep_ms {
+            0 => None,
+            ms => Some(Duration::from_millis(ms)),
+        };
 
         self.agent_herd_scan_started_at = Some(Instant::now());
         let future = promise::spawn::spawn_into_new_thread(move || {
@@ -17419,7 +17758,17 @@ impl crate::TermWindow {
                 }
                 crate::termwindow::tgz_usage_relay::tick(&relay_roots, want_relay, poll_quota);
             }
-            let sessions = crate::agent_herd::default_registry().collect_all_from(&roots);
+            let mut sessions = crate::agent_herd::default_registry().collect_all_from(&roots);
+            if let Some(keep) = keep_finished {
+                let now = SystemTime::now();
+                for activity in sessions.iter_mut().filter_map(|s| s.activity.as_mut()) {
+                    crate::agent_herd::prune_finished_subagents(
+                        &mut activity.subagent_tree,
+                        keep,
+                        now,
+                    );
+                }
+            }
             // A scan reads every vendor's store, WSL ones through the 9p share;
             // on a slow machine that is where the herd's latency goes.
             if started.elapsed() > Duration::from_secs(2) {
@@ -17567,7 +17916,11 @@ impl crate::TermWindow {
         let focused_active = self.focused_active_pane_id();
 
         let dpi = (self.dimensions.dpi as f32 / 96.0).clamp(1.0, 2.5);
-        let cell_h = self.render_metrics.cell_size.height as f32;
+        // The same line height `sidebar_agent_herd_metrics` laid the rows out
+        // with: a cell, or the Agents text when `sidebar_agents_font_size`
+        // makes it taller (the caller set the Agents area).
+        let cell_h = (self.render_metrics.cell_size.height as f32)
+            .max(self.ui_line_height(crate::termwindow::tgz_ui_text::UiFont::Regular));
         // Text advance comes from the cell's own width; deriving it from
         // `cell_h` (as this section used to) over-estimates it by ~30%.
         let cell_w = self.render_metrics.cell_size.width as f32;
@@ -19612,6 +19965,215 @@ mod tests {
         assert!(!left.contains('·') && right.is_none(), "{left}");
     }
 
+    /// An agent started in a home folder used to show the user's name where
+    /// the branch goes (the folder's basename). It says `~` instead.
+    #[test]
+    fn a_home_folder_is_labelled_tilde_not_the_user_name() {
+        let own = Path::new("/Users/someone.else");
+        assert!(is_home_dir(own, Some(own)));
+        assert!(is_home_dir(Path::new("/home/stefan.sigmund"), None));
+        assert!(is_home_dir(Path::new("/Users/stefan.sigmund"), None));
+        assert!(is_home_dir(Path::new(r"C:\Users\stefan.sigmund"), None));
+        assert!(is_home_dir(
+            Path::new(r"\\wsl.localhost\Ubuntu\home\stefan"),
+            None
+        ));
+        assert!(!is_home_dir(Path::new("/home/stefan/src"), None));
+        assert!(!is_home_dir(Path::new("/Users"), None));
+        assert!(!is_home_dir(Path::new("/srv/project"), None));
+        assert!(!is_home_dir(Path::new(r"C:\Users\stefan\src"), None));
+        assert_eq!(path_label(Path::new("/home/stefan.sigmund")), "~");
+        assert_eq!(path_label(Path::new("/home/stefan/src")), "src");
+    }
+
+    #[test]
+    fn an_svn_checkout_is_named_by_its_repository_layout() {
+        let label = |path: &str| svn_branch_label(path);
+        assert_eq!(label("project/trunk"), Some("trunk".to_string()));
+        assert_eq!(label("trunk/src/lib"), Some("trunk".to_string()));
+        assert_eq!(
+            label("project/branches/release-2026.11/module"),
+            Some("release-2026.11".to_string())
+        );
+        assert_eq!(label("tags/v1.2"), Some("v1.2".to_string()));
+        assert_eq!(label("project/main-line"), Some("main-line".to_string()));
+        assert_eq!(label("project/branches"), Some("branches".to_string()));
+        assert_eq!(label(""), None);
+    }
+
+    /// The branch is read from the working copy's own SQLite metadata, the
+    /// table `svn` itself keeps, without running `svn`.
+    #[test]
+    fn an_svn_branch_is_read_from_wc_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let svn = dir.path().join(".svn");
+        fs::create_dir_all(&svn).unwrap();
+        assert_eq!(
+            read_svn_branch(dir.path()),
+            None,
+            "no wc.db: an old or broken copy"
+        );
+        let conn = rusqlite::Connection::open(svn.join("wc.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE nodes (wc_id INTEGER, local_relpath TEXT, op_depth INTEGER, \
+                                 repos_id INTEGER, repos_path TEXT);
+             INSERT INTO nodes VALUES (1, '', 0, 1, 'proj/branches/feature-x');
+             INSERT INTO nodes VALUES (1, 'src', 0, 1, 'proj/branches/feature-x/src');",
+        )
+        .unwrap();
+        drop(conn);
+        assert_eq!(read_svn_branch(dir.path()), Some("feature-x".to_string()));
+    }
+
+    /// The nearest marker wins, as in the Changes panel: a git checkout
+    /// inside an SVN working copy reports git, and the other way round.
+    #[test]
+    fn the_nearest_vcs_marker_names_the_branch() {
+        let outer = tempfile::tempdir().unwrap();
+        let root = outer.path();
+        fs::create_dir_all(root.join(".svn")).unwrap();
+        let nested_git = root.join("vendor/lib");
+        fs::create_dir_all(nested_git.join(".git")).unwrap();
+        fs::write(nested_git.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        fs::create_dir_all(nested_git.join("src")).unwrap();
+        fs::create_dir_all(root.join("docs")).unwrap();
+
+        assert_eq!(
+            find_vcs_head(&nested_git.join("src")),
+            Some(VcsHead::Git("main".to_string()))
+        );
+        assert_eq!(
+            find_vcs_head(&root.join("docs")),
+            Some(VcsHead::Svn(root.to_path_buf()))
+        );
+
+        let git_outer = tempfile::tempdir().unwrap();
+        fs::create_dir_all(git_outer.path().join(".git")).unwrap();
+        fs::write(git_outer.path().join(".git/HEAD"), "ref: refs/heads/dev\n").unwrap();
+        let svn_inner = git_outer.path().join("legacy");
+        fs::create_dir_all(svn_inner.join(".svn")).unwrap();
+        assert_eq!(
+            find_vcs_head(&svn_inner),
+            Some(VcsHead::Svn(svn_inner.clone()))
+        );
+        assert_eq!(
+            find_vcs_head(git_outer.path()),
+            Some(VcsHead::Git("dev".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_wait_turns_grey_once_seen_or_after_the_settle_time() {
+        let t0 = Instant::now();
+        let ten = Some(Duration::from_secs(600));
+        let later = t0 + Duration::from_secs(60);
+        let much_later = t0 + Duration::from_secs(601);
+        // Not waiting: never amber.
+        assert!(!waiting_row_is_unseen(
+            false,
+            Some(t0),
+            None,
+            true,
+            ten,
+            later
+        ));
+        // Waiting, unseen, young: amber.
+        assert!(waiting_row_is_unseen(
+            true,
+            Some(t0),
+            None,
+            true,
+            ten,
+            later
+        ));
+        // Seen: grey.
+        assert!(!waiting_row_is_unseen(
+            true,
+            Some(t0),
+            Some(later),
+            true,
+            ten,
+            later
+        ));
+        // Seen, but the user wants amber until the turn moves on.
+        assert!(waiting_row_is_unseen(
+            true,
+            Some(t0),
+            Some(later),
+            false,
+            ten,
+            later
+        ));
+        // Unvisited past the settle time: grey either way.
+        assert!(!waiting_row_is_unseen(
+            true,
+            Some(t0),
+            None,
+            true,
+            ten,
+            much_later
+        ));
+        assert!(!waiting_row_is_unseen(
+            true,
+            Some(t0),
+            Some(later),
+            false,
+            ten,
+            much_later
+        ));
+        // Settle time off: an unvisited wait stays amber.
+        assert!(waiting_row_is_unseen(
+            true,
+            Some(t0),
+            None,
+            true,
+            None,
+            much_later
+        ));
+        // The first frame of a wait has no timestamp yet: amber.
+        assert!(waiting_row_is_unseen(
+            true, None, None, true, ten, much_later
+        ));
+        assert_eq!(waiting_settle_after(0), None);
+        assert_eq!(waiting_settle_after(5), Some(Duration::from_millis(5)));
+    }
+
+    #[test]
+    fn a_cold_cache_marker_shows_the_idle_time_and_keeps_the_branch() {
+        let min = |m: u64| Duration::from_secs(m * 60);
+        assert_eq!(cold_cache_label(min(0)), "0m");
+        assert_eq!(cold_cache_label(min(52)), "52m");
+        assert_eq!(cold_cache_label(min(60)), "1h");
+        assert_eq!(cold_cache_label(min(80)), "1h20");
+        assert_eq!(cold_cache_label(min(65)), "1h05");
+        assert_eq!(cold_cache_label(min(3 * 1440 + 7)), "3d");
+
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let hour = Some(min(60));
+        assert_eq!(cache_cold_idle(Some(now - min(59)), hour, now), None);
+        assert_eq!(
+            cache_cold_idle(Some(now - min(61)), hour, now),
+            Some(min(61))
+        );
+        assert_eq!(cache_cold_idle(Some(now - min(61)), None, now), None, "off");
+        assert_eq!(
+            cache_cold_idle(None, hour, now),
+            None,
+            "unknown is not cold"
+        );
+        assert_eq!(cache_cold_after(0), None);
+
+        let (left, right) = with_cold_marker(
+            "Claude ready".to_string(),
+            Some(format!("{SIDEBAR_BRANCH_GLYPH} main")),
+            min(80),
+        );
+        assert_eq!(left, format!("Claude ready  {SIDEBAR_BRANCH_GLYPH} main"));
+        assert_eq!(right, Some(format!("{SIDEBAR_COLD_GLYPH} 1h20")));
+        let (left, _) = with_cold_marker("Claude ready".to_string(), None, min(80));
+        assert_eq!(left, "Claude ready");
+    }
+
     #[test]
     fn reduced_motion_holds_everything_still_unless_told_not_to() {
         let reduced = SidebarAnimationGates::from_config(
@@ -20903,6 +21465,7 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
             input_tokens: None,
             output_tokens: None,
             context_percent: None,
+            last_turn_at: None,
             cost: None,
         }
     }
@@ -21051,6 +21614,7 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
             input_tokens: None,
             output_tokens: None,
             context_percent: None,
+            last_turn_at: None,
             cost: None,
             can_attach: true,
             can_open_logs: true,
@@ -22323,6 +22887,7 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
                 description: "scanning".to_string(),
                 status: HerdStatus::Working,
                 depth: 1,
+                last_activity: None,
                 children: Vec::new(),
                 events: Vec::new(),
             }],
@@ -22366,6 +22931,7 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
             description: format!("job {i}"),
             status: HerdStatus::Working,
             depth: 0,
+            last_activity: None,
             children: Vec::new(),
             events: Vec::new(),
         };

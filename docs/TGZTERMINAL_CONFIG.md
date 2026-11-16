@@ -104,10 +104,13 @@ config.sidebar_scroll_bar = true
 | `sidebar_tab_grouping` | enum | `"Auto"` | `"Auto"`: a new tab joins the group of the project folder (nearest `.git`) it starts in and stays there when it changes folder; tabs with no project sit under "Other". `"Manual"`: tabs are grouped only by hand. `"Off"`: one flat list, no headers. Drag a tab onto a tab or the header of another group to move it there, or use "Move to group" in the tab's right-click menu; click a header to fold the group. "New group…" (tab menu, header menu, or the empty part of the list) names a group of your own in the search field: Enter keeps it, Esc cancels. A header's right-click menu renames or deletes your own groups, re-sorts tabs by folder, and closes the group's tabs. Your groups' names are remembered across restarts; which tab was in which group is not. Groups are contiguous in the tab order, so `ActivateTab` numbers match the rows shown. |
 | `sidebar_font` | font | unset | Font of the sidebar's own text, e.g. `wezterm.font 'Inter'`. Unset: `window_frame.font`, which defaults to the bundled Roboto. The terminal font stays the fallback, so icon glyphs keep resolving. |
 | `sidebar_font_size` | number | `13` on macOS, `10` elsewhere | Size of `sidebar_font` in points. Follows the display's DPI, not the terminal font size. |
+| `sidebar_tab_font_size` | number | *(unset)* | Text size of the tab list (tab rows, group headers, pane and subagent rows), in points. Unset follows `sidebar_font_size`. Row heights grow with it. |
+| `sidebar_agents_font_size` | number | *(unset)* | Text size of the Agents section, in points. Unset follows `sidebar_font_size`. |
+| `sidebar_button_font_size` | number | *(unset)* | Text size of the footer buttons and the search field, in points. Unset follows `sidebar_font_size`. Menus, dialogs and panels keep `sidebar_font_size`. |
 | `sidebar_colors` | table | `{}` | Colour of each part of the fork's chrome: the sidebar, menus, the tab palette and dialogs, the Worktree and Changes panels and the Settings tab. Every key is optional; an unset one keeps what `sidebar_theme` derives. Keys: `background`, `row`, `row_active`, `row_hover`, `row_pressed`, `row_working`, `field`, `field_focused`, `divider`, `menu_border`, `text`, `text_idle`, `text_meta`, `accent` (focus, selections, the active rail; default for `new_tab` and `ring_running`, and takes precedence over `agent_ui.animations.colors.ring_b`), `attention` (an agent waiting for you; default for `ring_waiting`), `focus_ring` (the ring around whatever has keyboard focus; default a soft lavender, `#a99bd6`, never white), `new_tab`, `new_tab_text` (default: black or white, whichever reads), `ring_track`, `ring_running`, `ring_waiting`. (`quota` is still accepted but no longer drawn: the `Σ` button's meter takes the quota bars' colours.) Values are anything `colors` accepts, e.g. `config.sidebar_colors = { accent = '#58a6ff', new_tab = '#3fb950' }`. Also in Settings → Colours. The diff colours of the Changes panel come from the terminal palette (`colors.ansi`). |
 | `window_title_app_name` | bool | `true` | Title bar text when no `format-window-title` handler sets one: the app's name (`TGZTerminal`, or the brand name a build is compiled with). `false` gives upstream's title, the active pane's with `[n/m]` when there are several tabs. A `format-window-title` handler always wins. |
 | `sidebar_tab_title_source` | enum | `"Title"` | `"Title"`, `"Command"`, `"WorkingDirectory"`, `"GitBranch"` |
-| `sidebar_tab_metadata` | list of enum | `{ "GitBranch", "WorkingDirectory" }` | Elements: `"GitBranch"`, `"WorkingDirectory"` |
+| `sidebar_tab_metadata` | list of enum | `{ "GitBranch", "WorkingDirectory" }` | Elements: `"GitBranch"`, `"WorkingDirectory"`. `"GitBranch"` is the nearest checkout's branch, **git or Subversion**: for an SVN working copy it is read from `.svn/wc.db` (no `svn` process) and named by the repository layout (`trunk`, the name after `branches/` or `tags/`, else the last path segment). `"WorkingDirectory"` is the folder's name, or `~` for a home folder. In a WSL pane without OSC 7 both follow the bound agent session's directory rather than the `wsl.exe` host's Windows home. |
 | `sidebar_tab_hover_details` | bool | `false` | Shows the metadata sub-line on the active/hovered row — **and makes every row two text lines tall** whether or not you hover, so fewer tabs fit on screen. |
 | `sidebar_scroll_bar` | bool | `true` | Slim tab-list scrollbar when the list overflows. Reserves a 30px gutter, which narrows every row's text budget. |
 
@@ -589,6 +592,9 @@ config.agent_ui = {
   pulse_working_dot = true,
   pulse_period_ms = 1600,
   waiting_ack_ms = 5000, -- focus time that counts as "seen"; 0 = instant
+  waiting_settles_when_seen = true, -- seen waiting rows turn grey ("ready")
+  waiting_settle_after_ms = 600000, -- unvisited waits turn grey after 10 min; 0 = never
+  cache_cold_after_ms = 3600000, -- snowflake + idle time after 1 h without a request; 0 = off
   ring_colors = "RedBlue", -- or "OrangeCyan", "TanSage", "BrownSlate", "Brand"
   animations = {
     enabled = true,
@@ -767,6 +773,9 @@ vendor-neutral agent.
 | `dock_badge` | bool | `true` | Show a count badge on the macOS dock icon for agents waiting for input while the app is unfocused. Ignored on non-macOS platforms. |
 | `track_exited_unseen` | bool | `true` | Keep agents that finished while the window was unfocused in the waiting queue with a dimmed badge until seen. **Experimental**: relies on detecting the loss of agent identity, which is less reliable than the `WaitingForInput` signal. |
 | `waiting_ack_ms` | integer | `5000` | How long a waiting agent's pane has to stay focused before it counts as seen and its glow clears. Leaving sooner keeps it queued; `0` = on focus. Clicking its sidebar row or notification acknowledges immediately. |
+| `waiting_settles_when_seen` | bool | `true` | Once a waiting agent has been seen (see `waiting_ack_ms`), its tab row turns from the amber "waiting" ring, label, dot and group count to a grey "ready". `false` keeps it amber until the agent's turn moves on (the behaviour before this key). |
+| `waiting_settle_after_ms` | integer | `600000` | A waiting agent nobody visited counts as seen after this long: its row turns grey and it leaves the waiting queue and the dock badge. `0` = never by time. |
+| `cache_cold_after_ms` | integer | `3600000` | When an agent's session has made no model request for this long, its tab row shows a snowflake and the idle time (`\u{f2dc} 1h20`) where the branch was; the branch moves after the state. The provider's prompt cache has most likely expired (Claude keeps it 5 min to 1 h), so the next message re-reads the whole context. Never shown while the agent works. Claude and Codex only (from their transcripts). `0` = off. |
 | `activity_from_output` | bool | `true` | Treat a sustained burst of pane output (>=400 ms of activity, still flowing within the last 1.5 s) as evidence that the agent is working, even when its visible text shows a prompt. Ignored for the focused pane, where the output is your own keystrokes echoing back. This is what keeps the throbber — and with it the sidebar's whole repaint chain — alive while a tool call runs behind a redrawn prompt box. |
 | `activity_from_subagents` | bool | `true` | Treat a working subagent as evidence that its parent agent is working. Covers what `activity_from_output` cannot see: a subagent runs inside its parent's process and may write nothing to the parent's screen for minutes. Needs `agent_ui.section.enabled`, which is what populates the herd state subagents are read from. |
 
@@ -989,7 +998,10 @@ terminal), even before the agent's status changes. Switching away sooner leaves 
 queued, so tabbing *through* a pane does not clear it. Clicking its sidebar or
 rail row (or the notification) acknowledges it immediately. While you are looking
 at a pane its glow is hidden either way. Re-prompts after you have looked restart
-the timer cleanly.
+the timer cleanly. A wait nobody visits settles on its own after
+`agent_ui.waiting_settle_after_ms` (default 10 minutes). Once seen or settled,
+the tab row's ring, label (`ready`), dot and group count go grey too, unless
+`agent_ui.waiting_settles_when_seen = false`.
 
 The default key assignment is:
 
@@ -1457,6 +1469,7 @@ agent_ui = {
     show_quota = true, -- subscription rate limits in the usage popup and the Σ button
     claude_usage_relay = true, -- read Claude's limits through its statusLine (see below)
     sort_attention_first = true, -- surface blocked/waiting agents at the top of the list
+    finished_subagents_keep_ms = 3600000, -- how long finished subagents stay in the tree; 0 = all
   },
 }
 ```
@@ -2749,3 +2762,27 @@ you are not left hunting for one.
 
 One key is accepted by the schema but currently read by no code:
 `file_browser.list_command`.
+
+
+## Notifications
+
+Every system notification TGZTerminal shows, with one master switch. All of
+these are in the Settings tab under **Notifications**.
+
+```lua
+config.tgz_notifications = {
+  enabled = true, -- master switch: off silences every notification and clears the dock badge
+  copy = true,    -- "Copied ..." confirmations
+  status = true,  -- feedback and errors from agent, layout, Worktree and sidebar actions
+}
+```
+
+| Kind | Key |
+|---|---|
+| Everything | `tgz_notifications.enabled` (also covers program alerts, update notices and upstream error toasts) |
+| An agent is waiting for you | `agent_ui.waiting_notification` |
+| Programs' own alerts (OSC 9 / OSC 777) | `notification_handling` (upstream: `AlwaysShow`, `NeverShow`, `SuppressFromFocusedPane`, `SuppressFromFocusedTab`, `SuppressFromFocusedWindow`) |
+| Update available | `check_for_updates` |
+| Copy confirmations | `tgz_notifications.copy` |
+| Status and errors | `tgz_notifications.status` |
+| Dock badge (macOS) | `agent_ui.dock_badge` |

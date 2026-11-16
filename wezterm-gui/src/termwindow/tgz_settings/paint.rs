@@ -154,6 +154,21 @@ fn tilde(path: &std::path::Path) -> String {
 }
 
 fn value_text(setting: &Setting, value: &Value) -> String {
+    // A scaled number shows in its own unit, not the milliseconds Lua holds.
+    if let (
+        Kind::Int {
+            min,
+            max,
+            scale,
+            suffix,
+        },
+        Value::Int(n),
+    ) = (setting.kind, value)
+    {
+        if scale != 1 || !suffix.is_empty() {
+            return format!("{}{suffix}", (*n).clamp(min, max));
+        }
+    }
     match setting.to_lua(value) {
         LuaValue::Bool(b) => if b { "On" } else { "Off" }.to_string(),
         LuaValue::Int(n) => n.to_string(),
@@ -1000,7 +1015,14 @@ impl TermWindow {
                         Segment::button("\u{2212}", SettingsHit::Step(*index, -1)),
                         Segment::label(
                             value_text(setting, &value),
-                            self.chrome_text_width("00000", false).ceil(),
+                            self.chrome_text_width(
+                                match setting.kind {
+                                    Kind::Int { suffix, .. } if !suffix.is_empty() => "0000 min",
+                                    _ => "00000",
+                                },
+                                false,
+                            )
+                            .ceil(),
                         ),
                         Segment::button("+", SettingsHit::Step(*index, 1)),
                     ],

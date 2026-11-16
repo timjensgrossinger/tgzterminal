@@ -58,7 +58,30 @@ pub fn show_with_click(notif: ToastNotification, on_click: ToastClick) {
     show_impl(notif, Some(on_click))
 }
 
+/// Master switch for every notification this process shows, whichever code
+/// path asks for it (TGZTerminal fork addition: `tgz_notifications.enabled`).
+/// The GUI sets it from config at startup and on every reload; it is a global
+/// rather than a parameter so the ~30 call sites need not know about it.
+static ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Turn every notification on or off.
+pub fn set_enabled(enabled: bool) {
+    ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether notifications are on at all.
+pub fn enabled() -> bool {
+    ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 fn show_impl(notif: ToastNotification, on_click: Option<ToastClick>) {
+    if !enabled() {
+        log::trace!(
+            "notification suppressed (notifications off): {}",
+            notif.title
+        );
+        return;
+    }
     if let Err(err) = backend::show_notif(notif, on_click) {
         log::error!("Failed to show notification: {}", err);
     }

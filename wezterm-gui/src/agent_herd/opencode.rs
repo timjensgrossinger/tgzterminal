@@ -208,6 +208,7 @@ impl SessionSource for OpenCodeDetector {
                         input_tokens: None,
                         output_tokens: None,
                         context_percent: None,
+                        last_turn_at: None,
                         cost: None,
                     });
                 }
@@ -464,6 +465,7 @@ fn collect_database_sessions(home: &Path) -> Vec<VendorSession> {
                 input_tokens: u64_count(input_tokens),
                 output_tokens: u64_count(output_tokens),
                 context_percent,
+                last_turn_at: None,
                 cost,
             })
         })

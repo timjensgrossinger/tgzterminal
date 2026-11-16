@@ -130,6 +130,7 @@ pub mod spawn;
 pub mod tgz_alt_screen;
 pub(crate) mod tgz_footer;
 pub mod tgz_last_session;
+pub(crate) mod tgz_notify;
 mod tgz_pane_layout;
 pub mod tgz_secret_mask;
 pub(crate) mod tgz_settings;
@@ -979,6 +980,8 @@ pub(crate) struct HerdTabInfo {
     pub session_id: Option<String>,
     pub model: Option<String>,
     pub context_percent: Option<u8>,
+    /// When the session last made a model request (cold-cache marker).
+    pub last_turn_at: Option<std::time::SystemTime>,
     /// Labels of its subagents that are working right now.
     pub subagents: Vec<String>,
 }
@@ -1600,6 +1603,8 @@ pub struct TermWindow {
     herd_tab_info: RefCell<HashMap<PaneId, HerdTabInfo>>,
     /// Shaped chrome text, by font and string; see `tgz_ui_text`.
     ui_text_cache: RefCell<tgz_ui_text::UiTextCache>,
+    /// Which sidebar area chrome text is currently sized for.
+    ui_area: Cell<tgz_ui_text::UiArea>,
     /// The rows of the open menus that can be picked, as last painted, for
     /// keyboard navigation.
     dropdown_key_rows: Vec<UIItem>,
@@ -1906,7 +1911,8 @@ impl TermWindow {
         // macOS dock badge: surface the waiting-agent count while the app is
         // unfocused. Other platforms ignore it. Only meaningful when enabled.
         if self.config.agent_ui.dock_badge {
-            let count = if focused {
+            // Notifications off clears the badge too, rather than freezing it.
+            let count = if focused || !self.config.tgz_notifications.enabled {
                 0
             } else {
                 self.waiting_queue().len()
@@ -2202,6 +2208,7 @@ impl TermWindow {
             tab_group_roots: RefCell::new(HashMap::new()),
             herd_tab_info: RefCell::new(HashMap::new()),
             ui_text_cache: RefCell::new(tgz_ui_text::UiTextCache::default()),
+            ui_area: Cell::new(tgz_ui_text::UiArea::Base),
             dropdown_key_rows: Vec::new(),
             dropdown_key_selected: None,
             sidebar_kb_focus: None,
@@ -5485,7 +5492,7 @@ done
         // the browser locally. Bail out early so the user isn't confused.
         if pane_looks_remote && remote_context.is_none() {
             log::warn!("pane looks like a remote/ssh session but could not resolve destination; aborting worktree open");
-            wezterm_toast_notification::show(wezterm_toast_notification::ToastNotification {
+            crate::termwindow::tgz_notify::status(wezterm_toast_notification::ToastNotification {
                 title: "Worktree unavailable".to_string(),
                 message: "Could not resolve the SSH destination for this pane".to_string(),
                 url: None,
@@ -5525,12 +5532,14 @@ done
             Ok(choice) => choice,
             Err(message) => {
                 log::warn!("worktree: {message}");
-                wezterm_toast_notification::show(wezterm_toast_notification::ToastNotification {
-                    title: "Worktree unavailable".to_string(),
-                    message: message.to_string(),
-                    url: None,
-                    timeout: Some(Duration::from_millis(4000)),
-                });
+                crate::termwindow::tgz_notify::status(
+                    wezterm_toast_notification::ToastNotification {
+                        title: "Worktree unavailable".to_string(),
+                        message: message.to_string(),
+                        url: None,
+                        timeout: Some(Duration::from_millis(4000)),
+                    },
+                );
                 return;
             }
         };
@@ -6406,7 +6415,7 @@ done
                 } else {
                     // Say so: a key that does nothing looks like a key that
                     // is not bound.
-                    wezterm_toast_notification::show(
+                    crate::termwindow::tgz_notify::status(
                         wezterm_toast_notification::ToastNotification {
                             title: "Agents".to_string(),
                             message: if queue.is_empty() {

@@ -10,8 +10,8 @@ use super::lua_edit::LuaValue;
 use config::{
     AgentCopyClick, AgentLaunchTarget, AgentRingColors, Config, DiffPanelLongLines, DiffPanelMode,
     DiffPanelPosition, DiffPanelRaisedMode, FileBrowserEditorPlacement, FileBrowserUi,
-    PaneToolbeltPosition, ShellCopyClick, SidebarNewTabStyle, SidebarPosition, SidebarTabDensity,
-    SidebarTabGrouping, SidebarTabTitleSource, SidebarTheme,
+    NotificationHandling, PaneToolbeltPosition, ShellCopyClick, SidebarNewTabStyle,
+    SidebarPosition, SidebarTabDensity, SidebarTabGrouping, SidebarTabTitleSource, SidebarTheme,
 };
 use std::convert::TryFrom;
 
@@ -22,6 +22,8 @@ pub(crate) enum Section {
     Colors,
     Sidebar,
     Agents,
+    /// Every system notification, with a master switch.
+    Notifications,
     Worktree,
     Changes,
     Input,
@@ -33,11 +35,12 @@ pub(crate) enum Section {
 }
 
 impl Section {
-    pub(crate) const ALL: [Section; 10] = [
+    pub(crate) const ALL: [Section; 11] = [
         Section::Appearance,
         Section::Colors,
         Section::Sidebar,
         Section::Agents,
+        Section::Notifications,
         Section::Worktree,
         Section::Changes,
         Section::Input,
@@ -52,6 +55,7 @@ impl Section {
             Section::Colors => "Colours",
             Section::Sidebar => "Sidebar",
             Section::Agents => "Agents",
+            Section::Notifications => "Notifications",
             Section::Worktree => "Worktree",
             Section::Changes => "Changes",
             Section::Input => "Input",
@@ -76,9 +80,14 @@ pub(crate) enum Kind {
     Toggle,
     /// One of an enum's variants.
     Choice(fn() -> &'static [&'static str]),
+    /// A whole number, shown and stepped in a display unit: the config holds
+    /// `value * scale` (milliseconds shown as minutes, say), `suffix` names
+    /// the unit. `scale` is 1 and `suffix` empty for a plain number.
     Int {
         min: i64,
         max: i64,
+        scale: i64,
+        suffix: &'static str,
     },
     Float {
         min: f64,
@@ -111,7 +120,12 @@ impl Setting {
     pub(crate) fn to_lua(&self, value: &Value) -> LuaValue {
         match (self.kind, value) {
             (Kind::Font, Value::Text(name)) => LuaValue::Font(name.clone()),
-            (Kind::Int { min, max }, Value::Int(n)) => LuaValue::Int((*n).clamp(min, max)),
+            (
+                Kind::Int {
+                    min, max, scale, ..
+                },
+                Value::Int(n),
+            ) => LuaValue::Int((*n).clamp(min, max).saturating_mul(scale)),
             (Kind::Float { min, max, .. }, Value::Float(f)) => {
                 // Steps of 0.05 accumulate noise; two decimals is all a
                 // font size or an opacity needs.
@@ -128,7 +142,7 @@ impl Setting {
     /// when the setting does not step or is already at its end.
     pub(crate) fn stepped(&self, value: &Value, direction: i8) -> Option<Value> {
         let next = match (self.kind, value) {
-            (Kind::Int { min, max }, Value::Int(n)) => {
+            (Kind::Int { min, max, .. }, Value::Int(n)) => {
                 Value::Int((n + i64::from(direction)).clamp(min, max))
             }
             (Kind::Float { min, max, step }, Value::Float(f)) => {
@@ -184,8 +198,23 @@ macro_rules! int {
             path: path!($($p).+),
             label: $label,
             help: $help,
-            kind: Kind::Int { min: $min, max: $max },
+            kind: Kind::Int { min: $min, max: $max, scale: 1, suffix: "" },
             get: |c| Value::Int(c.$($p).+ as i64),
+        }
+    };
+}
+
+/// A millisecond key shown in a coarser unit (`scale` ms each, `suffix` after
+/// the number). The config value is rounded to the nearest unit for display.
+macro_rules! duration {
+    ($section:ident, $label:expr, $help:expr, $min:expr, $max:expr, $scale:expr, $suffix:expr, $($p:ident).+) => {
+        Setting {
+            section: Section::$section,
+            path: path!($($p).+),
+            label: $label,
+            help: $help,
+            kind: Kind::Int { min: $min, max: $max, scale: $scale, suffix: $suffix },
+            get: |c| Value::Int(((c.$($p).+ as i64) + $scale / 2) / $scale),
         }
     };
 }
@@ -443,6 +472,54 @@ pub(crate) static CATALOG: &[Setting] = &[
     chrome_color!("Text: idle", "Rows that are not active.", text_idle),
     chrome_color!("Text: meta", "Second lines, hints and counts.", text_meta),
     // Sidebar
+    float!(
+        Sidebar,
+        "Text size",
+        "Sidebar text in points; the sizes below start from it.",
+        8.,
+        30.,
+        0.5,
+        sidebar_font_size
+    ),
+    Setting {
+        section: Section::Sidebar,
+        path: &["sidebar_tab_font_size"],
+        label: "Tab text size",
+        help: "Tab rows, group headers, pane and subagent rows.",
+        kind: Kind::Float {
+            min: 8.,
+            max: 30.,
+            step: 0.5,
+        },
+        // Unset follows the sidebar text size, so show that.
+        get: |c| Value::Float(c.sidebar_tab_font_size.unwrap_or(c.sidebar_font_size)),
+    },
+    Setting {
+        section: Section::Sidebar,
+        path: &["sidebar_agents_font_size"],
+        label: "Agents text size",
+        help: "The Agents section.",
+        kind: Kind::Float {
+            min: 8.,
+            max: 30.,
+            step: 0.5,
+        },
+        // Unset follows the sidebar text size, so show that.
+        get: |c| Value::Float(c.sidebar_agents_font_size.unwrap_or(c.sidebar_font_size)),
+    },
+    Setting {
+        section: Section::Sidebar,
+        path: &["sidebar_button_font_size"],
+        label: "Button text size",
+        help: "The buttons at the bottom and the search field.",
+        kind: Kind::Float {
+            min: 8.,
+            max: 30.,
+            step: 0.5,
+        },
+        // Unset follows the sidebar text size, so show that.
+        get: |c| Value::Float(c.sidebar_button_font_size.unwrap_or(c.sidebar_font_size)),
+    },
     toggle!(
         Sidebar,
         "Sidebar",
@@ -525,9 +602,39 @@ pub(crate) static CATALOG: &[Setting] = &[
     ),
     toggle!(
         Agents,
-        "Notify when waiting",
-        "Send a notification when an agent needs you.",
-        agent_ui.waiting_notification
+        "Grey once seen",
+        "A waiting agent's tab turns from amber to a grey \u{201c}ready\u{201d} once you have looked at it.",
+        agent_ui.waiting_settles_when_seen
+    ),
+    duration!(
+        Agents,
+        "Counts as seen after",
+        "How long you have to stay on a waiting agent's pane before it counts as seen. 0 = as soon as you look.",
+        0,
+        60,
+        1000,
+        " s",
+        agent_ui.waiting_ack_ms
+    ),
+    duration!(
+        Agents,
+        "Grey after",
+        "A waiting agent nobody visited turns grey after this long. 0 keeps it amber until you answer.",
+        0,
+        1440,
+        60_000,
+        " min",
+        agent_ui.waiting_settle_after_ms
+    ),
+    duration!(
+        Agents,
+        "Cold cache after",
+        "Mark a tab with a snowflake and the idle time once its session has made no request for this long. 0 turns it off.",
+        0,
+        1440,
+        60_000,
+        " min",
+        agent_ui.cache_cold_after_ms
     ),
     choice!(
         Agents,
@@ -584,6 +691,16 @@ pub(crate) static CATALOG: &[Setting] = &[
         "Waiting agents first",
         "Sort agents that need you to the top.",
         agent_ui.section.sort_attention_first
+    ),
+    duration!(
+        Agents,
+        "Keep finished helpers",
+        "How long a finished subagent stays listed in the Agents section. 0 keeps all.",
+        0,
+        10_080,
+        60_000,
+        " min",
+        agent_ui.section.finished_subagents_keep_ms
     ),
     choice!(
         Agents,
@@ -662,6 +779,49 @@ pub(crate) static CATALOG: &[Setting] = &[
         unfocused
     ),
     // Worktree
+    toggle!(
+        Notifications,
+        "Notifications",
+        "Master switch: off silences every notification TGZTerminal shows and clears the dock badge.",
+        tgz_notifications.enabled
+    ),
+    toggle!(
+        Notifications,
+        "Agent needs you",
+        "A notification when an agent is waiting for you while you are elsewhere.",
+        agent_ui.waiting_notification
+    ),
+    choice!(
+        Notifications,
+        "From programs",
+        "Notifications programs send (OSC 9/777), e.g. a CLI saying it is done.",
+        NotificationHandling,
+        notification_handling
+    ),
+    toggle!(
+        Notifications,
+        "Updates",
+        "Check for TGZTerminal updates and say when one is out.",
+        check_for_updates
+    ),
+    toggle!(
+        Notifications,
+        "Copy confirmations",
+        "A \u{201c}Copied\u{201d} message after copying from a pane or the sidebar.",
+        tgz_notifications.copy
+    ),
+    toggle!(
+        Notifications,
+        "Status and errors",
+        "Feedback from agent, layout, Worktree and sidebar actions, including when they fail.",
+        tgz_notifications.status
+    ),
+    toggle!(
+        Notifications,
+        "Dock badge",
+        "Number of waiting agents on the dock icon while the app is in the background (macOS).",
+        agent_ui.dock_badge
+    ),
     choice!(
         Worktree,
         "Interface",
@@ -900,6 +1060,30 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Millisecond keys show and step in minutes or seconds, and write
+    /// milliseconds back: the file never learns about the display unit.
+    #[test]
+    fn a_duration_setting_shows_its_unit_and_writes_milliseconds() {
+        let find = |path: &[&str]| CATALOG.iter().find(|s| s.path == path).unwrap();
+        let config = Config::default_config();
+
+        let grey = find(&["agent_ui", "waiting_settle_after_ms"]);
+        assert_eq!((grey.get)(&config), Value::Int(10), "600000 ms = 10 min");
+        assert!(matches!(
+            grey.to_lua(&Value::Int(15)),
+            LuaValue::Int(900_000)
+        ));
+        assert_eq!(grey.stepped(&Value::Int(10), 1), Some(Value::Int(11)));
+        assert_eq!(grey.stepped(&Value::Int(0), -1), None, "0 is the floor");
+
+        let seen = find(&["agent_ui", "waiting_ack_ms"]);
+        assert_eq!((seen.get)(&config), Value::Int(5), "5000 ms = 5 s");
+        assert!(matches!(seen.to_lua(&Value::Int(2)), LuaValue::Int(2000)));
+
+        let cold = find(&["agent_ui", "cache_cold_after_ms"]);
+        assert_eq!((cold.get)(&config), Value::Int(60));
     }
 
     #[test]

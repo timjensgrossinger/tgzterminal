@@ -595,8 +595,12 @@ pub fn try_new() -> Result<Rc<GuiFrontEnd>, Error> {
     let front_end = GuiFrontEnd::try_new()?;
     FRONT_END.with(|f| *f.borrow_mut() = Some(Rc::clone(&front_end)));
 
+    // `tgz_notifications.enabled` gates every notification, including the
+    // ones raised below (OSC alerts) and by upstream code; keep it current.
+    crate::termwindow::tgz_notify::sync(&config::configuration());
     let config_subscription = config::subscribe_to_config_reload({
         move || {
+            crate::termwindow::tgz_notify::sync(&config::configuration());
             promise::spawn::spawn_into_main_thread(async {
                 crate::commands::CommandDef::recreate_menubar(&config::configuration());
             })

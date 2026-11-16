@@ -376,8 +376,31 @@ pub struct SubagentNode {
     pub description: String,
     pub status: HerdStatus,
     pub depth: u32,
+    /// The subagent transcript's last write, when known.
+    pub last_activity: Option<SystemTime>,
     pub children: Vec<SubagentNode>,
     pub events: Vec<HerdEvent>,
+}
+
+/// Drop subagents that finished more than `keep` ago from a tree, along with
+/// everything under them. A long-lived session otherwise lists every helper it
+/// ever started. A node that is not finished, or whose last write is unknown,
+/// is kept: hiding live work would be worse than a long list.
+pub fn prune_finished_subagents(tree: &mut Vec<SubagentNode>, keep: Duration, now: SystemTime) {
+    tree.retain(|node| {
+        let finished = matches!(
+            node.status,
+            HerdStatus::Done | HerdStatus::Unknown | HerdStatus::Idle
+        );
+        let old = node
+            .last_activity
+            .and_then(|at| now.duration_since(at).ok())
+            .is_some_and(|age| age > keep);
+        !(finished && old)
+    });
+    for node in tree.iter_mut() {
+        prune_finished_subagents(&mut node.children, keep, now);
+    }
 }
 
 impl SubagentNode {
@@ -477,6 +500,9 @@ pub struct HerdAgent {
     pub output_tokens: Option<u64>,
     /// How full the model's context window is, in percent, when known.
     pub context_percent: Option<u8>,
+    /// When the session last made a model request; drives the cold-cache
+    /// marker. Only filesystem sources know it.
+    pub last_turn_at: Option<SystemTime>,
     pub cost: Option<String>,
     /// Whether row actions resolved successfully for its bound pane.
     pub can_attach: bool,
@@ -730,18 +756,27 @@ fn promote_awaiting_human(status: HerdStatus, turn: TurnState) -> HerdStatus {
 /// used to go still in the middle of exactly that work. A subagent that signed
 /// off (`Done`) is never working, pending or not.
 pub fn subagent_is_working(sub: &HerdSubagent, now: SystemTime) -> bool {
-    let quiet_for = |window: Duration| {
-        sub.last_activity
-            .and_then(|at| now.duration_since(at).ok())
-            .is_none_or(|age| age < window)
-    };
+    // A time slightly in the future (clock skew between this machine and a
+    // WSL or network filesystem) counts as just written.
+    let quiet_for =
+        |at: SystemTime, window: Duration| now.duration_since(at).map_or(true, |age| age < window);
     if sub.status == HerdStatus::Done {
         return false;
     }
     if sub.pending {
-        return quiet_for(SUBAGENT_PENDING_MAX_QUIET);
+        // "Pending" rests on the parent's account alone, so it needs a
+        // transcript time to bound it. Without one it used to count as fresh,
+        // and a launch whose result never came spun the row for the rest of
+        // the session.
+        return sub
+            .last_activity
+            .is_some_and(|at| quiet_for(at, SUBAGENT_PENDING_MAX_QUIET));
     }
-    sub.status == HerdStatus::Working && quiet_for(SUBAGENT_ACTIVITY_WINDOW)
+    // No timestamp means no opinion: don't second-guess the status.
+    sub.status == HerdStatus::Working
+        && sub
+            .last_activity
+            .map_or(true, |at| quiet_for(at, SUBAGENT_ACTIVITY_WINDOW))
 }
 
 /// Join filesystem-discovered Claude sessions to detected panes.
@@ -889,6 +924,7 @@ pub fn join_sessions_with_panes(
             context_percent: session
                 .context_percent
                 .or_else(|| pane.and_then(|p| p.context_percent)),
+            last_turn_at: session.last_turn_at,
             cost: session
                 .cost
                 .clone()
@@ -941,6 +977,7 @@ pub fn join_sessions_with_panes(
             input_tokens: row.input_tokens,
             output_tokens: row.output_tokens,
             context_percent: row.context_percent,
+            last_turn_at: None,
             cost: row.cost,
             can_attach: row.can_attach,
             can_open_logs: row.can_open_logs,
@@ -1286,6 +1323,7 @@ mod tests {
             input_tokens: None,
             output_tokens: None,
             context_percent: None,
+            last_turn_at: None,
             cost: None,
         }
     }
@@ -1311,6 +1349,7 @@ mod tests {
             input_tokens: None,
             output_tokens: None,
             context_percent: None,
+            last_turn_at: None,
             cost: None,
             can_attach: true,
             can_open_logs: true,
@@ -1506,6 +1545,41 @@ mod tests {
                 now
             ),
             "a notification that never lands must not spin the row forever"
+        );
+        let node = |id: &str, status, age: Option<u64>, children| SubagentNode {
+            agent_id: id.to_string(),
+            agent_type: "Task".to_string(),
+            description: id.to_string(),
+            status,
+            depth: 1,
+            last_activity: age.map(|secs| now - Duration::from_secs(secs)),
+            children,
+            events: Vec::new(),
+        };
+        let hour = Duration::from_secs(3600);
+        let mut tree = vec![
+            node("old-done", HerdStatus::Done, Some(90_000), vec![]),
+            node("old-unknown", HerdStatus::Unknown, Some(7200), vec![]),
+            node("fresh-done", HerdStatus::Done, Some(60), vec![]),
+            node("old-working", HerdStatus::Working, Some(90_000), vec![]),
+            node("no-time", HerdStatus::Done, None, vec![]),
+            node(
+                "parent",
+                HerdStatus::Working,
+                Some(10),
+                vec![node("old-child", HerdStatus::Done, Some(7200), vec![])],
+            ),
+        ];
+        prune_finished_subagents(&mut tree, hour, now);
+        let kept: Vec<&str> = tree.iter().map(|n| n.agent_id.as_str()).collect();
+        assert_eq!(kept, vec!["fresh-done", "old-working", "no-time", "parent"]);
+        assert!(tree[3].children.is_empty(), "pruned at every depth");
+
+        let mut unknown_time = background_sub(HerdStatus::Working, true, Duration::ZERO, now);
+        unknown_time.last_activity = None;
+        assert!(
+            !subagent_is_working(&unknown_time, now),
+            "a pending agent with no transcript time has nothing to bound it"
         );
     }
 

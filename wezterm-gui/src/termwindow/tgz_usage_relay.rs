@@ -562,7 +562,7 @@ static LAST_ATTEMPT: LazyLock<Mutex<HashMap<PathBuf, (bool, Option<SystemTime>)>
     LazyLock::new(Default::default);
 
 fn toast(title: &str, message: String) {
-    wezterm_toast_notification::show(wezterm_toast_notification::ToastNotification {
+    crate::termwindow::tgz_notify::status(wezterm_toast_notification::ToastNotification {
         title: title.to_string(),
         message,
         url: None,
