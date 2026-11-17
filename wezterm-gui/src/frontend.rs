@@ -600,9 +600,14 @@ pub fn try_new() -> Result<Rc<GuiFrontEnd>, Error> {
     crate::termwindow::tgz_notify::sync(&config::configuration());
     let config_subscription = config::subscribe_to_config_reload({
         move || {
-            crate::termwindow::tgz_notify::sync(&config::configuration());
+            // Subscribers run while `Configuration::reload` still holds the
+            // config lock: reading the config here (`configuration()`) would
+            // take that lock again and deadlock every thread that reads
+            // config, the GUI thread first. Read it on the main thread.
             promise::spawn::spawn_into_main_thread(async {
-                crate::commands::CommandDef::recreate_menubar(&config::configuration());
+                let config = config::configuration();
+                crate::termwindow::tgz_notify::sync(&config);
+                crate::commands::CommandDef::recreate_menubar(&config);
             })
             .detach();
             true
