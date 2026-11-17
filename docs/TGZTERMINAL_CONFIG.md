@@ -2594,9 +2594,12 @@ cmux to upstream's:
 | `Cmd+Shift+Return` | zoom the pane |
 | `Cmd+Opt+=` | balance panes |
 | `Cmd+Opt+L` | the Layouts menu |
+| `Cmd+Opt+1` … `Cmd+Opt+6` | Columns, Rows, Main left, Main top, Grid, Agent + shells |
 
 Like every default key they give way to a binding of your own on the same
-keys; `false` leaves upstream's keys exactly as they are. `Cmd+D` also brings
+keys; `false` leaves upstream's keys exactly as they are. The Layouts menu
+shows the key bound to each row (a `tgz_layouts` entry shows one once you bind
+`OpenPaneLayout`), and Settings → Input has a switch for `tgz_pane_keys`. `Cmd+D` also brings
 `Ctrl+Shift+D`, as upstream's `Cmd` keys bring their `Ctrl+Shift` twins.
 
 **Command line.** The same from scripts, against the pane in `WEZTERM_PANE`

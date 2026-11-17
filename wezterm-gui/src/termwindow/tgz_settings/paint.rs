@@ -79,10 +79,11 @@ pub(crate) fn is_settings_pane(pane: &Arc<dyn Pane>) -> bool {
 }
 
 /// The actions listed under Shortcuts: the fork's own, in the order somebody
-/// new would meet them.
-fn shortcut_actions() -> Vec<KeyAssignment> {
+/// new would meet them, then each pane layout preset and each of the user's
+/// own `tgz_layouts`.
+fn shortcut_actions(config: &config::Config) -> Vec<KeyAssignment> {
     use KeyAssignment::*;
-    vec![
+    let mut actions = vec![
         ShowSettings,
         ActivateCommandPalette,
         SpawnTab(SpawnTabDomain::CurrentPaneDomain),
@@ -109,7 +110,19 @@ fn shortcut_actions() -> Vec<KeyAssignment> {
         ToggleDockedInput,
         ToggleSecureKeyboardEntry,
         LeaveAlternateScreen,
-    ]
+    ];
+    actions.extend(
+        config::keyassignment::PaneLayout::ALL
+            .iter()
+            .map(|layout| ApplyPaneLayout(*layout)),
+    );
+    actions.extend(
+        config
+            .tgz_layouts
+            .iter()
+            .map(|def| OpenPaneLayout(def.name.clone())),
+    );
+    actions
 }
 
 /// One piece of a control: a label in a box, lit when it is the current
@@ -698,7 +711,7 @@ impl TermWindow {
 
         // Shortcuts: a list to read.
         if section == Section::Shortcuts {
-            let rows: Vec<(String, Option<String>)> = shortcut_actions()
+            let rows: Vec<(String, Option<String>)> = shortcut_actions(&self.config)
                 .iter()
                 .filter_map(|action| {
                     let command = crate::commands::derive_command_from_key_assignment(action)?;

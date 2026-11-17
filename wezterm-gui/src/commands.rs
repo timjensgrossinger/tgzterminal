@@ -2400,6 +2400,12 @@ fn tgz_pane_keys(action: &KeyAssignment) -> Vec<(Modifiers, String)> {
         TogglePaneZoomState => key(cmd_shift, "Return"),
         BalancePanes => key(cmd_alt, "="),
         ShowPaneLayoutMenu => key(cmd_alt, "l"),
+        // Cmd+Opt+1…6 in the order the layout menu lists the presets.
+        ApplyPaneLayout(layout) => PaneLayout::ALL
+            .iter()
+            .position(|preset| preset == layout)
+            .map(|idx| key(cmd_alt, &(idx + 1).to_string()))
+            .unwrap_or_default(),
         _ => vec![],
     }
 }
@@ -2638,8 +2644,9 @@ mod tgz_pane_keys_test {
                 checked += 1;
             }
         }
-        // Two splits, four focus moves, four resizes, zoom, balance, menu.
-        assert_eq!(checked, 13);
+        // Two splits, four focus moves, four resizes, zoom, balance, menu,
+        // six layout presets.
+        assert_eq!(checked, 19);
 
         // Upstream's keys still do what they did.
         for (key, action) in &without {

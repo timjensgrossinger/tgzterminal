@@ -452,6 +452,10 @@ struct SidebarAnimationGates {
     agent_enter: bool,
     rail_breathe: bool,
     dot_pulse: bool,
+    /// Chrome nudges, such as the customize-mode Done pulse. Not a
+    /// user-facing switch of its own: it follows the master switch and
+    /// reduce-motion, and falls back to a steady mark when off.
+    nudge: bool,
     /// Keep asking for frames while the window is unfocused.
     unfocused: bool,
 }
@@ -474,6 +478,7 @@ impl SidebarAnimationGates {
             agent_enter: master && anim.agent_enter,
             rail_breathe: master && anim.rail_breathe,
             dot_pulse: master && anim.dot_pulse && agent_ui.pulse_working_dot,
+            nudge: master,
             unfocused: master && anim.unfocused,
         }
     }
@@ -790,6 +795,47 @@ fn agent_pulse_phase(elapsed: Duration, period: Duration) -> f32 {
     let t = (elapsed.as_millis() as f32 % period_ms) / period_ms;
     let triangle = 1. - (2. * t - 1.).abs();
     triangle * triangle * (3. - 2. * triangle)
+}
+
+/// Idle time in footer customize mode before Done first pulses, and the
+/// spacing of the pulses after that.
+const FOOTER_EDIT_NUDGE_EVERY: Duration = Duration::from_secs(10);
+/// How long one Done pulse lasts.
+const FOOTER_EDIT_NUDGE_LEN: Duration = Duration::from_millis(1200);
+/// Done's accent level while motion is held still: a steady mark instead of a
+/// pulse, so a forgotten customize mode still stands out.
+const FOOTER_EDIT_NUDGE_STILL: f32 = 0.6;
+
+/// When the footer nudge next needs a frame.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum NudgeWake {
+    /// One frame after this much time: the next pulse starts then.
+    After(Duration),
+    /// Every frame on the pulse grid: a pulse is running.
+    NextFrame,
+    /// Nothing changes until the user does something.
+    Never,
+}
+
+/// How strongly Done is marked after `idle` in customize mode, `0.0..=1.0`,
+/// and when that next changes. A pulse every [`FOOTER_EDIT_NUDGE_EVERY`] once
+/// the user has been idle that long; with `animate` off, a steady
+/// [`FOOTER_EDIT_NUDGE_STILL`] from then on instead.
+fn footer_edit_nudge(idle: Duration, animate: bool) -> (f32, NudgeWake) {
+    if idle < FOOTER_EDIT_NUDGE_EVERY {
+        return (0., NudgeWake::After(FOOTER_EDIT_NUDGE_EVERY - idle));
+    }
+    if !animate {
+        return (FOOTER_EDIT_NUDGE_STILL, NudgeWake::Never);
+    }
+    let every = FOOTER_EDIT_NUDGE_EVERY.as_nanos();
+    let into = Duration::from_nanos(((idle - FOOTER_EDIT_NUDGE_EVERY).as_nanos() % every) as u64);
+    if into < FOOTER_EDIT_NUDGE_LEN {
+        let t = into.as_secs_f32() / FOOTER_EDIT_NUDGE_LEN.as_secs_f32();
+        ((std::f32::consts::PI * t).sin(), NudgeWake::NextFrame)
+    } else {
+        (0., NudgeWake::After(FOOTER_EDIT_NUDGE_EVERY - into))
+    }
 }
 
 /// One full turn of the working-agent throbber ring.
@@ -4849,6 +4895,9 @@ pub(crate) struct SidebarDropdownRow {
     /// Draw a trailing `>` chevron, marking a row that expands into a
     /// submenu rather than acting immediately.
     pub(crate) trailing_chevron: bool,
+    /// Right-aligned text in the meta colour after the label, e.g. the key
+    /// bound to the row's action. The label gives way to it.
+    pub(crate) trailing_hint: Option<String>,
     /// What a usage popup row draws beyond its label: a header weight,
     /// right-aligned value columns, and its quota bar, bar graph, chart or
     /// span buttons. Columns, a gauge or buttons take the right of the row
@@ -12362,6 +12411,7 @@ impl crate::TermWindow {
                 divider_above: false,
                 indent: false,
                 trailing_chevron: false,
+                trailing_hint: None,
                 widget: None,
                 inert: false,
                 item_type: UIItemType::PaneCopyMenuItem {
@@ -12419,6 +12469,7 @@ impl crate::TermWindow {
             divider_above: false,
             indent: false,
             trailing_chevron: false,
+            trailing_hint: None,
             widget: None,
             inert: true,
             item_type: UIItemType::SidebarSessionsSearch,
@@ -12436,6 +12487,7 @@ impl crate::TermWindow {
                 divider_above: false,
                 indent: false,
                 trailing_chevron: false,
+                trailing_hint: None,
                 widget: None,
                 inert: false,
                 item_type: UIItemType::SidebarAgentMenuRestoreLastWindow,
@@ -12477,6 +12529,7 @@ impl crate::TermWindow {
                 divider_above: false,
                 indent: false,
                 trailing_chevron: false,
+                trailing_hint: None,
                 widget: None,
                 inert: true,
                 item_type: UIItemType::SidebarAgentMenuResume,
@@ -12493,6 +12546,7 @@ impl crate::TermWindow {
                 divider_above: false,
                 indent: false,
                 trailing_chevron: false,
+                trailing_hint: None,
                 widget: None,
                 inert: true,
                 // Not hit-testable as a session: there is no index behind it.
@@ -12642,6 +12696,7 @@ impl crate::TermWindow {
                 divider_above: false,
                 indent: false,
                 trailing_chevron: true,
+                trailing_hint: None,
                 widget: None,
                 inert: false,
                 item_type: UIItemType::SidebarAgentMenuItem {
@@ -12657,6 +12712,7 @@ impl crate::TermWindow {
                         divider_above: false,
                         indent: true,
                         trailing_chevron: false,
+                        trailing_hint: None,
                         widget: None,
                         inert: false,
                         item_type: UIItemType::SidebarAgentMenuTarget {
@@ -12674,6 +12730,7 @@ impl crate::TermWindow {
             divider_above: true,
             indent: false,
             trailing_chevron: false,
+            trailing_hint: None,
             widget: None,
             inert: false,
             item_type: UIItemType::SidebarAgentMenuProjectRootToggle,
@@ -12688,6 +12745,7 @@ impl crate::TermWindow {
                 divider_above: false,
                 indent: false,
                 trailing_chevron: false,
+                trailing_hint: None,
                 widget: None,
                 inert: false,
                 item_type: UIItemType::SidebarAgentMenuTower,
@@ -12705,6 +12763,7 @@ impl crate::TermWindow {
                 divider_above: false,
                 indent: false,
                 trailing_chevron: true,
+                trailing_hint: None,
                 widget: None,
                 inert: false,
                 item_type: UIItemType::SidebarAgentMenuResume,
@@ -12726,6 +12785,7 @@ impl crate::TermWindow {
                 divider_above: false,
                 indent: false,
                 trailing_chevron: false,
+                trailing_hint: None,
                 widget: None,
                 inert: false,
                 item_type: UIItemType::SidebarAgentMenuRestoreLastWindow,
@@ -12802,6 +12862,7 @@ impl crate::TermWindow {
             divider_above: false,
             indent: true,
             trailing_chevron: false,
+            trailing_hint: None,
             widget: None,
             inert: true,
             // Deliberately not a resume row: there is nothing to click, and a
@@ -12836,6 +12897,7 @@ impl crate::TermWindow {
                 divider_above: false,
                 indent: true,
                 trailing_chevron: false,
+                trailing_hint: None,
                 widget: None,
                 inert: false,
                 item_type: UIItemType::SidebarAgentMenuResumeSession {
@@ -12882,6 +12944,7 @@ impl crate::TermWindow {
                     divider_above,
                     indent: false,
                     trailing_chevron: false,
+                    trailing_hint: None,
                     widget: None,
                     inert: false,
                     item_type: UIItemType::SidebarNewTabMenuItem { index },
@@ -12898,6 +12961,7 @@ impl crate::TermWindow {
             divider_above,
             indent: false,
             trailing_chevron: false,
+            trailing_hint: None,
             widget: None,
             inert: false,
             item_type: UIItemType::SidebarContextMenuItem { action },
@@ -12923,6 +12987,7 @@ impl crate::TermWindow {
             divider_above: true,
             indent: false,
             trailing_chevron: false,
+            trailing_hint: None,
             widget: None,
             inert: false,
             item_type: UIItemType::SidebarContextMenuItem {
@@ -12971,6 +13036,7 @@ impl crate::TermWindow {
                 divider_above: false,
                 indent: false,
                 trailing_chevron: false,
+                trailing_hint: None,
                 widget: None,
                 inert: false,
                 item_type: UIItemType::CloseTabMenuItem {
@@ -12985,6 +13051,7 @@ impl crate::TermWindow {
                 divider_above: false,
                 indent: false,
                 trailing_chevron: false,
+                trailing_hint: None,
                 widget: None,
                 inert: false,
                 item_type: UIItemType::CloseTabMenuItem {
@@ -12999,6 +13066,7 @@ impl crate::TermWindow {
                 divider_above: false,
                 indent: false,
                 trailing_chevron: false,
+                trailing_hint: None,
                 widget: None,
                 inert: false,
                 item_type: UIItemType::CloseTabMenuItem {
@@ -13195,13 +13263,41 @@ impl crate::TermWindow {
             return Ok(());
         }
 
+        // The layout menu names the key bound to each row, the way the
+        // macOS menu bar does.
+        let hints: Vec<Option<String>> = specs
+            .iter()
+            .map(|(_, spec)| {
+                if menu.kind != SidebarContextMenuKind::PaneLayouts {
+                    return None;
+                }
+                use config::keyassignment::KeyAssignment;
+                let action = match spec.action {
+                    SidebarContextAction::BalancePanes => KeyAssignment::BalancePanes,
+                    SidebarContextAction::ApplyPaneLayout(layout) => {
+                        KeyAssignment::ApplyPaneLayout(layout)
+                    }
+                    SidebarContextAction::OpenUserPaneLayout(idx) => KeyAssignment::OpenPaneLayout(
+                        self.config.tgz_layouts.get(idx)?.name.clone(),
+                    ),
+                    _ => return None,
+                };
+                self.shortcut_text(&action)
+            })
+            .collect();
+
         // Sized to the longest label, as the close-tab menu is.
         let dpi_scale = (self.dimensions.dpi as f32 / 96.).clamp(1., 2.5);
         let cell_w_logical = self.render_metrics.cell_size.width as f32 / dpi_scale;
         let longest_cols = specs
             .iter()
-            .map(|(label, spec)| {
-                unicode_column_width(label, None) + if spec.checkbox.is_some() { 3 } else { 0 }
+            .zip(&hints)
+            .map(|((label, spec), hint)| {
+                unicode_column_width(label, None)
+                    + if spec.checkbox.is_some() { 3 } else { 0 }
+                    + hint
+                        .as_deref()
+                        .map_or(0, |hint| unicode_column_width(hint, None) + 3)
             })
             .max()
             .unwrap_or(0) as f32;
@@ -13211,13 +13307,15 @@ impl crate::TermWindow {
 
         let rows: Vec<SidebarDropdownRow> = specs
             .into_iter()
-            .map(|(label, spec)| SidebarDropdownRow {
+            .zip(hints)
+            .map(|((label, spec), hint)| SidebarDropdownRow {
                 label,
                 dot_color: None,
                 checkbox: spec.checkbox,
                 divider_above: spec.divider_above,
                 indent: false,
                 trailing_chevron: spec.opens_submenu,
+                trailing_hint: hint,
                 widget: None,
                 inert: false,
                 item_type: UIItemType::SidebarContextMenuItem {
@@ -13348,6 +13446,7 @@ impl crate::TermWindow {
                 divider_above: row.divider_above,
                 indent: row.indent,
                 trailing_chevron: row.trailing_chevron,
+                trailing_hint: None,
                 widget: row.line(),
                 inert: row.action == UsageRowAction::Inert,
                 item_type: UIItemType::SidebarUsageMenuRow { action: row.action },
@@ -13475,6 +13574,7 @@ impl crate::TermWindow {
             divider_above,
             indent: false,
             trailing_chevron: false,
+            trailing_hint: None,
             widget: None,
             // A row without a host (the search row, "No hosts match") is
             // not a button: no hover fill, and a click on it does nothing
@@ -13519,6 +13619,7 @@ impl crate::TermWindow {
             divider_above: true,
             indent: false,
             trailing_chevron: false,
+            trailing_hint: None,
             widget: None,
             inert: false,
             item_type: UIItemType::SidebarSshNewConnection,
@@ -13865,6 +13966,21 @@ impl crate::TermWindow {
             let mut widget_items: Vec<UIItem> = vec![];
             let mut draw_label = true;
             use crate::termwindow::tgz_ui_text::{Align, UiFont};
+            if let Some(hint) = row.trailing_hint.as_deref().filter(|h| !h.is_empty()) {
+                let hint_w = self.ui_text_width(UiFont::Regular, hint);
+                let text_y = row_y + (row_h - self.ui_line_height(UiFont::Regular)) * 0.5;
+                self.paint_ui_text(
+                    layers,
+                    UiFont::Regular,
+                    hint,
+                    label_right - hint_w,
+                    text_y,
+                    hint_w,
+                    sb.text_idle,
+                    Align::Left,
+                )?;
+                label_right -= hint_w + 16. * dpi_scale;
+            }
             use crate::termwindow::tgz_usage_menu::{RowWidget, CELL_COLUMN_TEMPLATES};
             let header = row.widget.as_ref().is_some_and(|line| line.header);
             // Value columns, laid right to left from the row's right edge.
@@ -16984,14 +17100,38 @@ impl crate::TermWindow {
             if show_reset {
                 buttons.push((FooterEditAction::Reset, "Reset", reset_x, reset_w));
             }
+            // Left on and forgotten, the mode would keep every button inert:
+            // Done pulses once the user has been idle a while.
+            let (nudge, wake) = footer_edit_nudge(
+                self.sidebar_footer_edit_touched.elapsed(),
+                self.sidebar_animation_gates().nudge,
+            );
+            match wake {
+                NudgeWake::After(wait) => self.schedule_sidebar_frame(Instant::now() + wait),
+                NudgeWake::NextFrame => self.schedule_sidebar_frame(next_agent_pulse_frame_due()),
+                NudgeWake::Never => {}
+            }
             for (action, label, x, w) in buttons {
-                let (bg, fg, offset, _) = paint_create_segment(
+                let (mut bg, mut fg, offset, hovered) = paint_create_segment(
                     self,
                     layers,
                     UIItemType::SidebarFooterEdit(action),
                     (x, w),
                     bar_y,
                 )?;
+                if action == FooterEditAction::Done && nudge > 0. && !hovered {
+                    bg = lerp_rgba(bg, accent, 0.5 * nudge);
+                    self.sidebar_bordered_fill(
+                        layers,
+                        1,
+                        euclid::rect(x, bar_y + offset, w, row_height as f32),
+                        footer_radius.min(w * 0.5),
+                        (2. * dpi_scale).max(2.),
+                        bg,
+                        lerp_rgba(sb.row_border, accent, nudge),
+                    )?;
+                    fg = contrast_label_color(bg, fg);
+                }
                 let label_w =
                     self.ui_text_width(crate::termwindow::tgz_ui_text::UiFont::Regular, label);
                 render_text(
@@ -18807,6 +18947,7 @@ impl crate::TermWindow {
                 divider_above,
                 indent: false,
                 trailing_chevron: false,
+                trailing_hint: None,
                 widget: None,
                 inert: false,
                 item_type: UIItemType::SidebarAgentAction {
@@ -19916,6 +20057,47 @@ mod tests {
     }
 
     #[test]
+    fn footer_edit_nudge_waits_then_pulses_every_ten_seconds() {
+        let ms = Duration::from_millis;
+        // Quiet at first, with one frame booked for when the pulse is due.
+        assert_eq!(
+            footer_edit_nudge(ms(0), true),
+            (0., NudgeWake::After(FOOTER_EDIT_NUDGE_EVERY))
+        );
+        assert_eq!(
+            footer_edit_nudge(ms(9_000), true),
+            (0., NudgeWake::After(ms(1_000)))
+        );
+        // A pulse rises and falls inside its window, asking for frames.
+        let (start, wake) = footer_edit_nudge(ms(10_000), true);
+        assert_eq!((start, wake), (0., NudgeWake::NextFrame));
+        let (peak, _) = footer_edit_nudge(ms(10_600), true);
+        assert!(peak > 0.99, "{peak}");
+        let (late, wake) = footer_edit_nudge(ms(11_100), true);
+        assert!(late > 0. && late < 0.5, "{late}");
+        assert_eq!(wake, NudgeWake::NextFrame);
+        // Between pulses: still, waking once for the next one.
+        assert_eq!(
+            footer_edit_nudge(ms(15_000), true),
+            (0., NudgeWake::After(ms(5_000)))
+        );
+        // And again ten seconds later.
+        assert_eq!(footer_edit_nudge(ms(20_600), true).1, NudgeWake::NextFrame);
+    }
+
+    #[test]
+    fn footer_edit_nudge_is_a_steady_mark_when_motion_is_held_still() {
+        let ms = Duration::from_millis;
+        assert_eq!(footer_edit_nudge(ms(9_999), false).0, 0.);
+        for idle in [10_000, 10_600, 15_000, 60_000] {
+            assert_eq!(
+                footer_edit_nudge(ms(idle), false),
+                (FOOTER_EDIT_NUDGE_STILL, NudgeWake::Never)
+            );
+        }
+    }
+
+    #[test]
     fn out_of_the_box_only_the_animations_that_carry_state_run() {
         let gates = SidebarAnimationGates::from_config(&AgentUiConfig::default(), false);
         assert_eq!(
@@ -19928,6 +20110,7 @@ mod tests {
                 agent_enter: true,
                 rail_breathe: false,
                 dot_pulse: false,
+                nudge: true,
                 unfocused: true,
             }
         );

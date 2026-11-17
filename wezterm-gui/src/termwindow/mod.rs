@@ -1584,6 +1584,9 @@ pub struct TermWindow {
     sidebar_footer_weights: tgz_footer::FooterWeights,
     /// The footer is being customized: its buttons drag instead of acting.
     sidebar_footer_edit: bool,
+    /// When customizing last saw a press: once it has sat idle a while,
+    /// Done pulses so the mode is not forgotten (`footer_edit_nudge`).
+    sidebar_footer_edit_touched: Instant,
     /// The footer's buttons as last painted, for the drag to aim at.
     sidebar_footer_slots: Vec<tgz_footer::PaintedSlot>,
     /// Which group each sidebar tab is in; see `tgz_tab_groups`.
@@ -2193,6 +2196,7 @@ impl TermWindow {
                 .filter_map(|(name, weight)| Some((tgz_footer::item_from_name(&name)?, weight)))
                 .collect(),
             sidebar_footer_edit: false,
+            sidebar_footer_edit_touched: Instant::now(),
             sidebar_footer_slots: Vec::new(),
             tab_groups: RefCell::new({
                 let mut groups = tgz_tab_groups::TabGroups::default();

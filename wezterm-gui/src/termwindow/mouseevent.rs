@@ -411,6 +411,12 @@ impl super::TermWindow {
         };
         let is_left_release = event.kind == WMEK::Release(MousePress::Left);
 
+        // Any press while customizing counts as attention: the Done nudge
+        // waits for the user to sit idle again.
+        if self.sidebar_footer_edit && matches!(&event.kind, WMEK::Press(_)) {
+            self.sidebar_footer_edit_touched = Instant::now();
+        }
+
         if matches!(&event.kind, WMEK::Press(_)) && self.sidebar_search.is_some() {
             let on_search = matches!(
                 &ui_item,
@@ -2399,6 +2405,7 @@ impl super::TermWindow {
         }
         self.sidebar_footer_custom = Some(rows);
         self.sidebar_footer_edit = true;
+        self.sidebar_footer_edit_touched = Instant::now();
         if let Some(window) = self.window.as_ref() {
             window.invalidate();
         }

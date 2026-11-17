@@ -934,6 +934,13 @@ pub(crate) static CATALOG: &[Setting] = &[
         "Ask before sending more than one line.",
         rich_input.require_confirm_for_multiline
     ),
+    toggle!(
+        Input,
+        "iTerm2-style pane keys",
+        "Cmd+D splits, Cmd+Opt+Arrows move focus, Cmd+Opt+1…6 apply a layout. \
+         Your own key bindings still win.",
+        tgz_pane_keys
+    ),
     // Privacy
     toggle!(
         Privacy,
