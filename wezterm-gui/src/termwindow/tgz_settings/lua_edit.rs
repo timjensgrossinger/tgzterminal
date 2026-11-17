@@ -12,6 +12,15 @@
 //! -- <<< TGZTerminal settings
 //! ```
 //!
+//! Key bindings changed in Settings → Shortcuts go in the same block, one
+//! `table.insert` per binding, each tagged with the action it belongs to so
+//! a later change replaces exactly those lines:
+//!
+//! ```lua
+//! config.keys = config.keys or {}
+//! table.insert(config.keys, { key = '5', mods = 'SUPER|ALT', action = … }) -- tgz-key: ApplyPaneLayout(Grid)
+//! ```
+//!
 //! A setting the file computes (a function call, a conditional, two
 //! assignments) is reported as locked and left alone: silently overriding
 //! code somebody wrote is worse than sending them to their editor.
@@ -610,12 +619,51 @@ impl<'a> Doc<'a> {
     }
 }
 
+/// Marks a key binding line of the block and names the action it is for.
+const KEY_TAG: &str = " -- tgz-key: ";
+
+/// One managed key binding: the action it belongs to and the Lua table
+/// inserted into `config.keys`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct KeyLine {
+    pub tag: String,
+    pub entry: String,
+}
+
 /// What the managed block holds: settings by path, with their right-hand
-/// side as written, and any other line somebody put there.
+/// side as written, key bindings, and any other line somebody put there.
 #[derive(Default)]
 struct Block {
     entries: BTreeMap<Vec<String>, String>,
+    keys: Vec<KeyLine>,
     extra: Vec<String>,
+}
+
+impl Block {
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty() && self.keys.is_empty() && self.extra.is_empty()
+    }
+}
+
+/// `table.insert(name.keys, { … }) -- tgz-key: tag` split into tag and table.
+fn parse_key_line(line: &str) -> Option<KeyLine> {
+    let (code, tag) = line.rsplit_once(KEY_TAG)?;
+    let inner = code
+        .trim()
+        .strip_prefix("table.insert(")?
+        .strip_suffix(')')?;
+    let (target, entry) = inner.split_once(',')?;
+    if !target.trim().ends_with(".keys") {
+        return None;
+    }
+    let (tag, entry) = (tag.trim(), entry.trim());
+    if tag.is_empty() || !entry.starts_with('{') || !entry.ends_with('}') {
+        return None;
+    }
+    Some(KeyLine {
+        tag: tag.to_string(),
+        entry: entry.to_string(),
+    })
 }
 
 /// `name.a.b = rhs` split into its path and right-hand side.
@@ -650,6 +698,10 @@ fn parse_block(src: &str, span: BlockSpan) -> Block {
         if trimmed.is_empty() {
             continue;
         }
+        if let Some(key) = parse_key_line(trimmed) {
+            block.keys.push(key);
+            continue;
+        }
         match parse_assignment(trimmed) {
             Some((name, path, rhs)) => {
                 // `x.a = x.a or {}` is scaffolding, written again on output.
@@ -679,6 +731,15 @@ fn render_block(block: &Block, name: &str, eol: &str) -> String {
             }
         }
         out.push_str(&format!("{name}.{} = {rhs}{eol}", path.join(".")));
+    }
+    if !block.keys.is_empty() {
+        out.push_str(&format!("{name}.keys = {name}.keys or {{}}{eol}"));
+        for key in &block.keys {
+            out.push_str(&format!(
+                "table.insert({name}.keys, {}){KEY_TAG}{}{eol}",
+                key.entry, key.tag
+            ));
+        }
     }
     for line in &block.extra {
         out.push_str(line);
@@ -719,7 +780,7 @@ fn fresh_name(doc: &Doc) -> String {
 fn write_block(doc: &Doc, root: &Root, block: &Block) -> String {
     let src = doc.src;
     let eol = eol_of(src);
-    let empty = block.entries.is_empty() && block.extra.is_empty();
+    let empty = block.is_empty();
 
     if let Some(span) = doc.block {
         // The block only ever sits before a `return <name>`.
@@ -879,6 +940,34 @@ pub(crate) fn unset_value(src: &str, path: &[&str]) -> Result<Option<String>, Ed
         return Ok(None);
     }
     Ok(Some(write_block(&doc, &root, &block)))
+}
+
+/// The key bindings the managed block holds, in file order.
+pub(crate) fn key_lines(src: &str) -> Result<Vec<KeyLine>, EditError> {
+    let doc = Doc::new(src);
+    doc.root()?;
+    Ok(doc
+        .block
+        .map(|span| parse_block(src, span).keys)
+        .unwrap_or_default())
+}
+
+/// `src` with the bindings tagged `tag` replaced by `entries` (Lua tables
+/// for `config.keys`); no entries forgets them. A tag must be one line.
+pub(crate) fn set_key_lines(src: &str, tag: &str, entries: &[String]) -> Result<String, EditError> {
+    let doc = Doc::new(src);
+    let root = doc.root()?;
+    let mut block = doc
+        .block
+        .map(|span| parse_block(src, span))
+        .unwrap_or_default();
+    let tag = tag.replace(['\r', '\n'], " ");
+    block.keys.retain(|key| key.tag != tag);
+    block.keys.extend(entries.iter().map(|entry| KeyLine {
+        tag: tag.clone(),
+        entry: entry.replace(['\r', '\n'], " "),
+    }));
+    Ok(write_block(&doc, &root, &block))
 }
 
 /// A config file for a machine that has none.
@@ -1222,5 +1311,80 @@ return config
             status(&out, &["sidebar_buttons", "custom1", "command"]),
             Ok(PathStatus::Block)
         );
+    }
+
+    const GRID: &str = "{ key = '5', mods = 'SUPER|ALT', action = require('wezterm').action.ApplyPaneLayout 'Grid' }";
+
+    #[test]
+    fn a_key_binding_goes_into_the_block_tagged_with_its_action() {
+        let out =
+            set_key_lines(BUILDER_STYLE, "ApplyPaneLayout(Grid)", &[GRID.to_string()]).unwrap();
+        assert!(
+            out.contains(&format!(
+                "config.keys = config.keys or {{}}\n\
+                 table.insert(config.keys, {GRID}) -- tgz-key: ApplyPaneLayout(Grid)\n"
+            )),
+            "{out}"
+        );
+        assert_eq!(
+            key_lines(&out).unwrap(),
+            vec![KeyLine {
+                tag: "ApplyPaneLayout(Grid)".into(),
+                entry: GRID.into()
+            }]
+        );
+        // Settings live beside it, and survive a key change.
+        let out = set(&out, &["sidebar_auto_hide"], LuaValue::Bool(true));
+        assert_eq!(key_lines(&out).unwrap().len(), 1, "{out}");
+        assert!(out.contains("config.sidebar_auto_hide = true"));
+    }
+
+    #[test]
+    fn changing_a_binding_replaces_only_its_own_lines() {
+        let other =
+            "{ key = 'b', mods = 'SUPER', action = require('wezterm').action.BalancePanes }";
+        let out = set_key_lines(BUILDER_STYLE, "BalancePanes", &[other.to_string()]).unwrap();
+        let out = set_key_lines(&out, "ApplyPaneLayout(Grid)", &[GRID.to_string()]).unwrap();
+        let moved = GRID.replace("'5'", "'g'");
+        let out = set_key_lines(&out, "ApplyPaneLayout(Grid)", &[moved.clone()]).unwrap();
+        let lines = key_lines(&out).unwrap();
+        assert_eq!(lines.len(), 2, "{out}");
+        assert_eq!(lines[0].entry, other);
+        assert_eq!(lines[1].entry, moved);
+        // The guard is written once however many bindings there are.
+        assert_eq!(out.matches("config.keys = config.keys or {}").count(), 1);
+    }
+
+    #[test]
+    fn forgetting_the_last_binding_drops_the_block() {
+        let out =
+            set_key_lines(BUILDER_STYLE, "ApplyPaneLayout(Grid)", &[GRID.to_string()]).unwrap();
+        let back = set_key_lines(&out, "ApplyPaneLayout(Grid)", &[]).unwrap();
+        assert_eq!(back, BUILDER_STYLE);
+    }
+
+    #[test]
+    fn a_returned_table_with_its_own_keys_keeps_them() {
+        let src = "local wezterm = require 'wezterm'\n\
+                   return {\n\
+                   \x20 keys = { { key = 'x', mods = 'CTRL', action = wezterm.action.Nop } },\n\
+                   }\n";
+        let out = set_key_lines(src, "ApplyPaneLayout(Grid)", &[GRID.to_string()]).unwrap();
+        assert!(out.contains("keys = { { key = 'x'"), "{out}");
+        assert!(out.contains("config.keys = config.keys or {}"), "{out}");
+        assert!(out.trim_end().ends_with("return config"), "{out}");
+        assert_eq!(key_lines(&out).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_tag_or_entry_cannot_break_out_of_its_line() {
+        let out = set_key_lines(
+            BUILDER_STYLE,
+            "OpenPaneLayout(\"a\\nb\")\nos.exit()",
+            &["{ key = 'a',\nmods = 'NONE', action = require('wezterm').action.Nop }".to_string()],
+        )
+        .unwrap();
+        assert!(!out.contains("\nos.exit()"), "{out}");
+        assert_eq!(key_lines(&out).unwrap().len(), 1, "{out}");
     }
 }

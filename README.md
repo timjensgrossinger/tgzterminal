@@ -178,7 +178,8 @@ from a different design.
 
 `Cmd+,` opens **Settings** as a tab: the fork's settings plus the basics (font, size,
 line height, colour scheme, opacity), grouped as Appearance, Colours, Sidebar, Agents,
-Worktree, Changes, Input, Privacy, Buttons and a read-only Shortcuts list. On/off
+Worktree, Changes, Input, Privacy, Buttons and Shortcuts, where you click an action
+and press the keys to rebind it. On/off
 settings are switches, lists open a filterable picker, colours take any value `colors`
 accepts and show a swatch.
 

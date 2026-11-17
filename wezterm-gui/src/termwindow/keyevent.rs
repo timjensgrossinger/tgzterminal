@@ -482,6 +482,12 @@ impl super::TermWindow {
             None => return,
         };
 
+        // Settings → Shortcuts is waiting for keys to bind: leave them
+        // unhandled so they arrive below as the binding, not as an action.
+        if self.settings_capturing(&pane) {
+            return;
+        }
+
         // First, try to match raw physical key
         let phys_key = match &key.key {
             phys @ KeyCode::Physical(_) => Some(phys.clone()),
@@ -699,6 +705,13 @@ impl super::TermWindow {
             Some(pane) => pane,
             None => return,
         };
+
+        if self.settings_capturing(&pane) {
+            if window_key.key_is_down {
+                self.settings_capture_key(&pane, &window_key.key, window_key.modifiers);
+            }
+            return;
+        }
 
         // The leader key is a kind of modal modifier key.
         // It is allowed to be active for up to the leader timeout duration,

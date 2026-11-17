@@ -125,6 +125,31 @@ fn shortcut_actions(config: &config::Config) -> Vec<KeyAssignment> {
     actions
 }
 
+/// Keys as the menus spell them: `⌘⌥5` with Apple symbols, else
+/// `CMD-ALT-5`.
+fn key_text(
+    config: &config::ConfigHandle,
+    key: &::window::KeyCode,
+    mods: ::window::Modifiers,
+) -> String {
+    let rendering = config.ui_key_cap_rendering;
+    let separator = if rendering == ::window::UIKeyCapRendering::AppleSymbols {
+        ""
+    } else {
+        "-"
+    };
+    let mut text = mods.to_string_with_separator(::window::ModifierToStringArgs {
+        separator,
+        want_none: false,
+        ui_key_cap_rendering: Some(rendering),
+    });
+    if !text.is_empty() {
+        text.push_str(separator);
+    }
+    text.push_str(&crate::inputmap::ui_key(key, rendering));
+    text
+}
+
 /// One piece of a control: a label in a box, lit when it is the current
 /// choice, clickable when it has a hit.
 struct Segment {
@@ -344,22 +369,7 @@ impl TermWindow {
             .locate_app_wide_key_assignment(action)
             .into_iter()
             .next()?;
-        let rendering = self.config.ui_key_cap_rendering;
-        let separator = if rendering == ::window::UIKeyCapRendering::AppleSymbols {
-            ""
-        } else {
-            "-"
-        };
-        let mut text = mods.to_string_with_separator(::window::ModifierToStringArgs {
-            separator,
-            want_none: false,
-            ui_key_cap_rendering: Some(rendering),
-        });
-        if !text.is_empty() {
-            text.push_str(separator);
-        }
-        text.push_str(&crate::inputmap::ui_key(&key, rendering));
-        Some(text)
+        Some(key_text(&self.config, &key, mods))
     }
 
     /// A row of boxes ending at `right`. Returns the x it starts at.
@@ -709,40 +719,126 @@ impl TermWindow {
         let content_right = content_x + content_w;
         let body_h = footer_y - cell_h * 0.5 - body_top;
 
-        // Shortcuts: a list to read.
+        // Shortcuts: click a row (or Enter on it) and press the new keys.
         if section == Section::Shortcuts {
-            let rows: Vec<(String, Option<String>)> = shortcut_actions(&self.config)
-                .iter()
-                .filter_map(|action| {
-                    let command = crate::commands::derive_command_from_key_assignment(action)?;
-                    Some((
-                        command.brief.to_string(),
-                        self.settings_shortcut_text(action),
-                    ))
-                })
-                .collect();
+            if state.key_lines.is_none() {
+                state.key_lines = Some(store::key_lines(&state.file).unwrap_or_default());
+            }
+            let managed = state.key_lines.clone().unwrap_or_default();
+            let actions = shortcut_actions(&self.config);
+            let mut shortcuts = Vec::with_capacity(actions.len());
+            let mut rows: Vec<(String, Option<String>)> = Vec::with_capacity(actions.len());
+            for action in actions {
+                let Some(command) = crate::commands::derive_command_from_key_assignment(&action)
+                else {
+                    continue;
+                };
+                let tag = super::pane::shortcut_tag(&action);
+                let ours: Vec<&super::lua_edit::KeyLine> =
+                    managed.iter().filter(|line| line.tag == tag).collect();
+                // A binding of the action the block did not write is the
+                // user's own: the row is theirs to change in the file.
+                let bound_by_block = ours
+                    .iter()
+                    .filter(|line| !line.entry.contains("DisableDefaultAssignment"))
+                    .count();
+                let bound_in_file = self
+                    .config
+                    .keys
+                    .iter()
+                    .filter(|key| key.action == action)
+                    .count();
+                rows.push((
+                    command.brief.to_string(),
+                    self.settings_shortcut_text(&action),
+                ));
+                shortcuts.push(super::pane::ShortcutRow {
+                    custom: !ours.is_empty(),
+                    locked: bound_in_file > bound_by_block,
+                    action,
+                });
+            }
+            state.shortcuts = shortcuts;
+            if state.focus.is_some_and(|row| row >= rows.len()) {
+                state.focus = None;
+            }
             let line_h = (cell_h + 8. * dpi_scale).ceil();
             let visible = ((body_h / line_h).floor() as usize).max(1);
             state.visible_rows = visible;
             state.max_scroll = rows.len().saturating_sub(visible);
             state.scroll = state.scroll.min(state.max_scroll);
-            for (slot, (brief, keys)) in rows.iter().skip(state.scroll).take(visible).enumerate() {
-                let y = body_top + slot as f32 * line_h;
-                let (keys, fg) = match keys {
-                    Some(keys) => (keys.as_str(), sb.text_active),
-                    None => ("not bound", sb.text_meta),
+            let capture = state.capture.clone();
+            for (row, (brief, keys)) in rows.iter().enumerate().skip(state.scroll).take(visible) {
+                let y = body_top + (row - state.scroll) as f32 * line_h;
+                let shortcut = &state.shortcuts[row];
+                let capturing = capture.as_ref().filter(|c| c.row == row);
+                let focused = state.focus == Some(row) || capturing.is_some();
+                let band: RectF = euclid::rect(
+                    content_x - unit * 1.5,
+                    y - 4. * dpi_scale,
+                    content_w + unit * 3.,
+                    line_h,
+                );
+                let row_bg = if focused {
+                    opaque(lerp_rgba(ground, sb.text_meta, 0.1))
+                } else {
+                    ground
+                };
+                if focused {
+                    self.paint_focus_ring(layers, 0, band, 10. * dpi_scale, ground)?;
+                    self.sidebar_rounded_fill(layers, 0, band, 10. * dpi_scale, row_bg)?;
+                }
+                let pending_text;
+                let (keys, fg) = match (capturing, keys) {
+                    (Some(c), _) => match &c.pending {
+                        Some(pending) => {
+                            pending_text = format!(
+                                "{} is {}: Enter replaces it",
+                                key_text(&self.config, &pending.key, pending.mods),
+                                pending.replaces
+                            );
+                            (pending_text.as_str(), accent)
+                        }
+                        None => ("Press keys\u{2026}  Esc cancels  \u{232b} none", accent),
+                    },
+                    (None, Some(keys)) => (keys.as_str(), sb.text_active),
+                    (None, None) => ("not bound", sb.text_meta),
+                };
+                let mark = if shortcut.locked {
+                    "  \u{f023}"
+                } else if shortcut.custom {
+                    "  \u{2022}"
+                } else {
+                    ""
                 };
                 let keys_w = self.chrome_text_width(keys, false).ceil() + 1.;
+                let mark_w = if mark.is_empty() {
+                    0.
+                } else {
+                    self.chrome_text_width(mark, false).ceil() + 1.
+                };
                 self.settings_text(
                     layers,
                     brief,
                     content_x,
                     y,
-                    (content_w - keys_w - unit * 2.).max(unit),
+                    (content_w - keys_w - mark_w - unit * 2.).max(unit),
                     sb.text_idle,
-                    ground,
+                    row_bg,
                     false,
                 )?;
+                if !mark.is_empty() {
+                    self.settings_text(
+                        layers,
+                        mark,
+                        content_right - keys_w - mark_w,
+                        y,
+                        mark_w,
+                        sb.text_meta,
+                        row_bg,
+                        false,
+                    )?;
+                }
                 self.settings_text(
                     layers,
                     keys,
@@ -750,22 +846,44 @@ impl TermWindow {
                     y,
                     keys_w,
                     fg,
-                    ground,
+                    row_bg,
                     false,
                 )?;
+                self.ui_items.push(UIItem {
+                    x: band.origin.x.max(0.) as usize,
+                    y: band.origin.y.max(0.) as usize,
+                    width: band.size.width as usize,
+                    height: band.size.height as usize,
+                    item_type: UIItemType::Settings(SettingsHit::Shortcut(row)),
+                });
             }
-            let footer = if state.max_scroll > 0 {
-                "Change these with config.keys in the config file. Scroll for more."
-            } else {
-                "Change these with config.keys in the config file."
+            let footer = match &state.message {
+                Some((text, _)) => text.clone(),
+                None if capture.is_some() => {
+                    "Press the new keys. Esc cancels, Backspace leaves it without keys.".to_string()
+                }
+                None => {
+                    let mut text = "Click a shortcut, or Enter on it, to change it. \
+                                    Backspace on a changed one (\u{2022}) restores the default."
+                        .to_string();
+                    if state.max_scroll > 0 {
+                        text.push_str(" Scroll for more.");
+                    }
+                    text
+                }
             };
+            let is_error = state.message.as_ref().is_some_and(|(_, error)| *error);
             self.settings_text(
                 layers,
-                footer,
+                &footer,
                 content_x,
                 footer_y,
                 right - content_x,
-                sb.text_meta,
+                if is_error {
+                    sb.text_active
+                } else {
+                    sb.text_meta
+                },
                 ground,
                 false,
             )?;
@@ -1294,6 +1412,93 @@ impl TermWindow {
         if let Some(window) = self.window.as_ref() {
             window.invalidate();
         }
+    }
+
+    /// Whether `pane` is a Settings tab with a Shortcuts row waiting for
+    /// keys. Those keys are the binding, so no key assignment may see them
+    /// first.
+    pub(crate) fn settings_capturing(&self, pane: &Arc<dyn Pane>) -> bool {
+        pane.downcast_ref::<SettingsPane>()
+            .is_some_and(|settings| settings.state.lock().capture.is_some())
+    }
+
+    /// A key pressed while a Shortcuts row captures: bind it, unbind, or
+    /// wait for Enter when the keys already do something else. `true` when
+    /// the key was taken.
+    pub(crate) fn settings_capture_key(
+        &mut self,
+        pane: &Arc<dyn Pane>,
+        key: &::window::KeyCode,
+        mods: ::window::Modifiers,
+    ) -> bool {
+        let Some(settings) = pane.downcast_ref::<SettingsPane>() else {
+            return false;
+        };
+        let mut state = settings.state.lock();
+        let Some(row) = state.capture.as_ref().map(|capture| capture.row) else {
+            return false;
+        };
+        let own = state.shortcuts.get(row).map(|row| row.action.clone());
+        let input_map = &self.input_map;
+        let outcome = state.capture_key(key, mods, |key, mods| {
+            let entry = input_map.lookup_key(key, mods, None)?;
+            if Some(&entry.action) == own.as_ref() {
+                return None;
+            }
+            Some(
+                crate::commands::derive_command_from_key_assignment(&entry.action)
+                    .map(|command| command.brief.to_string())
+                    .unwrap_or_else(|| format!("{:?}", entry.action)),
+            )
+        });
+        let entries =
+            |action: &KeyAssignment, keep: Option<(&::window::KeyCode, ::window::Modifiers)>| {
+                // The action's default keys stop working once it has keys of
+                // its own; disabled explicitly, since defaults stay otherwise.
+                let mut lines: Vec<String> = keep
+                    .map(|(key, mods)| crate::inputmap::lua_key_entry(key, mods, action))
+                    .into_iter()
+                    .collect();
+                for (default_mods, default_key, default_action) in
+                    crate::commands::CommandDef::default_key_assignments(&self.config)
+                {
+                    if &default_action != action
+                        || keep
+                            .is_some_and(|(key, mods)| *key == default_key && mods == default_mods)
+                    {
+                        continue;
+                    }
+                    lines.push(crate::inputmap::lua_key_entry(
+                        &default_key,
+                        default_mods,
+                        &KeyAssignment::DisableDefaultAssignment,
+                    ));
+                }
+                lines.dedup();
+                lines
+            };
+        use super::pane::{shortcut_tag, CaptureOutcome};
+        let (action, lines) = match &outcome {
+            CaptureOutcome::Nothing => {
+                drop(state);
+                if let Some(window) = self.window.as_ref() {
+                    window.invalidate();
+                }
+                return true;
+            }
+            CaptureOutcome::Bind { action, key, mods } => {
+                (action.clone(), entries(action, Some((key, *mods))))
+            }
+            CaptureOutcome::Unbind { action } => (action.clone(), entries(action, None)),
+        };
+        state.file = store::config_path();
+        let result = store::apply_keys(&state.file, &shortcut_tag(&action), &lines);
+        state.finish_key_write(result);
+        drop(state);
+        if let Some(window) = self.window.as_ref() {
+            window.invalidate();
+        }
+        true
     }
 }
 

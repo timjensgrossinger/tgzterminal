@@ -4,7 +4,7 @@
 //! config: a file that no longer loads never reaches disk. The first write
 //! of a run keeps the file as it was beside it (`<name>.tgz-bak`).
 
-use super::lua_edit::{self, EditError, LuaValue, PathStatus};
+use super::lua_edit::{self, EditError, KeyLine, LuaValue, PathStatus};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -129,13 +129,36 @@ fn write(path: &Path, text: &str, existed: bool) -> std::io::Result<()> {
 /// Set `key` to `value` in the config file (`None`: forget a value the
 /// Settings tab recorded), then reload the config.
 pub(crate) fn apply(file: &Path, key: &[&str], value: Option<&LuaValue>) -> Result<(), ApplyError> {
+    edit(file, |text| match value {
+        Some(value) => Ok(Some(lua_edit::set_value(text, key, value)?)),
+        None => Ok(lua_edit::unset_value(text, key)?),
+    })
+}
+
+/// Replace the key bindings Settings recorded for `tag` with `entries`
+/// (Lua tables for `config.keys`; none forgets them), then reload.
+pub(crate) fn apply_keys(file: &Path, tag: &str, entries: &[String]) -> Result<(), ApplyError> {
+    edit(file, |text| {
+        Ok(Some(lua_edit::set_key_lines(text, tag, entries)?))
+    })
+}
+
+/// The key bindings Settings recorded in the config file. `None` when the
+/// file cannot be read or edited.
+pub(crate) fn key_lines(file: &Path) -> Option<Vec<KeyLine>> {
+    let (text, _) = read(file).ok()?;
+    lua_edit::key_lines(&text).ok()
+}
+
+/// Run `change` over the config file's text and write what it returns,
+/// once that has been evaluated as a config; `None` means nothing to do.
+fn edit(
+    file: &Path,
+    change: impl FnOnce(&str) -> Result<Option<String>, ApplyError>,
+) -> Result<(), ApplyError> {
     let (text, existed) = read(file)?;
-    let edited = match value {
-        Some(value) => lua_edit::set_value(&text, key, value)?,
-        None => match lua_edit::unset_value(&text, key)? {
-            Some(edited) => edited,
-            None => return Ok(()),
-        },
+    let Some(edited) = change(&text)? else {
+        return Ok(());
     };
     if edited == text && existed {
         return Ok(());
@@ -145,4 +168,34 @@ pub(crate) fn apply(file: &Path, key: &[&str], value: Option<&LuaValue>) -> Resu
     write(file, &edited, existed).map_err(|err| ApplyError::Io(err.to_string()))?;
     config::reload();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use config::keyassignment::{KeyAssignment, PaneLayout};
+    use window::{KeyCode, Modifiers};
+
+    /// What the keys block writes loads as a config, and the bindings arrive
+    /// in `config.keys`.
+    #[test]
+    fn a_keys_block_loads_as_a_config() {
+        let entries = vec![
+            crate::inputmap::lua_key_entry(
+                &KeyCode::Char('g'),
+                Modifiers::SUPER | Modifiers::ALT,
+                &KeyAssignment::ApplyPaneLayout(PaneLayout::Grid),
+            ),
+            crate::inputmap::lua_key_entry(
+                &KeyCode::Char('5'),
+                Modifiers::SUPER | Modifiers::ALT,
+                &KeyAssignment::DisableDefaultAssignment,
+            ),
+        ];
+        let text =
+            lua_edit::set_key_lines(&lua_edit::new_file(), "ApplyPaneLayout(Grid)", &entries)
+                .unwrap();
+        config::Config::check_lua_text(Path::new("wezterm.lua"), &text)
+            .unwrap_or_else(|err| panic!("{err:#}\n{text}"));
+    }
 }

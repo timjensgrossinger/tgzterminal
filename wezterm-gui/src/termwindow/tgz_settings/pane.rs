@@ -11,8 +11,9 @@
 //! so the mouse and the keyboard cannot drift apart.
 
 use super::catalog::{in_section, Kind, Section, Value, CATALOG};
-use super::lua_edit::PathStatus;
+use super::lua_edit::{KeyLine, PathStatus};
 use super::store;
+use config::keyassignment::KeyAssignment;
 use config::Config;
 use mux::domain::DomainId;
 use mux::pane::{
@@ -56,6 +57,57 @@ pub enum SettingsHit {
     Pick(usize),
     /// Open the config file in the system's editor for it.
     OpenFile,
+    /// A row of the Shortcuts list, by its place in the list: click to give
+    /// the action a new key.
+    Shortcut(usize),
+}
+
+/// One row of the Shortcuts list, as the last paint saw it.
+#[derive(Clone, Debug)]
+pub(crate) struct ShortcutRow {
+    pub action: KeyAssignment,
+    /// Settings changed this action's keys (its lines are in the block).
+    pub custom: bool,
+    /// The config file binds the action itself, outside the block: change
+    /// it there.
+    pub locked: bool,
+}
+
+/// The tag that marks an action's lines in the keys block.
+pub(crate) fn shortcut_tag(action: &KeyAssignment) -> String {
+    format!("{action:?}")
+}
+
+/// A Shortcuts row waiting for the keys to bind.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Capture {
+    pub row: usize,
+    /// Keys already bound to something else, held until Enter confirms.
+    pub pending: Option<PendingKey>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct PendingKey {
+    pub key: ::window::KeyCode,
+    pub mods: ::window::Modifiers,
+    /// What the keys do now, as the palette names it.
+    pub replaces: String,
+}
+
+/// What a key pressed during capture asks for.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum CaptureOutcome {
+    /// Nothing to write (cancelled, waiting for confirmation, a lone
+    /// modifier).
+    Nothing,
+    /// Bind `action` to these keys in place of its current ones.
+    Bind {
+        action: KeyAssignment,
+        key: ::window::KeyCode,
+        mods: ::window::Modifiers,
+    },
+    /// Leave `action` without keys.
+    Unbind { action: KeyAssignment },
 }
 
 /// Where each catalog entry stands in the config file, and when that was
@@ -185,6 +237,12 @@ pub(crate) struct SettingsState {
     pub message: Option<(String, bool)>,
     pub file: PathBuf,
     pub statuses: Option<Statuses>,
+    /// The Shortcuts list as last painted.
+    pub shortcuts: Vec<ShortcutRow>,
+    /// The key bindings the block holds; read with `statuses`.
+    pub key_lines: Option<Vec<KeyLine>>,
+    /// A Shortcuts row waiting for its keys.
+    pub capture: Option<Capture>,
 }
 
 impl SettingsState {
@@ -199,6 +257,9 @@ impl SettingsState {
             message: None,
             file: store::config_path(),
             statuses: None,
+            shortcuts: Vec::new(),
+            key_lines: None,
+            capture: None,
         }
     }
 
@@ -268,6 +329,117 @@ impl SettingsState {
         };
         // The file changed (or did not): read where things stand again.
         self.statuses = None;
+        self.key_lines = None;
+    }
+
+    /// Start waiting for the keys of Shortcuts row `row`.
+    fn start_capture(&mut self, row: usize) {
+        let Some(shortcut) = self.shortcuts.get(row) else {
+            return;
+        };
+        self.focus = Some(row);
+        if shortcut.locked {
+            self.message = Some((
+                "Your config file binds this itself in config.keys. Change it there.".to_string(),
+                true,
+            ));
+            return;
+        }
+        self.capture = Some(Capture { row, pending: None });
+    }
+
+    /// Give Shortcuts row `row` its default keys back.
+    fn reset_shortcut(&mut self, row: usize) {
+        let Some(shortcut) = self.shortcuts.get(row) else {
+            return;
+        };
+        if !shortcut.custom {
+            return;
+        }
+        self.file = store::config_path();
+        let result = store::apply_keys(&self.file, &shortcut_tag(&shortcut.action), &[]);
+        self.finish_key_write(result);
+    }
+
+    /// Note how writing a key change went, and read the file again.
+    pub(crate) fn finish_key_write(&mut self, result: Result<(), store::ApplyError>) {
+        self.message = match result {
+            Ok(()) => None,
+            Err(err) => Some((err.message(&self.file), true)),
+        };
+        self.statuses = None;
+        self.key_lines = None;
+    }
+
+    /// A key while a Shortcuts row is capturing. `conflict` names what the
+    /// keys do now when that is something else; such keys wait for Enter.
+    pub(crate) fn capture_key(
+        &mut self,
+        key: &::window::KeyCode,
+        mods: ::window::Modifiers,
+        conflict: impl FnOnce(&::window::KeyCode, ::window::Modifiers) -> Option<String>,
+    ) -> CaptureOutcome {
+        use ::window::{KeyCode as WK, Modifiers as WM};
+        let Some(capture) = self.capture.clone() else {
+            return CaptureOutcome::Nothing;
+        };
+        if key.is_modifier() {
+            return CaptureOutcome::Nothing;
+        }
+        let Some(action) = self
+            .shortcuts
+            .get(capture.row)
+            .map(|row| row.action.clone())
+        else {
+            self.capture = None;
+            return CaptureOutcome::Nothing;
+        };
+        let mods = mods.remove_positional_mods() - WM::LEADER;
+        let plain = mods == WM::NONE;
+        let is = |c: char| matches!(key, WK::Char(k) if *k == c);
+        if plain && is('\u{1b}') {
+            // Esc backs out of a pending conflict first, then of capturing.
+            match self.capture.as_mut() {
+                Some(c) if c.pending.is_some() => c.pending = None,
+                _ => self.capture = None,
+            }
+            return CaptureOutcome::Nothing;
+        }
+        if plain && (is('\r') || is('\n')) {
+            if let Some(pending) = capture.pending {
+                self.capture = None;
+                return CaptureOutcome::Bind {
+                    action,
+                    key: pending.key,
+                    mods: pending.mods,
+                };
+            }
+        }
+        if plain && (is('\u{8}') || is('\u{7f}')) {
+            self.capture = None;
+            return CaptureOutcome::Unbind { action };
+        }
+        match conflict(key, mods) {
+            Some(replaces) => {
+                self.capture = Some(Capture {
+                    row: capture.row,
+                    pending: Some(PendingKey {
+                        key: key.clone(),
+                        mods,
+                        replaces,
+                    }),
+                });
+                CaptureOutcome::Nothing
+            }
+            None => {
+                self.capture = None;
+                CaptureOutcome::Bind {
+                    action,
+                    key: key.clone(),
+                    mods,
+                }
+            }
+        }
     }
 
     fn open_file(&mut self) {
@@ -372,7 +544,18 @@ impl SettingsState {
         {
             self.editing = None;
         }
+        if !matches!(&hit, SettingsHit::Shortcut(_)) {
+            self.capture = None;
+        }
         match hit {
+            SettingsHit::Shortcut(row) => {
+                let again = self.capture.as_ref().is_some_and(|c| c.row == row);
+                if again {
+                    self.capture = None;
+                } else {
+                    self.start_capture(row);
+                }
+            }
             SettingsHit::Section(index) => self.show_section(index),
             SettingsHit::Toggle(index) => {
                 if let Some(Value::Bool(on)) = CATALOG.get(index).map(|s| (s.get)(config)) {
@@ -407,6 +590,7 @@ impl SettingsState {
         self.scroll = 0;
         self.focus = None;
         self.editing = None;
+        self.capture = None;
     }
 
     fn step(&mut self, index: usize, direction: i8, config: &Config) {
@@ -441,9 +625,12 @@ impl SettingsState {
 
     /// Move the keyboard's row by `delta`, scrolling it into view.
     fn move_focus(&mut self, delta: isize) {
-        let count = in_section(self.current_section()).len();
+        let count = if self.current_section() == Section::Shortcuts {
+            self.shortcuts.len()
+        } else {
+            in_section(self.current_section()).len()
+        };
         if count == 0 {
-            // A list to read (Shortcuts): the arrows scroll it.
             self.scroll =
                 (self.scroll as isize + delta).clamp(0, self.max_scroll as isize) as usize;
             return;
@@ -524,6 +711,22 @@ impl SettingsState {
                 }
             }
             KeyCode::Escape => self.focus = None,
+            _ if self.current_section() == Section::Shortcuts => {
+                let Some(row) = self.focus else {
+                    return;
+                };
+                if enter || key == KeyCode::Char(' ') {
+                    self.start_capture(row);
+                } else if matches!(
+                    key,
+                    KeyCode::Backspace
+                        | KeyCode::Delete
+                        | KeyCode::Char('\u{8}')
+                        | KeyCode::Char('\u{7f}')
+                ) {
+                    self.reset_shortcut(row);
+                }
+            }
             _ => {
                 let Some(index) = focused else {
                     return;
@@ -801,6 +1004,107 @@ impl Pane for SettingsPane {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn capturing(action: KeyAssignment) -> SettingsState {
+        let mut state = SettingsState::new();
+        state.shortcuts = vec![ShortcutRow {
+            action,
+            custom: false,
+            locked: false,
+        }];
+        state.capture = Some(Capture {
+            row: 0,
+            pending: None,
+        });
+        state
+    }
+
+    #[test]
+    fn a_free_key_binds_at_once() {
+        use ::window::{KeyCode as WK, Modifiers as WM};
+        let mut state = capturing(KeyAssignment::BalancePanes);
+        let mods = WM::SUPER | WM::ALT;
+        assert_eq!(
+            state.capture_key(&WK::Char('b'), mods, |_, _| None),
+            CaptureOutcome::Bind {
+                action: KeyAssignment::BalancePanes,
+                key: WK::Char('b'),
+                mods,
+            }
+        );
+        assert!(state.capture.is_none());
+    }
+
+    #[test]
+    fn a_taken_key_waits_for_enter_and_esc_backs_out_a_step_at_a_time() {
+        use ::window::{KeyCode as WK, Modifiers as WM};
+        let mut state = capturing(KeyAssignment::BalancePanes);
+        let taken = |_: &WK, _: WM| Some("New tab".to_string());
+        assert_eq!(
+            state.capture_key(&WK::Char('t'), WM::SUPER, taken),
+            CaptureOutcome::Nothing
+        );
+        assert_eq!(
+            state
+                .capture
+                .as_ref()
+                .and_then(|c| c.pending.as_ref())
+                .map(|p| p.replaces.as_str()),
+            Some("New tab")
+        );
+        // Esc drops the pending keys but keeps listening.
+        state.capture_key(&WK::Char('\u{1b}'), WM::NONE, |_, _| None);
+        assert_eq!(
+            state.capture,
+            Some(Capture {
+                row: 0,
+                pending: None
+            })
+        );
+        state.capture_key(&WK::Char('t'), WM::SUPER, taken);
+        assert_eq!(
+            state.capture_key(&WK::Char('\r'), WM::NONE, |_, _| None),
+            CaptureOutcome::Bind {
+                action: KeyAssignment::BalancePanes,
+                key: WK::Char('t'),
+                mods: WM::SUPER,
+            }
+        );
+        // A second Esc on a fresh capture stops capturing.
+        let mut state = capturing(KeyAssignment::BalancePanes);
+        state.capture_key(&WK::Char('\u{1b}'), WM::NONE, |_, _| None);
+        assert!(state.capture.is_none());
+    }
+
+    #[test]
+    fn backspace_unbinds_and_a_lone_modifier_is_ignored() {
+        use ::window::{KeyCode as WK, Modifiers as WM};
+        let mut state = capturing(KeyAssignment::BalancePanes);
+        assert_eq!(
+            state.capture_key(&WK::Shift, WM::SHIFT, |_, _| None),
+            CaptureOutcome::Nothing
+        );
+        assert!(state.capture.is_some());
+        assert_eq!(
+            state.capture_key(&WK::Char('\u{8}'), WM::NONE, |_, _| None),
+            CaptureOutcome::Unbind {
+                action: KeyAssignment::BalancePanes
+            }
+        );
+    }
+
+    #[test]
+    fn a_locked_row_does_not_capture() {
+        let mut state = SettingsState::new();
+        state.shortcuts = vec![ShortcutRow {
+            action: KeyAssignment::BalancePanes,
+            custom: false,
+            locked: true,
+        }];
+        state.start_capture(0);
+        assert!(state.capture.is_none());
+        assert!(state.message.as_ref().is_some_and(|(_, error)| *error));
+    }
 
     fn names(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()

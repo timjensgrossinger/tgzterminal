@@ -778,6 +778,13 @@ fn lua_key(key: &KeyCode, mods: Modifiers, action: &KeyAssignment) -> String {
     format!("{{ key = {key}, mods = '{mods}', action = {action} }}")
 }
 
+/// One `config.keys` entry as Lua that stands on its own: the action is
+/// reached through `require('wezterm').action` rather than an `act` local
+/// the config file may not have. For the Settings tab's keys block.
+pub(crate) fn lua_key_entry(key: &KeyCode, mods: Modifiers, action: &KeyAssignment) -> String {
+    lua_key(key, mods, action).replacen("action = act.", "action = require('wezterm').action.", 1)
+}
+
 fn show_key_table(table: &config::keyassignment::KeyTable) {
     let ordered = table.iter().collect::<BTreeMap<_, _>>();
 
@@ -807,5 +814,34 @@ fn show_key_table_as_lua(table: &config::keyassignment::KeyTable, indent: usize)
     for ((key, mods), entry) in ordered {
         let action = &entry.action;
         println!("{pad}{},", lua_key(key, *mods, action));
+    }
+}
+
+#[cfg(test)]
+mod lua_key_entry_tests {
+    use super::*;
+    use config::keyassignment::PaneLayout;
+
+    #[test]
+    fn an_entry_needs_no_act_local() {
+        let entry = lua_key_entry(
+            &KeyCode::Char('5'),
+            Modifiers::SUPER | Modifiers::ALT,
+            &KeyAssignment::ApplyPaneLayout(PaneLayout::Grid),
+        );
+        assert!(entry.starts_with("{ key = '5', mods = '"), "{entry}");
+        assert!(
+            entry.ends_with("action = require('wezterm').action.ApplyPaneLayout 'Grid' }"),
+            "{entry}"
+        );
+        let entry = lua_key_entry(
+            &KeyCode::Char('b'),
+            Modifiers::SUPER,
+            &KeyAssignment::DisableDefaultAssignment,
+        );
+        assert!(
+            entry.ends_with("action = require('wezterm').action.DisableDefaultAssignment }"),
+            "{entry}"
+        );
     }
 }

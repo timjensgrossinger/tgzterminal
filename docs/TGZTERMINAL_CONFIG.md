@@ -15,9 +15,23 @@ On/off settings are switches, filled with the accent only while on. Colours
 holds one field per `sidebar_colors` key, plus the New Tab style: type a
 colour such as `#58a6ff` and Enter; a swatch shows it beside the field, and
 clearing the field goes back to the theme's colour (an empty field reads
-"Default"). A last section, Shortcuts, lists the fork's key bindings as
-they are bound right now; it is read-only, since bindings are changed with
-`config.keys`.
+"Default"). A last section, Shortcuts, lists the fork's actions, every pane
+layout preset and each `tgz_layouts` entry with the keys bound to them right
+now. Click a row (or `Enter` on it) and press the new keys: they are bound at
+once, unless they already do something else, in which case the row names
+that and `Enter` confirms. `Backspace` while it waits leaves the action
+without keys; `Backspace` on a changed row (marked `•`) restores the
+default. The new keys replace the action's default ones (written as
+`DisableDefaultAssignment` entries). A row your config already binds in its
+own `config.keys` shows a lock and is changed there instead.
+
+The bindings go into the managed block, one line per binding, tagged with the
+action so the next change replaces exactly those lines:
+
+```lua
+config.keys = config.keys or {}
+table.insert(config.keys, { key = 'g', mods = 'ALT|SUPER', action = require('wezterm').action.ApplyPaneLayout 'Grid' }) -- tgz-key: ApplyPaneLayout(Grid)
+```
 
 Font and colour scheme open a list: every installed font family (gathered in
 the background the first time), or every colour scheme, yours and the
