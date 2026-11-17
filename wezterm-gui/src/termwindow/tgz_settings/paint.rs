@@ -219,7 +219,7 @@ fn value_text(setting: &Setting, value: &Value) -> String {
                 text.to_string()
             }
         }
-        LuaValue::Str(s) | LuaValue::Font(s) => s,
+        LuaValue::Str(s) | LuaValue::Font(s) | LuaValue::Raw(s) => s,
     }
 }
 
@@ -719,6 +719,334 @@ impl TermWindow {
         let content_right = content_x + content_w;
         let body_h = footer_y - cell_h * 0.5 - body_top;
 
+        // Layouts: the user's own `tgz_layouts`, as a list and a form.
+        if section == Section::Layouts {
+            use super::layouts::{start_in_label, DraftField, START_IN};
+            use super::pane::LayoutHit;
+            use config::keyassignment::PaneLayout;
+            if state.layouts_lock.is_none() {
+                let status = store::statuses(&state.file, &[super::layouts::PATH])
+                    .and_then(|all| all.into_iter().next());
+                state.layouts_lock = Some(match status {
+                    Some(PathStatus::Locked { line }) | Some(PathStatus::InPlace { line }) => {
+                        Some(line)
+                    }
+                    _ => None,
+                });
+            }
+            let locked = state.layouts_lock.flatten();
+            let control_h = (cell_h + 6. * dpi_scale).ceil();
+            let line_h = (control_h + 8. * dpi_scale).ceil();
+            let text_dy = (control_h - cell_h) * 0.5;
+            let field_w = (content_w * 0.55).max(unit * 20.).min(content_w);
+            let hovered = self
+                .last_ui_item
+                .as_ref()
+                .map(|item| item.item_type.clone());
+            let max_y = footer_y - cell_h * 0.5;
+            let field_text = |this: &Self, text: &str, typing: bool, placeholder: &str| {
+                if typing {
+                    (
+                        format!(
+                            "{}|",
+                            this.chrome_elide_start(text, field_w - unit * 3., false)
+                        ),
+                        false,
+                    )
+                } else if text.is_empty() {
+                    (placeholder.to_string(), true)
+                } else {
+                    (
+                        this.chrome_elide_start(text, field_w - unit * 3., false),
+                        false,
+                    )
+                }
+            };
+            let field = |label: String, dim: bool, hit: LayoutHit, width: f32| Segment {
+                label,
+                selected: false,
+                hit: Some(SettingsHit::Layout(hit)),
+                min_px: width - (SEGMENT_PAD * dpi_scale).round() * 2.,
+                dim,
+            };
+
+            match state.draft.clone() {
+                None => {
+                    let layouts = self.config.tgz_layouts.clone();
+                    state.layout_rows = layouts.len() + 1;
+                    if state.focus.is_some_and(|row| row >= state.layout_rows) {
+                        state.focus = None;
+                    }
+                    for row in 0..=layouts.len() {
+                        let y = body_top + row as f32 * line_h;
+                        if y + line_h > max_y {
+                            break;
+                        }
+                        let (hit, name, detail) = match layouts.get(row) {
+                            Some(layout) => {
+                                let mut detail = format!(
+                                    "{} \u{b7} {} {}",
+                                    layout.layout.label(),
+                                    layout.panes.len(),
+                                    if layout.panes.len() == 1 {
+                                        "pane"
+                                    } else {
+                                        "panes"
+                                    }
+                                );
+                                if let Some(keys) = self.settings_shortcut_text(
+                                    &KeyAssignment::OpenPaneLayout(layout.name.clone()),
+                                ) {
+                                    detail.push_str(&format!(" \u{b7} {keys}"));
+                                }
+                                (LayoutHit::Open(row), layout.name.clone(), detail)
+                            }
+                            None => (LayoutHit::New, "+ New layout".to_string(), String::new()),
+                        };
+                        let band: RectF = euclid::rect(
+                            content_x - unit * 1.5,
+                            y - 4. * dpi_scale,
+                            content_w + unit * 3.,
+                            line_h,
+                        );
+                        let item_type = UIItemType::Settings(SettingsHit::Layout(hit.clone()));
+                        let focused = state.focus == Some(row);
+                        let row_bg = if focused || hovered.as_ref() == Some(&item_type) {
+                            opaque(lerp_rgba(ground, sb.text_meta, 0.1))
+                        } else {
+                            ground
+                        };
+                        if focused {
+                            self.paint_focus_ring(layers, 0, band, 10. * dpi_scale, ground)?;
+                        }
+                        if row_bg != ground {
+                            self.sidebar_rounded_fill(layers, 0, band, 10. * dpi_scale, row_bg)?;
+                        }
+                        let detail_w = self.chrome_text_width(&detail, false).ceil() + 1.;
+                        self.settings_text(
+                            layers,
+                            &name,
+                            content_x,
+                            y + text_dy,
+                            (content_w - detail_w - unit * 2.).max(unit),
+                            if hit == LayoutHit::New {
+                                accent
+                            } else {
+                                sb.text_active
+                            },
+                            row_bg,
+                            false,
+                        )?;
+                        if !detail.is_empty() {
+                            self.settings_text(
+                                layers,
+                                &detail,
+                                content_right - detail_w,
+                                y + text_dy,
+                                detail_w,
+                                sb.text_meta,
+                                row_bg,
+                                false,
+                            )?;
+                        }
+                        self.ui_items.push(UIItem {
+                            x: band.origin.x.max(0.) as usize,
+                            y: band.origin.y.max(0.) as usize,
+                            width: band.size.width as usize,
+                            height: band.size.height as usize,
+                            item_type,
+                        });
+                    }
+                }
+                Some(draft) => {
+                    let mut y = body_top;
+                    let typing = draft.typing;
+                    // Name.
+                    self.settings_text(
+                        layers,
+                        "Name",
+                        content_x,
+                        y + text_dy,
+                        content_w - field_w,
+                        sb.text_active,
+                        ground,
+                        false,
+                    )?;
+                    let (label, dim) =
+                        field_text(self, &draft.name, typing == Some(DraftField::Name), "Name");
+                    self.paint_settings_segments(
+                        layers,
+                        content_right,
+                        y,
+                        &[field(
+                            label,
+                            dim,
+                            LayoutHit::Field(DraftField::Name),
+                            field_w,
+                        )],
+                        ground,
+                    )?;
+                    y += line_h;
+                    // Arrangement.
+                    self.settings_text(
+                        layers,
+                        "Arrangement",
+                        content_x,
+                        y + text_dy,
+                        unit * 14.,
+                        sb.text_active,
+                        ground,
+                        false,
+                    )?;
+                    let presets: Vec<Segment> = PaneLayout::ALL
+                        .iter()
+                        .enumerate()
+                        .map(|(i, layout)| Segment {
+                            selected: *layout == draft.layout,
+                            ..Segment::button(
+                                layout.label(),
+                                SettingsHit::Layout(LayoutHit::Preset(i)),
+                            )
+                        })
+                        .collect();
+                    self.paint_settings_segments(layers, content_right, y, &presets, ground)?;
+                    y += line_h;
+                    // Starts in.
+                    self.settings_text(
+                        layers,
+                        "Starts in",
+                        content_x,
+                        y + text_dy,
+                        unit * 14.,
+                        sb.text_active,
+                        ground,
+                        false,
+                    )?;
+                    let starts: Vec<Segment> = START_IN
+                        .iter()
+                        .enumerate()
+                        .map(|(i, cwd)| Segment {
+                            selected: *cwd == draft.cwd,
+                            ..Segment::button(
+                                start_in_label(cwd),
+                                SettingsHit::Layout(LayoutHit::StartIn(i)),
+                            )
+                        })
+                        .collect();
+                    self.paint_settings_segments(layers, content_right, y, &starts, ground)?;
+                    y += line_h;
+                    // Panes, one command line each.
+                    let remove_w = (control_h + 2.).ceil();
+                    for (i, (line, _)) in draft.panes.iter().enumerate() {
+                        if y + line_h * 2. > max_y {
+                            break;
+                        }
+                        let label = if i == 0 {
+                            "Pane 1 (main)".to_string()
+                        } else {
+                            format!("Pane {}", i + 1)
+                        };
+                        self.settings_text(
+                            layers,
+                            &label,
+                            content_x,
+                            y + text_dy,
+                            content_w - field_w,
+                            sb.text_idle,
+                            ground,
+                            false,
+                        )?;
+                        let (text, dim) =
+                            field_text(self, line, typing == Some(DraftField::Pane(i)), "shell");
+                        self.paint_settings_segments(
+                            layers,
+                            content_right,
+                            y,
+                            &[
+                                field(
+                                    text,
+                                    dim,
+                                    LayoutHit::Field(DraftField::Pane(i)),
+                                    field_w - remove_w,
+                                ),
+                                Segment::button(
+                                    "\u{d7}",
+                                    SettingsHit::Layout(LayoutHit::RemovePane(i)),
+                                ),
+                            ],
+                            ground,
+                        )?;
+                        y += line_h;
+                    }
+                    self.paint_settings_segments(
+                        layers,
+                        content_right,
+                        y,
+                        &[Segment::button(
+                            "+ Add pane",
+                            SettingsHit::Layout(LayoutHit::AddPane),
+                        )],
+                        ground,
+                    )?;
+                    y += line_h * 1.5;
+                    let mut actions = Vec::new();
+                    if draft.original.is_some() {
+                        actions.push(Segment::button(
+                            "Delete",
+                            SettingsHit::Layout(LayoutHit::Delete),
+                        ));
+                    }
+                    actions.push(Segment::button(
+                        "Cancel",
+                        SettingsHit::Layout(LayoutHit::Cancel),
+                    ));
+                    actions.push(Segment {
+                        selected: true,
+                        ..Segment::button("Save", SettingsHit::Layout(LayoutHit::Save))
+                    });
+                    self.paint_settings_segments(
+                        layers,
+                        content_right,
+                        y.min(max_y - control_h),
+                        &actions,
+                        ground,
+                    )?;
+                }
+            }
+
+            let footer = match (&state.message, locked) {
+                (Some((text, _)), _) => text.clone(),
+                (None, Some(line)) => format!(
+                    "Your config sets tgz_layouts itself on line {line}; change them there."
+                ),
+                (None, None) if state.draft.is_some() => {
+                    "Each pane runs its command; empty is a shell. Enter saves, Esc leaves."
+                        .to_string()
+                }
+                (None, None) => {
+                    "Layouts open as a new tab from the Layouts button. Bind keys under Shortcuts."
+                        .to_string()
+                }
+            };
+            let is_error =
+                state.message.as_ref().is_some_and(|(_, error)| *error) || locked.is_some();
+            self.settings_text(
+                layers,
+                &footer,
+                content_x,
+                footer_y,
+                right - content_x,
+                if is_error {
+                    sb.text_active
+                } else {
+                    sb.text_meta
+                },
+                ground,
+                false,
+            )?;
+            return Ok(());
+        }
+
         // Shortcuts: click a row (or Enter on it) and press the new keys.
         if section == Section::Shortcuts {
             if state.key_lines.is_none() {
@@ -1017,6 +1345,34 @@ impl TermWindow {
             })
         });
 
+        // A colour field's grid of swatches, placed like the list above.
+        let swatch_grid = state.editing.as_ref().and_then(|editing| {
+            let highlighted = editing.swatch?;
+            let slot = rows
+                .iter()
+                .skip(first_row)
+                .take(visible)
+                .position(|index| *index == editing.index)?;
+            let swatches = super::catalog::color_swatches();
+            let columns = super::catalog::SWATCH_COLUMNS;
+            let grid_rows = swatches.len().div_ceil(columns);
+            let cell = ((field_w - popup_pad * 2.) / columns as f32)
+                .min(30. * dpi_scale)
+                .max(14. * dpi_scale)
+                .floor();
+            let w = cell * columns as f32 + popup_pad * 2.;
+            let h = cell * grid_rows as f32 + popup_pad * 2.;
+            let field_y = control_y_of(slot);
+            let below = field_y + control_h + popup_pad;
+            let y = if below + h <= area.max_y() - popup_pad {
+                below
+            } else {
+                (field_y - popup_pad - h).max(area.origin.y + popup_pad)
+            };
+            let rect: RectF = euclid::rect(content_right - w, y, w, h);
+            Some((rect, cell, swatches, highlighted))
+        });
+
         for (slot, index) in rows.iter().skip(state.scroll).take(visible).enumerate() {
             let setting = &CATALOG[*index];
             let k = state.scroll + slot;
@@ -1082,10 +1438,11 @@ impl TermWindow {
                 .as_ref()
                 .is_some_and(|editing| editing.index == *index);
             // Under the open list: its control would show through.
+            let covered =
+                |rect: &RectF| control_y < rect.max_y() && control_y + control_h > rect.origin.y;
             if !editing_this
-                && popup.as_ref().is_some_and(|popup| {
-                    control_y < popup.rect.max_y() && control_y + control_h > popup.rect.origin.y
-                })
+                && (popup.as_ref().is_some_and(|popup| covered(&popup.rect))
+                    || swatch_grid.as_ref().is_some_and(|(rect, ..)| covered(rect)))
             {
                 continue;
             }
@@ -1365,9 +1722,73 @@ impl TermWindow {
             }
         }
 
+        if let Some((rect, cell, swatches, highlighted)) = &swatch_grid {
+            let surface = opaque(lerp_rgba(ground, sb.text_meta, 0.14));
+            let stroke = dpi_scale.round().max(1.);
+            self.sidebar_rounded_fill(
+                layers,
+                0,
+                *rect,
+                8. * dpi_scale,
+                opaque(lerp_rgba(ground, sb.text_meta, 0.45)),
+            )?;
+            self.sidebar_rounded_fill(
+                layers,
+                0,
+                euclid::rect(
+                    rect.origin.x + stroke,
+                    rect.origin.y + stroke,
+                    rect.size.width - stroke * 2.,
+                    rect.size.height - stroke * 2.,
+                ),
+                (8. * dpi_scale - stroke).max(0.),
+                surface,
+            )?;
+            let columns = super::catalog::SWATCH_COLUMNS;
+            let inset = (2. * dpi_scale).round().max(1.);
+            for (at, hex) in swatches.iter().enumerate() {
+                let Ok(color) = config::RgbaColor::try_from(hex.clone()) else {
+                    continue;
+                };
+                let x = rect.origin.x + popup_pad + (at % columns) as f32 * cell;
+                let y = rect.origin.y + popup_pad + (at / columns) as f32 * cell;
+                let item_type = UIItemType::Settings(SettingsHit::Swatch(at));
+                let lit = at == *highlighted || hovered.as_ref() == Some(&item_type);
+                if lit {
+                    // A ring in the accent, then the colour inside it.
+                    self.sidebar_rounded_fill(
+                        layers,
+                        0,
+                        euclid::rect(x, y, *cell, *cell),
+                        5. * dpi_scale,
+                        accent,
+                    )?;
+                }
+                let pad = if lit { inset * 2. } else { inset };
+                self.sidebar_rounded_fill(
+                    layers,
+                    0,
+                    euclid::rect(x + pad, y + pad, cell - pad * 2., cell - pad * 2.),
+                    (4. * dpi_scale).min((cell - pad * 2.) * 0.5),
+                    color.to_linear(),
+                )?;
+                self.ui_items.push(UIItem {
+                    x: x as usize,
+                    y: y as usize,
+                    width: *cell as usize,
+                    height: *cell as usize,
+                    item_type,
+                });
+            }
+        }
+
         let footer = match &state.message {
             Some((text, _)) => text.clone(),
             None if !editable => store::ApplyError::Shape.message(&state.file),
+            None if swatch_grid.is_some() => {
+                "Click a colour, or \u{2190}\u{2191}\u{2192}\u{2193} and Enter. Type #rrggbb for any other; clear the field for the default."
+                    .to_string()
+            }
             None if popup.is_some() => {
                 "Type to filter    \u{2191}\u{2193} choose    Enter takes it    Esc cancels"
                     .to_string()

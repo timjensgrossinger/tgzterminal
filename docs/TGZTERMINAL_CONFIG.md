@@ -12,10 +12,21 @@ window opacity), grouped as Appearance, Colours, Sidebar, Agents, Worktree,
 Changes, Input and Privacy; long sections are split by small headings
 (Agents ends with **Animations**, one switch per `agent_ui.animations` key).
 On/off settings are switches, filled with the accent only while on. Colours
-holds one field per `sidebar_colors` key, plus the New Tab style: type a
-colour such as `#58a6ff` and Enter; a swatch shows it beside the field, and
+holds one field per `sidebar_colors` key, plus the New Tab style. Opening a
+colour field shows a grid of swatches (eight hues in five shades, and greys):
+click one, or walk the grid with the arrows and press Enter. Any other colour
+can still be typed, such as `#58a6ff`; a swatch shows it beside the field, and
 clearing the field goes back to the theme's colour (an empty field reads
-"Default"). A last section, Shortcuts, lists the fork's actions, every pane
+"Default").
+
+**Layouts** lists your own `tgz_layouts` and edits them in a form: name,
+arrangement (one of the six presets), where the panes start (the active
+pane's folder or its project root), and one command line per pane (empty is
+a shell; the first pane takes the main slot). Save writes the whole list as
+`config.tgz_layouts = { … }` into the managed block; fields the form does not
+show (a pane's `cwd`, `domain`, `label`, environment) are kept. Renaming or
+deleting a layout moves or drops the key bound to it under Shortcuts. A file
+that sets `tgz_layouts` itself keeps it: the section says on which line. A last section, Shortcuts, lists the fork's actions, every pane
 layout preset and each `tgz_layouts` entry with the keys bound to them right
 now. Click a row (or `Enter` on it) and press the new keys: they are bound at
 once, unless they already do something else, in which case the row names
@@ -111,7 +122,7 @@ config.sidebar_scroll_bar = true
 | `sidebar_width_px` | int px | `400` | Calibrated for 2x; scaled by display density (see below). Floored at `sidebar_collapsed_width_px`. |
 | `sidebar_collapsed_width_px` | int px | `48` | Also the reserved width under `sidebar_auto_hide`, where it is forced to at least 48. |
 | `sidebar_auto_hide` | bool | `true` | Reserves only the collapsed width and expands the sidebar as an overlay on hover. The in-app toggle persists to `tgz-ui-state.json` and then takes precedence over this key. |
-| `sidebar_position` | enum | `"Left"` | `"Left"`, `"Right"` |
+| `sidebar_position` | enum | `"Left"` | `"Left"`, `"Right"`. With `"Right"` the terminal scroll bar moves to the left of the panes, so it is never drawn over the sidebar. |
 | `sidebar_theme` | enum | `"Auto"` (`"Brand"` in a build with a brand palette) | `"Auto"`, `"Modern"`, `"FollowColorScheme"`, `"Brand"`. `Auto` derives the sidebar from `colors.tab_bar` when the scheme defines it, else from `colors.background` + `colors.foreground`, else uses the fork's near-black palette. `Modern` pins that near-black palette regardless of the scheme. `Brand` pins the chrome of the brand this binary was compiled with: dark base tinted with `BRAND_NEUTRAL`, `BRAND_ACCENT` for active/focus, `BRAND_ATTENTION` for attention. Every variant is chrome only — terminal colours are never touched. See [Build flavours](#build-flavours). |
 | `sidebar_tab_density` | enum | `"Comfortable"` | `"Comfortable"`, `"Compact"`. `Compact` also suppresses the metadata sub-line entirely. |
 | `sidebar_new_tab_style` | enum | `"Filled"` | `"Filled"`: `+ New Tab` is the one filled button of the sidebar, in `sidebar_colors.new_tab` (default: the accent). `"Plain"`: drawn like the footer's other buttons. Either way the bound shortcut (`⌘T`) shows at its right when there is room. Also in Settings → Colours. |

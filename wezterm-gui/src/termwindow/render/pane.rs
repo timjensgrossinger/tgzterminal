@@ -261,13 +261,7 @@ impl crate::TermWindow {
             None
         };
         if let Some(geometry) = scroll_bar {
-            let config = &self.config;
-            let padding = self.effective_right_padding(&config);
-
-            let thumb_x = self
-                .dimensions
-                .pixel_width
-                .saturating_sub(padding + border.right.get() + self.diff_panel_right_reserved());
+            let (thumb_x, padding) = self.scroll_bar_gutter();
             let (hit_top, hit_height) = geometry.thumb_hit();
 
             // Register the scroll bar location

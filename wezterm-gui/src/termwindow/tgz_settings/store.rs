@@ -152,7 +152,7 @@ pub(crate) fn key_lines(file: &Path) -> Option<Vec<KeyLine>> {
 
 /// Run `change` over the config file's text and write what it returns,
 /// once that has been evaluated as a config; `None` means nothing to do.
-fn edit(
+pub(crate) fn edit(
     file: &Path,
     change: impl FnOnce(&str) -> Result<Option<String>, ApplyError>,
 ) -> Result<(), ApplyError> {

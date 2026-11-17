@@ -30,12 +30,14 @@ pub(crate) enum Section {
     Privacy,
     /// Buttons of the user's own for the sidebar footer (`sidebar_buttons`).
     Buttons,
-    /// The fork's key bindings, to read: they are changed with `config.keys`.
+    /// The user's own pane layouts (`tgz_layouts`), in a form.
+    Layouts,
+    /// The fork's key bindings: click one to rebind it.
     Shortcuts,
 }
 
 impl Section {
-    pub(crate) const ALL: [Section; 11] = [
+    pub(crate) const ALL: [Section; 12] = [
         Section::Appearance,
         Section::Colors,
         Section::Sidebar,
@@ -46,6 +48,7 @@ impl Section {
         Section::Input,
         Section::Privacy,
         Section::Buttons,
+        Section::Layouts,
         Section::Shortcuts,
     ];
 
@@ -61,6 +64,7 @@ impl Section {
             Section::Input => "Input",
             Section::Privacy => "Privacy",
             Section::Buttons => "Buttons",
+            Section::Layouts => "Layouts",
             Section::Shortcuts => "Shortcuts",
         }
     }
@@ -275,6 +279,45 @@ pub(crate) fn color_hex(color: Option<config::RgbaColor>) -> String {
 /// Whether `text` is a colour the config would accept.
 pub(crate) fn is_color(text: &str) -> bool {
     config::RgbaColor::try_from(text.trim().to_string()).is_ok()
+}
+
+/// Columns of the colour picker's grid: one per hue.
+pub(crate) const SWATCH_COLUMNS: usize = 8;
+
+/// The colour picker's swatches, row by row: eight hues from light to dark
+/// in five rows, then a row of greys from white to black. `#rrggbb`.
+pub(crate) fn color_swatches() -> Vec<String> {
+    const HUES: [f32; SWATCH_COLUMNS] = [0., 28., 48., 140., 180., 210., 255., 315.];
+    const LIGHTNESS: [f32; 5] = [0.85, 0.72, 0.58, 0.44, 0.30];
+    let mut out = Vec::with_capacity(HUES.len() * (LIGHTNESS.len() + 1));
+    for l in LIGHTNESS {
+        for h in HUES {
+            out.push(hsl_hex(h, 0.72, l));
+        }
+    }
+    for step in 0..SWATCH_COLUMNS {
+        let v = 1. - step as f32 / (SWATCH_COLUMNS - 1) as f32;
+        out.push(hsl_hex(0., 0., v));
+    }
+    out
+}
+
+/// HSL (hue in degrees, saturation and lightness 0..=1) as `#rrggbb`.
+fn hsl_hex(h: f32, s: f32, l: f32) -> String {
+    let c = (1. - (2. * l - 1.).abs()) * s;
+    let hp = h.rem_euclid(360.) / 60.;
+    let x = c * (1. - (hp % 2. - 1.).abs());
+    let (r, g, b) = match hp as u32 {
+        0 => (c, x, 0.),
+        1 => (x, c, 0.),
+        2 => (0., c, x),
+        3 => (0., x, c),
+        4 => (x, 0., c),
+        _ => (c, 0., x),
+    };
+    let m = l - c / 2.;
+    let byte = |v: f32| ((v + m).clamp(0., 1.) * 255.).round() as u8;
+    format!("#{:02x}{:02x}{:02x}", byte(r), byte(g), byte(b))
 }
 
 /// One field of a button of the user's own. The Settings tab has room for
@@ -1019,7 +1062,84 @@ pub(crate) fn in_section(section: Section) -> Vec<usize> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::lua_edit;
     use super::*;
+
+    #[test]
+    fn the_colour_grid_is_full_rows_of_valid_colours() {
+        let swatches = color_swatches();
+        assert_eq!(swatches.len() % SWATCH_COLUMNS, 0);
+        assert!(swatches.iter().all(|s| is_color(s)), "{swatches:?}");
+        let mut unique = swatches.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), swatches.len());
+        // Greys run white to black on the last row.
+        assert_eq!(swatches[swatches.len() - SWATCH_COLUMNS], "#ffffff");
+        assert_eq!(swatches[swatches.len() - 1], "#000000");
+        assert_eq!(hsl_hex(0., 1., 0.5), "#ff0000");
+        assert_eq!(hsl_hex(120., 1., 0.5), "#00ff00");
+    }
+
+    /// Writes one config file per setting and value the Settings tab can
+    /// write, into `$TGZ_SETTINGS_SMOKE_DIR`, for a smoke run that loads
+    /// each into a live window (a reload must never hang or crash it).
+    /// `cargo test -p wezterm-gui dump_settings_smoke_cases -- --ignored`
+    #[test]
+    #[ignore]
+    fn dump_settings_smoke_cases() {
+        let Some(dir) = std::env::var_os("TGZ_SETTINGS_SMOKE_DIR") else {
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let defaults = Config::default_config();
+        let mut written = 0;
+        for (index, setting) in CATALOG.iter().enumerate() {
+            let current = (setting.get)(&defaults);
+            let values: Vec<Value> = match (setting.kind, &current) {
+                (Kind::Toggle, Value::Bool(on)) => vec![Value::Bool(!on), Value::Bool(*on)],
+                (Kind::Choice(variants), _) => variants()
+                    .iter()
+                    .map(|v| Value::Text(v.to_string()))
+                    .collect(),
+                (
+                    Kind::Int {
+                        min, max, scale, ..
+                    },
+                    _,
+                ) => {
+                    let lo = min.max(i64::MIN / scale.max(1));
+                    vec![Value::Int(lo), Value::Int(max), current.clone()]
+                }
+                (Kind::Float { min, max, .. }, _) => {
+                    vec![Value::Float(min), Value::Float(max), current.clone()]
+                }
+                (Kind::Color, _) => vec![
+                    Value::Text("#ff3366".into()),
+                    Value::Text("not a colour".into()),
+                ],
+                (Kind::Font, _) => vec![Value::Text("Menlo".into())],
+                (Kind::Scheme, _) => vec![Value::Text("Dracula".into())],
+                (Kind::Text, _) => vec![Value::Text("x".into()), Value::Text(String::new())],
+                _ => vec![current.clone()],
+            };
+            for (v, value) in values.iter().enumerate() {
+                let text = match lua_edit::set_value(
+                    &lua_edit::new_file(),
+                    setting.path,
+                    &setting.to_lua(value),
+                ) {
+                    Ok(text) => text,
+                    Err(err) => panic!("{:?}: {err:?}", setting.path),
+                };
+                let name = format!("{index:03}-{v}-{}.lua", setting.path.join("."));
+                std::fs::write(dir.join(name), text).unwrap();
+                written += 1;
+            }
+        }
+        eprintln!("wrote {written} cases to {}", dir.display());
+    }
 
     #[test]
     fn colour_fields_show_hex_and_accept_only_colours() {
@@ -1100,10 +1220,10 @@ mod tests {
         paths.dedup();
         assert_eq!(paths.len(), CATALOG.len());
         for section in Section::ALL {
-            // Shortcuts lists key bindings, not settings.
+            // Shortcuts and Layouts are lists of their own, not settings.
             assert_eq!(
                 in_section(section).is_empty(),
-                section == Section::Shortcuts,
+                matches!(section, Section::Shortcuts | Section::Layouts),
                 "{:?}",
                 section
             );

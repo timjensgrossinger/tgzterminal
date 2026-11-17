@@ -11,7 +11,8 @@
 //! so the mouse and the keyboard cannot drift apart.
 
 use super::catalog::{in_section, Kind, Section, Value, CATALOG};
-use super::lua_edit::{KeyLine, PathStatus};
+use super::layouts::{self, DraftField, LayoutDraft};
+use super::lua_edit::{self, KeyLine, LuaValue, PathStatus};
 use super::store;
 use config::keyassignment::KeyAssignment;
 use config::Config;
@@ -55,11 +56,34 @@ pub enum SettingsHit {
     Field(usize),
     /// An entry of the open picker, by its place among the matches.
     Pick(usize),
+    /// A swatch of the open colour grid, by index into `color_swatches`.
+    Swatch(usize),
+    /// A control of the Layouts section.
+    Layout(LayoutHit),
     /// Open the config file in the system's editor for it.
     OpenFile,
     /// A row of the Shortcuts list, by its place in the list: click to give
     /// the action a new key.
     Shortcut(usize),
+}
+
+/// A control of the Layouts section.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LayoutHit {
+    /// Edit `tgz_layouts[i]`.
+    Open(usize),
+    New,
+    /// Type into a field of the form.
+    Field(DraftField),
+    /// Choose `PaneLayout::ALL[i]`.
+    Preset(usize),
+    /// Choose `layouts::START_IN[i]`.
+    StartIn(usize),
+    RemovePane(usize),
+    AddPane,
+    Save,
+    Cancel,
+    Delete,
 }
 
 /// One row of the Shortcuts list, as the last paint saw it.
@@ -134,6 +158,8 @@ pub(crate) struct Editing {
     pub index: usize,
     pub buffer: String,
     pub picker: Option<Picker>,
+    /// A colour field's grid of swatches is open; the highlighted one.
+    pub swatch: Option<usize>,
 }
 
 impl Editing {
@@ -243,6 +269,13 @@ pub(crate) struct SettingsState {
     pub key_lines: Option<Vec<KeyLine>>,
     /// A Shortcuts row waiting for its keys.
     pub capture: Option<Capture>,
+    /// The layout open in the Layouts form.
+    pub draft: Option<LayoutDraft>,
+    /// Where the file sets `tgz_layouts` itself (outside the block): read
+    /// with `statuses`. `Some(None)`: the form may write it.
+    pub layouts_lock: Option<Option<usize>>,
+    /// Rows of the Layouts list as last painted (layouts and "New").
+    pub layout_rows: usize,
 }
 
 impl SettingsState {
@@ -260,6 +293,9 @@ impl SettingsState {
             shortcuts: Vec::new(),
             key_lines: None,
             capture: None,
+            draft: None,
+            layouts_lock: None,
+            layout_rows: 0,
         }
     }
 
@@ -330,6 +366,177 @@ impl SettingsState {
         // The file changed (or did not): read where things stand again.
         self.statuses = None;
         self.key_lines = None;
+        self.layouts_lock = None;
+    }
+
+    /// A control of the Layouts section.
+    fn layout_hit(&mut self, hit: LayoutHit, config: &Config) {
+        if let Some(Some(line)) = self.layouts_lock {
+            if hit != LayoutHit::Cancel {
+                self.message = Some((
+                    format!(
+                        "Your config sets tgz_layouts itself on line {line}. Change them there."
+                    ),
+                    true,
+                ));
+                return;
+            }
+        }
+        if let LayoutHit::Open(i) = hit {
+            self.draft = config.tgz_layouts.get(i).map(LayoutDraft::edit);
+            self.focus = None;
+            return;
+        }
+        if hit == LayoutHit::New {
+            self.draft = Some(LayoutDraft::new_layout(&config.tgz_layouts));
+            self.focus = None;
+            return;
+        }
+        match hit {
+            LayoutHit::Save => return self.save_draft(config),
+            LayoutHit::Delete => return self.delete_draft(config),
+            LayoutHit::Cancel => {
+                self.draft = None;
+                return;
+            }
+            _ => {}
+        }
+        let Some(draft) = self.draft.as_mut() else {
+            return;
+        };
+        match hit {
+            LayoutHit::Field(field) => draft.typing = Some(field),
+            LayoutHit::Preset(i) => {
+                if let Some(layout) = config::keyassignment::PaneLayout::ALL.get(i) {
+                    draft.layout = *layout;
+                }
+            }
+            LayoutHit::StartIn(i) => {
+                if let Some(cwd) = layouts::START_IN.get(i) {
+                    draft.cwd = cwd.clone();
+                }
+            }
+            LayoutHit::RemovePane(i) => draft.remove_pane(i),
+            LayoutHit::AddPane => draft.add_pane(),
+            _ => {}
+        }
+    }
+
+    fn save_draft(&mut self, config: &Config) {
+        let Some(draft) = self.draft.clone() else {
+            return;
+        };
+        let saved = match layouts::apply_draft(&config.tgz_layouts, &draft) {
+            Ok(saved) => saved,
+            Err(why) => {
+                self.message = Some((why, true));
+                return;
+            }
+        };
+        let name = draft.name.trim().to_string();
+        let rename = draft
+            .original
+            .filter(|old| *old != name)
+            .map(|old| (old, name));
+        if self.write_layouts(&saved, rename, None) {
+            self.draft = None;
+        }
+    }
+
+    fn delete_draft(&mut self, config: &Config) {
+        let Some(original) = self.draft.as_ref().and_then(|d| d.original.clone()) else {
+            self.draft = None;
+            return;
+        };
+        let kept: Vec<config::TgzPaneLayout> = config
+            .tgz_layouts
+            .iter()
+            .filter(|layout| layout.name != original)
+            .cloned()
+            .collect();
+        if self.write_layouts(&kept, None, Some(original)) {
+            self.draft = None;
+        }
+    }
+
+    /// Write `layouts` as the whole of `tgz_layouts`, moving or dropping the
+    /// keys of a renamed or deleted one. `true` when it was written.
+    fn write_layouts(
+        &mut self,
+        layouts: &[config::TgzPaneLayout],
+        rename: Option<(String, String)>,
+        deleted: Option<String>,
+    ) -> bool {
+        self.file = store::config_path();
+        let rhs = layouts::layouts_to_lua(layouts);
+        let result = store::edit(&self.file, |text| {
+            let mut out = if layouts.is_empty() {
+                lua_edit::unset_value(text, layouts::PATH)?.unwrap_or_else(|| text.to_string())
+            } else {
+                lua_edit::set_value(text, layouts::PATH, &LuaValue::Raw(rhs.clone()))?
+            };
+            if let Some((old, new)) = &rename {
+                out = layouts::move_layout_keys(&out, old, Some(new))?;
+            }
+            if let Some(old) = &deleted {
+                out = layouts::move_layout_keys(&out, old, None)?;
+            }
+            Ok(Some(out))
+        });
+        let written = result.is_ok();
+        self.finish_key_write(result);
+        written
+    }
+
+    /// Keys for the Layouts section. `true` when taken.
+    fn layout_key(&mut self, key: &KeyCode, mods: KeyModifiers, config: &Config) -> bool {
+        let plain = mods == KeyModifiers::NONE || mods == KeyModifiers::SHIFT;
+        let enter = matches!(
+            key,
+            KeyCode::Enter | KeyCode::Char('\r') | KeyCode::Char('\n')
+        );
+        let backspace = matches!(
+            key,
+            KeyCode::Backspace | KeyCode::Char('\u{8}') | KeyCode::Char('\u{7f}')
+        );
+        if let Some(draft) = self.draft.as_mut() {
+            if let Some(field) = draft.typing {
+                match key {
+                    KeyCode::Escape => draft.typing = None,
+                    _ if enter => draft.typing = None,
+                    _ if backspace => {
+                        if let Some(text) = draft.field_mut(field) {
+                            text.pop();
+                        }
+                    }
+                    KeyCode::Char(c) if plain && !c.is_control() => {
+                        if let Some(text) = draft.field_mut(field) {
+                            text.push(*c);
+                        }
+                    }
+                    _ => {}
+                }
+                return true;
+            }
+            match key {
+                KeyCode::Escape => self.draft = None,
+                _ if enter => self.save_draft(config),
+                _ => return false,
+            }
+            return true;
+        }
+        if enter {
+            if let Some(row) = self.focus {
+                let hit = if row < config.tgz_layouts.len() {
+                    LayoutHit::Open(row)
+                } else {
+                    LayoutHit::New
+                };
+                self.layout_hit(hit, config);
+            }
+            return true;
+        }
+        false
     }
 
     /// Start waiting for the keys of Shortcuts row `row`.
@@ -491,10 +698,17 @@ impl SettingsState {
             ),
             _ => (current.clone(), None),
         };
+        let swatch = matches!(setting.kind, Kind::Color).then(|| {
+            super::catalog::color_swatches()
+                .iter()
+                .position(|hex| hex.eq_ignore_ascii_case(current.trim()))
+                .unwrap_or(0)
+        });
         let mut editing = Editing {
             index,
             buffer,
             picker,
+            swatch,
         };
         let at = editing.matches().iter().position(|item| *item == current);
         if let (Some(at), Some(picker)) = (at, editing.picker.as_mut()) {
@@ -539,7 +753,7 @@ impl SettingsState {
     pub(crate) fn hit(&mut self, hit: SettingsHit, config: &Config, pane_id: PaneId) {
         self.message = None;
         // A click anywhere but in the open field or its list abandons it.
-        if !matches!(&hit, SettingsHit::Pick(_))
+        if !matches!(&hit, SettingsHit::Pick(_) | SettingsHit::Swatch(_))
             && !matches!((&hit, &self.editing), (SettingsHit::Field(index), Some(e)) if *index == e.index)
         {
             self.editing = None;
@@ -575,6 +789,15 @@ impl SettingsState {
                     self.open_field(index, config, pane_id);
                 }
             }
+            SettingsHit::Layout(hit) => self.layout_hit(hit, config),
+            SettingsHit::Swatch(at) => {
+                if let Some(hex) = super::catalog::color_swatches().get(at) {
+                    if let Some(editing) = self.editing.as_mut() {
+                        editing.buffer = hex.clone();
+                    }
+                    self.commit_edit();
+                }
+            }
             SettingsHit::Pick(at) => {
                 if let Some(picker) = self.editing.as_mut().and_then(|e| e.picker.as_mut()) {
                     picker.selected = at;
@@ -591,6 +814,7 @@ impl SettingsState {
         self.focus = None;
         self.editing = None;
         self.capture = None;
+        self.draft = None;
     }
 
     fn step(&mut self, index: usize, direction: i8, config: &Config) {
@@ -623,10 +847,34 @@ impl SettingsState {
         }
     }
 
+    /// Move the colour grid's highlight by `delta` and put its colour in the
+    /// field, so Enter takes it.
+    fn move_swatch(&mut self, delta: isize) {
+        let swatches = super::catalog::color_swatches();
+        let Some(editing) = self.editing.as_mut() else {
+            return;
+        };
+        let Some(at) = editing.swatch else {
+            return;
+        };
+        let next = at as isize + delta;
+        if next < 0 || next >= swatches.len() as isize {
+            return;
+        }
+        editing.swatch = Some(next as usize);
+        editing.buffer = swatches[next as usize].clone();
+    }
+
     /// Move the keyboard's row by `delta`, scrolling it into view.
     fn move_focus(&mut self, delta: isize) {
         let count = if self.current_section() == Section::Shortcuts {
             self.shortcuts.len()
+        } else if self.current_section() == Section::Layouts {
+            if self.draft.is_some() {
+                0
+            } else {
+                self.layout_rows
+            }
         } else {
             in_section(self.current_section()).len()
         };
@@ -669,6 +917,26 @@ impl SettingsState {
             KeyCode::Enter | KeyCode::Char('\r') | KeyCode::Char('\n')
         );
 
+        if self.current_section() == Section::Layouts && self.layout_key(&key, mods, config) {
+            return;
+        }
+        if self.editing.as_ref().is_some_and(|e| e.swatch.is_some()) {
+            let step = if left {
+                Some(-1)
+            } else if right {
+                Some(1)
+            } else if up {
+                Some(-(super::catalog::SWATCH_COLUMNS as isize))
+            } else if down {
+                Some(super::catalog::SWATCH_COLUMNS as isize)
+            } else {
+                None
+            };
+            if let Some(step) = step {
+                self.move_swatch(step);
+                return;
+            }
+        }
         if self.editing.is_some() {
             match key {
                 KeyCode::Escape => self.editing = None,
@@ -843,10 +1111,17 @@ impl SettingsPane {
     /// Add composed or pasted text to the field being edited.
     fn insert(&self, text: &str) {
         let mut state = self.state.lock();
+        let clean = || text.chars().filter(|c| !c.is_control());
         if state.editing.is_some() {
-            state.edit_buffer(|buffer| buffer.extend(text.chars().filter(|c| !c.is_control())));
+            state.edit_buffer(|buffer| buffer.extend(clean()));
             drop(state);
             self.repaint();
+        } else if let Some(draft) = state.draft.as_mut() {
+            if let Some(text_field) = draft.typing.and_then(|field| draft.field_mut(field)) {
+                text_field.extend(clean());
+                drop(state);
+                self.repaint();
+            }
         }
     }
 }

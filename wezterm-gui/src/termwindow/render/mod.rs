@@ -385,6 +385,31 @@ impl crate::TermWindow {
         crate::scrollbar::ScrollBarGeometry::compute(layout, &pane.get_dimensions(), viewport)
     }
 
+    /// The scroll bar sits left of the panes while the sidebar is on the
+    /// right: on the right edge it would be drawn over the sidebar.
+    pub fn scroll_bar_on_left(&self) -> bool {
+        self.sidebar_is_active() && self.config.sidebar_position == SidebarPosition::Right
+    }
+
+    /// The terminal scroll bar's strip: `(x, width)` in window pixels. The
+    /// one place painting, hover and hit-testing take it from.
+    pub fn scroll_bar_gutter(&self) -> (usize, usize) {
+        let border = self.get_os_border();
+        let width = self.effective_right_padding(&self.config);
+        if self.scroll_bar_on_left() {
+            let x = border.left.get()
+                + self.file_tree_reserved_width()
+                + self.diff_panel_left_reserved();
+            (x, width)
+        } else {
+            let x = self
+                .dimensions
+                .pixel_width
+                .saturating_sub(width + border.right.get() + self.diff_panel_right_reserved());
+            (x, width + border.right.get())
+        }
+    }
+
     pub fn padding_left_top(&self) -> (f32, f32) {
         let h_context = DimensionContext {
             dpi: self.dimensions.dpi as f32,
@@ -452,10 +477,19 @@ impl crate::TermWindow {
                 0.
             };
 
+        // The scroll bar's strip moved to the left takes its width there
+        // instead of on the right; the total reserved is the same.
+        let scroll_bar_left = if self.show_scroll_bar && self.scroll_bar_on_left() {
+            self.right_padding(&self.config, h_context) as f32
+        } else {
+            0.
+        };
+
         (
             padding_left
                 + left_gap
                 + sidebar_left_offset
+                + scroll_bar_left
                 + self.file_tree_reserved_width() as f32
                 + self.diff_panel_left_reserved() as f32,
             padding_top + top_gap,

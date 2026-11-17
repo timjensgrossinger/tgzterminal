@@ -778,6 +778,11 @@ fn lua_key(key: &KeyCode, mods: Modifiers, action: &KeyAssignment) -> String {
     format!("{{ key = {key}, mods = '{mods}', action = {action} }}")
 }
 
+/// An action as Lua that needs no `act` local, as the keys block writes it.
+pub(crate) fn lua_action(action: &KeyAssignment) -> String {
+    luaify(action.to_dynamic(), true).replacen("act.", "require('wezterm').action.", 1)
+}
+
 /// One `config.keys` entry as Lua that stands on its own: the action is
 /// reached through `require('wezterm').action` rather than an `act` local
 /// the config file may not have. For the Settings tab's keys block.

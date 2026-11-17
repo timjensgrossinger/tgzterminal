@@ -49,6 +49,9 @@ pub(crate) enum LuaValue {
     Str(String),
     /// A font family: `wezterm.font('Name')`.
     Font(String),
+    /// A Lua expression written as is, e.g. a whole table. It must be one
+    /// line: the block is read back line by line.
+    Raw(String),
 }
 
 impl LuaValue {
@@ -63,6 +66,7 @@ impl LuaValue {
             LuaValue::Float(f) if f.fract() == 0.0 => format!("{f:.1}"),
             LuaValue::Float(f) => f.to_string(),
             LuaValue::Str(s) | LuaValue::Font(s) => quote_lua(s, quote),
+            LuaValue::Raw(expr) => expr.replace(['\r', '\n'], " "),
         }
     }
 
@@ -904,8 +908,9 @@ pub(crate) fn set_value(src: &str, path: &[&str], value: &LuaValue) -> Result<St
                 return Err(locked);
             }
             let is_font = matches!(value, LuaValue::Font(_));
+            let is_raw = matches!(value, LuaValue::Raw(_));
             let fits = match first.kind {
-                SlotKind::Literal => !is_font,
+                SlotKind::Literal => !is_font && !is_raw,
                 SlotKind::FontName => is_font,
                 SlotKind::Table | SlotKind::Opaque => false,
             };

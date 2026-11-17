@@ -448,12 +448,11 @@ impl crate::TermWindow {
             return Ok(());
         };
 
-        let thumb_x = self.dimensions.pixel_width.saturating_sub(
-            padding as usize + border.right.get() + self.diff_panel_right_reserved(),
-        );
+        let (thumb_x, gutter_w) = self.scroll_bar_gutter();
+        let on_left = self.scroll_bar_on_left();
         let mouse_over_scrollbar = self.current_mouse_event.as_ref().is_some_and(|event| {
             event.coords.x >= thumb_x as isize
-                && event.coords.x <= (thumb_x + padding as usize + border.right.get()) as isize
+                && event.coords.x <= (thumb_x + gutter_w) as isize
                 && event.coords.y >= geometry.track_top as isize
                 && event.coords.y <= geometry.track_bottom as isize
         });
@@ -473,11 +472,17 @@ impl crate::TermWindow {
         } else {
             (6. * dpi_scale).clamp(5., 9.)
         };
-        let visual_right = self.dimensions.pixel_width as f32
-            - border.right.get() as f32
-            - self.diff_panel_right_reserved() as f32
-            - edge_gap;
-        let visible_track_x = visual_right - track_width;
+        // Kept `edge_gap` off the outer edge of its strip: the window's
+        // edge on the right, the panes' far side on the left.
+        let visible_track_x = if on_left {
+            thumb_x as f32 + edge_gap
+        } else {
+            let visual_right = self.dimensions.pixel_width as f32
+                - border.right.get() as f32
+                - self.diff_panel_right_reserved() as f32
+                - edge_gap;
+            visual_right - track_width
+        };
         let foreground = self.palette().foreground.to_linear();
         let color = foreground.mul_alpha(if expanded { 0.56 } else { 0.44 });
 
