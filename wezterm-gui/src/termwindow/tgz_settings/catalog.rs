@@ -339,6 +339,21 @@ macro_rules! chrome_color {
     };
 }
 
+/// One `agent_ui.animations.colors` entry: a colour of its own for one
+/// animation, over the ring preset's. Empty follows the preset.
+macro_rules! animation_color {
+    ($label:expr, $help:expr, $field:ident) => {
+        Setting {
+            section: Section::Agents,
+            path: &["agent_ui", "animations", "colors", stringify!($field)],
+            label: $label,
+            help: $help,
+            kind: Kind::Color,
+            get: |c| Value::Text(color_hex(c.agent_ui.resolved_animations().colors.$field)),
+        }
+    };
+}
+
 /// `#rrggbb` (or `#rrggbbaa` when not opaque); empty when unset.
 pub(crate) fn color_hex(color: Option<config::RgbaColor>) -> String {
     let Some(color) = color else {
@@ -834,9 +849,34 @@ pub(crate) static CATALOG: &[Setting] = &[
     choice!(
         Agents,
         "Ring colours",
-        "Colour set for agent states.",
+        "A pair: warm for working and waiting, cool for the ring's far end and finished.",
         AgentRingColors,
         agent_ui.ring_colors
+    ),
+    animation_color!(
+        "Working ring, first arc",
+        "Empty follows the preset's warm colour.",
+        ring_a
+    ),
+    animation_color!(
+        "Working ring, second arc",
+        "Empty follows the preset's cool colour.",
+        ring_b
+    ),
+    animation_color!(
+        "Finished ring",
+        "The ripple and hairline when an agent is done. Empty: the second arc at 55%.",
+        resolve
+    ),
+    animation_color!(
+        "Waiting glow",
+        "Outline of a row whose agent waits for you. Empty follows the first arc.",
+        waiting_glow
+    ),
+    animation_color!(
+        "Working dot pulse",
+        "The dot that breathes while an agent works. Empty follows the first arc.",
+        dot_pulse
     ),
     toggle!(
         Agents,
@@ -1389,10 +1429,20 @@ mod tests {
             .iter()
             .filter(|setting| matches!(setting.kind, Kind::Color))
             .collect();
-        assert_eq!(colours.len(), 21);
-        assert!(colours.iter().all(
-            |setting| setting.section == Section::Colors && setting.path[0] == "sidebar_colors"
-        ));
+        // The chrome's colours under Colours, and one per animation under
+        // Agents.
+        let (chrome, animation): (Vec<&Setting>, Vec<&Setting>) = colours
+            .into_iter()
+            .partition(|setting| setting.path[0] == "sidebar_colors");
+        assert_eq!(chrome.len(), 21);
+        assert!(chrome
+            .iter()
+            .all(|setting| setting.section == Section::Colors));
+        assert_eq!(animation.len(), 5);
+        assert!(animation
+            .iter()
+            .all(|setting| setting.section == Section::Agents
+                && setting.path[..3] == ["agent_ui", "animations", "colors"]));
     }
 
     #[test]

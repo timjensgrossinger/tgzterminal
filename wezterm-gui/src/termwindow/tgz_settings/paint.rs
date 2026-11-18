@@ -160,6 +160,8 @@ struct Segment {
     /// that is wider.
     min_px: f32,
     dim: bool,
+    /// Colour dots drawn before the label, e.g. a ring preset's pair.
+    dots: Vec<LinearRgba>,
 }
 
 impl Segment {
@@ -170,6 +172,7 @@ impl Segment {
             hit: Some(hit),
             min_px: 0.,
             dim: false,
+            dots: vec![],
         }
     }
 
@@ -180,8 +183,26 @@ impl Segment {
             hit: None,
             min_px,
             dim: false,
+            dots: vec![],
         }
     }
+}
+
+/// The two colours of ring preset `name`, warm first; none for a name that
+/// is not a preset.
+fn ring_preset_dots(name: &str) -> Vec<LinearRgba> {
+    use wezterm_dynamic::FromDynamic;
+    let Ok(preset) = config::AgentRingColors::from_dynamic(
+        &wezterm_dynamic::Value::String(name.to_string()),
+        Default::default(),
+    ) else {
+        return vec![];
+    };
+    let (warm, cool) = preset.stops();
+    [warm, cool]
+        .iter()
+        .map(|&(r, g, b)| LinearRgba::with_srgba(r, g, b, 0xff))
+        .collect()
 }
 
 fn tilde(path: &std::path::Path) -> String {
@@ -395,10 +416,19 @@ impl TermWindow {
             .map(|item| item.item_type.clone());
 
         let seg_pad = (SEGMENT_PAD * dpi_scale).round();
+        let dot_d = (cell_h * 0.6).round().max(4.);
+        let dot_gap = (4. * dpi_scale).round();
+        let dots_w = |s: &Segment| {
+            if s.dots.is_empty() {
+                0.
+            } else {
+                s.dots.len() as f32 * (dot_d + dot_gap) + dot_gap
+            }
+        };
         let widths: Vec<f32> = segments
             .iter()
             .map(|s| {
-                (self.chrome_text_width(&s.label, false).max(s.min_px) + seg_pad * 2.)
+                (self.chrome_text_width(&s.label, false).max(s.min_px) + dots_w(s) + seg_pad * 2.)
                     .max(height)
                     .ceil()
             })
@@ -442,9 +472,25 @@ impl TermWindow {
                 sb.text_active
             };
             let label_px = self.chrome_text_width(&segment.label, false);
+            let lead = dots_w(segment);
             // Centred in its box; a label too long for it starts at the
             // padding and is cut at the far one.
-            let inset = ((width - label_px) * 0.5).max(seg_pad).round();
+            let inset = ((width - label_px - lead) * 0.5).max(seg_pad).round();
+            for (n, dot) in segment.dots.iter().enumerate() {
+                self.sidebar_rounded_fill(
+                    layers,
+                    0,
+                    euclid::rect(
+                        x + inset + n as f32 * (dot_d + dot_gap),
+                        y + ((height - dot_d) * 0.5).round(),
+                        dot_d,
+                        dot_d,
+                    ),
+                    dot_d * 0.5,
+                    *dot,
+                )?;
+            }
+            let inset = inset + lead;
             self.settings_text(
                 layers,
                 &segment.label,
@@ -696,6 +742,7 @@ impl TermWindow {
                     hit: Some(SettingsHit::Search),
                     min_px: field_text_w,
                     dim,
+                    dots: vec![],
                 }],
                 ground,
             )?;
@@ -822,6 +869,7 @@ impl TermWindow {
                 hit: Some(SettingsHit::Layout(hit)),
                 min_px: width - (SEGMENT_PAD * dpi_scale).round() * 2.,
                 dim,
+                dots: vec![],
             };
 
             match state.draft.clone() {
@@ -1539,9 +1587,21 @@ impl TermWindow {
                     (Kind::Toggle, Value::Bool(_)) => vec![],
                     (Kind::Choice(variants), Value::Text(current)) => {
                         let variants = variants();
+                        // A ring preset shows the pair of colours it is.
+                        let dots = |variant: &str| -> Vec<LinearRgba> {
+                            if setting.path == ["agent_ui", "ring_colors"] {
+                                ring_preset_dots(variant)
+                            } else {
+                                vec![]
+                            }
+                        };
+                        let dot_room = (cell_h * 0.6 + 4. * dpi_scale) * 2. + 4. * dpi_scale;
                         let needed: f32 = variants
                             .iter()
-                            .map(|v| (self.chrome_text_width(v, false) + seg_pad * 2.).ceil())
+                            .map(|v| {
+                                let extra = if dots(v).is_empty() { 0. } else { dot_room };
+                                (self.chrome_text_width(v, false) + extra + seg_pad * 2.).ceil()
+                            })
                             .sum();
                         if needed <= control_w {
                             variants
@@ -1549,6 +1609,7 @@ impl TermWindow {
                                 .enumerate()
                                 .map(|(n, variant)| Segment {
                                     selected: variant == current,
+                                    dots: dots(variant),
                                     ..Segment::button(*variant, SettingsHit::Choose(*index, n))
                                 })
                                 .collect()
@@ -1624,6 +1685,7 @@ impl TermWindow {
                             hit: Some(SettingsHit::Field(*index)),
                             min_px: field_text_w,
                             dim,
+                            dots: vec![],
                         }]
                     }
                     _ => vec![Segment::label(value_text(setting, &value), 0.)],

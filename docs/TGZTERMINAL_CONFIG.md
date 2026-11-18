@@ -55,6 +55,14 @@ A search field at the top (or just start typing letters) finds settings in
 every section by label, help text or Lua key, grouped by section; `Down` or
 `Enter` moves into the results, `Esc` steps back and then clears it.
 
+Agents → Ring colours shows each preset with its pair of colours (warm, cool);
+under it, five colour fields give one animation a colour of its own
+(`agent_ui.animations.colors`: working ring arcs `ring_a`/`ring_b`, finished
+ring `resolve`, `waiting_glow`, `dot_pulse`). An empty field follows the
+preset. Like every Animations setting, writing one creates the
+`agent_ui.animations` table, which retires the old `pulse_working_dot = false`
+master switch.
+
 Font weight is written as part of `font` (`wezterm.font(name, { weight = … })`),
 and changing the family keeps a weight already set. Ligatures write
 `harfbuzz_features` (`calt=0`, `clig=0`, `liga=0` when off). Letter spacing is
