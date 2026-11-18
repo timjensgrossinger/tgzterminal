@@ -492,7 +492,7 @@ impl crate::TermWindow {
         sidebar_width_scale_for_dpi(self.dimensions.dpi as f64)
     }
 
-    fn file_tree_list_options(&self) -> ListOptions {
+    pub(crate) fn file_tree_list_options(&self) -> ListOptions {
         ListOptions {
             show_hidden: self
                 .file_tree
@@ -571,7 +571,7 @@ impl crate::TermWindow {
 
     /// Whether `pane` is somewhere the panel cannot list yet: a pane on
     /// another machine. Those keep the fzf picker.
-    fn file_tree_needs_picker(&self, pane: &Arc<dyn Pane>) -> bool {
+    pub(crate) fn file_tree_needs_picker(&self, pane: &Arc<dyn Pane>) -> bool {
         let local = Mux::get()
             .get_domain(pane.domain_id())
             .is_some_and(|domain| domain.downcast_ref::<mux::domain::LocalDomain>().is_some());
@@ -969,15 +969,30 @@ impl crate::TermWindow {
         let Some(target) = self.file_tree_target(tab_id) else {
             return;
         };
-        let Some(path) = self
+        let Some((root, path)) = self
             .file_tree
             .views
             .get(&tab_id)
             .and_then(|view| view.tree.as_ref())
-            .map(|tree| tree.abs_path(rel))
+            .map(|tree| (tree.root.clone(), tree.abs_path(rel)))
         else {
             return;
         };
+        self.open_file_in_editor(tab_id, target, root, path, in_tab);
+    }
+
+    /// Open `path`, a file under `root`, in the configured editor: beside
+    /// `target` (a pane of tab `tab_id`), or in a new tab with `in_tab`.
+    /// The `file-tree-open-file` Lua event sees it first, as for the
+    /// Worktree. Also what the sidebar search opens files with.
+    pub(crate) fn open_file_in_editor(
+        &mut self,
+        tab_id: TabId,
+        target: Arc<dyn Pane>,
+        root: PathBuf,
+        path: PathBuf,
+        in_tab: bool,
+    ) {
         let Some(window) = self.window.clone() else {
             return;
         };
@@ -987,6 +1002,7 @@ impl crate::TermWindow {
         self.file_tree.focused = false;
         let gui_win = crate::scripting::guiwin::GuiWin::new(self);
         let pane = mux_lua::MuxPane(target.pane_id());
+        let target_id = target.pane_id();
 
         async fn ask_lua(
             lua: Option<std::rc::Rc<mlua::Lua>>,
@@ -1013,7 +1029,7 @@ impl crate::TermWindow {
                     .unwrap_or(true)
                 {
                     window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
-                        term_window.file_tree_open_path(tab_id, path, in_tab);
+                        term_window.file_tree_open_path(tab_id, target_id, root, path, in_tab);
                     })));
                 }
                 Ok::<(), anyhow::Error>(())
@@ -1024,19 +1040,18 @@ impl crate::TermWindow {
 
     /// Open `path` in the configured editor: [`Self::file_tree_open_file`]
     /// once Lua has let it.
-    fn file_tree_open_path(&mut self, tab_id: TabId, path: PathBuf, in_tab: bool) {
-        let Some(target) = self.file_tree_target(tab_id) else {
+    fn file_tree_open_path(
+        &mut self,
+        tab_id: TabId,
+        target_id: PaneId,
+        root: PathBuf,
+        path: PathBuf,
+        in_tab: bool,
+    ) {
+        let Some(target) = Mux::get().get_pane(target_id) else {
             return;
         };
-        let Some(tree) = self
-            .file_tree
-            .views
-            .get(&tab_id)
-            .and_then(|view| view.tree.as_ref())
-        else {
-            return;
-        };
-        let host = self.file_tree_editor_host(&tree.root, &target);
+        let host = self.file_tree_editor_host(&root, &target);
         let config = &self.config.file_browser;
         let launch = resolve_editor(
             config.editor_command.as_deref(),

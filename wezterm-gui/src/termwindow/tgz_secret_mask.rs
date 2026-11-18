@@ -441,7 +441,7 @@ impl TermWindow {
         self.secret_masking_enabled() && self.config.secret_masking.mask_on_screen
     }
 
-    fn secret_rules(&mut self) -> Arc<SecretRules> {
+    pub(crate) fn secret_rules(&mut self) -> Arc<SecretRules> {
         let generation = self.config.generation();
         match &self.secret_mask.rules {
             Some((cached, rules)) if *cached == generation => Arc::clone(rules),

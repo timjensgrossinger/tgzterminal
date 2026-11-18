@@ -668,6 +668,13 @@ impl super::TermWindow {
                 context.invalidate();
                 true
             }
+            // Through the results, when there are any.
+            KC::DownArrow | KC::UpArrow
+                if self.move_sidebar_search_selection(if key == KC::UpArrow { -1 } else { 1 }) =>
+            {
+                context.invalidate();
+                true
+            }
             // On from the field to the tab list and the sidebar's buttons.
             KC::Tab | KC::DownArrow => {
                 self.focus_sidebar();
@@ -677,12 +684,22 @@ impl super::TermWindow {
                 if let Some(state) = self.sidebar_search.as_mut() {
                     state.query.pop();
                 }
+                self.refresh_sidebar_search();
                 context.invalidate();
                 true
             }
             KC::Enter => {
-                self.activate_first_sidebar_search_match();
-                self.sidebar_search = None;
+                match self
+                    .sidebar_search
+                    .as_ref()
+                    .and_then(|state| state.selected)
+                {
+                    Some(row) => self.activate_sidebar_search_row(row),
+                    None => {
+                        self.activate_first_sidebar_search_match();
+                        self.sidebar_search = None;
+                    }
+                }
                 context.invalidate();
                 true
             }
@@ -693,6 +710,7 @@ impl super::TermWindow {
                 if let Some(state) = self.sidebar_search.as_mut() {
                     state.query.push(c);
                 }
+                self.refresh_sidebar_search();
                 context.invalidate();
                 true
             }

@@ -405,6 +405,8 @@ impl crate::TermWindow {
             .context("paint_usage_menu")?;
         self.paint_file_tree_menu(&mut layers)
             .context("paint_file_tree_menu")?;
+        self.paint_sidebar_search_results(&mut layers)
+            .context("paint_sidebar_search_results")?;
         self.settle_dropdown_key_selection();
         self.paint_chrome_tooltip(&mut layers)
             .context("paint_chrome_tooltip")?;

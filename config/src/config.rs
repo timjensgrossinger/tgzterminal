@@ -877,6 +877,42 @@ impl Default for DiffPanelConfig {
     }
 }
 
+/// What the sidebar search field finds besides the tab list
+/// (`sidebar_search`). Each kind can be left out.
+///
+/// ```lua
+/// config.sidebar_search = { scrollback = false }
+/// ```
+#[derive(Debug, Clone, PartialEq, FromDynamic, ToDynamic)]
+pub struct SidebarSearchConfig {
+    /// Commands of the palette, pane layouts and ssh hosts (`>`).
+    #[dynamic(default = "default_true")]
+    pub commands: bool,
+    /// Files of the active pane's project, by name (`/`). Read on a worker,
+    /// from `git ls-files` or a walk of the folder.
+    #[dynamic(default = "default_true")]
+    pub files: bool,
+    /// Past agent sessions, by title, first prompt and folder (`@`).
+    #[dynamic(default = "default_true")]
+    pub sessions: bool,
+    /// Text in the scrollback of this window's panes (`#`), searched in
+    /// memory when asked. Nothing is indexed or written anywhere; previews
+    /// pass through `secret_masking`.
+    #[dynamic(default = "default_true")]
+    pub scrollback: bool,
+}
+
+impl Default for SidebarSearchConfig {
+    fn default() -> Self {
+        Self {
+            commands: true,
+            files: true,
+            sessions: true,
+            scrollback: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, FromDynamic, ToDynamic)]
 pub struct RichInputConfig {
     /// Enable the optional multiline input composer overlay.
@@ -2937,6 +2973,10 @@ pub struct Config {
     /// Shells and domains offered by the sidebar new-tab dropdown.
     #[dynamic(default)]
     pub new_tab_menu: NewTabMenuConfig,
+
+    /// What the sidebar search field finds besides tabs (TGZTerminal).
+    #[dynamic(default)]
+    pub sidebar_search: SidebarSearchConfig,
 
     /// Optional multiline input composer for agent panes.
     #[dynamic(default)]

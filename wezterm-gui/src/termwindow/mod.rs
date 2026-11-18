@@ -132,6 +132,7 @@ pub(crate) mod tgz_footer;
 pub mod tgz_last_session;
 pub(crate) mod tgz_notify;
 mod tgz_pane_layout;
+pub(crate) mod tgz_search;
 pub mod tgz_secret_mask;
 pub(crate) mod tgz_settings;
 pub(crate) mod tgz_sidebar_focus;
@@ -706,6 +707,8 @@ pub enum UIItemType {
     },
     /// "+ New connection…" at the foot of the SSH dropdown.
     SidebarSshNewConnection,
+    /// A result under the sidebar search field, by row index.
+    SidebarSearchHit(usize),
     /// A text field of the "New SSH connection" form.
     SshSetupField(tgz_ssh_setup::Field),
     /// One option of a choice in that form.
@@ -989,6 +992,17 @@ pub(crate) struct HerdTabInfo {
 #[derive(Clone, Debug, Default)]
 pub struct SidebarSearchState {
     pub query: String,
+    /// What the query finds beyond the tab list (`tgz_search`).
+    pub rows: Vec<tgz_search::Row>,
+    /// The highlighted result, by index into `rows`.
+    pub selected: Option<usize>,
+    /// First result row in view.
+    pub scroll: usize,
+    /// When the session scan the results were built from finished, so a
+    /// newer scan refreshes them.
+    pub sessions_at: Option<Instant>,
+    /// Counts queries; a file search answers only the one it was asked.
+    pub generation: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -1177,6 +1191,7 @@ impl UIItemType {
                 | Self::SidebarUsageMenuRow { .. }
                 | Self::SidebarSshMenuItem { .. }
                 | Self::SidebarSshNewConnection
+                | Self::SidebarSearchHit(_)
                 | Self::SshSetupField(_)
                 | Self::SshSetupOption { .. }
                 | Self::SshSetupButton { .. }
@@ -1518,6 +1533,9 @@ pub struct TermWindow {
     sidebar_auto_hide_open: bool,
     sidebar_auto_hide_close_after: Option<Instant>,
     sidebar_search: Option<SidebarSearchState>,
+    /// Where the search field was last painted: left, bottom, width. The
+    /// results hang from it.
+    sidebar_search_anchor: Option<(f32, f32, f32)>,
     pane_copy_menu: Option<PaneCopyMenuState>,
     /// Drives the copy → checkmark → copy animation; see [`CopyFlash`].
     copy_flash: Option<CopyFlash>,
@@ -2164,6 +2182,7 @@ impl TermWindow {
             sidebar_auto_hide_open: false,
             sidebar_auto_hide_close_after: None,
             sidebar_search: None,
+            sidebar_search_anchor: None,
             pane_copy_menu: None,
             copy_flash: None,
             agent_launch_menu: None,

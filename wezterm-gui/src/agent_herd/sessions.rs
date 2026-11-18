@@ -73,6 +73,9 @@ pub struct AgentSession {
     pub git_branch: Option<String>,
     /// Short human description of what the session was about.
     pub label: String,
+    /// The first prompt the user typed, when the store records one apart from
+    /// the title. Searched, never shown on its own.
+    pub first_prompt: Option<String>,
     /// Last write to the transcript; the sort key, newest first.
     pub modified: SystemTime,
     /// Which home the transcript was found under. A session recorded inside a
@@ -387,6 +390,7 @@ fn ready_session(
     cwd: PathBuf,
     git_branch: Option<String>,
     label: Option<String>,
+    first_prompt: Option<String>,
     modified: SystemTime,
 ) -> AgentSession {
     let project = cwd
@@ -400,6 +404,7 @@ fn ready_session(
         project,
         git_branch,
         label: label.unwrap_or_else(|| NO_DESCRIPTION.to_string()),
+        first_prompt,
         modified,
         // Stamped by the scan, which knows which root the session came from.
         origin: SessionOrigin::Host,
@@ -439,6 +444,7 @@ fn read_candidate(candidate: &Candidate) -> Result<AgentSession, Skip> {
         details.cwd,
         details.git_branch,
         details.label,
+        details.first_prompt,
         *modified,
     ))
 }
@@ -450,6 +456,8 @@ struct SessionDetails {
     /// `None` when the store records nothing usable; the caller substitutes
     /// [`NO_DESCRIPTION`].
     label: Option<String>,
+    /// The first prompt typed, when known apart from `label`.
+    first_prompt: Option<String>,
     /// Set only by vendors that record the id inside the file rather than in
     /// its name; `None` keeps the id derived from the filename.
     session_id: Option<String>,
@@ -578,6 +586,7 @@ fn read_claude_details(path: &Path) -> Result<SessionDetails, Skip> {
         cwd,
         git_branch: head.git_branch,
         label: head.label,
+        first_prompt: head.prompt,
         session_id: None,
     })
 }
@@ -637,6 +646,8 @@ struct ClaudeHead {
     cwds: Vec<PathBuf>,
     git_branch: Option<String>,
     label: Option<String>,
+    /// The first real prompt, whatever the label became.
+    prompt: Option<String>,
     /// The session was started without a human at the keyboard: a headless
     /// entrypoint, or a scheduled task's automated run.
     headless: bool,
@@ -795,7 +806,8 @@ fn claude_head_scan(path: &Path, stop_at_headless: bool) -> ClaudeHead {
     ClaudeHead {
         cwds,
         git_branch,
-        label: tail_title.or(title).or(prompt),
+        label: tail_title.or(title).or(prompt.clone()),
+        prompt,
         headless,
         parsed,
     }
@@ -1003,6 +1015,8 @@ fn read_codex_details(path: &Path) -> Result<SessionDetails, Skip> {
         cwd: cwd.ok_or(Skip::NoCwd)?,
         // Codex's `session_meta` records no branch, so rows are unprefixed.
         git_branch: None,
+        // Codex's label is its first prompt.
+        first_prompt: label.clone(),
         label,
         // The filename carries no id to fall back on.
         session_id: Some(session_id.ok_or(Skip::Unreadable)?),
@@ -1105,6 +1119,7 @@ fn collect_opencode_candidates(
                 // OpenCode records no branch per session.
                 None,
                 label,
+                None,
                 epoch_millis(updated),
             )));
         }
@@ -1275,6 +1290,7 @@ fn read_copilot_workspace(path: &Path) -> Result<SessionDetails, Skip> {
             .name
             .map(|name| transcript::trim_to_words(name.trim(), 10))
             .filter(|name| !name.is_empty()),
+        first_prompt: None,
         // The directory name is the session id.
         session_id: None,
     })

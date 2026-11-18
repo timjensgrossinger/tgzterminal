@@ -51,6 +51,7 @@ use window::color::LinearRgba;
 use window::{MousePress, RectF, WindowOps};
 
 mod modal;
+mod search;
 mod ssh_setup;
 
 const INSET: f32 = 8.;
@@ -12509,7 +12510,7 @@ impl crate::TermWindow {
                     if row.inert {
                         query.trim().is_empty()
                     } else {
-                        session_label_matches(&row.label, &query)
+                        session_label_matches(&self.session_row_haystack(row), &query)
                     }
                 });
             for (index, row) in matching.enumerate() {
@@ -12636,7 +12637,9 @@ impl crate::TermWindow {
                 let first = self
                     .agent_resume_session_rows()
                     .into_iter()
-                    .filter(|row| !row.inert && session_label_matches(&row.label, &query))
+                    .filter(|row| {
+                        !row.inert && session_label_matches(&self.session_row_haystack(row), &query)
+                    })
                     .find_map(|row| match row.item_type {
                         UIItemType::SidebarAgentMenuResumeSession {
                             index,
@@ -12854,6 +12857,27 @@ impl crate::TermWindow {
     /// Never scans here — painting must not touch the filesystem. The scan is
     /// kicked off by the click that expands the row and lands in
     /// `agent_session_cache`, so a first open shows progress for a frame or two.
+    /// What a session row is matched against when typing in the sessions
+    /// menu: its label, and the session's first prompt and folder.
+    fn session_row_haystack(&self, row: &SidebarDropdownRow) -> String {
+        let UIItemType::SidebarAgentMenuResumeSession { index, .. } = &row.item_type else {
+            return row.label.clone();
+        };
+        match self
+            .agent_session_cache
+            .as_ref()
+            .and_then(|scan| scan.sessions.get(*index))
+        {
+            Some(session) => format!(
+                "{} {} {}",
+                row.label,
+                session.first_prompt.as_deref().unwrap_or(""),
+                session.cwd.to_string_lossy()
+            ),
+            None => row.label.clone(),
+        }
+    }
+
     fn agent_resume_session_rows(&self) -> Vec<SidebarDropdownRow> {
         let placeholder = |label: &str| SidebarDropdownRow {
             label: label.to_string(),
@@ -15549,6 +15573,7 @@ impl crate::TermWindow {
                 height: row_height,
                 item_type: UIItemType::SidebarSearch,
             });
+            self.sidebar_search_anchor = Some((search_x, y + row_height as f32, search_w));
             y += row_height as f32 + GAP;
         } else {
             // Narrow sidebar: no search field is drawn, so the toggle keeps

@@ -114,6 +114,7 @@ impl super::TermWindow {
             | UIItemType::SidebarSshLaunchButton
             | UIItemType::SidebarSshMenuItem { .. }
             | UIItemType::SidebarSshNewConnection
+            | UIItemType::SidebarSearchHit(_)
             | UIItemType::SshSetupField(_)
             | UIItemType::SshSetupOption { .. }
             | UIItemType::SshSetupButton { .. }
@@ -197,6 +198,7 @@ impl super::TermWindow {
             | UIItemType::SidebarSshLaunchButton
             | UIItemType::SidebarSshMenuItem { .. }
             | UIItemType::SidebarSshNewConnection
+            | UIItemType::SidebarSearchHit(_)
             | UIItemType::SshSetupField(_)
             | UIItemType::SshSetupOption { .. }
             | UIItemType::SshSetupButton { .. }
@@ -420,7 +422,14 @@ impl super::TermWindow {
         if matches!(&event.kind, WMEK::Press(_)) && self.sidebar_search.is_some() {
             let on_search = matches!(
                 &ui_item,
-                Some(item) if item.item_type == UIItemType::SidebarSearch
+                Some(item) if matches!(
+                    item.item_type,
+                    UIItemType::SidebarSearch
+                        | UIItemType::SidebarSearchHit(_)
+                        | UIItemType::SidebarDropdownBody
+                        | UIItemType::SidebarDropdownScrollTrack
+                        | UIItemType::SidebarDropdownScrollThumb
+                )
             );
             if !on_search {
                 self.sidebar_search = None;
@@ -1246,6 +1255,13 @@ impl super::TermWindow {
             }
             UIItemType::SidebarUsageMenuRow { action } => {
                 self.mouse_event_sidebar_usage_menu_row(action, event, context);
+            }
+            UIItemType::SidebarSearchHit(row) => {
+                if event.kind == WMEK::Release(MousePress::Left) {
+                    self.pressed_ui_item = None;
+                    self.activate_sidebar_search_row(row);
+                }
+                context.invalidate();
             }
             UIItemType::SidebarSshNewConnection => {
                 if event.kind == WMEK::Release(MousePress::Left) {
@@ -2226,6 +2242,8 @@ impl super::TermWindow {
             self.sidebar_auto_hide_open = true;
         }
         self.sidebar_search.get_or_insert_with(Default::default);
+        // Past sessions are among what the field finds.
+        self.kick_agent_session_scan();
         if let Some(window) = self.window.as_ref() {
             window.invalidate();
         }

@@ -569,6 +569,30 @@ pub(crate) static CATALOG: &[Setting] = &[
         "Vertical tab list. Off shows the classic tab bar.",
         sidebar_enabled
     ),
+    toggle!(
+        Sidebar,
+        "Search commands",
+        "The search field also finds commands, layouts and ssh hosts (> narrows to them).",
+        sidebar_search.commands
+    ),
+    toggle!(
+        Sidebar,
+        "Search files",
+        "The search field also finds files of the active pane's project (/ narrows to them).",
+        sidebar_search.files
+    ),
+    toggle!(
+        Sidebar,
+        "Search past sessions",
+        "By title, first prompt and folder (@ narrows to them).",
+        sidebar_search.sessions
+    ),
+    toggle!(
+        Sidebar,
+        "Search scrollback",
+        "Text in this window's panes, searched in memory and never stored (# narrows to it).",
+        sidebar_search.scrollback
+    ),
     choice!(
         Sidebar,
         "Position",

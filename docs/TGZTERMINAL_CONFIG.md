@@ -139,6 +139,42 @@ config.sidebar_scroll_bar = true
 | `sidebar_tab_hover_details` | bool | `false` | Shows the metadata sub-line on the active/hovered row — **and makes every row two text lines tall** whether or not you hover, so fewer tabs fit on screen. |
 | `sidebar_scroll_bar` | bool | `true` | Slim tab-list scrollbar when the list overflows. Reserves a 30px gutter, which narrows every row's text budget. |
 
+### Sidebar search
+
+The search field at the top of the sidebar filters the tab list as you type,
+and opens a list of everything else the query finds, in sections:
+**Commands** (the command palette's), **Layouts** (presets and your
+`tgz_layouts`), **SSH hosts**, **Sessions** (past agent sessions, matched on
+their title, **first prompt**, folder and branch), **Files** (of the active
+pane's project) and **In scrollback**. `Up`/`Down` walk the list, `Enter`
+acts: runs the command, applies or opens the layout, connects, resumes the
+session, opens the file in the Worktree's editor (`file-tree-open-file` sees it
+first), or shows the line in its pane.
+
+A prefix narrows the search to one kind and shows more of it: `>` commands,
+layouts and ssh hosts, `@` sessions, `/` files, `#` scrollback.
+
+- **Files** are listed on a worker, from `git ls-files` (or a walk of the
+  folder), kept 30 s per project. A pane on another machine has none. In a
+  WSL pane the files come from that distro through `\\wsl.localhost\`; a
+  distro without a live pane is never touched, so a stopped one stays stopped.
+- **Scrollback** is searched only for three characters or more, in the
+  memory of this window's local panes, at most 30 lines. Nothing is indexed,
+  written or logged (only counts), and each line shown passes through
+  `secret_masking` first.
+
+```lua
+config.sidebar_search = {
+  commands = true,    -- commands, layouts, ssh hosts
+  files = true,
+  sessions = true,
+  scrollback = true,
+}
+```
+
+The same switches are in Settings → Sidebar. The sessions menu matches on a
+session's first prompt and folder too.
+
 ### Tab rows, tab palette and the close dialog
 
 Each tab row has two lines: what the tab is doing (an agent's session title, else the tab title), then who
