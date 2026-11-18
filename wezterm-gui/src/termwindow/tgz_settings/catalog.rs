@@ -119,7 +119,83 @@ pub(crate) struct Setting {
     pub get: fn(&Config) -> Value,
 }
 
+/// Font weights by the names Lua takes, lightest first.
+fn font_weights() -> &'static [&'static str] {
+    &[
+        "Thin",
+        "ExtraLight",
+        "Light",
+        "DemiLight",
+        "Book",
+        "Regular",
+        "Medium",
+        "DemiBold",
+        "Bold",
+        "ExtraBold",
+        "Black",
+    ]
+}
+
+fn bold_brightening_variants() -> &'static [&'static str] {
+    &["BrightAndBold", "BrightOnly", "No"]
+}
+
+/// The weight of the configured font, by the name Lua takes.
+fn font_weight_name(config: &Config) -> String {
+    use wezterm_dynamic::ToDynamic;
+    match config.font.font.first().map(|f| f.weight.to_dynamic()) {
+        Some(wezterm_dynamic::Value::String(name)) => name,
+        _ => "Regular".to_string(),
+    }
+}
+
+fn font_family(config: &Config) -> String {
+    config
+        .font
+        .font
+        .first()
+        .map(|f| f.family.clone())
+        .unwrap_or_default()
+}
+
+/// What `harfbuzz_features` holds with ligatures on (WezTerm's default) and
+/// off.
+const LIGATURES_ON: &str = "{ 'kern', 'liga', 'clig' }";
+const LIGATURES_OFF: &str = "{ 'kern', 'calt=0', 'clig=0', 'liga=0' }";
+
 impl Setting {
+    /// Where and what to write for `value`: most settings write their own
+    /// path, but a few are spelled differently in Lua. The weight is part of
+    /// `font`, a family change keeps a weight already set (unless the file
+    /// sets the font itself, `in_place`, where only the name is swapped and
+    /// the weight stays in the call), and ligatures are a feature list.
+    pub(crate) fn lua_write(
+        &self,
+        value: &Value,
+        config: &Config,
+        in_place: bool,
+    ) -> (&'static [&'static str], LuaValue) {
+        match (self.path, value) {
+            (["font", "weight"], Value::Text(weight)) => (
+                &["font"],
+                LuaValue::FontWithWeight(font_family(config), weight.clone()),
+            ),
+            (["font"], Value::Text(name)) if !in_place => {
+                let weight = font_weight_name(config);
+                if weight == "Regular" {
+                    (self.path, LuaValue::Font(name.clone()))
+                } else {
+                    (self.path, LuaValue::FontWithWeight(name.clone(), weight))
+                }
+            }
+            (["harfbuzz_features"], Value::Bool(on)) => (
+                self.path,
+                LuaValue::Raw(if *on { LIGATURES_ON } else { LIGATURES_OFF }.to_string()),
+            ),
+            _ => (self.path, self.to_lua(value)),
+        }
+    }
+
     /// `value` clamped to what the setting accepts, as Lua will hold it.
     pub(crate) fn to_lua(&self, value: &Value) -> LuaValue {
         match (self.kind, value) {
@@ -449,6 +525,58 @@ pub(crate) static CATALOG: &[Setting] = &[
         2.,
         0.05,
         line_height
+    ),
+    Setting {
+        section: Section::Appearance,
+        path: &["font", "weight"],
+        label: "Font weight",
+        help: "How heavy the font draws. The font needs that weight installed.",
+        kind: Kind::Choice(font_weights),
+        get: |c| Value::Text(font_weight_name(c)),
+    },
+    float!(
+        Appearance,
+        "Letter spacing",
+        "Cell width: 1.0 is the font's own, 1.1 is 10% wider.",
+        0.7,
+        1.6,
+        0.05,
+        cell_width
+    ),
+    Setting {
+        section: Section::Appearance,
+        path: &["harfbuzz_features"],
+        label: "Ligatures",
+        help: "Join character pairs like -> and != into one glyph, where the font has them.",
+        kind: Kind::Toggle,
+        get: |c| {
+            Value::Bool(
+                !c.harfbuzz_features
+                    .iter()
+                    .any(|f| f == "liga=0" || f == "calt=0"),
+            )
+        },
+    },
+    Setting {
+        section: Section::Appearance,
+        path: &["bold_brightens_ansi_colors"],
+        label: "Bold text",
+        help: "Bold in the bright colours and bold, in the bright colours only, or as is.",
+        kind: Kind::Choice(bold_brightening_variants),
+        get: |c| Value::Text(format!("{:?}", c.bold_brightens_ansi_colors)),
+    },
+    choice!(
+        Appearance,
+        "Glyph hinting",
+        "How glyph outlines snap to pixels. Light is closest to the Mac's own look.",
+        config::FreeTypeLoadTarget,
+        freetype_load_target
+    ),
+    toggle!(
+        Appearance,
+        "Built-in box drawing",
+        "Draw box, block and powerline glyphs so they join seamlessly, not with the font's.",
+        custom_block_glyphs
     ),
     Setting {
         section: Section::Appearance,
@@ -1075,6 +1203,38 @@ pub(crate) static CATALOG: &[Setting] = &[
 ];
 
 /// Indices into [`CATALOG`] of the settings in `section`, in order.
+/// Catalog entries matching a search: every word of `query` appears, in any
+/// case, in the setting's label, help, Lua key or section name. In section
+/// order, then catalog order.
+pub(crate) fn search(query: &str) -> Vec<usize> {
+    let words: Vec<String> = query
+        .split_whitespace()
+        .map(|word| word.to_lowercase())
+        .collect();
+    if words.is_empty() {
+        return vec![];
+    }
+    let mut hits: Vec<usize> = CATALOG
+        .iter()
+        .enumerate()
+        .filter(|(_, setting)| {
+            let text = format!(
+                "{} {} {} {}",
+                setting.label,
+                setting.help,
+                setting.path.join("."),
+                setting.section.label()
+            )
+            .to_lowercase();
+            words.iter().all(|word| text.contains(word.as_str()))
+        })
+        .map(|(i, _)| i)
+        .collect();
+    let order = |section: Section| Section::ALL.iter().position(|s| *s == section);
+    hits.sort_by_key(|&i| (order(CATALOG[i].section), i));
+    hits
+}
+
 pub(crate) fn in_section(section: Section) -> Vec<usize> {
     CATALOG
         .iter()
@@ -1088,6 +1248,59 @@ pub(crate) fn in_section(section: Section) -> Vec<usize> {
 mod tests {
     use super::super::lua_edit;
     use super::*;
+
+    #[test]
+    fn font_settings_write_what_lua_reads_and_load() {
+        let config = Config::default_config();
+        let find = |path: &[&str]| CATALOG.iter().find(|s| s.path == path).unwrap();
+        // The weight is written as part of `font`, with the family.
+        let (path, lua) =
+            find(&["font", "weight"]).lua_write(&Value::Text("Medium".into()), &config, false);
+        assert_eq!(path, &["font"]);
+        assert!(matches!(&lua, LuaValue::FontWithWeight(_, w) if w == "Medium"));
+        // Ligatures are a feature list.
+        let (_, off) = find(&["harfbuzz_features"]).lua_write(&Value::Bool(false), &config, false);
+        assert_eq!(off, LuaValue::Raw(LIGATURES_OFF.to_string()));
+        // Each new font setting, written into a file, loads as a config.
+        for (path, value) in [
+            (&["font", "weight"][..], Value::Text("Bold".into())),
+            (&["cell_width"][..], Value::Float(1.1)),
+            (&["harfbuzz_features"][..], Value::Bool(false)),
+            (
+                &["bold_brightens_ansi_colors"][..],
+                Value::Text("BrightOnly".into()),
+            ),
+            (&["freetype_load_target"][..], Value::Text("Light".into())),
+            (&["custom_block_glyphs"][..], Value::Bool(false)),
+        ] {
+            let (path, lua) = find(path).lua_write(&value, &config, false);
+            let text = lua_edit::set_value(&lua_edit::new_file(), path, &lua).unwrap();
+            config::Config::check_lua_text(std::path::Path::new("wezterm.lua"), &text)
+                .unwrap_or_else(|err| panic!("{:?}: {err:#}\n{}", path, text));
+        }
+    }
+
+    #[test]
+    fn search_finds_settings_across_sections_by_label_help_or_key() {
+        let labels = |query: &str| -> Vec<&'static str> {
+            search(query)
+                .into_iter()
+                .map(|i| CATALOG[i].label)
+                .collect()
+        };
+        assert!(labels("").is_empty());
+        // By label, in any case.
+        assert!(labels("WINDOW OPACITY").contains(&"Window opacity"));
+        // By the Lua key.
+        assert!(labels("tgz_pane_keys").contains(&"iTerm2-style pane keys"));
+        // Every word must appear somewhere.
+        assert!(labels("scroll bar idle").contains(&"Hide scroll bar when idle"));
+        assert!(labels("scroll bar zebra").is_empty());
+        // Results run in section order.
+        let hits = search("colour");
+        let order = |i: usize| Section::ALL.iter().position(|s| *s == CATALOG[i].section);
+        assert!(hits.windows(2).all(|w| order(w[0]) <= order(w[1])));
+    }
 
     #[test]
     fn the_colour_grid_is_full_rows_of_valid_colours() {
@@ -1149,11 +1362,8 @@ mod tests {
                 _ => vec![current.clone()],
             };
             for (v, value) in values.iter().enumerate() {
-                let text = match lua_edit::set_value(
-                    &lua_edit::new_file(),
-                    setting.path,
-                    &setting.to_lua(value),
-                ) {
+                let (path, lua) = setting.lua_write(value, &defaults, false);
+                let text = match lua_edit::set_value(&lua_edit::new_file(), path, &lua) {
                     Ok(text) => text,
                     Err(err) => panic!("{:?}: {err:?}", setting.path),
                 };

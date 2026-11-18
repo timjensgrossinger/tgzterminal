@@ -220,6 +220,7 @@ fn value_text(setting: &Setting, value: &Value) -> String {
             }
         }
         LuaValue::Str(s) | LuaValue::Font(s) | LuaValue::Raw(s) => s,
+        LuaValue::FontWithWeight(_, weight) => weight,
     }
 }
 
@@ -662,6 +663,58 @@ impl TermWindow {
             false,
         )?;
 
+        // Search, top right: every setting of every section.
+        {
+            let search_w = ((right - left) * 0.34)
+                .clamp(unit * 22., unit * 44.)
+                .min(right - left - self.chrome_text_width(TITLE, true) - unit * 4.)
+                .max(unit * 10.);
+            let field_text_w = search_w - (SEGMENT_PAD * dpi_scale).round() * 2.;
+            let (label, dim) = if state.search_focused {
+                (
+                    format!(
+                        "{}|",
+                        self.chrome_elide_start(&state.search, field_text_w - unit, false)
+                    ),
+                    false,
+                )
+            } else if state.search.is_empty() {
+                ("\u{f002}  Search settings".to_string(), true)
+            } else {
+                (
+                    self.chrome_elide_start(&state.search, field_text_w - unit, false),
+                    false,
+                )
+            };
+            let left_x = self.paint_settings_segments(
+                layers,
+                right,
+                header_y - 3. * dpi_scale,
+                &[Segment {
+                    label,
+                    selected: false,
+                    hit: Some(SettingsHit::Search),
+                    min_px: field_text_w,
+                    dim,
+                }],
+                ground,
+            )?;
+            if state.search_focused {
+                let control_h = (cell_h + 6. * dpi_scale).ceil();
+                self.filled_rectangle(
+                    layers,
+                    0,
+                    euclid::rect(
+                        left_x,
+                        header_y - 3. * dpi_scale + control_h,
+                        right - left_x,
+                        (2. * dpi_scale).round().max(1.),
+                    ),
+                    accent,
+                )?;
+            }
+        }
+
         let body_top = file_line_y + cell_h * 2.5;
         let footer_y = area.max_y() - cell_h * 1.5;
 
@@ -677,7 +730,8 @@ impl TermWindow {
                 break;
             }
             let item_type = UIItemType::Settings(SettingsHit::Section(index));
-            let active = index == state.section;
+            // While searching no section is chosen: the results span them.
+            let active = index == state.section && !state.searching();
             let fill = if active {
                 opaque(lerp_rgba(ground, accent, 0.28))
             } else if hovered.as_ref() == Some(&item_type) {
@@ -720,7 +774,7 @@ impl TermWindow {
         let body_h = footer_y - cell_h * 0.5 - body_top;
 
         // Layouts: the user's own `tgz_layouts`, as a list and a form.
-        if section == Section::Layouts {
+        if state.list_section() == Some(Section::Layouts) {
             use super::layouts::{start_in_label, DraftField, START_IN};
             use super::pane::LayoutHit;
             use config::keyassignment::PaneLayout;
@@ -1048,7 +1102,7 @@ impl TermWindow {
         }
 
         // Shortcuts: click a row (or Enter on it) and press the new keys.
-        if section == Section::Shortcuts {
+        if state.list_section() == Some(Section::Shortcuts) {
             if state.key_lines.is_none() {
                 state.key_lines = Some(store::key_lines(&state.file).unwrap_or_default());
             }
@@ -1219,7 +1273,8 @@ impl TermWindow {
         }
 
         // Settings of the chosen section.
-        let rows = in_section(section);
+        let rows = state.rows();
+        let searching = state.searching();
         // Controls widen with the column.
         let control_w = (CONTROL_W * dpi_scale * content_w / (BASE_CONTENT_W * dpi_scale))
             .min(content_w * 0.55);
@@ -1239,7 +1294,17 @@ impl TermWindow {
             .collect();
         let headings: Vec<Option<&'static str>> = rows
             .iter()
-            .map(|index| super::catalog::group_heading(&CATALOG[*index]))
+            .enumerate()
+            .map(|(k, index)| {
+                if searching {
+                    // Results are grouped by the section they live in.
+                    let section = CATALOG[*index].section;
+                    let first = k == 0 || CATALOG[rows[k - 1]].section != section;
+                    first.then(|| section.label())
+                } else {
+                    super::catalog::group_heading(&CATALOG[*index])
+                }
+            })
             .collect();
         let row_h_at = |k: usize| {
             (cell_h * 2. + 12. * dpi_scale + help_lines[k].len().saturating_sub(1) as f32 * help_h)

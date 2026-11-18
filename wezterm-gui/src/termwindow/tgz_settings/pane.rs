@@ -60,6 +60,8 @@ pub enum SettingsHit {
     Swatch(usize),
     /// A control of the Layouts section.
     Layout(LayoutHit),
+    /// The search field at the top.
+    Search,
     /// Open the config file in the system's editor for it.
     OpenFile,
     /// A row of the Shortcuts list, by its place in the list: click to give
@@ -276,6 +278,11 @@ pub(crate) struct SettingsState {
     pub layouts_lock: Option<Option<usize>>,
     /// Rows of the Layouts list as last painted (layouts and "New").
     pub layout_rows: usize,
+    /// What the search field holds; while it is not empty the rows are the
+    /// matching settings of every section.
+    pub search: String,
+    /// The search field has the keyboard.
+    pub search_focused: bool,
 }
 
 impl SettingsState {
@@ -296,7 +303,76 @@ impl SettingsState {
             draft: None,
             layouts_lock: None,
             layout_rows: 0,
+            search: String::new(),
+            search_focused: false,
         }
+    }
+
+    /// The search is showing results instead of the chosen section.
+    pub(crate) fn searching(&self) -> bool {
+        !self.search.trim().is_empty()
+    }
+
+    /// The catalog entries on show: the search's matches, else the
+    /// section's settings.
+    pub(crate) fn rows(&self) -> Vec<usize> {
+        if self.searching() {
+            super::catalog::search(&self.search)
+        } else {
+            in_section(self.current_section())
+        }
+    }
+
+    /// The section's own list (Shortcuts, Layouts) is on show, not settings.
+    pub(crate) fn list_section(&self) -> Option<Section> {
+        match self.current_section() {
+            section @ (Section::Shortcuts | Section::Layouts) if !self.searching() => Some(section),
+            _ => None,
+        }
+    }
+
+    /// Change what the search holds; the rows start over at the top.
+    fn edit_search(&mut self, edit: impl FnOnce(&mut String)) {
+        edit(&mut self.search);
+        self.scroll = 0;
+        self.focus = None;
+        self.editing = None;
+    }
+
+    /// Keys while the search field has the keyboard. `true` when taken.
+    fn search_key(&mut self, key: &KeyCode, mods: KeyModifiers) -> bool {
+        let plain = mods == KeyModifiers::NONE || mods == KeyModifiers::SHIFT;
+        match key {
+            KeyCode::Escape => {
+                if self.search.is_empty() {
+                    self.search_focused = false;
+                } else {
+                    self.edit_search(String::clear);
+                }
+            }
+            KeyCode::Backspace | KeyCode::Char('\u{8}') | KeyCode::Char('\u{7f}') => {
+                self.edit_search(|text| {
+                    text.pop();
+                });
+            }
+            // On to the results.
+            KeyCode::Enter
+            | KeyCode::Char('\r')
+            | KeyCode::Char('\n')
+            | KeyCode::DownArrow
+            | KeyCode::ApplicationDownArrow => {
+                self.search_focused = false;
+                if !self.rows().is_empty() {
+                    self.focus = Some(0);
+                }
+            }
+            KeyCode::Char(c) if plain && !c.is_control() => {
+                let c = *c;
+                self.edit_search(|text| text.push(c));
+            }
+            _ => return false,
+        }
+        true
     }
 
     pub(crate) fn current_section(&self) -> Section {
@@ -356,7 +432,9 @@ impl SettingsState {
                 None => store::apply(&self.file, setting.path, None),
             }
         } else {
-            store::apply(&self.file, setting.path, Some(&setting.to_lua(&value)))
+            let config = config::configuration();
+            let (path, lua) = setting.lua_write(&value, &config, in_file_line.is_some());
+            store::apply(&self.file, path, Some(&lua))
         };
 
         self.message = match result {
@@ -761,7 +839,9 @@ impl SettingsState {
         if !matches!(&hit, SettingsHit::Shortcut(_)) {
             self.capture = None;
         }
+        self.search_focused = hit == SettingsHit::Search;
         match hit {
+            SettingsHit::Search => {}
             SettingsHit::Shortcut(row) => {
                 let again = self.capture.as_ref().is_some_and(|c| c.row == row);
                 if again {
@@ -815,6 +895,8 @@ impl SettingsState {
         self.editing = None;
         self.capture = None;
         self.draft = None;
+        self.search.clear();
+        self.search_focused = false;
     }
 
     fn step(&mut self, index: usize, direction: i8, config: &Config) {
@@ -867,16 +949,11 @@ impl SettingsState {
 
     /// Move the keyboard's row by `delta`, scrolling it into view.
     fn move_focus(&mut self, delta: isize) {
-        let count = if self.current_section() == Section::Shortcuts {
-            self.shortcuts.len()
-        } else if self.current_section() == Section::Layouts {
-            if self.draft.is_some() {
-                0
-            } else {
-                self.layout_rows
-            }
-        } else {
-            in_section(self.current_section()).len()
+        let count = match self.list_section() {
+            Some(Section::Shortcuts) => self.shortcuts.len(),
+            Some(_) if self.draft.is_some() => 0,
+            Some(_) => self.layout_rows,
+            None => self.rows().len(),
         };
         if count == 0 {
             self.scroll =
@@ -917,7 +994,7 @@ impl SettingsState {
             KeyCode::Enter | KeyCode::Char('\r') | KeyCode::Char('\n')
         );
 
-        if self.current_section() == Section::Layouts && self.layout_key(&key, mods, config) {
+        if self.list_section() == Some(Section::Layouts) && self.layout_key(&key, mods, config) {
             return;
         }
         if self.editing.as_ref().is_some_and(|e| e.swatch.is_some()) {
@@ -959,7 +1036,23 @@ impl SettingsState {
         }
 
         self.message = None;
-        let rows = in_section(self.current_section());
+        // Letters start a search, as in the system's own settings; a field,
+        // a capture or the Layouts form took its keys above.
+        if !self.search_focused
+            && self.draft.is_none()
+            && matches!(key, KeyCode::Char(c) if c.is_alphanumeric())
+            && (mods == KeyModifiers::NONE || mods == KeyModifiers::SHIFT)
+        {
+            self.search_focused = true;
+        }
+        if self.search_focused && self.search_key(&key, mods) {
+            return;
+        }
+        if key == KeyCode::Escape && self.searching() && self.focus.is_none() {
+            self.edit_search(String::clear);
+            return;
+        }
+        let rows = self.rows();
         let focused = self.focus.and_then(|at| rows.get(at).copied());
         match key {
             _ if up => self.move_focus(-1),
@@ -974,12 +1067,12 @@ impl SettingsState {
                     (self.section + 1) % count
                 };
                 self.show_section(next);
-                if !in_section(self.current_section()).is_empty() {
+                if !self.rows().is_empty() {
                     self.focus = Some(0);
                 }
             }
             KeyCode::Escape => self.focus = None,
-            _ if self.current_section() == Section::Shortcuts => {
+            _ if self.list_section() == Some(Section::Shortcuts) => {
                 let Some(row) = self.focus else {
                     return;
                 };
@@ -1122,6 +1215,10 @@ impl SettingsPane {
                 drop(state);
                 self.repaint();
             }
+        } else if state.search_focused {
+            state.edit_search(|search| search.extend(clean()));
+            drop(state);
+            self.repaint();
         }
     }
 }
@@ -1440,6 +1537,28 @@ mod tests {
 
         press(&mut state, KeyCode::Escape, KeyModifiers::NONE);
         assert_eq!(state.focus, None);
+    }
+
+    #[test]
+    fn typing_searches_every_section_and_esc_backs_out() {
+        let mut state = state(5);
+        for c in "opacity".chars() {
+            press(&mut state, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        assert!(state.search_focused && state.searching());
+        let rows = state.rows();
+        assert!(rows
+            .iter()
+            .any(|&i| CATALOG[i].path == ["window_background_opacity"]));
+        // Down goes on to the results, keeping the query.
+        press(&mut state, KeyCode::DownArrow, KeyModifiers::NONE);
+        assert_eq!((state.search_focused, state.focus), (false, Some(0)));
+        // Esc leaves the row, then clears the search.
+        press(&mut state, KeyCode::Escape, KeyModifiers::NONE);
+        assert_eq!(state.focus, None);
+        press(&mut state, KeyCode::Escape, KeyModifiers::NONE);
+        assert!(!state.searching());
+        assert_eq!(state.rows(), in_section(state.current_section()));
     }
 
     #[test]

@@ -7,9 +7,10 @@ WezTerm compatibility unless noted.
 
 `CMD|,` (action `ShowSettings`, also in the command palette and in the menu
 of a right click on the empty tab list) opens Settings as a tab. It covers the
-fork's settings and a few basics (font, font size, line height, colour scheme,
-window opacity), grouped as Appearance, Colours, Sidebar, Agents, Worktree,
-Changes, Input and Privacy; long sections are split by small headings
+fork's settings and a few basics (font, weight, size, line height, letter
+spacing, ligatures, bold text, glyph hinting, built-in box drawing, colour
+scheme, window opacity), grouped as Appearance, Colours, Sidebar, Agents,
+Worktree, Changes, Input and Privacy; long sections are split by small headings
 (Agents ends with **Animations**, one switch per `agent_ui.animations` key).
 On/off settings are switches, filled with the accent only while on. Colours
 holds one field per `sidebar_colors` key, plus the New Tab style. Opening a
@@ -49,6 +50,17 @@ the background the first time), or every colour scheme, yours and the
 built-in ones, with "None" on top. Type to filter, names that start with what
 you typed come first. A font the system does not list can still be entered by
 name.
+
+A search field at the top (or just start typing letters) finds settings in
+every section by label, help text or Lua key, grouped by section; `Down` or
+`Enter` moves into the results, `Esc` steps back and then clears it.
+
+Font weight is written as part of `font` (`wezterm.font(name, { weight = … })`),
+and changing the family keeps a weight already set. Ligatures write
+`harfbuzz_features` (`calt=0`, `clig=0`, `liga=0` when off). Letter spacing is
+upstream's `cell_width`. Everything else WezTerm offers for fonts
+(`font_rules`, `underline_thickness`, `freetype_render_target`, …) still works
+in Lua.
 
 From the keyboard:
 

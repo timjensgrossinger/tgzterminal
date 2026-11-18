@@ -2968,7 +2968,8 @@ pub(crate) fn sidebar_reserved_width_for_config(config: &ConfigHandle, dpi: f64)
 /// Label ladders for the sidebar's fixed-width buttons, widest first.
 const NEW_TAB_LABELS: [&str; 3] = ["+ New Tab", "+ Tab", "+"];
 const SSH_ROW_LABELS: [&str; 3] = ["SSH Connect", "SSH", ">_"];
-const SEARCH_PLACEHOLDER_LABELS: [&str; 3] = ["Search tabs...", "Search...", "Search"];
+const SEARCH_PLACEHOLDER_LABELS: [&str; 3] =
+    ["Search\u{2026}  > @ / #", "Search\u{2026}", "Search"];
 
 /// What the SSH button says in `cols` columns.
 ///
@@ -15439,7 +15440,11 @@ impl crate::TermWindow {
             // tab-label column below (content_x + list_indent). Keeping toggle
             // and search on one row means the tab list starts right below with
             // no leftover gap up top.
-            let toggle_rect = euclid::rect(content_x, y, toggle_side, toggle_side);
+            // On the tab rows' left edge (`item_x`), not the content column's:
+            // with the sidebar on the right the content column starts past the
+            // resize grip and the list's scroll bar gutter, which the top row
+            // does not have, and the toggle stood off the rows by both.
+            let toggle_rect = euclid::rect(item_x, y, toggle_side, toggle_side);
             let toggle_bg = self.paint_sidebar_autohide_toggle(
                 layers,
                 toggle_rect,
@@ -15461,7 +15466,7 @@ impl crate::TermWindow {
             };
             draw_toggle_icon(self, layers, toggle_rect, toggle_fg, toggle_bg)?;
 
-            let search_x = content_x + list_indent;
+            let search_x = item_x + list_indent;
             // Extend the search box to the tab-row pill's right edge
             // (item_x + item_w) so it lines up with the highlighted tab rows
             // below, which span the full item width rather than stopping short
@@ -15578,7 +15583,11 @@ impl crate::TermWindow {
         } else {
             // Narrow sidebar: no search field is drawn, so the toggle keeps
             // its own row at the top-left of the content column.
-            let toggle_rect = euclid::rect(content_x, y, toggle_side, toggle_side);
+            // On the tab rows' left edge (`item_x`), not the content column's:
+            // with the sidebar on the right the content column starts past the
+            // resize grip and the list's scroll bar gutter, which the top row
+            // does not have, and the toggle stood off the rows by both.
+            let toggle_rect = euclid::rect(item_x, y, toggle_side, toggle_side);
             let toggle_bg = self.paint_sidebar_autohide_toggle(
                 layers,
                 toggle_rect,

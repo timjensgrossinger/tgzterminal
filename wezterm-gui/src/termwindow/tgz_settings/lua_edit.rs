@@ -52,6 +52,9 @@ pub(crate) enum LuaValue {
     /// A Lua expression written as is, e.g. a whole table. It must be one
     /// line: the block is read back line by line.
     Raw(String),
+    /// A font family with a weight: `wezterm.font('Name', { weight = 'W' })`.
+    /// Written whole, so a file that sets the font in code keeps it.
+    FontWithWeight(String, String),
 }
 
 impl LuaValue {
@@ -67,6 +70,7 @@ impl LuaValue {
             LuaValue::Float(f) => f.to_string(),
             LuaValue::Str(s) | LuaValue::Font(s) => quote_lua(s, quote),
             LuaValue::Raw(expr) => expr.replace(['\r', '\n'], " "),
+            LuaValue::FontWithWeight(name, _) => quote_lua(name, quote),
         }
     }
 
@@ -77,6 +81,11 @@ impl LuaValue {
             LuaValue::Font(name) => {
                 format!("require('wezterm').font({})", quote_lua(name, '\''))
             }
+            LuaValue::FontWithWeight(name, weight) => format!(
+                "require('wezterm').font({}, {{ weight = {} }})",
+                quote_lua(name, '\''),
+                quote_lua(weight, '\'')
+            ),
             other => other.literal('\''),
         }
     }
@@ -908,7 +917,8 @@ pub(crate) fn set_value(src: &str, path: &[&str], value: &LuaValue) -> Result<St
                 return Err(locked);
             }
             let is_font = matches!(value, LuaValue::Font(_));
-            let is_raw = matches!(value, LuaValue::Raw(_));
+            // Whole expressions: never a literal's spelling to swap in.
+            let is_raw = matches!(value, LuaValue::Raw(_) | LuaValue::FontWithWeight(..));
             let fits = match first.kind {
                 SlotKind::Literal => !is_font && !is_raw,
                 SlotKind::FontName => is_font,
