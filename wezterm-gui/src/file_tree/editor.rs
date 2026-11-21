@@ -143,27 +143,21 @@ pub fn is_vim(program: &str) -> bool {
 /// when it is already open and edits it otherwise. The path is escaped as
 /// vim's `fnameescape()` would; a Windows path keeps its backslashes, which
 /// are its separators there.
-pub fn vim_drop_keys(path: &str) -> String {
+///
+/// `None` for a path with a control character in it. These are typed keys,
+/// not file name text, and no escape holds them: a CR or Ctrl-J ends the
+/// `:drop` and the rest of the name runs as vim commands. Such a file opens
+/// in a new editor instead, which gets the path as an argument.
+pub fn vim_drop_keys(path: &str) -> Option<String> {
+    if super::ops::has_control(path) {
+        return None;
+    }
     let windows = path.as_bytes().get(1) == Some(&b':') || path.starts_with("\\\\");
     let mut escaped = String::with_capacity(path.len());
     for (index, c) in path.chars().enumerate() {
         let special = matches!(
             c,
-            ' ' | '\t'
-                | '\n'
-                | '*'
-                | '?'
-                | '['
-                | '{'
-                | '`'
-                | '$'
-                | '%'
-                | '#'
-                | '\''
-                | '"'
-                | '|'
-                | '!'
-                | '<'
+            ' ' | '*' | '?' | '[' | '{' | '`' | '$' | '%' | '#' | '\'' | '"' | '|' | '!' | '<'
         ) || (c == '\\' && !windows)
             || (index == 0 && matches!(c, '+' | '>' | '-'));
         if special {
@@ -171,7 +165,7 @@ pub fn vim_drop_keys(path: &str) -> String {
         }
         escaped.push(c);
     }
-    format!("\x1c\x0e:drop {escaped}\r")
+    Some(format!("\x1c\x0e:drop {escaped}\r"))
 }
 
 fn with_arg(argv: &[String], arg: String) -> Vec<String> {
@@ -391,20 +385,25 @@ mod tests {
 
     #[test]
     fn vim_is_told_to_drop_onto_the_file() {
-        assert_eq!(
-            vim_drop_keys("/r/src/main.rs"),
-            "\x1c\x0e:drop /r/src/main.rs\r"
-        );
-        assert_eq!(
-            vim_drop_keys("/r/a b%#.md"),
-            "\x1c\x0e:drop /r/a\\ b\\%\\#.md\r"
-        );
-        assert_eq!(vim_drop_keys("+x"), "\x1c\x0e:drop \\+x\r");
-        assert_eq!(vim_drop_keys(r"C:\r\a b"), "\x1c\x0e:drop C:\\r\\a\\ b\r");
-        assert_eq!(
-            vim_drop_keys(r"/r/back\slash"),
-            "\x1c\x0e:drop /r/back\\\\slash\r"
-        );
+        let keys = |path: &str| vim_drop_keys(path).unwrap();
+        assert_eq!(keys("/r/src/main.rs"), "\x1c\x0e:drop /r/src/main.rs\r");
+        assert_eq!(keys("/r/a b%#.md"), "\x1c\x0e:drop /r/a\\ b\\%\\#.md\r");
+        assert_eq!(keys("+x"), "\x1c\x0e:drop \\+x\r");
+        assert_eq!(keys(r"C:\r\a b"), "\x1c\x0e:drop C:\\r\\a\\ b\r");
+        assert_eq!(keys(r"/r/back\slash"), "\x1c\x0e:drop /r/back\\\\slash\r");
+    }
+
+    #[test]
+    fn a_name_with_control_characters_is_not_typed_into_vim() {
+        for path in [
+            "/r/a\x1b!j./evil\r",
+            "/r/a\nb",
+            "/r/a\tb",
+            "/r/\x12=x",
+            "/r/\x7f",
+        ] {
+            assert_eq!(vim_drop_keys(path), None, "{path:?}");
+        }
     }
 
     #[test]

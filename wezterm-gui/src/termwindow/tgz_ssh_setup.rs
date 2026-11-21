@@ -18,6 +18,7 @@
 //! Pure apart from [`append_host_block`]; the painting and input live in
 //! `render/sidebar/ssh_setup.rs`.
 
+use super::tgz_fs;
 use config::SshTransport;
 use std::path::{Path, PathBuf};
 
@@ -262,6 +263,10 @@ pub(crate) fn validate(form: &SshSetupForm) -> Result<NewHost, String> {
     if !is_token(name) || name.contains(['*', '?', '!', ',']) {
         return Err("A name is one word: no spaces, and none of * ? ! , # \"".into());
     }
+    // ssh would read such a name as an option, not a host.
+    if name.starts_with('-') {
+        return Err("A name cannot start with -.".into());
+    }
     let host = form.host.trim();
     if host.is_empty() {
         return Err("Which host? Type its address or IP.".into());
@@ -290,6 +295,11 @@ pub(crate) fn validate(form: &SshSetupForm) -> Result<NewHost, String> {
             if key.contains('"') {
                 return Err("The key file path has a quote in it.".into());
             }
+            // ssh reads a backslash in the config as an escape. A Windows
+            // path is written with `/` instead; elsewhere one is refused.
+            if key.contains('\\') && !cfg!(windows) && !is_windows_path(key) {
+                return Err("The key file path has a backslash in it.".into());
+            }
             Some(key.to_string())
         }
     };
@@ -312,6 +322,24 @@ pub(crate) fn expand_home(path: &str, home: &Path) -> PathBuf {
     }
 }
 
+/// Whether `path` is spelled the Windows way: a drive letter, or a share.
+fn is_windows_path(path: &str) -> bool {
+    path.as_bytes().get(1) == Some(&b':') || path.starts_with("\\\\")
+}
+
+/// `key` as an `IdentityFile` value inside quotes. ssh reads `\` there as an
+/// escape (a trailing one would swallow the closing quote) and `%` as a
+/// token, so a Windows path gets `/` separators, which every Windows ssh
+/// accepts, and `%` is doubled.
+fn identity_file_text(key: &str) -> String {
+    let key = if cfg!(windows) || is_windows_path(key) {
+        key.replace('\\', "/")
+    } else {
+        key.to_string()
+    };
+    key.replace('%', "%%")
+}
+
 /// The `Host` block for `ssh_config`. Paths are quoted, since a Windows
 /// profile path often has a space in it.
 pub(crate) fn host_block(new: &NewHost, product: &str) -> String {
@@ -324,7 +352,10 @@ pub(crate) fn host_block(new: &NewHost, product: &str) -> String {
         block.push_str(&format!("    Port {port}\n"));
     }
     if let Some(key) = &new.key_file {
-        block.push_str(&format!("    IdentityFile \"{key}\"\n"));
+        block.push_str(&format!(
+            "    IdentityFile \"{}\"\n",
+            identity_file_text(key)
+        ));
         // Offer this key, not every key the agent holds: servers cut a
         // client off after a few failed keys.
         block.push_str("    IdentitiesOnly yes\n");
@@ -355,7 +386,7 @@ fn line_hosts(line: &str) -> impl Iterator<Item = &str> {
 }
 
 /// `config_text` with `block` after it, separated by a blank line.
-pub(crate) fn appended(config_text: &str, block: &str) -> String {
+fn appended(config_text: &str, block: &str) -> String {
     let mut text = config_text.to_string();
     if !text.is_empty() {
         if !text.ends_with('\n') {
@@ -367,6 +398,76 @@ pub(crate) fn appended(config_text: &str, block: &str) -> String {
     }
     text.push_str(block);
     text
+}
+
+/// A config line's keyword and value, `Key value` and `Key=value` alike;
+/// `None` for a blank line or a comment.
+fn directive(line: &str) -> Option<(&str, &str)> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return None;
+    }
+    let end = line
+        .find(|c: char| c.is_whitespace() || c == '=')
+        .unwrap_or(line.len());
+    let value = line[end..].trim_start_matches(|c: char| c.is_whitespace() || c == '=');
+    Some((&line[..end], value.trim()))
+}
+
+/// Whether `line` ends the global section: a block, or an included file
+/// that may hold blocks.
+fn opens_section(line: &str) -> bool {
+    directive(line).is_some_and(|(key, _)| {
+        ["host", "match", "include"]
+            .iter()
+            .any(|section| key.eq_ignore_ascii_case(section))
+    })
+}
+
+/// `config_text` with `block` put before its first `Host`, `Match` or
+/// `Include`, and the comment lines right above that. ssh takes each setting
+/// from the first block that matches, so a block at the end would lose to a
+/// `Host *` or an included file above it; up front, only the global lines
+/// come first, and [`global_override`] checks those.
+pub(crate) fn inserted(config_text: &str, block: &str) -> String {
+    let lines: Vec<&str> = config_text.split_inclusive('\n').collect();
+    let Some(mut at) = lines.iter().position(|line| opens_section(line)) else {
+        return appended(config_text, block);
+    };
+    while at > 0 && lines[at - 1].trim_start().starts_with('#') {
+        at -= 1;
+    }
+    let mut text = appended(&lines[..at].concat(), block);
+    text.push('\n');
+    text.push_str(&lines[at..].concat());
+    text
+}
+
+/// The global line, above every `Host`, `Match` and `Include`, that would
+/// override a setting of `new`: ssh keeps the first value it reads.
+fn global_override<'a>(config_text: &'a str, new: &NewHost) -> Option<&'a str> {
+    for line in config_text.lines() {
+        if opens_section(line) {
+            break;
+        }
+        let Some((key, value)) = directive(line) else {
+            continue;
+        };
+        let value = value.trim_matches('"');
+        let ours = if key.eq_ignore_ascii_case("hostname") {
+            Some(new.host.clone())
+        } else if key.eq_ignore_ascii_case("user") {
+            new.user.clone()
+        } else if key.eq_ignore_ascii_case("port") {
+            new.port.map(|port| port.to_string())
+        } else {
+            None
+        };
+        if ours.is_some_and(|ours| ours != value) {
+            return Some(line.trim());
+        }
+    }
+    None
 }
 
 /// The user's ssh config file.
@@ -390,44 +491,47 @@ pub(crate) fn append_host_block(path: &Path, new: &NewHost, product: &str) -> Re
             new.name
         ));
     }
+    if let Some(line) = global_override(&existing, new) {
+        return Err(format!(
+            "{} sets `{line}` for every host, which would override this one. \
+             Leave that field empty, or move the line under a `Host *` at the end.",
+            path.display()
+        ));
+    }
     if let Some(dir) = path.parent() {
         if !dir.is_dir() {
-            std::fs::create_dir_all(dir)
-                .map_err(|err| format!("Could not create {}: {err}", dir.display()))?;
+            let mut builder = std::fs::DirBuilder::new();
+            builder.recursive(true);
             #[cfg(unix)]
             {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
             }
+            builder
+                .create(dir)
+                .map_err(|err| format!("Could not create {}: {err}", dir.display()))?;
         }
     }
-    let text = appended(&existing, &host_block(new, product));
+    let text = inserted(&existing, &host_block(new, product));
     // Written beside it and moved over it, so a failed write cannot leave
     // half a config behind.
-    let tmp = path.with_extension("tgz-tmp");
-    std::fs::write(&tmp, text.as_bytes())
-        .map_err(|err| format!("Could not write {}: {err}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(path)
-            .map(|meta| meta.permissions().mode() & 0o777)
-            .unwrap_or(0o600);
-        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode));
-    }
-    std::fs::rename(&tmp, path).map_err(|err| {
-        let _ = std::fs::remove_file(&tmp);
-        format!("Could not write {}: {err}", path.display())
-    })
+    let mode = tgz_fs::existing_mode_or(path, 0o600);
+    tgz_fs::replace_file(path, text.as_bytes(), mode)
+        .map_err(|err| format!("Could not write {}: {err}", path.display()))
 }
 
 /// The command that connects to `name` with `transport`, the program
-/// resolved by `resolve`. `None` when that program is not installed.
+/// resolved by `resolve`. `None` when that program is not installed, or
+/// when `name` would be read as an option (an alias from the ssh config may
+/// be anything).
 pub(crate) fn connect_argv(
     name: &str,
     transport: SshTransport,
     resolve: &dyn Fn(&str) -> Option<PathBuf>,
 ) -> Option<Vec<String>> {
+    if name.is_empty() || name.starts_with('-') {
+        return None;
+    }
     let program = resolve(transport_program(transport))?;
     Some(vec![
         program.to_string_lossy().into_owned(),
@@ -462,22 +566,24 @@ mod tests {
         form.user.clear();
         form.port.clear();
         let block = host_block(&validate(&form).unwrap(), "X");
-        assert!(
-            block.contains("    IdentityFile \"C:\\Users\\Tim Grossinger\\.ssh\\id_ed25519\"\n")
-        );
+        assert!(block.contains("    IdentityFile \"C:/Users/Tim Grossinger/.ssh/id_ed25519\"\n"));
         assert!(block.contains("    IdentitiesOnly yes\n"));
         assert!(!block.contains("    User ") && !block.contains("    Port "));
     }
 
     #[test]
     fn the_form_refuses_what_ssh_config_cannot_hold() {
-        let cases: [(&dyn Fn(&mut SshSetupForm), &str); 6] = [
+        let cases: [(&dyn Fn(&mut SshSetupForm), &str); 7] = [
             (&|f: &mut SshSetupForm| f.name.clear(), "name"),
             (
                 &|f: &mut SshSetupForm| f.name = "two words".into(),
                 "one word",
             ),
             (&|f: &mut SshSetupForm| f.name = "web*".into(), "one word"),
+            (
+                &|f: &mut SshSetupForm| f.name = "-oProxyCommand=x".into(),
+                "start with -",
+            ),
             (&|f: &mut SshSetupForm| f.host.clear(), "host"),
             (&|f: &mut SshSetupForm| f.port = "70000".into(), "port"),
             (
@@ -546,6 +652,50 @@ mod tests {
         assert_eq!(appended("", "Host a\n"), "Host a\n");
         assert_eq!(appended("Host b", "Host a\n"), "Host b\n\nHost a\n");
         assert_eq!(appended("Host b\n\n", "Host a\n"), "Host b\n\nHost a\n");
+        // No block to go before: at the end, after the global lines.
+        assert_eq!(appended("User me\n", "Host a\n"), "User me\n\nHost a\n");
+        assert_eq!(inserted("User me\n", "Host a\n"), "User me\n\nHost a\n");
+    }
+
+    #[test]
+    fn a_new_block_goes_before_every_block_that_could_shadow_it() {
+        let config =
+            "ServerAliveInterval 30\n\n# work\nHost web*\n  User other\nHost *\n  Port 22\n";
+        assert_eq!(
+            inserted(config, "Host web1\n"),
+            "ServerAliveInterval 30\n\nHost web1\n\n# work\nHost web*\n  User other\nHost *\n  Port 22\n"
+        );
+        assert_eq!(
+            inserted("Include ~/.ssh/conf.d/*\n", "Host a\n"),
+            "Host a\n\nInclude ~/.ssh/conf.d/*\n"
+        );
+        assert_eq!(inserted("match all\n", "Host a\n"), "Host a\n\nmatch all\n");
+    }
+
+    #[test]
+    fn a_global_setting_that_would_win_is_refused() {
+        let new = validate(&filled()).unwrap();
+        assert_eq!(
+            global_override("User root\nHost x\n", &new),
+            Some("User root")
+        );
+        assert_eq!(global_override("Port=22\n", &new), Some("Port=22"));
+        // The same value, or one set only inside a block, changes nothing.
+        assert_eq!(global_override("User tim\nHost x\n  Port 22\n", &new), None);
+        let mut form = filled();
+        form.user.clear();
+        let new = validate(&form).unwrap();
+        assert_eq!(global_override("User root\n", &new), None);
+    }
+
+    #[test]
+    fn a_key_path_is_written_the_way_ssh_reads_it() {
+        assert_eq!(
+            identity_file_text(r"C:\Users\Tim\.ssh\id_ed25519"),
+            "C:/Users/Tim/.ssh/id_ed25519"
+        );
+        assert_eq!(identity_file_text(r"\\server\keys\id"), "//server/keys/id");
+        assert_eq!(identity_file_text("~/.ssh/100%"), "~/.ssh/100%%");
     }
 
     #[test]
@@ -571,6 +721,10 @@ mod tests {
             Some(vec!["/usr/bin/mosh".to_string(), "web1".to_string()])
         );
         assert_eq!(connect_argv("web1", SshTransport::Et, &resolve), None);
+        assert_eq!(
+            connect_argv("-oProxyCommand=x", SshTransport::Ssh, &resolve),
+            None
+        );
         assert_eq!(
             expand_home("~/.ssh/id", Path::new("/home/t")),
             PathBuf::from("/home/t/.ssh/id")

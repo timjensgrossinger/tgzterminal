@@ -330,8 +330,23 @@ pub fn detect_vcs(dir: &Path) -> Option<(Vcs, PathBuf)> {
     None
 }
 
-/// Why a file's content is not shown, or its text.
-pub fn read_text_file(path: &Path, max_bytes: usize) -> Result<String, String> {
+/// Why a file's content is not shown, or its text. A symbolic link is read
+/// only when it leads to a file inside `root`, the working copy: one planted
+/// in a downloaded tree must not put `~/.ssh/id_ed25519` on screen.
+pub fn read_text_file(path: &Path, root: &Path, max_bytes: usize) -> Result<String, String> {
+    let link = std::fs::symlink_metadata(path).map_err(|err| err.to_string())?;
+    if link.file_type().is_symlink() {
+        let inside = match (std::fs::canonicalize(path), std::fs::canonicalize(root)) {
+            (Ok(target), Ok(root)) => target.starts_with(root),
+            _ => false,
+        };
+        if !inside {
+            let target = std::fs::read_link(path)
+                .map(|target| target.display().to_string())
+                .unwrap_or_default();
+            return Err(format!("link to {target}, outside this folder"));
+        }
+    }
     let meta = std::fs::metadata(path).map_err(|err| err.to_string())?;
     if !meta.is_file() {
         return Err("not a regular file".to_string());
@@ -532,11 +547,41 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let bin = tmp.path().join("a.bin");
         std::fs::write(&bin, [1u8, 0, 2]).unwrap();
-        assert_eq!(read_text_file(&bin, 1024).unwrap_err(), "binary");
+        assert_eq!(
+            read_text_file(&bin, tmp.path(), 1024).unwrap_err(),
+            "binary"
+        );
 
         let big = tmp.path().join("big.txt");
         std::fs::write(&big, "x".repeat(100)).unwrap();
-        assert_eq!(read_text_file(&big, 10).unwrap_err(), "too large to show");
-        assert_eq!(read_text_file(&big, 1000).unwrap().len(), 100);
+        assert_eq!(
+            read_text_file(&big, tmp.path(), 10).unwrap_err(),
+            "too large to show"
+        );
+        assert_eq!(read_text_file(&big, tmp.path(), 1000).unwrap().len(), 100);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_out_of_the_working_copy_is_not_followed() {
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("id_ed25519");
+        std::fs::write(&secret, "PRIVATE KEY").unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("readme.md"), "hello").unwrap();
+        std::os::unix::fs::symlink(&secret, root.join("notes.txt")).unwrap();
+        std::os::unix::fs::symlink("readme.md", root.join("README")).unwrap();
+
+        let err = read_text_file(&root.join("notes.txt"), root, 1024).unwrap_err();
+        assert!(
+            err.starts_with("link to ") && err.ends_with("outside this folder"),
+            "{err}"
+        );
+        assert!(!err.contains("PRIVATE"));
+        assert_eq!(
+            read_text_file(&root.join("README"), root, 1024).unwrap(),
+            "hello"
+        );
     }
 }

@@ -30,6 +30,7 @@
 
 use crate::agent_herd::quota;
 use crate::agent_herd::vendor::{SessionOrigin, SessionRoot};
+use crate::termwindow::tgz_fs;
 use anyhow::{bail, Context};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
@@ -321,35 +322,11 @@ fn read_settings(path: &Path) -> anyhow::Result<Option<(Value, Vec<u8>)>> {
 }
 
 /// Write via a temporary file and a rename, so a reader never sees half a
-/// file. Keeps the permissions of the file being replaced.
+/// file. The file gets `mode`, else keeps the permissions of the file being
+/// replaced, else is the owner's only: Claude's settings can hold tokens.
 fn write_atomic(path: &Path, bytes: &[u8], mode: Option<u32>) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-    }
-    let name = path
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let tmp = path.with_file_name(format!(".{name}.tgz-tmp"));
-    std::fs::write(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
-    let permissions = std::fs::metadata(path).ok().map(|meta| meta.permissions());
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let permissions = match (permissions, mode) {
-            (_, Some(mode)) => std::fs::Permissions::from_mode(mode),
-            (Some(permissions), None) => permissions,
-            (None, None) => std::fs::Permissions::from_mode(0o644),
-        };
-        std::fs::set_permissions(&tmp, permissions).ok();
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (permissions, mode);
-    }
-    std::fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))?;
-    Ok(())
+    let mode = mode.unwrap_or_else(|| tgz_fs::existing_mode_or(path, 0o600));
+    tgz_fs::replace_file(path, bytes, mode).with_context(|| format!("replacing {}", path.display()))
 }
 
 fn write_settings(path: &Path, settings: &Value, previous: Option<&[u8]>) -> anyhow::Result<()> {
@@ -358,8 +335,14 @@ fn write_settings(path: &Path, settings: &Value, previous: Option<&[u8]>) -> any
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default();
-        std::fs::write(path.with_file_name(format!("{name}.bak")), previous)
-            .context("writing the settings backup")?;
+        // As private as the settings it copies.
+        let mode = tgz_fs::existing_mode_or(path, 0o600);
+        write_atomic(
+            &path.with_file_name(format!("{name}.bak")),
+            previous,
+            Some(mode),
+        )
+        .context("writing the settings backup")?;
     }
     let mut text = serde_json::to_string_pretty(settings)?;
     text.push('\n');

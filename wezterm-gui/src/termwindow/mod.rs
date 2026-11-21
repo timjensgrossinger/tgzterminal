@@ -129,6 +129,7 @@ pub mod shell_copy;
 pub mod spawn;
 pub mod tgz_alt_screen;
 pub(crate) mod tgz_footer;
+pub(crate) mod tgz_fs;
 pub mod tgz_last_session;
 pub(crate) mod tgz_notify;
 mod tgz_pane_layout;

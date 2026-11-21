@@ -70,6 +70,15 @@ files through the configured editor command (`vim` by default) in a split beside
 the shell pane, and keeps pane management compatible with normal terminal
 splits. Listing never blocks the GUI thread.
 
+File names and repositories are untrusted input. A path typed into a pane
+(vim's `:drop`, "cd Here", a dragged path) never carries a control character:
+it is spelled in printable escapes the shell understands, or the action falls
+back to one that passes the path as an argument (a new editor, a new shell in
+the folder). The Changes panel switches off commands named by a repository's
+own Git config (fsmonitor hooks, textconv, filters) unless the repository is
+listed in `diff_panel.trusted_repos`, and does not follow a symbolic link out
+of the working copy.
+
 ## Agent Telemetry
 
 Agent telemetry is vendor-neutral. Public code and docs use generic fields:

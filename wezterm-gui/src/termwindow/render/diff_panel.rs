@@ -1172,6 +1172,13 @@ impl crate::TermWindow {
             nested_max_roots: self.config.diff_panel.nested_max_roots,
         };
         let other_distro = Self::default_wsl_distro();
+        let trusted: Vec<PathBuf> = self
+            .config
+            .diff_panel
+            .trusted_repos
+            .iter()
+            .map(|repo| crate::termwindow::tgz_ssh_setup::expand_home(repo, &config::HOME_DIR))
+            .collect();
         let watched = self.diff_panel.watch.as_ref().map(|watch| {
             watch.clear();
             watch.root().to_path_buf()
@@ -1180,8 +1187,9 @@ impl crate::TermWindow {
         let spawned = std::thread::Builder::new()
             .name("diff-panel-scan".into())
             .spawn(move || {
-                let settled =
-                    target.and_then(|target| settle_scan_target(target, other_distro.clone()));
+                let settled = target
+                    .and_then(|target| settle_scan_target(target, other_distro.clone()))
+                    .map(|(dir, runner)| (dir, runner.trusting(trusted.clone())));
                 let settled_in = now.elapsed();
                 let result = match (mode, settled) {
                     (config::DiffPanelMode::Session, settled) => {
@@ -1195,7 +1203,8 @@ impl crate::TermWindow {
                                         other_distro.map(|distro| Env::Wsl { distro, user: None }),
                                     )
                                     .collect(),
-                            ),
+                            )
+                            .trusting(trusted),
                         };
                         let sources: Vec<_> =
                             sessions.iter().filter_map(PaneSession::source).collect();

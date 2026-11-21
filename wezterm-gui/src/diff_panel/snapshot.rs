@@ -312,14 +312,16 @@ pub fn scan(root: &Path, base: &Path, limits: Limits) -> Scan {
         seen.insert(relative.as_str());
         match manifest.files.get(relative) {
             Some(entry) => files.extend(compare(relative, full, entry, &store, limits)),
-            None => files.push(match super::read_text_file(full, limits.max_file_bytes) {
-                Ok(text) => FileChange::all_added(relative.clone(), &text),
-                Err(reason) => {
-                    let mut file = FileChange::new(relative.clone(), FileStatus::Added);
-                    file.note = Some(reason);
-                    file
-                }
-            }),
+            None => files.push(
+                match super::read_text_file(full, root, limits.max_file_bytes) {
+                    Ok(text) => FileChange::all_added(relative.clone(), &text),
+                    Err(reason) => {
+                        let mut file = FileChange::new(relative.clone(), FileStatus::Added);
+                        file.note = Some(reason);
+                        file
+                    }
+                },
+            ),
         }
     }
     for (relative, entry) in &manifest.files {

@@ -91,45 +91,184 @@ pub fn apply_moves(root: &Path, moves: &[Move]) -> Result<usize, String> {
         }
     }
     for (done, planned) in moves.iter().enumerate() {
-        if let Err(err) = std::fs::rename(abs(&planned.from), abs(&planned.to)) {
+        if let Err(err) = rename_new(&abs(&planned.from), &abs(&planned.to)) {
             let moved = if done == 0 {
                 String::new()
             } else {
                 format!(" ({done} moved before it)")
             };
+            if err.kind() == std::io::ErrorKind::AlreadyExists {
+                return Err(format!("{} already exists{moved}", planned.to));
+            }
             return Err(format!("Could not move {}: {err}{moved}", planned.from));
         }
     }
     Ok(moves.len())
 }
 
-/// How the program in a pane reads a pasted path.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PasteSyntax {
-    /// sh, bash, zsh, fish, and agents running under them.
-    Posix,
-    /// PowerShell and cmd.
-    Windows,
+/// `std::fs::rename` that fails rather than replace a file that appeared at
+/// `to` after it was checked. Where the system has no such rename, it is the
+/// check and a plain rename.
+fn rename_new(from: &Path, to: &Path) -> std::io::Result<()> {
+    #[cfg(any(
+        target_os = "macos",
+        all(target_os = "linux", any(target_env = "gnu", target_env = "musl"))
+    ))]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let from_c = std::ffi::CString::new(from.as_os_str().as_bytes())?;
+        let to_c = std::ffi::CString::new(to.as_os_str().as_bytes())?;
+        // SAFETY: both are NUL-terminated paths that outlive the call.
+        #[cfg(target_os = "macos")]
+        let rc = unsafe { libc::renamex_np(from_c.as_ptr(), to_c.as_ptr(), libc::RENAME_EXCL) };
+        // SAFETY: as above; AT_FDCWD resolves relative paths as rename does.
+        #[cfg(target_os = "linux")]
+        let rc = unsafe {
+            libc::renameat2(
+                libc::AT_FDCWD,
+                from_c.as_ptr(),
+                libc::AT_FDCWD,
+                to_c.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        if rc == 0 {
+            return Ok(());
+        }
+        let err = std::io::Error::last_os_error();
+        // A filesystem (or kernel) without the flag: fall through.
+        if !matches!(
+            err.raw_os_error(),
+            Some(libc::EINVAL) | Some(libc::ENOSYS) | Some(libc::ENOTSUP)
+        ) {
+            return Err(err);
+        }
+    }
+    if std::fs::symlink_metadata(to).is_ok() {
+        return Err(std::io::ErrorKind::AlreadyExists.into());
+    }
+    std::fs::rename(from, to)
 }
 
-/// `paths` as text to paste into a pane: quoted where needed, separated by
-/// spaces, with a trailing space so typing can go straight on.
-pub fn paste_text(paths: &[String], syntax: PasteSyntax) -> String {
+/// Whether `a` and `b` are one file: on a filesystem that ignores case, two
+/// spellings of a name.
+fn same_file(a: &Path, b: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match (std::fs::symlink_metadata(a), std::fs::symlink_metadata(b)) {
+            (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+            _ => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // The final path carries the name's case as stored.
+        match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+/// Whether typing `text` would press a key: a control character in a path
+/// (a file name may hold any byte but `/` and NUL) is Enter, Ctrl-U or
+/// Escape to the line editor reading it.
+pub fn has_control(text: &str) -> bool {
+    text.chars().any(is_control)
+}
+
+fn is_control(c: char) -> bool {
+    c < ' ' || c == '\x7f'
+}
+
+/// `path` quoted for bash, zsh or ksh. A path with control characters is
+/// spelled in `$'…'` with them as `\xHH`, so only printable text is typed.
+fn quote_posix(path: &str) -> String {
+    if !has_control(path) {
+        return shlex::try_quote(path)
+            .map(|quoted| quoted.into_owned())
+            .unwrap_or_else(|_| path.to_string());
+    }
+    let mut quoted = String::from("$'");
+    for c in path.chars() {
+        match c {
+            '\\' | '\'' => {
+                quoted.push('\\');
+                quoted.push(c);
+            }
+            c if is_control(c) => quoted.push_str(&format!("\\x{:02x}", c as u32)),
+            c => quoted.push(c),
+        }
+    }
+    quoted.push('\'');
+    quoted
+}
+
+/// `path` quoted for fish, which has no `$'…'`: single-quoted runs, with
+/// control characters between them as unquoted `\xHH`.
+fn quote_fish(path: &str) -> String {
+    fn flush(run: &mut String, quoted: &mut String) {
+        if !run.is_empty() {
+            quoted.push('\'');
+            quoted.push_str(run);
+            quoted.push('\'');
+            run.clear();
+        }
+    }
+    let mut quoted = String::new();
+    let mut run = String::new();
+    for c in path.chars() {
+        if is_control(c) {
+            flush(&mut run, &mut quoted);
+            quoted.push_str(&format!("\\x{:02x}", c as u32));
+        } else {
+            if matches!(c, '\\' | '\'') {
+                run.push('\\');
+            }
+            run.push(c);
+        }
+    }
+    flush(&mut run, &mut quoted);
+    if quoted.is_empty() {
+        quoted.push_str("''");
+    }
+    quoted
+}
+
+/// `path` in PowerShell's single quotes. PowerShell ends such a string on
+/// the typographic single quotes too, not only `'`; each is doubled to stand
+/// for itself.
+fn quote_powershell(path: &str) -> String {
+    let mut quoted = String::from("'");
+    for c in path.chars() {
+        if matches!(c, '\'' | '\u{2018}' | '\u{2019}' | '\u{201a}' | '\u{201b}') {
+            quoted.push(c);
+        }
+        quoted.push(c);
+    }
+    quoted.push('\'');
+    quoted
+}
+
+/// `paths` as text to paste into a pane running `shell`: quoted where
+/// needed, separated by spaces, with a trailing space so typing can go
+/// straight on. Never contains a control character.
+pub fn paste_text(paths: &[String], shell: ShellKind) -> String {
     let quoted: Vec<String> = paths
         .iter()
-        .map(|path| match syntax {
-            PasteSyntax::Posix => shlex::try_quote(path)
-                .map(|quoted| quoted.into_owned())
-                .unwrap_or_else(|_| path.clone()),
-            PasteSyntax::Windows => {
-                let plain = path
-                    .chars()
-                    .all(|c| c.is_alphanumeric() || "\\/:._-".contains(c));
-                if plain {
-                    path.clone()
-                } else {
-                    format!("\"{path}\"")
-                }
+        .map(|path| {
+            let plain = path
+                .chars()
+                .all(|c| c.is_alphanumeric() || "\\/:._-".contains(c));
+            match shell {
+                ShellKind::Posix | ShellKind::Other => quote_posix(path),
+                ShellKind::Fish => quote_fish(path),
+                ShellKind::PowerShell if plain => path.clone(),
+                ShellKind::PowerShell => quote_powershell(path),
+                // A Windows name holds neither `"` nor control characters.
+                ShellKind::Cmd if plain => path.clone(),
+                ShellKind::Cmd => format!("\"{path}\""),
             }
         })
         .collect();
@@ -148,13 +287,27 @@ pub fn validate_name(name: &str) -> Result<(), String> {
     if name == "." || name == ".." {
         return Err(format!("{name} is not a name"));
     }
-    if let Some(bad) = name.chars().find(|c| matches!(c, '/' | '\\' | '\0')) {
-        let shown = if bad == '\0' {
-            "NUL".to_string()
-        } else {
-            bad.to_string()
+    // Windows reserves more: `C:x` would land on another drive and `a:b` in
+    // an alternate stream. Its filesystems cannot store any of these anyway.
+    let forbidden = |c: char| {
+        matches!(c, '/' | '\\' | '\0')
+            || (cfg!(windows)
+                && (matches!(c, ':' | '<' | '>' | '"' | '|' | '?' | '*') || is_control(c)))
+    };
+    if let Some(bad) = name.chars().find(|c| forbidden(*c)) {
+        let shown = match bad {
+            '\0' => "NUL".to_string(),
+            c if is_control(c) => format!("U+{:04X}", c as u32),
+            c => c.to_string(),
         };
         return Err(format!("A name cannot contain {shown}"));
+    }
+    let mut parts = Path::new(name).components();
+    if !matches!(
+        (parts.next(), parts.next()),
+        (Some(std::path::Component::Normal(_)), None)
+    ) {
+        return Err(format!("{name} is not a name"));
     }
     Ok(())
 }
@@ -177,10 +330,19 @@ pub fn apply_rename(root: &Path, from: &str, to: &str) -> Result<(), String> {
     };
     let (from_abs, to_abs) = (abs(from), abs(to));
     let case_only = from.to_lowercase() == to.to_lowercase() && from != to;
-    if !case_only && std::fs::symlink_metadata(&to_abs).is_ok() {
+    let failed = |err: std::io::Error| match err.kind() {
+        std::io::ErrorKind::AlreadyExists => format!("{to} already exists"),
+        _ => format!("Could not rename {from}: {err}"),
+    };
+    if std::fs::symlink_metadata(&to_abs).is_ok() {
+        // Where names ignore case, the new spelling finds the file itself;
+        // where they do not, it is another file and stays.
+        if case_only && same_file(&from_abs, &to_abs) {
+            return std::fs::rename(&from_abs, &to_abs).map_err(failed);
+        }
         return Err(format!("{to} already exists"));
     }
-    std::fs::rename(&from_abs, &to_abs).map_err(|err| format!("Could not rename {from}: {err}"))
+    rename_new(&from_abs, &to_abs).map_err(failed)
 }
 
 /// Create an empty file (or a folder, with `folder`) at `rel` under `root`.
@@ -204,43 +366,50 @@ pub fn create(root: &Path, rel: &str, folder: bool) -> Result<(), String> {
     })
 }
 
-/// The shell a pane runs, as far as typing a `cd` into it goes.
+/// The shell a pane runs, as far as typing a path into it goes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShellKind {
+    /// bash, zsh and ksh, which read `$'…'`.
     Posix,
+    Fish,
     PowerShell,
     Cmd,
+    /// Anything else (`sh`, an agent, …): POSIX quoting, but no `$'…'`.
+    Other,
 }
 
 impl ShellKind {
     /// From the basename of the pane's foreground program.
     pub fn from_program(name: &str) -> Self {
         let name = name.to_ascii_lowercase();
-        let name = name.strip_suffix(".exe").unwrap_or(&name);
+        // A login shell's name starts with `-`.
+        let name = name.trim_start_matches('-');
+        let name = name.strip_suffix(".exe").unwrap_or(name);
         match name {
+            "bash" | "zsh" | "ksh" | "mksh" => ShellKind::Posix,
+            "fish" => ShellKind::Fish,
             "pwsh" | "powershell" => ShellKind::PowerShell,
             "cmd" => ShellKind::Cmd,
-            _ => ShellKind::Posix,
+            _ => ShellKind::Other,
         }
     }
 }
 
 /// What to type into a shell to move it to `dir`: the line cleared first,
-/// then the `cd`, then Enter.
-pub fn cd_command(dir: &str, shell: ShellKind) -> String {
+/// then the `cd`, then Enter. `None` when `dir` cannot be spelled for that
+/// shell in printable text; the caller opens a shell there instead.
+pub fn cd_command(dir: &str, shell: ShellKind) -> Option<String> {
     match shell {
-        ShellKind::Posix => {
-            let quoted = shlex::try_quote(dir)
-                .map(|quoted| quoted.into_owned())
-                .unwrap_or_else(|_| dir.to_string());
-            format!("\x15cd -- {quoted}\r")
-        }
+        ShellKind::Posix => Some(format!("\x15cd -- {}\r", quote_posix(dir))),
+        ShellKind::Fish => Some(format!("\x15cd -- {}\r", quote_fish(dir))),
+        _ if has_control(dir) => None,
+        ShellKind::Other => Some(format!("\x15cd -- {}\r", quote_posix(dir))),
         // PSReadLine and cmd both clear the line on Escape.
-        ShellKind::PowerShell => format!(
-            "\x1bSet-Location -LiteralPath '{}'\r",
-            dir.replace('\'', "''")
-        ),
-        ShellKind::Cmd => format!("\x1bcd /d \"{dir}\"\r"),
+        ShellKind::PowerShell => Some(format!(
+            "\x1bSet-Location -LiteralPath {}\r",
+            quote_powershell(dir)
+        )),
+        ShellKind::Cmd => Some(format!("\x1bcd /d \"{dir}\"\r")),
     }
 }
 
@@ -360,21 +529,95 @@ mod tests {
     }
 
     #[test]
+    fn names_with_a_drive_or_stream_are_refused_on_windows() {
+        for name in ["C:x", "a:b", "a|b", "a\x01b"] {
+            assert_eq!(validate_name(name).is_err(), cfg!(windows), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn a_case_rename_never_replaces_another_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.txt"), "a").unwrap();
+        fs::write(root.join("A.txt"), "upper").unwrap();
+        let separate = fs::read_dir(root).unwrap().count() == 2;
+        if separate {
+            // A filesystem that keeps case: these are two files.
+            assert!(apply_rename(root, "a.txt", "A.txt").is_err());
+            assert_eq!(fs::read_to_string(root.join("A.txt")).unwrap(), "upper");
+        }
+    }
+
+    #[test]
     fn cd_is_typed_for_the_shell_in_the_pane() {
         assert_eq!(ShellKind::from_program("zsh"), ShellKind::Posix);
+        assert_eq!(ShellKind::from_program("-bash"), ShellKind::Posix);
+        assert_eq!(ShellKind::from_program("fish"), ShellKind::Fish);
+        assert_eq!(ShellKind::from_program("sh"), ShellKind::Other);
         assert_eq!(ShellKind::from_program("pwsh.exe"), ShellKind::PowerShell);
         assert_eq!(ShellKind::from_program("CMD.EXE"), ShellKind::Cmd);
         assert_eq!(
-            cd_command("/r/a b", ShellKind::Posix),
-            "\x15cd -- '/r/a b'\r"
+            cd_command("/r/a b", ShellKind::Posix).as_deref(),
+            Some("\x15cd -- '/r/a b'\r")
         );
         assert_eq!(
-            cd_command(r"C:\it's", ShellKind::PowerShell),
-            "\x1bSet-Location -LiteralPath 'C:\\it''s'\r"
+            cd_command("/r/a b", ShellKind::Other).as_deref(),
+            Some("\x15cd -- '/r/a b'\r")
         );
         assert_eq!(
-            cd_command(r"C:\a b", ShellKind::Cmd),
-            "\x1bcd /d \"C:\\a b\"\r"
+            cd_command("/r/a b", ShellKind::Fish).as_deref(),
+            Some("\x15cd -- '/r/a b'\r")
+        );
+        assert_eq!(
+            cd_command(r"C:\it's", ShellKind::PowerShell).as_deref(),
+            Some("\x1bSet-Location -LiteralPath 'C:\\it''s'\r")
+        );
+        assert_eq!(
+            cd_command(r"C:\a b", ShellKind::Cmd).as_deref(),
+            Some("\x1bcd /d \"C:\\a b\"\r")
+        );
+    }
+
+    /// Only the final Enter may be a control character: anything else in
+    /// the typed text is a key press inside the line being typed.
+    fn printable_but_the_frame(typed: &str, frame: &[char]) -> bool {
+        let body = typed.trim_start_matches(frame).trim_end_matches('\r');
+        !has_control(body)
+    }
+
+    #[test]
+    fn control_characters_in_a_folder_are_never_typed() {
+        let dir = "/r/x\x15touch pwned #\r\x1b";
+        let posix = cd_command(dir, ShellKind::Posix).unwrap();
+        assert_eq!(posix, "\x15cd -- $'/r/x\\x15touch pwned #\\x0d\\x1b'\r");
+        assert!(printable_but_the_frame(&posix, &['\x15']));
+        let fish = cd_command(dir, ShellKind::Fish).unwrap();
+        assert_eq!(fish, "\x15cd -- '/r/x'\\x15'touch pwned #'\\x0d\\x1b\r");
+        assert!(printable_but_the_frame(&fish, &['\x15']));
+        assert_eq!(
+            cd_command("/r/it's\x07", ShellKind::Posix).as_deref(),
+            Some("\x15cd -- $'/r/it\\'s\\x07'\r")
+        );
+        // No printable spelling: the caller opens a shell there instead.
+        for shell in [ShellKind::Other, ShellKind::PowerShell, ShellKind::Cmd] {
+            assert_eq!(cd_command(dir, shell), None, "{shell:?}");
+        }
+    }
+
+    #[test]
+    fn typographic_quotes_cannot_end_a_powershell_string() {
+        let typed = cd_command("C:\\a\u{2019};calc;\u{2018}", ShellKind::PowerShell).unwrap();
+        assert_eq!(
+            typed,
+            "\x1bSet-Location -LiteralPath 'C:\\a\u{2019}\u{2019};calc;\u{2018}\u{2018}'\r"
+        );
+        assert_eq!(
+            paste_text(
+                &["C:\\$(calc) \u{201b}.txt".to_string()],
+                ShellKind::PowerShell
+            ),
+            "'C:\\$(calc) \u{201b}\u{201b}.txt' "
         );
     }
 
@@ -382,17 +625,29 @@ mod tests {
     fn pasted_paths_are_quoted_for_the_shell() {
         let paths = vec!["/r/plain.rs".to_string(), "/r/with space's.md".to_string()];
         assert_eq!(
-            paste_text(&["/r/a b".to_string()], PasteSyntax::Posix),
+            paste_text(&["/r/a b".to_string()], ShellKind::Posix),
             "'/r/a b' "
         );
         assert_eq!(
-            paste_text(&paths, PasteSyntax::Posix),
+            paste_text(&paths, ShellKind::Posix),
             r#"/r/plain.rs "/r/with space's.md" "#
+        );
+        assert_eq!(
+            paste_text(&["/r/a\rb".to_string()], ShellKind::Other),
+            "$'/r/a\\x0db' "
+        );
+        assert_eq!(
+            paste_text(&["/r/a\rb".to_string()], ShellKind::Fish),
+            "'/r/a'\\x0d'b' "
         );
         let paths = vec![r"C:\r\plain.rs".to_string(), r"C:\r\a b.md".to_string()];
         assert_eq!(
-            paste_text(&paths, PasteSyntax::Windows),
+            paste_text(&paths, ShellKind::Cmd),
             r#"C:\r\plain.rs "C:\r\a b.md" "#
+        );
+        assert_eq!(
+            paste_text(&paths, ShellKind::PowerShell),
+            r"C:\r\plain.rs 'C:\r\a b.md' "
         );
     }
 }

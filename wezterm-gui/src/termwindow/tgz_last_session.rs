@@ -290,28 +290,10 @@ fn write_file_at(path: &Path, file: &LastSessionFile) {
             return;
         }
     };
-    if let Some(parent) = path.parent() {
-        if let Err(err) = std::fs::create_dir_all(parent) {
-            log::warn!("failed to create {}: {err:#}", parent.display());
-            return;
-        }
-    }
-    let temp = path.with_extension("json.tmp");
-    if let Err(err) = std::fs::write(&temp, json) {
-        log::warn!("failed to write {}: {err:#}", temp.display());
-        return;
-    }
-    // The file lists project paths and session ids, so keep it to its owner.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Err(err) = std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600)) {
-            log::warn!("failed to chmod {}: {err:#}", temp.display());
-        }
-    }
-    if let Err(err) = std::fs::rename(&temp, path) {
-        log::warn!("failed to rename {}: {err:#}", temp.display());
-        let _ = std::fs::remove_file(&temp);
+    // The file lists project paths and session ids, so keep it to its owner
+    // from the moment it exists.
+    if let Err(err) = super::tgz_fs::replace_file(path, json.as_bytes(), 0o600) {
+        log::warn!("failed to write {}: {err:#}", path.display());
     }
 }
 
@@ -692,7 +674,14 @@ mod tests {
         assert_eq!(read_back.windows.len(), 1);
         assert_eq!(read_back.windows[0].sessions.len(), 2);
         // The temp file must not be left behind.
-        assert!(!path.with_extension("json.tmp").exists());
+        assert!(!dir.path().join(".tgz-last-session.json.tgz-tmp").exists());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
     }
 
     #[test]

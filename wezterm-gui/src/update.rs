@@ -223,9 +223,33 @@ pub fn load_last_release_info_and_set_banner() {
     }
 }
 
+/// The fork's releases page: what a link falls back to when the URL in the
+/// release data is not one to open.
+fn releases_page() -> String {
+    format!("https://github.com/{}/releases", crate::brand::GITHUB_REPO)
+}
+
+/// Whether `url`, from the GitHub API or the cached copy of its answer, may
+/// be opened or put in a link: https to GitHub, and no control character
+/// that could end the hyperlink escape early.
+fn release_url_ok(url: &str) -> bool {
+    if url.chars().any(char::is_control) {
+        return false;
+    }
+    let Some(rest) = url.strip_prefix("https://") else {
+        return false;
+    };
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    host == "github.com" || host.ends_with(".githubusercontent.com")
+}
+
 fn set_banner_from_release_info(latest: &Release) {
     let mux = crate::Mux::get();
-    let url = latest.html_url.clone();
+    let url = if release_url_ok(&latest.html_url) {
+        latest.html_url.clone()
+    } else {
+        releases_page()
+    };
 
     let icon = ITermFileData {
         name: None,
@@ -299,10 +323,12 @@ fn cache_release(latest: &Release) {
 /// artifact directly; when the release has no artifact for us (Linux, or a
 /// release whose upload failed) it falls back to the release page.
 fn notify_update_available(latest: &Release) {
-    let asset = pick_asset(latest);
-    let url = asset
-        .map(|asset| asset.browser_download_url.as_str())
-        .unwrap_or(latest.html_url.as_str());
+    let asset = pick_asset(latest).filter(|asset| release_url_ok(&asset.browser_download_url));
+    let url = match asset {
+        Some(asset) => asset.browser_download_url.clone(),
+        None if release_url_ok(&latest.html_url) => latest.html_url.clone(),
+        None => releases_page(),
+    };
     let message = match asset {
         Some(asset) => format!("Click to download {}", asset.name),
         None => "Click to see release details".to_string(),
@@ -315,7 +341,7 @@ fn notify_update_available(latest: &Release) {
             latest.tag_name
         ),
         &message,
-        url,
+        &url,
     );
 }
 
@@ -460,7 +486,10 @@ pub fn start_update_checker() {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_release_build, pick_asset_for, release_tag_is_newer, Asset, Platform, Release};
+    use super::{
+        is_release_build, pick_asset_for, release_tag_is_newer, release_url_ok, Asset, Platform,
+        Release,
+    };
 
     fn release_with(asset_names: &[&str]) -> Release {
         Release {
@@ -493,6 +522,26 @@ mod tests {
             &format!("{}-Setup-tgz-v2026.08.5.exe.sha256", PRODUCT),
             &format!("{}.dmg", PRODUCT),
         ])
+    }
+
+    #[test]
+    fn only_https_github_urls_are_opened() {
+        for url in [
+            "https://github.com/o/r/releases/tag/tgz-v2026.07.2",
+            "https://github.com/o/r/releases/download/v1/TGZTerminal.dmg",
+            "https://objects.githubusercontent.com/x",
+        ] {
+            assert!(release_url_ok(url), "{url}");
+        }
+        for url in [
+            "http://github.com/o/r",
+            "https://github.com.evil.example/x",
+            "https://github.com@evil.example/x",
+            "https://github.com/x\x1b]8;;\x07",
+            "file:///etc/passwd",
+        ] {
+            assert!(!release_url_ok(url), "{url}");
+        }
     }
 
     #[test]

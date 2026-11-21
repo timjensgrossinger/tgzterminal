@@ -855,6 +855,16 @@ pub struct DiffPanelConfig {
     /// and the panel says so.
     #[dynamic(default = "default_diff_panel_nested_max_roots")]
     pub nested_max_roots: usize,
+
+    /// Git repositories (their top-level directories; `~` allowed) whose
+    /// own `.git/config` may run commands when the panel reads them: an
+    /// fsmonitor hook, `textconv` diff drivers and `clean`/`smudge`/`process`
+    /// filters, as git-crypt and `git lfs install --local` set up. In any
+    /// other repository the panel switches those off, since the panel runs
+    /// Git on its own in any directory a pane visits, a downloaded one
+    /// included. Commands from the global and system Git config always run.
+    #[dynamic(default)]
+    pub trusted_repos: Vec<String>,
 }
 
 impl Default for DiffPanelConfig {
@@ -873,6 +883,7 @@ impl Default for DiffPanelConfig {
             snapshot_max_files: default_diff_panel_snapshot_max_files(),
             nested_max_depth: default_diff_panel_nested_max_depth(),
             nested_max_roots: default_diff_panel_nested_max_roots(),
+            trusted_repos: Vec::new(),
         }
     }
 }
@@ -5492,6 +5503,7 @@ mod agent_ui_tests {
         assert_eq!(config.diff_panel.width_px, 840);
         assert_eq!(config.diff_panel.nested_max_depth, 3);
         assert_eq!(config.diff_panel.nested_max_roots, 64);
+        assert!(config.diff_panel.trusted_repos.is_empty());
         assert!(!config.diff_panel.avoid_input);
         assert_eq!(config.diff_panel.long_lines, DiffPanelLongLines::Wrap);
     }

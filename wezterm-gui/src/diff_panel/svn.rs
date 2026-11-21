@@ -162,7 +162,7 @@ pub fn scan_paths(root: &Path, runner: &Runner, paths: &[&str], limits: Limits) 
                     files.push(FileChange::new(path, FileStatus::Added));
                     continue;
                 }
-                files.push(match read_text_file(&full, limits.max_file_bytes) {
+                files.push(match read_text_file(&full, root, limits.max_file_bytes) {
                     Ok(text) => FileChange::all_added(path, &text),
                     Err(reason) => {
                         let mut file = FileChange::new(path, FileStatus::Added);

@@ -6,7 +6,7 @@
 //! few pixels, and a release before that is an ordinary click.
 
 use super::*;
-use crate::file_tree::ops::{self, PasteSyntax};
+use crate::file_tree::ops::{self, ShellKind};
 
 /// Pixels the pointer moves before a press on a row becomes a drag.
 const DRAG_THRESHOLD: isize = 4;
@@ -433,12 +433,21 @@ impl crate::TermWindow {
                 }
             })
             .collect();
-        let syntax = if distro.is_none() && cfg!(windows) {
-            PasteSyntax::Windows
+        let shell = if distro.is_some() {
+            ShellKind::Posix
         } else {
-            PasteSyntax::Posix
+            match self
+                .pane_command_basename(&pane)
+                .map(|name| ShellKind::from_program(&name))
+            {
+                // An agent or other program on Windows reads paths the way
+                // cmd spells them.
+                Some(ShellKind::Other) | None if cfg!(windows) => ShellKind::Cmd,
+                Some(shell) => shell,
+                None => ShellKind::Other,
+            }
         };
-        if let Err(err) = pane.send_paste(&ops::paste_text(&paths, syntax)) {
+        if let Err(err) = pane.send_paste(&ops::paste_text(&paths, shell)) {
             log::warn!("file tree: paste into pane {pane_id} failed: {err:#}");
             return;
         }

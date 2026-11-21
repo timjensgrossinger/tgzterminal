@@ -1191,7 +1191,11 @@ impl crate::TermWindow {
             }
             _ => native,
         };
-        if let Err(err) = editor.writer().write_all(vim_drop_keys(&shown).as_bytes()) {
+        // A name that cannot be typed opens in a new editor, as argv.
+        let Some(keys) = vim_drop_keys(&shown) else {
+            return false;
+        };
+        if let Err(err) = editor.writer().write_all(keys.as_bytes()) {
             log::warn!("file tree: could not reach the editor: {err:#}");
             return false;
         }

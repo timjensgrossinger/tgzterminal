@@ -91,6 +91,11 @@ fn parse_session_file(path: &Path) -> Option<ClaudeSession> {
     }
     let pid = pid as u32;
     let session_id = value.get("sessionId")?.as_str()?.to_string();
+    // The id is joined onto the project directory to find the transcript
+    // and subagents; `../` or an absolute path would read files elsewhere.
+    if !super::sessions::session_id_is_sane(&session_id) {
+        return None;
+    }
     let cwd = PathBuf::from(value.get("cwd")?.as_str()?);
 
     let status_text = value
@@ -1150,6 +1155,23 @@ mod tests {
                 "name":"release-prep"}"#,
         );
         assert!(!parse_session_file(&explicit).unwrap().name_is_derived);
+    }
+
+    #[test]
+    fn a_session_id_that_is_a_path_is_ignored() {
+        let temp = tempfile::tempdir().unwrap();
+        for (file, id) in [
+            ("dots.json", "../../elsewhere"),
+            ("abs.json", "/etc"),
+            ("opt.json", "-x"),
+        ] {
+            let path = temp.path().join(file);
+            write(
+                &path,
+                &format!(r#"{{"pid":1,"sessionId":"{id}","cwd":"/repo","status":"idle"}}"#),
+            );
+            assert!(parse_session_file(&path).is_none(), "{id}");
+        }
     }
 
     #[test]

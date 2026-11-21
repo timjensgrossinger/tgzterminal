@@ -2,7 +2,7 @@
 //! ceiling on both how much and how long.
 
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -96,6 +96,8 @@ impl Env {
 pub struct Runner {
     envs: Vec<Env>,
     chosen: std::cell::Cell<Option<usize>>,
+    /// `diff_panel.trusted_repos`, `~` expanded.
+    trusted: std::sync::Arc<[PathBuf]>,
 }
 
 impl Runner {
@@ -103,13 +105,37 @@ impl Runner {
         Self {
             envs,
             chosen: std::cell::Cell::new(None),
+            trusted: Vec::new().into(),
         }
+    }
+
+    /// This runner, with `repos` as the working copies whose own Git
+    /// configuration may run commands.
+    pub fn trusting(mut self, repos: Vec<PathBuf>) -> Self {
+        self.trusted = repos.into();
+        self
+    }
+
+    /// Whether the working copy at `root` is one of [`Runner::trusting`]'s.
+    pub fn trusts(&self, root: &Path) -> bool {
+        if self.trusted.is_empty() {
+            return false;
+        }
+        let Ok(root) = std::fs::canonicalize(root) else {
+            return false;
+        };
+        self.trusted
+            .iter()
+            .any(|repo| std::fs::canonicalize(repo).is_ok_and(|repo| repo == root))
     }
 
     /// A runner over the same environments that has not chosen one yet, for
     /// a scan of another working copy.
     pub fn fork(&self) -> Self {
-        Self::new(self.envs.clone())
+        Self {
+            trusted: self.trusted.clone(),
+            ..Self::new(self.envs.clone())
+        }
     }
 
     #[cfg(test)]

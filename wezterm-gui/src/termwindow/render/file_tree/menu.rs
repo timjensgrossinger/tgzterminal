@@ -367,36 +367,20 @@ impl crate::TermWindow {
         });
         self.file_tree.focused = false;
         if is_agent {
-            let spawn = SpawnCommand {
-                cwd: Some(PathBuf::from(path)),
-                domain: SpawnTabDomain::CurrentPaneDomain,
-                ..Default::default()
-            };
-            let pane_id = pane.pane_id();
-            let term_config = Arc::new(TermConfig::with_config(self.config.clone()));
-            promise::spawn::spawn(async move {
-                let request = SplitRequest {
-                    direction: SplitDirection::Horizontal,
-                    target_is_second: true,
-                    size: MuxSplitSize::Percent(50),
-                    top_level: false,
-                };
-                match split_spawn(spawn, pane_id, request, term_config).await {
-                    Ok((tab, pane)) => tab.set_active_pane(&pane),
-                    Err(err) => log::error!("file tree: could not open a shell: {err:#}"),
-                }
-            })
-            .detach();
-            return;
+            return self.file_tree_shell_beside(&pane, path);
         }
         let shell = if distro.is_some() {
             ShellKind::Posix
         } else {
             self.pane_command_basename(&pane)
                 .map(|name| ShellKind::from_program(&name))
-                .unwrap_or(ShellKind::Posix)
+                .unwrap_or(ShellKind::Other)
         };
-        let text = ops::cd_command(&path, shell);
+        // A folder name this shell cannot be typed in printable text: a
+        // shell opens in it instead.
+        let Some(text) = ops::cd_command(&path, shell) else {
+            return self.file_tree_shell_beside(&pane, path);
+        };
         if let Err(err) = pane.writer().write_all(text.as_bytes()) {
             log::warn!(
                 "file tree: could not type into pane {}: {err:#}",
@@ -407,6 +391,30 @@ impl crate::TermWindow {
         if let Some(tab) = mux.get_active_tab_for_window(self.mux_window_id) {
             tab.set_active_pane(&pane);
         }
+    }
+
+    /// Open a shell in `path` in a split beside `pane`.
+    fn file_tree_shell_beside(&self, pane: &Arc<dyn Pane>, path: String) {
+        let spawn = SpawnCommand {
+            cwd: Some(PathBuf::from(path)),
+            domain: SpawnTabDomain::CurrentPaneDomain,
+            ..Default::default()
+        };
+        let pane_id = pane.pane_id();
+        let term_config = Arc::new(TermConfig::with_config(self.config.clone()));
+        promise::spawn::spawn(async move {
+            let request = SplitRequest {
+                direction: SplitDirection::Horizontal,
+                target_is_second: true,
+                size: MuxSplitSize::Percent(50),
+                top_level: false,
+            };
+            match split_spawn(spawn, pane_id, request, term_config).await {
+                Ok((tab, pane)) => tab.set_active_pane(&pane),
+                Err(err) => log::error!("file tree: could not open a shell: {err:#}"),
+            }
+        })
+        .detach();
     }
 
     fn file_tree_start_new(&mut self, tab_id: TabId, dir: String, folder: bool) {

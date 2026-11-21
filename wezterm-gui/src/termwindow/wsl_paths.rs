@@ -913,11 +913,12 @@ pub(crate) fn wsl_home_base(distro: &str) -> Option<PathBuf> {
 /// other user pointed at a directory that does not exist and made those agents
 /// invisible.
 ///
-/// The user name reaches a path join, so a separator in it would escape the
-/// distro's `/home` entirely; such a name is refused rather than sanitised.
+/// The user name reaches a path join, so a separator in it (or a name of
+/// `.` or `..`) would escape the distro's `/home` entirely; such a name is
+/// refused rather than sanitised.
 pub(crate) fn wsl_home(distro: &str, user: &str) -> Option<PathBuf> {
     let user = user.trim();
-    if user.is_empty() || user.contains('/') || user.contains('\\') {
+    if user.is_empty() || user == "." || user == ".." || user.contains('/') || user.contains('\\') {
         return None;
     }
     if user == "root" {
@@ -1297,6 +1298,8 @@ mod tests {
         assert_eq!(wsl_home("Ubuntu", "../../etc"), None);
         assert_eq!(wsl_home("Ubuntu", r"a\b"), None);
         assert_eq!(wsl_home("Ubuntu", ""), None);
+        assert_eq!(wsl_home("Ubuntu", ".."), None);
+        assert_eq!(wsl_home("Ubuntu", "."), None);
         assert_eq!(wsl_home("", "tim"), None);
     }
 

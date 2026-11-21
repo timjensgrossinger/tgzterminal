@@ -508,7 +508,10 @@ same tab, while it is still running there: the panel sends it
 <kbd>Ctrl-\</kbd><kbd>Ctrl-N</kbd> `:drop <file>`, which switches to the
 file's window if it is open and edits it otherwise. Other editors, a vim that
 has quit, and WSL panes (whose running program cannot be seen from Windows)
-get a new split each time.
+get a new split each time. So does a file whose path holds a control
+character (a newline, an Escape, …): typed into vim, it would end the `:drop`
+and run the rest of the name as vim commands, so the path goes to a new
+editor as an argument instead.
 
 To decide yourself what happens, handle `file-tree-open-file`. It receives
 the window, the pane the tree follows and the file's path; return `false` to
@@ -538,7 +541,7 @@ end)
 | Middle click on a file | Open it in the editor in a new tab |
 | Right click | The menu below, for the row (or every selected row) |
 | Drag onto a folder | Move the dragged rows there. Rest on a closed folder to open it; drop below the last row for the top folder. Moving more than one item asks first, and nothing is ever overwritten: when a name is taken, nothing moves. |
-| Drag onto a terminal pane | Paste the dragged paths into it, quoted for its shell (Linux paths for a WSL pane), and move the keyboard there |
+| Drag onto a terminal pane | Paste the dragged paths into it, quoted for its shell (Linux paths for a WSL pane), and move the keyboard there. A control character in a name is spelled as `\xHH` (bash and zsh `$'…'`, fish escapes), never pasted as itself |
 | Drag near the top or bottom edge | Scroll while dragging |
 | Scroll bar | Drag the thumb; click the track to page |
 
@@ -559,7 +562,11 @@ for the top folder.
 
 - **cd Here** types `cd -- <folder>` into the shell, quoted for it (also
   PowerShell and cmd). When the pane runs an agent instead, a new shell opens
-  in that folder beside it rather than typing into the agent's prompt.
+  in that folder beside it rather than typing into the agent's prompt. A
+  folder name with a control character in it is typed as `$'…'` for bash,
+  zsh and ksh and with `\xHH` escapes for fish; for any other shell such a
+  folder also gets a new shell beside the pane, since typing it would press
+  those keys.
 - **New File… / New Folder… / Rename…** name the row in place: a field opens
   in the tree, <kbd>Enter</kbd> saves, <kbd>Esc</kbd> or a click elsewhere
   cancels. A name that is taken is refused; nothing is overwritten.
@@ -2237,6 +2244,7 @@ config.diff_panel = {
   snapshot_max_files = 5000,
   nested_max_depth = 3,
   nested_max_roots = 64,
+  trusted_repos = {},      -- e.g. { "~/src/secrets-repo" }
 }
 ```
 
@@ -2279,6 +2287,7 @@ config.keys = {
 | `snapshot_max_files` | `5000` | Most files a snapshot baseline may record (see "No version control"). All mode only: Session mode never takes a snapshot. |
 | `nested_max_depth` | `3` | How many folder levels below the pane's directory to look for Git and Subversion working copies when the directory itself is in none (see "A folder of working copies"). `0` turns the search off. |
 | `nested_max_roots` | `64` | Most working copies that search collects; the panel says when there are more. |
+| `trusted_repos` | `{}` | Git repositories (top-level folders, `~` allowed) whose own `.git/config` may run commands while the panel reads them; see "Commands from a repository's own config". |
 
 ### Session mode
 
@@ -2396,6 +2405,42 @@ Git and Subversion are read with their command-line clients, which must be
 installed. Nothing is written to the repository, and Git is run with
 `--no-optional-locks` so it never contends with an agent for the index.
 
+A symbolic link is shown with its target's text only when that target is a
+file inside the working copy. A link that leads out of it (a planted
+`notes.txt -> ~/.ssh/id_ed25519`, say) is listed with "link to …, outside
+this folder" instead.
+
+#### Commands from a repository's own config
+
+The panel runs Git by itself, in any folder a pane visits: a downloaded
+archive, or a nested checkout found under it that you never opened. A
+repository's own `.git/config` (and `config.worktree`, and the files they
+include) can name commands Git then runs: an fsmonitor hook,
+`diff.<driver>.textconv` and `filter.<driver>.clean`/`smudge`/`process`.
+Unless the repository is in `trusted_repos`, the panel switches off those it
+finds there for its own Git calls:
+
+- an fsmonitor hook is turned off (Git's built-in `core.fsmonitor = true`
+  daemon is kept);
+- a repository-defined `textconv` driver means `--no-textconv`, so its files
+  diff as plain text;
+- a repository-defined filter becomes no filter, so the diff compares the
+  stored content as it is.
+
+Submodules are compared by commit only (`--ignore-submodules=dirty`): telling
+whether one is dirty would run Git under the submodule's own config.
+
+Your global and system Git config is not touched: a global Git LFS setup, or
+your own `textconv` drivers, keep working. A repository whose tools put
+commands in its local config, such as git-crypt or `git lfs install --local`,
+shows them again once trusted:
+
+```lua
+config.diff_panel = {
+  trusted_repos = { "~/src/vault", "/work/assets" },
+}
+```
+
 ### A folder of working copies
 
 A workspace often has no checkout of its own, only one per module:
@@ -2480,9 +2525,16 @@ and connects in a new tab, Esc closes.
 
 Save adds a `Host` block to `~/.ssh/config` (`%USERPROFILE%\.ssh\config` on
 Windows), so `ssh`, `mosh` and `et` all know the host by its name and the
-host shows up in this menu like any other. The file is only appended to, and
-a name that is already a `Host` there is refused rather than shadowed. A key
-is written as `IdentityFile` with `IdentitiesOnly yes`. **Passwords are never
+host shows up in this menu like any other. The block goes in front of the
+first `Host`, `Match` or `Include` line (and the comments right above it),
+since ssh takes each setting from the first block that matches: at the end,
+a `Host *` or an included file would override it. Nothing else in the file
+changes. A name that is already a `Host` there is refused rather than
+shadowed, and so is a host whose user, port or address would lose to a line
+above every block (such a line applies to all hosts). A name cannot start
+with `-`. A key is written as `IdentityFile` with `IdentitiesOnly yes`; a
+Windows key path is written with `/` separators, which every Windows ssh
+reads, and a `%` in it is doubled. **Passwords are never
 saved:** OpenSSH has no setting for one, so ssh asks for it in the terminal
 when it connects. Which program connects is remembered per host name in the
 UI state file (names only). Mosh and ET must be installed; the form says so

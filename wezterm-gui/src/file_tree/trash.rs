@@ -146,10 +146,17 @@ fn freedesktop_trash(
     now: &chrono::DateTime<chrono::Local>,
 ) -> Result<(), String> {
     use std::io::Write;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
     let files = trash.join("files");
     let info = trash.join("info");
+    // Owner only, as gio makes it: a file trashed out of a private folder
+    // keeps its own mode, and the records name where each one came from.
     for dir in [&files, &info] {
-        std::fs::create_dir_all(dir).map_err(|err| format!("Could not make the trash: {err}"))?;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+            .map_err(|err| format!("Could not make the trash: {err}"))?;
     }
     let absolute = std::path::absolute(path).map_err(|err| err.to_string())?;
     let name = absolute
@@ -172,6 +179,7 @@ fn freedesktop_trash(
         let mut file = match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
+            .mode(0o600)
             .open(&info_path)
         {
             Ok(file) => file,
@@ -253,6 +261,13 @@ mod tests {
         assert!(record.starts_with("[Trash Info]\nPath=/"));
         assert!(record.contains("/a%20b.txt\n"));
         assert!(record.ends_with("DeletionDate=2026-10-19T14:03:07\n"));
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&trash.join("files")), 0o700);
+            assert_eq!(mode(&trash.join("info")), 0o700);
+            assert_eq!(mode(&trash.join("info/a b.txt.trashinfo")), 0o600);
+        }
 
         // A second item of the same name gets a number, not the first's place.
         std::fs::write(&first, "2").unwrap();
