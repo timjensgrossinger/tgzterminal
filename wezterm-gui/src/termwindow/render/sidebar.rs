@@ -771,6 +771,37 @@ static AGENT_PULSE_EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
 /// One turn of a running tab's ring.
 const TAB_RING_TURN_SECS: f32 = 1.1;
 
+/// Time per sprite step of a turning ring: one turn is
+/// [`RING_TURN_STEPS`](crate::termwindow::tgz_ui_text::RING_TURN_STEPS)
+/// sprites.
+fn ring_step_interval() -> Duration {
+    Duration::from_secs_f32(
+        TAB_RING_TURN_SECS / crate::termwindow::tgz_ui_text::RING_TURN_STEPS as f32,
+    )
+}
+
+/// Where a turning ring is, `0.0..1.0`, as a whole number of sprite steps.
+///
+/// Floor, not round, of elapsed time over the step: a frame that lands just
+/// after a step boundary shows exactly that step, so every ring moves one
+/// sprite per step, evenly. Rings used to be timed off the pulse grid
+/// (33 ms), which a ring step (1.1 s / 48 ≈ 22.9 ms) does not divide: each
+/// frame moved 1.44 steps, rounded to alternating jumps of one and two
+/// sprites, and the ring visibly stuttered.
+fn ring_turn_phase(elapsed: Duration) -> f32 {
+    let steps = crate::termwindow::tgz_ui_text::RING_TURN_STEPS as u128;
+    let step = elapsed.as_nanos() / ring_step_interval().as_nanos().max(1);
+    (step % steps) as f32 / steps as f32
+}
+
+/// The next ring step boundary after now, on the grid measured from
+/// [`AGENT_PULSE_EPOCH`], so every ring in every window steps together.
+fn next_ring_step_due() -> Instant {
+    let interval = ring_step_interval().as_nanos().max(1);
+    let elapsed = AGENT_PULSE_EPOCH.elapsed().as_nanos();
+    *AGENT_PULSE_EPOCH + Duration::from_nanos(((elapsed / interval + 1) * interval) as u64)
+}
+
 /// Instant at which the pulse next needs a frame, snapped to the frame grid
 /// measured from [`AGENT_PULSE_EPOCH`].
 ///
@@ -15005,10 +15036,8 @@ impl crate::TermWindow {
                         // The same round, one-colour ring a running tab's
                         // row has, drawn around the tile's icon.
                         self.sidebar_rounded_fill(layers, 1, tile_rect, rail_radius, faded_tab_bg)?;
-                        self.schedule_sidebar_frame(next_agent_pulse_frame_due());
-                        let phase = (AGENT_PULSE_EPOCH.elapsed().as_secs_f32()
-                            / TAB_RING_TURN_SECS)
-                            .fract();
+                        self.schedule_sidebar_frame(next_ring_step_due());
+                        let phase = ring_turn_phase(AGENT_PULSE_EPOCH.elapsed());
                         let inset = (2. * dpi_scale).round();
                         self.paint_ring(
                             layers,
@@ -15770,8 +15799,8 @@ impl crate::TermWindow {
                     let ring_y = y + (row_height as f32 - ring_side) * 0.5;
                     let animate = self.sidebar_animation_gates().dot_pulse;
                     let phase = if animate {
-                        self.schedule_sidebar_frame(next_agent_pulse_frame_due());
-                        (AGENT_PULSE_EPOCH.elapsed().as_secs_f32() / TAB_RING_TURN_SECS).fract()
+                        self.schedule_sidebar_frame(next_ring_step_due());
+                        ring_turn_phase(AGENT_PULSE_EPOCH.elapsed())
                     } else {
                         0.
                     };
@@ -16255,10 +16284,8 @@ impl crate::TermWindow {
                     } else if running && anim.spin.is_some() {
                         // The one thing that moves on a running row: an arc
                         // in one colour.
-                        self.schedule_sidebar_frame(next_agent_pulse_frame_due());
-                        let phase = (AGENT_PULSE_EPOCH.elapsed().as_secs_f32()
-                            / TAB_RING_TURN_SECS)
-                            .fract();
+                        self.schedule_sidebar_frame(next_ring_step_due());
+                        let phase = ring_turn_phase(AGENT_PULSE_EPOCH.elapsed());
                         (Some(ring_track), vec![(fade(ring_running), phase, 0.30)])
                     } else if running {
                         // Held still (animation off, or reduced motion): the
@@ -23746,6 +23773,40 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
         let working = program_status_fingerprint(&program_status(&["state=working"]));
         assert_ne!(idle, 0);
         assert_ne!(idle, working);
+    }
+
+    #[test]
+    fn a_ring_moves_exactly_one_sprite_per_step() {
+        let steps = crate::termwindow::tgz_ui_text::RING_TURN_STEPS;
+        let step = ring_step_interval();
+        let one = 1.0 / steps as f32;
+        for k in 0..(steps as u32 * 2) {
+            // Anywhere inside step k reads as step k: a late or early frame
+            // never skips or repeats a sprite.
+            for frac in [0.0, 0.3, 0.99] {
+                let at = step * k + step.mul_f32(frac);
+                let want = (k % steps) as f32 * one;
+                assert!(
+                    (ring_turn_phase(at) - want).abs() < 1e-6,
+                    "step {} frac {}: {} vs {}",
+                    k,
+                    frac,
+                    ring_turn_phase(at),
+                    want
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_next_ring_frame_is_on_a_step_boundary() {
+        let interval = ring_step_interval().as_nanos();
+        let due = next_ring_step_due();
+        assert!(due > Instant::now() - Duration::from_millis(1));
+        assert_eq!(
+            due.duration_since(*AGENT_PULSE_EPOCH).as_nanos() % interval,
+            0
+        );
     }
 
     #[test]
