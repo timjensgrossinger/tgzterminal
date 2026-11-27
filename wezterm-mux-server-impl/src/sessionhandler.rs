@@ -1079,6 +1079,47 @@ impl SessionHandler {
                 .detach();
             }
 
+            Pdu::GetCommandBlocks(GetCommandBlocks {
+                pane_id,
+                last,
+                failed_only,
+            }) => {
+                spawn_into_main_thread(async move {
+                    catch(
+                        move || {
+                            if !config::configuration().assist.mcp.enabled {
+                                anyhow::bail!(
+                                    "command blocks are off: set assist.mcp.enabled = true"
+                                );
+                            }
+                            let pane = Mux::get()
+                                .get_pane(pane_id)
+                                .ok_or_else(|| anyhow!("pane_id {} invalid", pane_id))?;
+                            let blocks = mux::tgz_blocks::pane_last_blocks_redacted(
+                                &*pane,
+                                last.clamp(1, 50),
+                                failed_only,
+                            );
+                            Ok(Pdu::GetCommandBlocksResponse(GetCommandBlocksResponse {
+                                pane_id,
+                                blocks: blocks
+                                    .into_iter()
+                                    .map(|block| CommandBlockText {
+                                        command: block.command,
+                                        output: block.output,
+                                        exit_status: block.exit_status,
+                                        guessed: block.guessed,
+                                        head_clipped: block.head_clipped,
+                                    })
+                                    .collect(),
+                            }))
+                        },
+                        send_response,
+                    )
+                })
+                .detach();
+            }
+
             Pdu::Invalid { .. } => send_response(Err(anyhow!("invalid PDU {:?}", decoded.pdu))),
             Pdu::Pong { .. }
             | Pdu::ListPanesResponse { .. }
@@ -1087,6 +1128,7 @@ impl SessionHandler {
             | Pdu::SpawnResponse { .. }
             | Pdu::GetPaneRenderChangesResponse { .. }
             | Pdu::UnitResponse { .. }
+            | Pdu::GetCommandBlocksResponse { .. }
             | Pdu::LivenessResponse { .. }
             | Pdu::GetPaneDirectionResponse { .. }
             | Pdu::SearchScrollbackResponse { .. }

@@ -369,6 +369,10 @@ pub struct TerminalState {
     progress: Progress,
     /// OSC 7501 records (TGZTerminal addition).
     program_status: crate::ProgramStatus,
+    /// OSC 133;D exit statuses keyed by the stable row the cursor was on
+    /// when the shell reported them (TGZTerminal addition). Bounded; see
+    /// `record_command_status`.
+    command_statuses: std::collections::BTreeMap<StableRowIndex, i32>,
 
     palette: Option<ColorPalette>,
 
@@ -615,6 +619,7 @@ impl TerminalState {
             bidi_hint: None,
             progress: Progress::default(),
             program_status: crate::ProgramStatus::default(),
+            command_statuses: std::collections::BTreeMap::new(),
         }
     }
 
@@ -691,6 +696,44 @@ impl TerminalState {
         if self.program_status.drop_live() {
             self.program_status_did_change();
         }
+    }
+
+    /// Remember an OSC 133;D exit status at the cursor's row (TGZTerminal).
+    ///
+    /// Only the primary screen counts: a shell does not report command
+    /// status from the alternate screen, and alt-screen rows have no
+    /// scrollback for a block to live in. Rows that have scrolled out of
+    /// the scrollback are pruned, and the map never holds more than
+    /// `MAX_COMMAND_STATUSES` entries.
+    pub(crate) fn record_command_status(&mut self, status: i32) {
+        const MAX_COMMAND_STATUSES: usize = 2000;
+        if self.screen.alt_screen_is_active {
+            return;
+        }
+        let row = self.screen.visible_row_to_stable_row(self.cursor.y);
+        self.command_statuses.insert(row, status);
+        let first = self.screen.phys_to_stable_row_index(0);
+        self.command_statuses = self.command_statuses.split_off(&first);
+        while self.command_statuses.len() > MAX_COMMAND_STATUSES {
+            self.command_statuses.pop_first();
+        }
+    }
+
+    /// OSC 133;D exit statuses whose rows fall in `range`, in row order
+    /// (TGZTerminal). The row is where the cursor was when the shell
+    /// reported the status: the row after a command's output, normally the
+    /// row its next prompt starts on.
+    pub fn command_statuses(
+        &self,
+        range: std::ops::Range<StableRowIndex>,
+    ) -> Vec<(StableRowIndex, i32)> {
+        if range.start >= range.end {
+            return vec![];
+        }
+        self.command_statuses
+            .range(range)
+            .map(|(row, status)| (*row, *status))
+            .collect()
     }
 
     fn program_status_did_change(&mut self) {

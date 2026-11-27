@@ -340,6 +340,14 @@ pub trait Pane: Downcast + Send + Sync {
         Ok(vec![])
     }
 
+    /// OSC 133;D exit statuses whose rows fall in `range`, in row order
+    /// (TGZTerminal). Each row is where the shell reported the status: the
+    /// row after a command's output. Panes that cannot tell (remote client
+    /// panes, for now) report none.
+    fn get_command_statuses(&self, _range: Range<StableRowIndex>) -> Vec<(StableRowIndex, i32)> {
+        vec![]
+    }
+
     /// Returns true if the terminal has grabbed the mouse and wants to
     /// give the embedded application a chance to process events.
     /// In practice this controls whether the gui will perform local

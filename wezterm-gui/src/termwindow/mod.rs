@@ -128,6 +128,7 @@ mod selection;
 pub mod shell_copy;
 pub mod spawn;
 pub mod tgz_alt_screen;
+pub(crate) mod tgz_assist;
 pub(crate) mod tgz_footer;
 pub(crate) mod tgz_fs;
 pub mod tgz_last_session;
@@ -721,6 +722,8 @@ pub enum UIItemType {
     SshSetupButton {
         save: bool,
     },
+    /// The Ask card (TGZTerminal): its body, a suggestion row or Close.
+    AssistCard(tgz_assist::AssistHit),
     PaneToolbeltButton {
         pane_id: PaneId,
         action: PaneToolbeltAction,
@@ -1196,6 +1199,7 @@ impl UIItemType {
                 | Self::SshSetupField(_)
                 | Self::SshSetupOption { .. }
                 | Self::SshSetupButton { .. }
+                | Self::AssistCard(_)
                 | Self::PaneCopyMenuItem { .. }
                 | Self::CloseTabMenuItem { .. }
                 | Self::SidebarContextMenuItem { .. }
@@ -1682,6 +1686,8 @@ pub struct TermWindow {
     ssh_host_transports: std::collections::BTreeMap<String, config::SshTransport>,
     /// The "New SSH connection" form, while open; it takes the keyboard.
     ssh_setup: Option<tgz_ssh_setup::SshSetupForm>,
+    /// The Ask card (TGZTerminal, `assist.ask`).
+    pub(crate) assist: Option<tgz_assist::AssistCard>,
     /// Past sessions offered by the session menus, and the scan they came from.
     ///
     /// Finding these means statting every transcript on disk and reading the
@@ -2255,6 +2261,7 @@ impl TermWindow {
             ssh_recent_hosts: tgz_ui_state::load_ssh_recent_hosts(),
             ssh_host_transports: tgz_ui_state::load_ssh_host_transports(),
             ssh_setup: None,
+            assist: None,
             agent_session_cache: None,
             agent_session_scan_started_at: None,
             agent_window_sessions: tgz_last_session::WindowAgents::default(),
@@ -6405,6 +6412,8 @@ done
             // too (it is just text), and the provenance toast keeps them
             // honest. That is the keyboard path to the same actions the Copy
             // icon's menu offers.
+            AskAssistant => self.open_assist(pane),
+            ConnectAssistMcp => self.connect_assist_mcp(),
             CopyLastCommandOutput => {
                 self.perform_pane_copy(
                     pane,

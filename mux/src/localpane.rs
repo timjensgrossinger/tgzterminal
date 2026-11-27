@@ -821,6 +821,10 @@ impl Pane for LocalPane {
         term.get_semantic_zones()
     }
 
+    fn get_command_statuses(&self, range: Range<StableRowIndex>) -> Vec<(StableRowIndex, i32)> {
+        self.terminal.lock().command_statuses(range)
+    }
+
     async fn search(
         &self,
         pattern: Pattern,

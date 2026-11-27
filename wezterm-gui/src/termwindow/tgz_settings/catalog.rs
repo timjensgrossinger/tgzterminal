@@ -8,9 +8,9 @@
 
 use super::lua_edit::LuaValue;
 use config::{
-    AgentCopyClick, AgentLaunchTarget, AgentRingColors, Config, DiffPanelLongLines, DiffPanelMode,
-    DiffPanelPosition, DiffPanelRaisedMode, FileBrowserEditorPlacement, FileBrowserUi,
-    NotificationHandling, PaneToolbeltPosition, ShellCopyClick, SidebarNewTabStyle,
+    AgentCopyClick, AgentLaunchTarget, AgentRingColors, AssistTools, Config, DiffPanelLongLines,
+    DiffPanelMode, DiffPanelPosition, DiffPanelRaisedMode, FileBrowserEditorPlacement,
+    FileBrowserUi, NotificationHandling, PaneToolbeltPosition, ShellCopyClick, SidebarNewTabStyle,
     SidebarPosition, SidebarTabDensity, SidebarTabGrouping, SidebarTabTitleSource, SidebarTheme,
 };
 use std::convert::TryFrom;
@@ -28,6 +28,8 @@ pub(crate) enum Section {
     Changes,
     Input,
     Privacy,
+    /// Experimental `assist` features: Ask panel, command blocks, MCP.
+    Assist,
     /// Buttons of the user's own for the sidebar footer (`sidebar_buttons`).
     Buttons,
     /// The user's own pane layouts (`tgz_layouts`), in a form.
@@ -37,7 +39,7 @@ pub(crate) enum Section {
 }
 
 impl Section {
-    pub(crate) const ALL: [Section; 12] = [
+    pub(crate) const ALL: [Section; 13] = [
         Section::Appearance,
         Section::Colors,
         Section::Sidebar,
@@ -47,6 +49,7 @@ impl Section {
         Section::Changes,
         Section::Input,
         Section::Privacy,
+        Section::Assist,
         Section::Buttons,
         Section::Layouts,
         Section::Shortcuts,
@@ -63,6 +66,7 @@ impl Section {
             Section::Changes => "Changes",
             Section::Input => "Input",
             Section::Privacy => "Privacy",
+            Section::Assist => "Assist (experimental)",
             Section::Buttons => "Buttons",
             Section::Layouts => "Layouts",
             Section::Shortcuts => "Shortcuts",
@@ -1226,6 +1230,67 @@ pub(crate) static CATALOG: &[Setting] = &[
         "Heal a stuck full-screen view",
         "Leave the alternate screen a crashed program left behind.",
         heal_stranded_alt_screen
+    ),
+    // Assist (experimental)
+    toggle!(
+        Assist,
+        "Shell integration for zsh",
+        "Mark prompts, commands and exit codes (OSC 133) in new zsh tabs. \
+         Your own startup files still run.",
+        assist.shell_integration
+    ),
+    toggle!(
+        Assist,
+        "Command blocks",
+        "Mark failed commands, Cmd+Up/Down between prompts, Cmd+Shift+C copies the last output.",
+        assist.command_blocks
+    ),
+    toggle!(
+        Assist,
+        "Ask panel",
+        "Cmd+I asks Claude (or another CLI) about the last commands of a shell pane.",
+        assist.ask.enabled
+    ),
+    choice!(
+        Assist,
+        "What Ask may do",
+        "ReadOnly lets it read files in the pane's folder; ContextOnly sends only the context.",
+        AssistTools,
+        assist.ask.tools
+    ),
+    int!(
+        Assist,
+        "Commands sent as context",
+        "How many recent commands Ask sends with a question.",
+        1,
+        10,
+        assist.ask.context_blocks
+    ),
+    int!(
+        Assist,
+        "Ask timeout (seconds)",
+        "A request still running after this long is stopped.",
+        10,
+        600,
+        assist.ask.timeout_secs
+    ),
+    toggle!(
+        Assist,
+        "Risk labels",
+        "Label suggested commands Only looks / Changes things / Deletes, and ask before running a delete.",
+        assist.risk_labels
+    ),
+    toggle!(
+        Assist,
+        "Terminal tools for agents",
+        "Let `wezterm cli mcp` serve recent commands of a pane to agents (secrets masked).",
+        assist.mcp.enabled
+    ),
+    toggle!(
+        Assist,
+        "Agents may paste commands",
+        "Offer agents a tool that pastes a command at a prompt. It never presses Enter.",
+        assist.mcp.allow_insert
     ),
     // Buttons
     custom_button_label!("custom1", "1"),

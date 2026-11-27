@@ -1391,4 +1391,9 @@ impl Client {
     );
     rpc!(adjust_pane_size, AdjustPaneSize, UnitResponse);
     rpc!(apply_pane_layout, ApplyPaneLayout, UnitResponse);
+    rpc!(
+        get_command_blocks,
+        GetCommandBlocks,
+        GetCommandBlocksResponse
+    );
 }

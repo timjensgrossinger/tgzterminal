@@ -181,6 +181,7 @@ impl CommandDef {
                     if config.tgz_pane_keys {
                         def.keys.extend(tgz_pane_keys(&action));
                     }
+                    def.keys.extend(tgz_assist_keys(&action, config));
                 }
                 let keys = if is_built_in && config.disable_default_key_bindings {
                     vec![]
@@ -888,6 +889,29 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             args: &[ArgType::ActiveWindow],
             menubar: &[],
             icon: None,
+        },
+        ConnectAssistMcp => CommandDef {
+            brief: "Connect terminal tools to Claude Code".into(),
+            doc: "Registers `wezterm cli mcp` as a user-wide MCP server in Claude Code, \
+                  so an agent can read another pane's recent commands, output and exit \
+                  codes. Experimental; needs assist.mcp.enabled."
+                .into(),
+            keys: vec![],
+            args: &[],
+            menubar: &[],
+            icon: Some("md_connection"),
+        },
+        AskAssistant => CommandDef {
+            brief: "Ask about this pane".into(),
+            doc: "Opens the Ask panel for the active pane: a question goes to the \
+                  configured CLI (Claude by default) with the last commands, their \
+                  output and the selection as context. Experimental; needs \
+                  assist.ask.enabled."
+                .into(),
+            keys: vec![],
+            args: &[ArgType::ActivePane],
+            menubar: &["Edit"],
+            icon: Some("md_chat_question"),
         },
         CopyLastCommandOutput => CommandDef {
             brief: "Copy last command output".into(),
@@ -2410,6 +2434,22 @@ fn tgz_pane_keys(action: &KeyAssignment) -> Vec<(Modifiers, String)> {
     }
 }
 
+/// Default keys for the experimental `assist` features (TGZTerminal). Each
+/// is present only while its feature is switched on, and like every default
+/// it yields to a user binding on the same key.
+fn tgz_assist_keys(action: &KeyAssignment, config: &ConfigHandle) -> Vec<(Modifiers, String)> {
+    let cmd_shift = Modifiers::SUPER.union(Modifiers::SHIFT);
+    let key = |mods, label: &str| vec![(mods, label.to_string())];
+    let blocks = config.assist.command_blocks;
+    match action {
+        ScrollToPrompt(-1) if blocks => key(Modifiers::SUPER, "UpArrow"),
+        ScrollToPrompt(1) if blocks => key(Modifiers::SUPER, "DownArrow"),
+        CopyLastCommandOutput if blocks => key(cmd_shift, "c"),
+        AskAssistant if config.assist.ask.enabled => key(Modifiers::SUPER, "i"),
+        _ => vec![],
+    }
+}
+
 /// Returns a list of key assignment actions that should be
 /// included in the default key assignments and command palette.
 fn compute_default_actions() -> Vec<KeyAssignment> {
@@ -2456,6 +2496,10 @@ fn compute_default_actions() -> Vec<KeyAssignment> {
         CopyLastCommandOutput,
         CopyLastCommandWithOutput,
         CopyPaneScrollback,
+        ScrollToPrompt(-1),
+        ScrollToPrompt(1),
+        AskAssistant,
+        ConnectAssistMcp,
         CopyRedactedTo(ClipboardCopyDestination::Clipboard),
         PasteFrom(ClipboardPasteSource::Clipboard),
         ClearScrollback(ScrollbackEraseMode::ScrollbackOnly),

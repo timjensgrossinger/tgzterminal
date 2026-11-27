@@ -6,6 +6,7 @@ mod c0;
 use bitflags::bitflags;
 mod alt_screen_prompt;
 mod c1;
+mod command_status;
 mod csi;
 mod image;
 mod program_status;

@@ -723,6 +723,7 @@ impl<'a> Performer<'a> {
                 if self.program_status.clear() {
                     self.program_status_did_change();
                 }
+                self.command_statuses.clear();
 
                 self.screen.full_reset();
                 self.screen.activate_alt_screen(seqno);
@@ -915,8 +916,12 @@ impl<'a> Performer<'a> {
             }
 
             OperatingSystemCommand::FinalTermSemanticPrompt(
-                FinalTermSemanticPrompt::CommandStatus { .. },
-            ) => {}
+                FinalTermSemanticPrompt::CommandStatus { status, .. },
+            ) => {
+                // TGZTerminal: keep the exit status (upstream drops it) so
+                // command blocks can be marked failed.
+                self.record_command_status(status);
+            }
 
             OperatingSystemCommand::SystemNotification(message) => {
                 if let Some(handler) = self.alert_handler.as_mut() {

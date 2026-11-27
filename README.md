@@ -95,6 +95,17 @@ config since 2019, it still works exactly the same. We just added furniture to t
 | 🙈 | **Secret masking** | Token-shaped strings (API keys, access tokens, passwords in URLs) are hidden on screen and left out of the copy menu's "(no secrets)" rows. On by default. | Screen-sharing a terminal stops being a small act of faith. |
 | 🔒 | **Secure Keyboard Entry** (macOS) | The **Lock** button holds Secure Keyboard Entry while a TGZTerminal window has focus, and it switches on by itself at password prompts. Keyloggers and input monitors stop seeing what you type. | The same switch Terminal.app and iTerm2 have, without a trip to the menu bar. |
 
+### Experimental: Assist
+
+Off by default and still settling. Switch each part on under **Settings → Assist (experimental)**
+or in Lua with `config.assist` (see [`docs/TGZTERMINAL_CONFIG.md`](docs/TGZTERMINAL_CONFIG.md#assist-experimental-ask-panel-command-blocks-terminal-tools-for-agents)).
+
+| | Feature | What it does | Why you'd care |
+|---|---|---|---|
+| 🧪 | **Ask panel** (`assist.ask`) | `Cmd+I` on a shell pane opens a card that asks Claude (or Codex, or a CLI of your own) about what just happened. Enter on an empty field explains the last failed command. It sends the last few commands with their output and exit codes, the folder and your selection, with secrets masked, and shows you what it sends. Claude runs on your own login, read-only (Read/Grep/Glob in that folder, `.env` and `~/.ssh` refused), with your hooks and plugins left out. Suggested commands carry a label (**Only looks**, **Changes things**, **Deletes**): Enter pastes one at the prompt, `Cmd+Enter` runs it, a delete asks once more. | "Why did that fail?" without copying forty lines of output into another window. Nothing runs that you didn't press a key for. |
+| 🧪 | **Command blocks** (`assist.command_blocks`, `assist.shell_integration`) | Shell integration injected into new zsh tabs (your own startup files still run; powerlevel10k marks its own prompt). Failed commands get a red bar beside them, `Cmd+Up` / `Cmd+Down` jump between prompts, `Cmd+Shift+C` copies the last output. | The command that failed three screens ago is one keystroke away. |
+| 🧪 | **Terminal tools for agents** (`assist.mcp`) | `wezterm cli get-blocks` prints a pane's recent commands with output and exit codes; `wezterm cli mcp` serves the same to agents as an MCP server, secrets masked. *Connect terminal tools to Claude Code* in the palette registers it. Pasting a command into a pane is a separate opt-in and never presses Enter. | Claude in one pane can see what failed in the other without you pasting it. |
+
 > **Security model**: Control actions (Stop / Resume / Attach) are gated behind **both**
 > an explicit config opt-in **and** trusted evidence (process name or explicit user
 > variable), never visible terminal text alone. A pane printing the word "claude" in a

@@ -483,6 +483,11 @@ impl LocalDomain {
         if let Some(agent) = Mux::get().agent.as_ref() {
             cmd.env("SSH_AUTH_SOCK", agent.path());
         }
+        // TGZTerminal: OSC 133 for a default-program zsh (opt-in). Never for
+        // a WSL domain: its default program runs inside the distro.
+        if config.assist.shell_integration && wsl.is_none() {
+            crate::tgz_shell_integration::inject(&mut cmd);
+        }
         self.fixup_command(&mut cmd).await?;
         Ok(cmd)
     }

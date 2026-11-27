@@ -2922,3 +2922,77 @@ config.tgz_notifications = {
 | Copy confirmations | `tgz_notifications.copy` |
 | Status and errors | `tgz_notifications.status` |
 | Dock badge (macOS) | `agent_ui.dock_badge` |
+
+## Assist (experimental): Ask panel, command blocks, terminal tools for agents
+
+Experimental and off by default. Every switch is in the Settings tab under
+**Assist (experimental)**.
+
+```lua
+config.assist = {
+  -- Inject OSC 133 shell integration into new zsh tabs (the local domain's
+  -- default program only). Your own .zshenv/.zprofile/.zshrc/.zlogin still run.
+  shell_integration = false,
+  -- Failed-command marks (a red bar beside the command and its output),
+  -- Cmd+Up/Down between prompts, Cmd+Shift+C copies the last output.
+  command_blocks = false,
+  ask = {
+    enabled = false,          -- Cmd+I opens the Ask panel on a shell pane
+    provider = 'claude',      -- 'claude', 'codex', or a key of assist.providers
+    model = nil,              -- passed to the provider when set
+    effort = 'low',           -- ordinary question
+    think_effort = 'high',    -- Alt+Enter: think longer
+    context_blocks = 3,       -- recent commands sent with a question
+    max_context_bytes = 24000,
+    timeout_secs = 120,
+    tools = 'ReadOnly',       -- 'ReadOnly' (Read/Grep/Glob in the pane's folder) or 'ContextOnly'
+    deny_read = { '**/.env*', '~/.ssh/**', '~/.aws/**', '~/.gnupg/**',
+                  '**/*.pem', '**/*.key', '**/id_rsa*', '**/id_ed25519*' },
+  },
+  -- Your own providers; the prompt is written to stdin.
+  providers = {
+    -- gemini = { argv = { 'gemini', '-p' }, stream = 'Text' },
+  },
+  risk_labels = true,         -- Only looks / Changes things / Deletes; a delete asks before it runs
+  mcp = {
+    enabled = false,          -- answer `wezterm cli get-blocks` / `wezterm cli mcp`
+    allow_insert = false,     -- offer agents a tool that pastes a command (never presses Enter)
+  },
+}
+```
+
+**Command blocks** need OSC 133 marks. With `shell_integration` on, a new zsh
+tab starts with `ZDOTDIR` pointing at `<data dir>/shell-integration/zsh`,
+whose `.zshenv` puts your `ZDOTDIR` back, sources your own `.zshenv` and
+loads `wezterm.sh` at the first prompt. bash, fish and PowerShell are not
+injected; source `wezterm.sh` yourself, or the prompt is guessed from its
+shape (no exit codes then). Exit codes are only known for local panes.
+
+**Ask** (Cmd+I, or *Ask about this pane* in the palette) opens a card over the
+bottom of the pane. Enter on an empty field explains the last failed command;
+typing asks anything. The card shows what is sent ("Sees: ..."): the last
+commands with output and exit codes, the folder, the selection (or the screen
+text in a full-screen program) and the two previous turns, all passed through
+`secret_masking` first. The answer streams in, followed by the commands it
+suggests. ↑/↓ picks one, Enter pastes it at the prompt, Cmd+Enter runs it, and
+a command labelled *Deletes* asks once more. Esc stops a running request,
+then closes the card. Agent panes are left alone: ask the agent.
+
+The `claude` provider runs `claude -p` on your own Claude login with
+`--safe-mode` (your hooks, plugins, MCP servers and CLAUDE.md stay out),
+`--no-session-persistence`, `--tools Read,Grep,Glob` (none for a remote pane
+or `ContextOnly`), `--permission-prompts none` and a deny rule for every
+`deny_read` pattern. `codex` runs `codex exec --sandbox read-only`. The risk
+label is a local reading of the command text, not a sandbox: it never calls
+an unknown command "Only looks", but obfuscated commands can fool it.
+
+**Terminal tools for agents.** With `mcp.enabled`, `wezterm cli get-blocks
+[--pane-id N] [--last K] [--failed-only] [--format json]` prints a pane's
+recent commands, and `wezterm cli mcp` serves the same as a stdio MCP server
+with `terminal_list_panes` and `terminal_last_blocks` (plus
+`terminal_insert_command` with `allow_insert`). Output is masked with
+`secret_masking` and capped at 16 KB per command. *Connect terminal tools to
+Claude Code* in the palette registers it user-wide via `claude mcp add
+--scope user tgzterminal -- <app>/wezterm cli mcp`; for another CLI, add that
+command line as a stdio MCP server yourself (it needs `WEZTERM_PANE` and
+`WEZTERM_UNIX_SOCKET` from the pane's environment).

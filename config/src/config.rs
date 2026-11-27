@@ -974,6 +974,195 @@ impl Default for RichInputConfig {
     }
 }
 
+/// Experimental "assist" features (TGZTerminal): shell integration injection,
+/// command-block marks and navigation, the Ask panel and the MCP reverse
+/// channel. Every switch defaults to off.
+#[derive(Debug, Clone, FromDynamic, ToDynamic)]
+pub struct AssistConfig {
+    /// Inject OSC 133 shell integration into zsh shells the local domain
+    /// spawns as the default program (via a temporary `ZDOTDIR`). Without
+    /// it, command blocks fall back to guessing prompts and there are no
+    /// exit codes.
+    #[dynamic(default)]
+    pub shell_integration: bool,
+
+    /// Failed-command marks, CMD+Up/Down between prompts and
+    /// CMD+Shift+C to copy the last command's output.
+    #[dynamic(default)]
+    pub command_blocks: bool,
+
+    /// The Ask panel (CMD+I).
+    #[dynamic(default)]
+    pub ask: AssistAskConfig,
+
+    /// User-defined answer providers, merged over the built-ins (`claude`,
+    /// `codex`). A provider with a built-in's name replaces it.
+    #[dynamic(default)]
+    pub providers: BTreeMap<String, AssistProviderConfig>,
+
+    /// Label suggested commands "Only looks" / "Changes files" / "Deletes",
+    /// and ask again before running anything that deletes.
+    #[dynamic(default = "default_true")]
+    pub risk_labels: bool,
+
+    /// `wezterm cli mcp`: lets agents in panes read command blocks.
+    #[dynamic(default)]
+    pub mcp: AssistMcpConfig,
+}
+
+impl Default for AssistConfig {
+    fn default() -> Self {
+        Self {
+            shell_integration: false,
+            command_blocks: false,
+            ask: AssistAskConfig::default(),
+            providers: BTreeMap::new(),
+            risk_labels: true,
+            mcp: AssistMcpConfig::default(),
+        }
+    }
+}
+
+/// What the answering CLI may do while it answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, FromDynamic, ToDynamic)]
+pub enum AssistTools {
+    /// Read, Grep and Glob inside the pane's directory (local panes only).
+    #[default]
+    ReadOnly,
+    /// No tools: the CLI sees only the context we send.
+    ContextOnly,
+}
+
+#[derive(Debug, Clone, FromDynamic, ToDynamic)]
+pub struct AssistAskConfig {
+    #[dynamic(default)]
+    pub enabled: bool,
+
+    /// Key into `assist.providers` / the built-ins.
+    #[dynamic(default = "default_assist_provider")]
+    pub provider: String,
+
+    /// Model override passed to the provider when it supports one.
+    #[dynamic(default)]
+    pub model: Option<String>,
+
+    /// Reasoning effort for an ordinary question.
+    #[dynamic(default = "default_assist_effort")]
+    pub effort: String,
+
+    /// Reasoning effort for "think longer" (Alt+Enter).
+    #[dynamic(default = "default_assist_think_effort")]
+    pub think_effort: String,
+
+    /// How many recent command blocks are sent as context.
+    #[dynamic(default = "default_assist_context_blocks")]
+    pub context_blocks: usize,
+
+    /// Upper bound on the context sent, in bytes; oldest output goes first.
+    #[dynamic(default = "default_assist_max_context_bytes")]
+    pub max_context_bytes: usize,
+
+    /// A request still running after this long is stopped.
+    #[dynamic(default = "default_assist_timeout_secs")]
+    pub timeout_secs: u64,
+
+    #[dynamic(default)]
+    pub tools: AssistTools,
+
+    /// Read-permission deny patterns handed to the provider on top of the
+    /// secret masking applied to everything we send.
+    #[dynamic(default = "default_assist_deny_read")]
+    pub deny_read: Vec<String>,
+}
+
+impl Default for AssistAskConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider: default_assist_provider(),
+            model: None,
+            effort: default_assist_effort(),
+            think_effort: default_assist_think_effort(),
+            context_blocks: default_assist_context_blocks(),
+            max_context_bytes: default_assist_max_context_bytes(),
+            timeout_secs: default_assist_timeout_secs(),
+            tools: AssistTools::default(),
+            deny_read: default_assist_deny_read(),
+        }
+    }
+}
+
+/// How a provider's stdout is read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, FromDynamic, ToDynamic)]
+pub enum AssistStreamFormat {
+    /// `claude -p --output-format stream-json` events, one JSON per line.
+    ClaudeStreamJson,
+    /// Plain text, shown as it arrives.
+    #[default]
+    Text,
+}
+
+/// A user-defined answer provider. The prompt is written to its stdin.
+#[derive(Debug, Clone, Default, FromDynamic, ToDynamic)]
+pub struct AssistProviderConfig {
+    /// Full command line, program first.
+    pub argv: Vec<String>,
+    #[dynamic(default)]
+    pub stream: AssistStreamFormat,
+}
+
+#[derive(Debug, Clone, Default, FromDynamic, ToDynamic)]
+pub struct AssistMcpConfig {
+    /// Answer `GetCommandBlocks` requests (and so `wezterm cli get-blocks`
+    /// and the MCP tools built on it).
+    #[dynamic(default)]
+    pub enabled: bool,
+    /// Offer the `terminal_insert_command` MCP tool. It pastes a command at
+    /// a pane's prompt and never presses Enter.
+    #[dynamic(default)]
+    pub allow_insert: bool,
+}
+
+fn default_assist_provider() -> String {
+    "claude".to_string()
+}
+
+fn default_assist_effort() -> String {
+    "low".to_string()
+}
+
+fn default_assist_think_effort() -> String {
+    "high".to_string()
+}
+
+fn default_assist_context_blocks() -> usize {
+    3
+}
+
+fn default_assist_max_context_bytes() -> usize {
+    24_000
+}
+
+fn default_assist_timeout_secs() -> u64 {
+    120
+}
+
+fn default_assist_deny_read() -> Vec<String> {
+    [
+        "**/.env*",
+        "~/.ssh/**",
+        "~/.aws/**",
+        "~/.gnupg/**",
+        "**/*.pem",
+        "**/*.key",
+        "**/id_rsa*",
+        "**/id_ed25519*",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, FromDynamic, ToDynamic)]
 pub enum AgentTelemetryField {
     Kind,
@@ -2992,6 +3181,10 @@ pub struct Config {
     /// Optional multiline input composer for agent panes.
     #[dynamic(default)]
     pub rich_input: RichInputConfig,
+
+    /// Experimental assist features: Ask panel, command blocks, MCP channel.
+    #[dynamic(default)]
+    pub assist: AssistConfig,
 
     /// The "Changes" panel showing working-copy diffs beside the active pane.
     #[dynamic(default)]

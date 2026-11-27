@@ -118,6 +118,7 @@ impl super::TermWindow {
             | UIItemType::SshSetupField(_)
             | UIItemType::SshSetupOption { .. }
             | UIItemType::SshSetupButton { .. }
+            | UIItemType::AssistCard(_)
             | UIItemType::PaneToolbeltButton { .. }
             | UIItemType::PaneToolbeltHandle { .. }
             | UIItemType::PaneCopyMenuItem { .. }
@@ -202,6 +203,7 @@ impl super::TermWindow {
             | UIItemType::SshSetupField(_)
             | UIItemType::SshSetupOption { .. }
             | UIItemType::SshSetupButton { .. }
+            | UIItemType::AssistCard(_)
             | UIItemType::PaneToolbeltButton { .. }
             | UIItemType::PaneToolbeltHandle { .. }
             | UIItemType::PaneCopyMenuItem { .. }
@@ -1275,6 +1277,9 @@ impl super::TermWindow {
             | UIItemType::SshSetupOption { .. }
             | UIItemType::SshSetupButton { .. } => {
                 self.mouse_event_ssh_setup(&item.item_type, &event, context);
+            }
+            UIItemType::AssistCard(hit) => {
+                self.mouse_event_assist(hit, &event, context);
             }
             UIItemType::SidebarSshMenuItem { domain_name } => {
                 self.mouse_event_sidebar_ssh_menu_item(domain_name, event, context);

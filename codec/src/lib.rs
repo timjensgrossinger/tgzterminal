@@ -506,6 +506,8 @@ pdu! {
     DomainExec: 63,
     DomainExecResponse: 64,
     ApplyPaneLayout: 65,
+    GetCommandBlocks: 66,
+    GetCommandBlocksResponse: 67,
 }
 
 impl Pdu {
@@ -886,6 +888,32 @@ pub struct AdjustPaneSize {
 pub struct ApplyPaneLayout {
     pub pane_id: PaneId,
     pub layout: Option<config::keyassignment::PaneLayout>,
+}
+
+/// The newest command blocks of `pane_id` (TGZTerminal). The server answers
+/// only while `assist.mcp.enabled` is on.
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct GetCommandBlocks {
+    pub pane_id: PaneId,
+    pub last: usize,
+    /// Only blocks whose command exited non-zero.
+    pub failed_only: bool,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
+pub struct CommandBlockText {
+    pub command: String,
+    pub output: String,
+    pub exit_status: Option<i32>,
+    /// No shell integration: the boundary was guessed from the prompt shape.
+    pub guessed: bool,
+    pub head_clipped: bool,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct GetCommandBlocksResponse {
+    pub pane_id: PaneId,
+    pub blocks: Vec<CommandBlockText>,
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Debug)]

@@ -35,6 +35,7 @@ use wezterm_mux_server_impl::update_mux_domains;
 use wezterm_toast_notification::*;
 
 mod agent_herd;
+mod assist;
 mod brand;
 mod colorease;
 mod commands;
@@ -916,6 +917,29 @@ fn run_gui_forever(gui: std::rc::Rc<crate::frontend::GuiFrontEnd>) -> anyhow::Re
     // ambushing the user later when the sidebar first probes a pane's cwd.
     #[cfg(target_os = "macos")]
     crate::macos_permissions::prime_first_run();
+    // TGZTerminal: command blocks served to other processes
+    // (`GetCommandBlocks`, `wezterm cli get-blocks`) are masked with the
+    // same rules as the screen. Rules are recompiled when the config changes.
+    {
+        use crate::termwindow::tgz_secret_mask::SecretRules;
+        let cache: std::sync::Mutex<Option<(usize, std::sync::Arc<SecretRules>)>> =
+            std::sync::Mutex::new(None);
+        mux::tgz_blocks::set_redactor(Box::new(move |text: &str| {
+            let config = config::configuration();
+            let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+            let rules = match cache.as_ref() {
+                Some((generation, rules)) if *generation == config.generation() => {
+                    std::sync::Arc::clone(rules)
+                }
+                _ => {
+                    let rules = std::sync::Arc::new(SecretRules::compile(&config.secret_masking));
+                    *cache = Some((config.generation(), std::sync::Arc::clone(&rules)));
+                    rules
+                }
+            };
+            rules.redact(text).0
+        }));
+    }
 
     // Load the WSL distro list off the GUI thread before the first paint
     // asks for it; the sidebar never spawns `wsl.exe` itself.

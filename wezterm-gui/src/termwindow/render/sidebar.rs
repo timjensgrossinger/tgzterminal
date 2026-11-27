@@ -50,6 +50,7 @@ use url::Url;
 use window::color::LinearRgba;
 use window::{MousePress, RectF, WindowOps};
 
+mod assist;
 mod modal;
 mod search;
 mod ssh_setup;

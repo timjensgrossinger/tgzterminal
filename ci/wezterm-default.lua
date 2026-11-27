@@ -89,5 +89,19 @@ local config = {}
 -- config.heal_stranded_alt_screen = true
 
 -- ---------------------------------------------------------------------------
+-- Assist (experimental; everything off by default)
+-- ---------------------------------------------------------------------------
+
+-- Cmd+I asks Claude about a shell pane's last commands; failed-command marks;
+-- zsh shell integration; terminal tools for agents (`wezterm cli mcp`).
+-- See docs/TGZTERMINAL_CONFIG.md, "Assist".
+-- config.assist = {
+--   shell_integration = true,
+--   command_blocks = true,
+--   ask = { enabled = true, provider = 'claude' },  -- or 'codex'
+--   mcp = { enabled = true },
+-- }
+
+-- ---------------------------------------------------------------------------
 
 return config

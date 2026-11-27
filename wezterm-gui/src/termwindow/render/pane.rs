@@ -341,6 +341,9 @@ impl crate::TermWindow {
                 /// Rows beside a raised Changes panel, wrapped on screen.
                 wrap_zone: Option<WrapZone>,
                 wrap_layout: Option<WrapLayout>,
+                /// Filled with the viewport rows' OSC 133 kinds when a
+                /// failed command may need marking (`assist.command_blocks`).
+                block_kinds: Option<Vec<mux::tgz_blocks::RowKind>>,
             }
 
             let left_pixel_x = padding_left
@@ -355,6 +358,21 @@ impl crate::TermWindow {
                 cell_width,
                 cell_height,
             });
+
+            // Failed-command marks (TGZTerminal, `assist.command_blocks`):
+            // only classify rows when a non-zero status is in reach.
+            let failure_statuses =
+                if config.assist.command_blocks && !pos.pane.is_alt_screen_active() {
+                    let statuses = pos
+                        .pane
+                        .get_command_statuses(stable_range.start..StableRowIndex::MAX);
+                    statuses
+                        .iter()
+                        .any(|(_, status)| *status != 0)
+                        .then_some(statuses)
+                } else {
+                    None
+                };
 
             let mut render = LineRender {
                 term_window: self,
@@ -382,6 +400,7 @@ impl crate::TermWindow {
                 error: None,
                 wrap_zone,
                 wrap_layout: None,
+                block_kinds: failure_statuses.as_ref().map(|_| Vec::new()),
             };
 
             impl<'a, 'b> LineRender<'a, 'b> {
@@ -621,6 +640,9 @@ impl crate::TermWindow {
 
             impl<'a, 'b> WithPaneLines for LineRender<'a, 'b> {
                 fn with_lines_mut(&mut self, stable_top: StableRowIndex, lines: &mut [&mut Line]) {
+                    if let Some(kinds) = self.block_kinds.as_mut() {
+                        kinds.extend(lines.iter().map(|line| mux::tgz_blocks::classify_row(line)));
+                    }
                     if let Some(zone) = self.wrap_zone {
                         let cursor_row = self.cursor.y - stable_top;
                         let (lens, shown): (Vec<usize>, Vec<usize>) = lines
@@ -675,6 +697,21 @@ impl crate::TermWindow {
             pos.pane.with_lines_mut(stable_range.clone(), &mut render);
             let wrap_layout = render.wrap_layout.take();
             let error = render.error.take();
+            let block_kinds = render.block_kinds.take();
+            if let (Some(statuses), Some(kinds)) = (failure_statuses, block_kinds) {
+                self.paint_failed_block_marks(
+                    layers,
+                    pos,
+                    &palette,
+                    &kinds,
+                    stable_range.start,
+                    &statuses,
+                    wrap_layout.as_ref(),
+                    left_pixel_x,
+                    top_pixel_y,
+                    padding_left,
+                )?;
+            }
             self.diff_panel_set_wrap(pane_id, wrap_layout);
             if let Some(error) = error {
                 return Err(error).context("error while calling with_lines_mut");
@@ -689,6 +726,68 @@ impl crate::TermWindow {
         metrics::histogram!("paint_pane.lines").record(start.elapsed());
         log::trace!("lines elapsed {:?}", start.elapsed());
 
+        Ok(())
+    }
+
+    /// A thin bar in the palette's red beside every row of a command that
+    /// exited non-zero (TGZTerminal, `assist.command_blocks`): solid on the
+    /// prompt row, fainter down its output. Sits in the left padding when
+    /// there is room, else over the first pixels of column 0. Rows map to
+    /// screen rows through the Changes-panel wrap layout, like the text.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_failed_block_marks(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        pos: &PositionedPane,
+        palette: &ColorPalette,
+        kinds: &[mux::tgz_blocks::RowKind],
+        top: StableRowIndex,
+        statuses: &[(StableRowIndex, i32)],
+        wrap_layout: Option<&WrapLayout>,
+        left_pixel_x: f32,
+        top_pixel_y: f32,
+        padding_left: f32,
+    ) -> anyhow::Result<()> {
+        use mux::tgz_blocks::RowKind;
+        let spans = mux::tgz_blocks::failed_block_rows(kinds, top, statuses);
+        if spans.is_empty() {
+            return Ok(());
+        }
+        let mut screen_rows: Vec<Vec<usize>> = (0..kinds.len()).map(|row| vec![row]).collect();
+        if let Some(layout) = wrap_layout {
+            screen_rows.iter_mut().for_each(Vec::clear);
+            for piece in layout.pieces() {
+                if let Some(rows) = screen_rows.get_mut(piece.row) {
+                    rows.push(piece.screen_row);
+                }
+            }
+        }
+        let cell_width = self.render_metrics.cell_size.width as f32;
+        let cell_height = self.render_metrics.cell_size.height as f32;
+        let bar_w = (cell_width * 0.2).max(2.0).round();
+        let x = if pos.left == 0 && padding_left >= bar_w + 2.0 {
+            left_pixel_x - bar_w - 1.0
+        } else {
+            left_pixel_x
+        };
+        let red = palette
+            .resolve_fg(ColorAttribute::PaletteIndex(1))
+            .to_linear();
+        for span in spans {
+            for row in span.clone() {
+                let strong =
+                    row == span.start && matches!(kinds[row], RowKind::Prompt | RowKind::Input);
+                let color = red.mul_alpha(if strong { 1.0 } else { 0.55 });
+                for &screen_row in &screen_rows[row] {
+                    if screen_row >= pos.height {
+                        continue;
+                    }
+                    let y = top_pixel_y + (pos.top + screen_row) as f32 * cell_height;
+                    self.filled_rectangle(layers, 2, euclid::rect(x, y, bar_w, cell_height), color)
+                        .context("failed block mark")?;
+                }
+            }
+        }
         Ok(())
     }
 

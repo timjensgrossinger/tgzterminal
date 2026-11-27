@@ -679,6 +679,13 @@ pub enum KeyAssignment {
     CopyLastCommandOutput,
     /// Copy the last command line together with its output.
     CopyLastCommandWithOutput,
+    /// Open the Ask panel for the active pane (TGZTerminal, experimental;
+    /// needs `assist.ask.enabled`).
+    AskAssistant,
+    /// Register `wezterm cli mcp` with Claude Code (`claude mcp add --scope
+    /// user`), so agents can read command blocks (TGZTerminal, experimental;
+    /// needs `assist.mcp.enabled`).
+    ConnectAssistMcp,
     /// Copy the active pane's scrollback, capped by
     /// `agent_ui.copy_scrollback_lines`.
     CopyPaneScrollback,

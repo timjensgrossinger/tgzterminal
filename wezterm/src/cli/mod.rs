@@ -7,6 +7,7 @@ mod activate_pane;
 mod activate_pane_direction;
 mod activate_tab;
 mod adjust_pane_size;
+mod blocks;
 mod domain_exec;
 mod get_pane_direction;
 mod get_text;
@@ -179,6 +180,16 @@ Outputs the pane-id for the newly created pane on success"
     /// Give every split in a tab an equal share of its space
     #[command(name = "balance-panes", rename_all = "kebab")]
     BalancePanes(pane_layout::BalancePanes),
+
+    /// Print a pane's recent commands with output and exit code
+    /// (experimental; needs assist.mcp.enabled)
+    #[command(name = "get-blocks", rename_all = "kebab")]
+    GetBlocks(blocks::GetBlocks),
+
+    /// Serve the terminal to agents as a stdio MCP server
+    /// (experimental; needs assist.mcp.enabled)
+    #[command(name = "mcp", rename_all = "kebab")]
+    Mcp(blocks::Mcp),
 }
 
 async fn run_cli_async(opts: &crate::Opt, cli: CliCommand) -> anyhow::Result<()> {
@@ -218,6 +229,8 @@ async fn run_cli_async(opts: &crate::Opt, cli: CliCommand) -> anyhow::Result<()>
         CliSubCommand::ZoomPane(cmd) => cmd.run(client).await,
         CliSubCommand::ApplyLayout(cmd) => cmd.run(client).await,
         CliSubCommand::BalancePanes(cmd) => cmd.run(client).await,
+        CliSubCommand::GetBlocks(cmd) => cmd.run(client).await,
+        CliSubCommand::Mcp(cmd) => cmd.run(client).await,
     }
 }
 

@@ -285,6 +285,16 @@ impl super::TermWindow {
                 }
             }
 
+            // The Ask card (TGZTerminal) takes Enter with modifiers, Esc
+            // and the arrows before any key binding (Alt+Enter is upstream's
+            // full-screen toggle).
+            if only_key_bindings == OnlyKeyBindings::No
+                && self.assist_early_key(keycode, raw_modifiers)
+            {
+                context.invalidate();
+                return true;
+            }
+
             // An open menu takes the arrows, Enter and Esc before anything
             // else does.
             if self.dropdown_menu_key(keycode) {
@@ -807,6 +817,12 @@ impl super::TermWindow {
                 }
 
                 // A dialog, a form or the tab palette has the whole keyboard.
+                if self.chrome_dialog.is_none() && self.assist.is_some() {
+                    if window_key.key_is_down {
+                        self.assist_key(&key, modifiers, context);
+                    }
+                    return;
+                }
                 if self.ssh_setup.is_some() {
                     if window_key.key_is_down {
                         self.ssh_setup_key(&key, modifiers);
